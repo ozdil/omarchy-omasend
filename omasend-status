@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+python3 -c "
+import json, subprocess
+
+# Check if omasend-server is currently active
+try:
+    res = subprocess.run(['pgrep', '-f', 'omasend-server'], capture_output=True, text=True)
+    is_running = len(res.stdout.strip()) > 0
+except:
+    is_running = False
+
+icon = '🚀' if is_running else '󰐳'
+text = '🚀 omasend (Aktif)' if is_running else '󰐳 omasend'
+tooltip = '🚀 omasend • Kablosuz Hava Köprüsü\n• Yerel Wi-Fi üzerinden QR kodla telefondan/bilgisayardan dosya transferi.\n• Bluetooth dosya aktarımı.\n\n[Sol Tık] Transfer Panelini Başlat'
+
+print(json.dumps({
+    'text': text,
+    'tooltip': tooltip,
+    'class': 'active' if is_running else 'normal'
+}))
+"

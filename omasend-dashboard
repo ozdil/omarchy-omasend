@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+clear
+echo -e "\033[1;36m=================================================================\033[0m"
+echo -e "\033[1;33m  🚀 OMASEND • Omarchy Kablosuz Hava Köprüsü & Dosya Transferi \033[0m"
+echo -e "\033[1;36m=================================================================\033[0m"
+echo ""
+echo -e "Lütfen yapmak istediğiniz işlemi seçin:"
+echo -e "  \033[1;32m[1]\033[0m 📱 \033[1;37mTelefondan Bilgisayara Dosya Al (QR Kod ile Tara & Yükle)\033[0m"
+echo -e "  \033[1;34m[2]\033[0m 📤 \033[1;37mBilgisayardan Telefona Dosya Gönder (QR İndirme Linki)\033[0m"
+echo -e "  \033[1;35m[3]\033[0m 📶 \033[1;37mBluetooth ile Dosya Gönder\033[0m"
+echo -e "  \033[1;31m[q]\033[0m Çıkış"
+echo ""
+echo -n "Seçiminiz [1/2/3/q]: "
+read -r CHOICE
+
+LOCAL_IP=$(python3 -c "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(('10.255.255.255', 1)); print(s.getsockname()[0]); s.close()")
+
+if [ "$CHOICE" == "1" ]; then
+    clear
+    echo -e "\033[1;36m=================================================================\033[0m"
+    echo -e "\033[1;32m  📱 TELEFONDAN DOSYA ALMA MODU (QR KODU OKUTUN) \033[0m"
+    echo -e "\033[1;36m=================================================================\033[0m"
+    echo ""
+    echo -e "Telefonunuzun kamerasını aşağıdaki QR koda tutun:"
+    echo -e "🌐 Web Adresi: \033[1;34mhttp://${LOCAL_IP}:8844\033[0m"
+    echo -e "📁 Gelen Dosyalar: \033[1;32m~/Downloads\033[0m klasörüne kaydedilir."
+    echo ""
+    
+    qrencode -t ANSIUTF8 "http://${LOCAL_IP}:8844"
+    
+    echo ""
+    echo -e "\033[1;33m[Sunucu aktif. Çıkmak veya transferi sonlandırmak için Ctrl+C'ye basın...]\033[0m"
+    python3 ~/.config/omarchy/plugins/omasend/omasend-server
+
+elif [ "$CHOICE" == "2" ]; then
+    FILE_PATH=""
+    if command -v zenity &>/dev/null; then
+        FILE_PATH=$(zenity --file-selection --title="Telefona Gönderilecek Dosyayı Seçin" 2>/dev/null)
+    fi
+    if [ -z "$FILE_PATH" ]; then
+        echo -n "Dosya yolunu girin: "
+        read -r FILE_PATH
+        FILE_PATH=$(echo "$FILE_PATH" | tr -d "'\"")
+    fi
+
+    if [ -n "$FILE_PATH" ] && [ -f "$FILE_PATH" ]; then
+        clear
+        echo -e "\033[1;36m=================================================================\033[0m"
+        echo -e "\033[1;34m  📤 BİLGİSAYARDAN DOSYA GÖNDERME MODU \033[0m"
+        echo -e "\033[1;36m=================================================================\033[0m"
+        echo ""
+        echo -e "📦 Paylaşılan Dosya: \033[1;37m$(basename "$FILE_PATH")\033[0m"
+        echo -e "Telefonunuzun kamerasını aşağıdaki QR koda tutarak anında indirin:"
+        echo ""
+        
+        qrencode -t ANSIUTF8 "http://${LOCAL_IP}:8844"
+        
+        echo ""
+        echo -e "\033[1;33m[Sunucu aktif. İndirme tamamlanınca çıkmak için Ctrl+C'ye basın...]\033[0m"
+        python3 ~/.config/omarchy/plugins/omasend/omasend-server "$FILE_PATH"
+    else
+        echo -e "\033[1;31mDosya seçilmedi.\033[0m"
+        sleep 1
+    fi
+
+elif [ "$CHOICE" == "3" ]; then
+    if command -v bluetooth-sendto &>/dev/null; then
+        bluetooth-sendto
+    elif command -v blueman-sendto &>/dev/null; then
+        blueman-sendto
+    else
+        echo -e "\033[1;33mBluetooth dosya transferi başlatılıyor...\033[0m"
+        omarchy-launch-floating-terminal-with-presentation "bluetoothctl"
+    fi
+fi

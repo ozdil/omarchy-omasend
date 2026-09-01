@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+import http.server
+import socketserver
+import os
+import sys
+import socket
+import cgi
+import json
+import urllib.parse
+from datetime import datetime
+
+PORT = 8844
+DOWNLOAD_DIR = os.path.expanduser("~/Downloads")
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# Shared file path if hosting a specific file for download
+SHARED_FILE = None
+if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
+    SHARED_FILE = os.path.abspath(sys.argv[1])
+
+def get_local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(('10.255.255.255', 1))
+        IP = s.getsockname()[0]
+    except Exception:
+        IP = '127.0.0.1'
+    finally:
+        s.close()
+    return IP
+
+HTML_PAGE = """<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>omasend • Omarchy Hava Köprüsü</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #080c14;
+      color: #f1f5f9;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .container {
+      width: 100%;
+      max-width: 480px;
+      background: #0f172a;
+      border: 1px solid #1e293b;
+      border-radius: 20px;
+      padding: 24px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+    }
+    .header {
+      text-align: center;
+      margin-bottom: 24px;
+    }
+    .logo {
+      font-size: 32px;
+      margin-bottom: 8px;
+    }
+    .title {
+      font-size: 22px;
+      font-weight: 800;
+      color: #38bdf8;
+    }
+    .subtitle {
+      font-size: 13px;
+      color: #94a3b8;
+      margin-top: 4px;
+    }
+    .card {
+      background: #1e293b;
+      border-radius: 14px;
+      padding: 18px;
+      margin-bottom: 16px;
+      border: 1px solid #334155;
+    }
+    .card-title {
+      font-size: 15px;
+      font-weight: 700;
+      color: #cbd5e1;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .upload-btn {
+      display: block;
+      width: 100%;
+      background: linear-gradient(135deg, #0284c7, #0369a1);
+      color: white;
+      text-align: center;
+      padding: 14px;
+      border-radius: 12px;
+      font-size: 15px;
+      font-weight: 700;
+      border: none;
+      cursor: pointer;
+      margin-top: 10px;
+      transition: all 0.2s;
+    }
+    .upload-btn:active {
+      transform: scale(0.98);
+    }
+    .file-input {
+      display: none;
+    }
+    .file-label {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      border: 2px dashed #475569;
+      border-radius: 12px;
+      cursor: pointer;
+      background: #0f172a;
+      transition: border-color 0.2s;
+    }
+    .file-label:hover {
+      border-color: #38bdf8;
+    }
+    .file-icon {
+      font-size: 28px;
+      margin-bottom: 8px;
+    }
+    .file-name {
+      font-size: 13px;
+      color: #94a3b8;
+      word-break: break-all;
+    }
+    .download-btn {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      width: 100%;
+      background: #0f172a;
+      color: #38bdf8;
+      text-decoration: none;
+      padding: 14px;
+      border-radius: 10px;
+      border: 1px solid #0284c7;
+      font-weight: 600;
+      font-size: 14px;
+    }
+    .progress-bar {
+      width: 100%;
+      height: 6px;
+      background: #334155;
+      border-radius: 3px;
+      margin-top: 12px;
+      display: none;
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      width: 0%;
+      background: #38bdf8;
+      transition: width 0.2s;
+    }
+    .status-msg {
+      font-size: 13px;
+      text-align: center;
+      margin-top: 10px;
+      font-weight: 600;
+    }
+    .success { color: #4ade80; }
+    .error { color: #f87171; }
+    .footer {
+      text-align: center;
+      font-size: 12px;
+      color: #64748b;
+      margin-top: 16px;
+    }
+  </style>
+</head>
+<body>
+
+<div class="container">
+  <div class="header">
+    <div class="logo">🚀</div>
+    <div class="title">omasend</div>
+    <div class="subtitle">Omarchy Yerel Hava Köprüsü & Dosya Transferi</div>
+  </div>
+
+  <!-- BİLGİSAYARA DOSYA GÖNDER -->
+  <div class="card">
+    <div class="card-title">📱 ➔ 💻 Bilgisayara Dosya Yükle</div>
+    <form id="uploadForm" enctype="multipart/form-data">
+      <label class="file-label" for="fileInput">
+        <div class="file-icon">📁</div>
+        <div class="file-name" id="fileChosen">Görsel, Video veya Belge Seçin</div>
+      </label>
+      <input type="file" id="fileInput" name="files" multiple class="file-input">
+      
+      <div class="progress-bar" id="progressBar">
+        <div class="progress-fill" id="progressFill"></div>
+      </div>
+      <div class="status-msg" id="statusMsg"></div>
+
+      <button type="button" class="upload-btn" id="uploadBtn" onclick="uploadFiles()">Bilgisayara Gönder 🚀</button>
+    </form>
+  </div>
+
+  <!-- BİLGİSAYARDAN İNDİR (EĞER PAYLAŞILAN DOSYA VARSA) -->
+  __DOWNLOAD_SECTION__
+
+  <div class="footer">
+    Ozan Özdil (ozdil) • Omarchy 4.0.2+
+  </div>
+</div>
+
+<script>
+  const fileInput = document.getElementById('fileInput');
+  const fileChosen = document.getElementById('fileChosen');
+  const progressBar = document.getElementById('progressBar');
+  const progressFill = document.getElementById('progressFill');
+  const statusMsg = document.getElementById('statusMsg');
+
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files.length > 0) {
+      if (fileInput.files.length === 1) {
+        fileChosen.innerText = fileInput.files[0].name + " (" + (fileInput.files[0].size/1024/1024).toFixed(2) + " MB)";
+      } else {
+        fileChosen.innerText = fileInput.files.length + " dosya seçildi";
+      }
+    }
+  });
+
+  function uploadFiles() {
+    if (!fileInput.files.length) {
+      statusMsg.className = "status-msg error";
+      statusMsg.innerText = "Lütfen önce bir dosya seçin!";
+      return;
+    }
+
+    const formData = new FormData();
+    for (let i = 0; i < fileInput.files.length; i++) {
+      formData.append('files', fileInput.files[i]);
+    }
+
+    progressBar.style.display = 'block';
+    statusMsg.className = "status-msg";
+    statusMsg.innerText = "Yükleniyor...";
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/upload', true);
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) {
+        const percent = Math.round((e.loaded / e.total) * 100);
+        progressFill.style.width = percent + '%';
+        statusMsg.innerText = "Yükleniyor: %" + percent;
+      }
+    };
+
+    xhr.onload = () => {
+      if (xhr.status === 200) {
+        progressFill.style.width = '100%';
+        statusMsg.className = "status-msg success";
+        statusMsg.innerText = "✅ Dosyalar bilgisayarınıza (İndirilenler) başarıyla aktarıldı!";
+        fileInput.value = "";
+        fileChosen.innerText = "Başka bir dosya seçin";
+      } else {
+        statusMsg.className = "status-msg error";
+        statusMsg.innerText = "❌ Hata oluştu: " + xhr.responseText;
+      }
+    };
+
+    xhr.onerror = () => {
+      statusMsg.className = "status-msg error";
+      statusMsg.innerText = "❌ Bağlantı hatası oluştu!";
+    };
+
+    xhr.send(formData);
+  }
+</script>
+
+</body>
+</html>
+"""
+
+class OmasendHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass # Quiet mode
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        
+        if parsed.path == "/" or parsed.path == "/index.html":
+            download_section = ""
+            if SHARED_FILE and os.path.exists(SHARED_FILE):
+                filename = os.path.basename(SHARED_FILE)
+                filesize = round(os.path.getsize(SHARED_FILE) / 1024 / 1024, 2)
+                download_section = f"""
+                <div class="card">
+                  <div class="card-title">💻 ➔ 📱 Bilgisayardan Dosya İndir</div>
+                  <a href="/download/{urllib.parse.quote(filename)}" class="download-btn">
+                    <span>📥 {filename} ({filesize} MB)</span>
+                    <span>İndir ⬇️</span>
+                  </a>
+                </div>
+                """
+            
+            content = HTML_PAGE.replace("__DOWNLOAD_SECTION__", download_section).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+            return
+
+        elif parsed.path.startswith("/download/"):
+            if SHARED_FILE and os.path.exists(SHARED_FILE):
+                filename = os.path.basename(SHARED_FILE)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.send_header("Content-Length", str(os.path.getsize(SHARED_FILE)))
+                self.end_headers()
+                with open(SHARED_FILE, "rb") as f:
+                    while chunk := f.read(65536):
+                        self.wfile.write(chunk)
+                return
+
+        self.send_error(404, "Not found")
+
+    def do_POST(self):
+        if self.path == "/upload":
+            content_type = self.headers.get("Content-Type")
+            if not content_type or "multipart/form-data" not in content_type:
+                self.send_error(400, "Bad Request")
+                return
+
+            try:
+                form = cgi.FieldStorage(
+                    fp=self.rfile,
+                    headers=self.headers,
+                    environ={
+                        'REQUEST_METHOD': 'POST',
+                        'CONTENT_TYPE': content_type,
+                    }
+                )
+
+                fileitems = form.getlist('files') if 'files' in form else []
+                if not fileitems and 'files' in form:
+                    fileitems = [form['files']]
+
+                saved_count = 0
+                for item in fileitems:
+                    if item.filename:
+                        filename = os.path.basename(item.filename)
+                        out_path = os.path.join(DOWNLOAD_DIR, filename)
+                        
+                        # Handle duplicate names
+                        base, ext = os.path.splitext(filename)
+                        counter = 1
+                        while os.path.exists(out_path):
+                            out_path = os.path.join(DOWNLOAD_DIR, f"{base}_{counter}{ext}")
+                            counter += 1
+
+                        with open(out_path, 'wb') as f:
+                            f.write(item.file.read())
+                        saved_count += 1
+                        print(f"📥 [omasend] Alındı: {out_path}", flush=True)
+
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(f"OK ({saved_count} dosya kaydedildi)".encode("utf-8"))
+            except Exception as e:
+                self.send_error(500, str(e))
+
+def start_server():
+    socketserver.TCPServer.allow_reuse_address = True
+    with socketserver.ThreadingTCPServer(("", PORT), OmasendHandler) as httpd:
+        local_ip = get_local_ip()
+        print(f"OMARSI_READY:{local_ip}:{PORT}", flush=True)
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
+
+if __name__ == "__main__":
+    start_server()

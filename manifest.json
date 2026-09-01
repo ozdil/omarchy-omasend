@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "ozdil.omasend",
+  "name": "omasend",
+  "version": "1.0.0",
+  "author": "Ozan Özdil (ozdil)",
+  "license": "MIT",
+  "description": "Wireless AirBridge, local Wi-Fi QR file transfer, and Bluetooth sharing sentinel for Omarchy.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "omasend",
+    "description": "Wireless AirBridge and QR code local network file transfer.",
+    "category": "Productivity",
+    "defaultSection": "right",
+    "aliases": ["omasend", "airdrop", "localsend", "transfer", "share"],
+    "allowMultiple": false
+  }
+}
