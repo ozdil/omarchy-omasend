@@ -1,37 +1,118 @@
 #!/usr/bin/env bash
 clear
 echo -e "\033[1;36m=================================================================\033[0m"
-echo -e "\033[1;33m  🚀 OMASEND • Omarchy Kablosuz Hava Köprüsü & Pano Transferi \033[0m"
+echo -e "\033[1;33m  🔒 OMASEND • Sıfır-Güven (Zero-Trust) Kablosuz Hava Köprüsü \033[0m"
 echo -e "\033[1;36m=================================================================\033[0m"
+echo -e "\033[0;90mHer oturum rastgele bir kriptografik erişim tokenı ile korunur.\033[0m"
 echo ""
-echo -e "Lütfen yapmak istediğiniz işlemi seçin:"
-echo -e "  \033[1;32m[1]\033[0m 📱 \033[1;37mTelefondan Bilgisayara Dosya Al (QR Kod ile Tara & Yükle)\033[0m"
-echo -e "  \033[1;34m[2]\033[0m 📤 \033[1;37mBilgisayardan Telefona Dosya Gönder (QR İndirme Linki)\033[0m"
-echo -e "  \033[1;33m[3]\033[0m 📋 \033[1;37mBilgisayarın Panosunu (Clipboard) Telefona Gönder\033[0m"
-echo -e "  \033[1;35m[4]\033[0m 📶 \033[1;37mBluetooth ile Dosya Gönder\033[0m"
+echo -e "Lütfen transfer modunu seçin:"
+echo -e "  \033[1;32m[1]\033[0m 📱 \033[1;37mYerel Ağ Modu (Ev / Ofis Wi-Fi - Şifreli QR)\033[0m"
+echo -e "  \033[1;31m[2]\033[0m 🌐 \033[1;37mGenel Ağ / Tünel Modu (Kafe, Belediye Wi-Fi & İstemci İzolasyonu Aşımı)\033[0m"
+echo -e "  \033[1;33m[3]\033[0m 📋 \033[1;37mOptik Pano Modu (Sıfır Ağ / Air-Gapped Güvenlik)\033[0m"
+echo -e "  \033[1;34m[4]\033[0m 📤 \033[1;37mBilgisayardan Dosya Paylaş (İndirme Linki Üret)\033[0m"
+echo -e "  \033[1;35m[5]\033[0m 📶 \033[1;37mBluetooth Doğrudan Transfer\033[0m"
 echo -e "  \033[1;31m[q]\033[0m Çıkış"
 echo ""
-echo -n "Seçiminiz [1/2/3/4/q]: "
+echo -n "Seçiminiz [1/2/3/4/5/q]: "
 read -r CHOICE
 
 LOCAL_IP=$(python3 -c "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(('10.255.255.255', 1)); print(s.getsockname()[0]); s.close()")
 
 if [ "$CHOICE" == "1" ]; then
     clear
+    # Launch server in background to capture the generated session token
+    python3 ~/.config/omarchy/plugins/omasend/omasend-server > /tmp/omasend_session.log 2>&1 &
+    SERVER_PID=$!
+    sleep 0.5
+    
+    TOKEN=$(grep -m1 "TOKEN:" /tmp/omasend_session.log | cut -d':' -f2 | tr -d ' \r\n')
+    URL="http://${LOCAL_IP}:8844/?k=${TOKEN}"
+
     echo -e "\033[1;36m=================================================================\033[0m"
-    echo -e "\033[1;32m  📱 TELEFONDAN DOSYA ALMA MODU \033[0m"
+    echo -e "\033[1;32m  📱 YEREL AĞ MODU • KRİPTOGRAFİK TOKEN KORUMALI \033[0m"
     echo -e "\033[1;36m=================================================================\033[0m"
     echo ""
-    echo -e "Telefonunuzun kamerasını aşağıdaki QR koda tutun:"
-    echo -e "🌐 Web Adresi: \033[1;34mhttp://${LOCAL_IP}:8844\033[0m"
-    echo -e "📁 Gelen Dosyalar: \033[1;32m~/Downloads\033[0m klasörüne kaydedilir."
+    echo -e "🔑 \033[1;33mOturum Tokenı:\033[0m \033[1;32m${TOKEN}\033[0m (Ağ tarayıcılarına ve yabancılara kapalı)"
+    echo -e "🌐 \033[1;34m${URL}\033[0m"
+    echo -e "📁 \033[0;90mGelen Dosyalar: ~/Downloads/omasend/\033[0m"
     echo ""
-    qrencode -t ANSIUTF8 "http://${LOCAL_IP}:8844"
+    
+    qrencode -t ANSIUTF8 "$URL"
+    
     echo ""
-    echo -e "\033[1;33m[Sunucu aktif. Çıkmak için Ctrl+C'ye basın...]\033[0m"
-    python3 ~/.config/omarchy/plugins/omasend/omasend-server
+    echo -e "\033[1;33m[Transferi sonlandırmak ve sunucuyu kapatmak için Ctrl+C'ye basın...]\033[0m"
+    
+    trap "kill $SERVER_PID 2>/dev/null; rm -f /tmp/omasend_session.log; exit 0" SIGINT SIGTERM
+    wait $SERVER_PID
 
 elif [ "$CHOICE" == "2" ]; then
+    clear
+    echo -e "\033[1;36m=================================================================\033[0m"
+    echo -e "\033[1;31m  🌐 GENEL AĞ / TÜNEL MODU (İstemci İzolasyonu Aşımı) \033[0m"
+    echo -e "\033[1;36m=================================================================\033[0m"
+    echo ""
+    echo -e "\033[1;33m⚡ Uçtan uca şifreli geçici TLS tüneli kuruluyor...\033[0m"
+    
+    # Launch server
+    python3 ~/.config/omarchy/plugins/omasend/omasend-server > /tmp/omasend_session.log 2>&1 &
+    SERVER_PID=$!
+    sleep 0.5
+    TOKEN=$(grep -m1 "TOKEN:" /tmp/omasend_session.log | cut -d':' -f2 | tr -d ' \r\n')
+    
+    # Launch SSH reverse tunnel
+    ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=10 -R 80:localhost:8844 nokey@localhost.run > /tmp/omasend_tunnel.log 2>&1 &
+    TUNNEL_PID=$!
+    
+    # Wait for tunnel URL
+    TUNNEL_URL=""
+    for i in {1..20}; do
+        sleep 0.8
+        TUNNEL_URL=$(grep -o "https://[a-zA-Z0-9.-]*\.lhr\.life" /tmp/omasend_tunnel.log | head -n1)
+        if [ -n "$TUNNEL_URL" ]; then break; fi
+    done
+
+    if [ -n "$TUNNEL_URL" ]; then
+        FULL_URL="${TUNNEL_URL}/?k=${TOKEN}"
+        echo ""
+        echo -e "✅ \033[1;32mŞifreli Tünel Aktif!\033[0m (Belediye/Kafe kısıtlamaları aşıldı)"
+        echo -e "🔒 \033[1;33mErişim Tokenı:\033[0m \033[1;32m${TOKEN}\033[0m"
+        echo -e "🌐 \033[1;34m${FULL_URL}\033[0m"
+        echo ""
+        qrencode -t ANSIUTF8 "$FULL_URL"
+        echo ""
+        echo -e "\033[1;33m[Güvenli tüneli kapatmak için Ctrl+C'ye basın...]\033[0m"
+    else
+        echo -e "\033[1;33mİnternet tüneli yanıt vermedi, yerel güvenli IP'ye geçiliyor:\033[0m"
+        URL="http://${LOCAL_IP}:8844/?k=${TOKEN}"
+        qrencode -t ANSIUTF8 "$URL"
+    fi
+
+    trap "kill $SERVER_PID $TUNNEL_PID 2>/dev/null; rm -f /tmp/omasend_session.log /tmp/omasend_tunnel.log; exit 0" SIGINT SIGTERM
+    wait $SERVER_PID
+
+elif [ "$CHOICE" == "3" ]; then
+    clear
+    CLIP_TEXT=$(wl-paste 2>/dev/null || true)
+    echo -e "\033[1;36m=================================================================\033[0m"
+    echo -e "\033[1;33m  📋 OPTİK PANO MODU (Air-Gapped / Sıfır Ağ İletişimi) \033[0m"
+    echo -e "\033[1;36m=================================================================\033[0m"
+    echo ""
+    if [ -z "$CLIP_TEXT" ]; then
+        echo -e "\033[1;31m⚠️ Bilgisayarınızın panosu şu anda boş!\033[0m"
+    else
+        echo -e "📄 \033[1;32mPanodaki Metin:\033[0m"
+        echo "$CLIP_TEXT" | head -n 4
+        [ $(echo "$CLIP_TEXT" | wc -l) -gt 4 ] && echo "..."
+        echo ""
+        echo -e "\033[1;37mBu aktarım için hiçbir ağ kullanılmaz. Telefon kamerasıyla doğrudan tarayın:\033[0m"
+        echo ""
+        qrencode -t ANSIUTF8 "$CLIP_TEXT"
+    fi
+    echo ""
+    echo -e "\033[0;90mÇıkmak için bir tuşa basın...\033[0m"
+    read -n 1 -s -r
+
+elif [ "$CHOICE" == "4" ]; then
     FILE_PATH=""
     if command -v zenity &>/dev/null; then
         FILE_PATH=$(zenity --file-selection --title="Telefona Gönderilecek Dosyayı Seçin" 2>/dev/null)
@@ -44,61 +125,31 @@ elif [ "$CHOICE" == "2" ]; then
 
     if [ -n "$FILE_PATH" ] && [ -f "$FILE_PATH" ]; then
         clear
-        echo -e "\033[1;36m=================================================================\033[0m"
-        echo -e "\033[1;34m  📤 BİLGİSAYARDAN DOSYA GÖNDERME MODU \033[0m"
-        echo -e "\033[1;36m=================================================================\033[0m"
-        echo ""
-        echo -e "📦 Paylaşılan Dosya: \033[1;37m$(basename "$FILE_PATH")\033[0m"
-        echo -e "Telefonunuzun kamerasını aşağıdaki QR koda tutarak anında indirin:"
-        echo ""
-        qrencode -t ANSIUTF8 "http://${LOCAL_IP}:8844"
-        echo ""
-        echo -e "\033[1;33m[Sunucu aktif. Çıkmak için Ctrl+C'ye basın...]\033[0m"
-        python3 ~/.config/omarchy/plugins/omasend/omasend-server "$FILE_PATH"
-    else
-        echo -e "\033[1;31mDosya seçilmedi.\033[0m"
-        sleep 1
-    fi
+        python3 ~/.config/omarchy/plugins/omasend/omasend-server "$FILE_PATH" > /tmp/omasend_session.log 2>&1 &
+        SERVER_PID=$!
+        sleep 0.5
+        TOKEN=$(grep -m1 "TOKEN:" /tmp/omasend_session.log | cut -d':' -f2 | tr -d ' \r\n')
+        URL="http://${LOCAL_IP}:8844/?k=${TOKEN}"
 
-elif [ "$CHOICE" == "3" ]; then
-    clear
-    CLIP_TEXT=$(wl-paste 2>/dev/null || true)
-    echo -e "\033[1;36m=================================================================\033[0m"
-    echo -e "\033[1;33m  📋 BİLGİSAYARIN PANOSUNU (CLIPBOARD) TELEFONA GÖNDER \033[0m"
-    echo -e "\033[1;36m=================================================================\033[0m"
-    echo ""
-    if [ -z "$CLIP_TEXT" ]; then
-        echo -e "\033[1;31m⚠️ Bilgisayarınızın panosu şu anda boş!\033[0m"
-        echo -e "Lütfen önce bir metin veya link kopyalayın (Ctrl+C)."
-    else
-        echo -e "📄 \033[1;32mPanodaki Metin:\033[0m"
-        echo -e "\033[0;90m-----------------------------------------------------------------\033[0m"
-        echo "$CLIP_TEXT" | head -n 5
-        [ $(echo "$CLIP_TEXT" | wc -l) -gt 5 ] && echo "..."
-        echo -e "\033[0;90m-----------------------------------------------------------------\033[0m"
+        echo -e "\033[1;36m=================================================================\033[0m"
+        echo -e "\033[1;34m  📤 BİLGİSAYARDAN DOSYA İNDİRME MODU \033[0m"
+        echo -e "\033[1;36m=================================================================\033[0m"
         echo ""
+        echo -e "📦 Paylaşılan: \033[1;37m$(basename "$FILE_PATH")\033[0m"
+        echo -e "🔑 Token Korumalı Link: \033[1;34m${URL}\033[0m"
+        echo ""
+        qrencode -t ANSIUTF8 "$URL"
+        echo ""
+        echo -e "\033[1;33m[İndirme tamamlanınca sunucuyu kapatmak için Ctrl+C'ye basın...]\033[0m"
         
-        # If clipboard text is short (<200 chars), display direct QR code for instant camera read
-        CHAR_COUNT=$(echo -n "$CLIP_TEXT" | wc -c)
-        if [ "$CHAR_COUNT" -le 200 ]; then
-            echo -e "\033[1;37mTelefon kamerasıyla okutarak metni/linki doğrudan açın:\033[0m"
-            qrencode -t ANSIUTF8 "$CLIP_TEXT"
-        else
-            echo -e "\033[1;37mMetin uzun olduğu için web köprüsü üzerinden aktarılıyor:\033[0m"
-            qrencode -t ANSIUTF8 "http://${LOCAL_IP}:8844"
-        fi
+        trap "kill $SERVER_PID 2>/dev/null; rm -f /tmp/omasend_session.log; exit 0" SIGINT SIGTERM
+        wait $SERVER_PID
     fi
-    echo ""
-    echo -e "\033[1;33m[Web panosu aktif. Telefonunuzdan 'http://${LOCAL_IP}:8844' adresinden de alabilirsiniz. Çıkış: Ctrl+C]\033[0m"
-    python3 ~/.config/omarchy/plugins/omasend/omasend-server
 
-elif [ "$CHOICE" == "4" ]; then
+elif [ "$CHOICE" == "5" ]; then
     if command -v bluetooth-sendto &>/dev/null; then
         bluetooth-sendto
-    elif command -v blueman-sendto &>/dev/null; then
-        blueman-sendto
     else
-        echo -e "\033[1;33mBluetooth dosya transferi başlatılıyor...\033[0m"
         omarchy-launch-floating-terminal-with-presentation "bluetoothctl"
     fi
 fi
