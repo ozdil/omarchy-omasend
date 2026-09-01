@@ -4,12 +4,12 @@ import socketserver
 import os
 import sys
 import socket
-import cgi
 import json
 import urllib.parse
 import subprocess
 import secrets
-from datetime import datetime
+import email.parser
+import email.policy
 
 PORT = 8844
 DOWNLOAD_DIR = os.path.expanduser("~/Downloads/omasend")
@@ -52,7 +52,6 @@ def set_pc_clipboard(text):
         return False
 
 def sanitize_filename(filename):
-    # Strip any directory traversal attacks
     clean = os.path.basename(filename).replace("..", "").replace("/", "").replace("\\", "").strip()
     return clean if clean else f"file_{secrets.token_hex(4)}.dat"
 
@@ -374,6 +373,9 @@ class SecureOmasendHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
+    def do_HEAD(self):
+        self.do_GET()
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         
@@ -453,29 +455,22 @@ class SecureOmasendHandler(http.server.BaseHTTPRequestHandler):
             return
 
         elif parsed.path == "/upload":
-            content_type = self.headers.get("Content-Type")
+            content_type = self.headers.get("Content-Type", "")
+            content_length = int(self.headers.get('Content-Length', 0))
             if not content_type or "multipart/form-data" not in content_type:
                 self.send_error(400, "Bad Request")
                 return
 
             try:
-                form = cgi.FieldStorage(
-                    fp=self.rfile,
-                    headers=self.headers,
-                    environ={
-                        'REQUEST_METHOD': 'POST',
-                        'CONTENT_TYPE': content_type,
-                    }
-                )
-
-                fileitems = form.getlist('files') if 'files' in form else []
-                if not fileitems and 'files' in form:
-                    fileitems = [form['files']]
+                body_bytes = self.rfile.read(content_length)
+                msg_bytes = f"Content-Type: {content_type}\r\n\r\n".encode("utf-8") + body_bytes
+                msg = email.parser.BytesParser(policy=email.policy.default).parsebytes(msg_bytes)
 
                 saved_count = 0
-                for item in fileitems:
-                    if item.filename:
-                        safe_name = sanitize_filename(item.filename)
+                for part in msg.iter_parts():
+                    filename = part.get_filename()
+                    if filename:
+                        safe_name = sanitize_filename(filename)
                         out_path = os.path.join(DOWNLOAD_DIR, safe_name)
                         
                         base, ext = os.path.splitext(safe_name)
@@ -485,7 +480,7 @@ class SecureOmasendHandler(http.server.BaseHTTPRequestHandler):
                             counter += 1
 
                         with open(out_path, 'wb') as f:
-                            f.write(item.file.read())
+                            f.write(part.get_payload(decode=True))
                         saved_count += 1
                         print(f"🔒 [omasend] Güvenli Alındı: {out_path}", flush=True)
 
@@ -498,7 +493,7 @@ class SecureOmasendHandler(http.server.BaseHTTPRequestHandler):
 
 def start_server():
     socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.ThreadingTCPServer(("", PORT), SecureOmasendHandler) as httpd:
+    with socketserver.ThreadingTCPServer(("0.0.0.0", PORT), SecureOmasendHandler) as httpd:
         local_ip = get_local_ip()
         print(f"TOKEN:{SESSION_TOKEN}", flush=True)
         print(f"URL:http://{local_ip}:{PORT}/?k={SESSION_TOKEN}", flush=True)
