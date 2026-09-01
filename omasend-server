@@ -7,6 +7,7 @@ import socket
 import cgi
 import json
 import urllib.parse
+import subprocess
 from datetime import datetime
 
 PORT = 8844
@@ -29,12 +30,30 @@ def get_local_ip():
         s.close()
     return IP
 
+def get_pc_clipboard():
+    try:
+        res = subprocess.run(['wl-paste', '--no-newline'], capture_output=True, text=True, timeout=1)
+        return res.stdout
+    except Exception:
+        return ""
+
+def set_pc_clipboard(text):
+    try:
+        p = subprocess.Popen(['wl-copy'], stdin=subprocess.PIPE, text=True)
+        p.communicate(input=text)
+        # Send desktop notification
+        preview = text[:40] + ('...' if len(text) > 40 else '')
+        subprocess.run(['notify-send', '🚀 omasend • Pano Güncellendi', f'Mobilden kopyalandı: {preview}'], check=False)
+        return True
+    except Exception:
+        return False
+
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="tr">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>omasend • Omarchy Hava Köprüsü</title>
+  <title>omasend • Çift Yönlü Hava Köprüsü</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -45,7 +64,7 @@ HTML_PAGE = """<!DOCTYPE html>
       flex-direction: column;
       align-items: center;
       min-height: 100vh;
-      padding: 20px;
+      padding: 16px;
     }
     .container {
       width: 100%;
@@ -53,16 +72,16 @@ HTML_PAGE = """<!DOCTYPE html>
       background: #0f172a;
       border: 1px solid #1e293b;
       border-radius: 20px;
-      padding: 24px;
+      padding: 20px;
       box-shadow: 0 10px 30px rgba(0,0,0,0.5);
     }
     .header {
       text-align: center;
-      margin-bottom: 24px;
+      margin-bottom: 20px;
     }
     .logo {
       font-size: 32px;
-      margin-bottom: 8px;
+      margin-bottom: 4px;
     }
     .title {
       font-size: 22px;
@@ -72,111 +91,97 @@ HTML_PAGE = """<!DOCTYPE html>
     .subtitle {
       font-size: 13px;
       color: #94a3b8;
-      margin-top: 4px;
+      margin-top: 2px;
     }
     .card {
       background: #1e293b;
       border-radius: 14px;
-      padding: 18px;
-      margin-bottom: 16px;
+      padding: 16px;
+      margin-bottom: 14px;
       border: 1px solid #334155;
     }
     .card-title {
-      font-size: 15px;
+      font-size: 14px;
       font-weight: 700;
       color: #cbd5e1;
-      margin-bottom: 12px;
+      margin-bottom: 10px;
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: 6px;
     }
-    .upload-btn {
+    .btn {
       display: block;
       width: 100%;
       background: linear-gradient(135deg, #0284c7, #0369a1);
       color: white;
       text-align: center;
-      padding: 14px;
-      border-radius: 12px;
-      font-size: 15px;
+      padding: 12px;
+      border-radius: 10px;
+      font-size: 14px;
       font-weight: 700;
       border: none;
       cursor: pointer;
-      margin-top: 10px;
-      transition: all 0.2s;
+      margin-top: 8px;
+      transition: transform 0.1s;
     }
-    .upload-btn:active {
-      transform: scale(0.98);
+    .btn:active { transform: scale(0.98); }
+    .btn-green {
+      background: linear-gradient(135deg, #059669, #047857);
     }
-    .file-input {
-      display: none;
-    }
+    .file-input { display: none; }
     .file-label {
       display: flex;
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      padding: 24px;
+      padding: 18px;
       border: 2px dashed #475569;
-      border-radius: 12px;
+      border-radius: 10px;
       cursor: pointer;
       background: #0f172a;
-      transition: border-color 0.2s;
-    }
-    .file-label:hover {
-      border-color: #38bdf8;
-    }
-    .file-icon {
-      font-size: 28px;
-      margin-bottom: 8px;
     }
     .file-name {
-      font-size: 13px;
+      font-size: 12px;
       color: #94a3b8;
+      margin-top: 4px;
       word-break: break-all;
     }
-    .download-btn {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
+    .textarea {
       width: 100%;
+      height: 60px;
       background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      color: #f1f5f9;
+      padding: 10px;
+      font-size: 13px;
+      resize: vertical;
+    }
+    .clip-preview {
+      background: #0f172a;
+      padding: 10px;
+      border-radius: 8px;
+      border: 1px solid #334155;
+      font-size: 13px;
       color: #38bdf8;
-      text-decoration: none;
-      padding: 14px;
-      border-radius: 10px;
-      border: 1px solid #0284c7;
-      font-weight: 600;
-      font-size: 14px;
-    }
-    .progress-bar {
-      width: 100%;
-      height: 6px;
-      background: #334155;
-      border-radius: 3px;
-      margin-top: 12px;
-      display: none;
-      overflow: hidden;
-    }
-    .progress-fill {
-      height: 100%;
-      width: 0%;
-      background: #38bdf8;
-      transition: width 0.2s;
+      max-height: 80px;
+      overflow-y: auto;
+      word-break: break-all;
+      white-space: pre-wrap;
     }
     .status-msg {
-      font-size: 13px;
+      font-size: 12px;
       text-align: center;
-      margin-top: 10px;
+      margin-top: 8px;
       font-weight: 600;
     }
     .success { color: #4ade80; }
     .error { color: #f87171; }
     .footer {
       text-align: center;
-      font-size: 12px;
+      font-size: 11px;
       color: #64748b;
-      margin-top: 16px;
+      margin-top: 12px;
     }
   </style>
 </head>
@@ -186,29 +191,39 @@ HTML_PAGE = """<!DOCTYPE html>
   <div class="header">
     <div class="logo">🚀</div>
     <div class="title">omasend</div>
-    <div class="subtitle">Omarchy Yerel Hava Köprüsü & Dosya Transferi</div>
+    <div class="subtitle">Çift Yönlü Dosya & Pano (Clipboard) Köprüsü</div>
   </div>
 
-  <!-- BİLGİSAYARA DOSYA GÖNDER -->
+  <!-- 1. BİLGİSAYARIN PANOSUNU TELEFONA AL (PC -> MOBİL) -->
+  <div class="card">
+    <div class="card-title">💻 ➔ 📱 Bilgisayarın Panosunu Telefona Al</div>
+    <div class="clip-preview" id="pcClipText">Yükleniyor...</div>
+    <button class="btn btn-green" onclick="copyPcClipToPhone()">Telefona Kopyala 📋</button>
+  </div>
+
+  <!-- 2. TELEFONUN PANOSUNU BİLGİSAYARA GÖNDER (MOBİL -> PC) -->
+  <div class="card">
+    <div class="card-title">📱 ➔ 💻 Telefondan Bilgisayara Pano Gönder</div>
+    <textarea id="mobileText" class="textarea" placeholder="Buraya bir metin veya link yapıştırın..."></textarea>
+    <button class="btn" onclick="sendTextToPc()">Bilgisayarın Panosuna Yaz ⚡</button>
+    <div id="clipStatus" class="status-msg"></div>
+  </div>
+
+  <!-- 3. BİLGİSAYARA DOSYA YÜKLE (MOBİL -> PC) -->
   <div class="card">
     <div class="card-title">📱 ➔ 💻 Bilgisayara Dosya Yükle</div>
     <form id="uploadForm" enctype="multipart/form-data">
       <label class="file-label" for="fileInput">
-        <div class="file-icon">📁</div>
+        <div style="font-size:24px;">📁</div>
         <div class="file-name" id="fileChosen">Görsel, Video veya Belge Seçin</div>
       </label>
       <input type="file" id="fileInput" name="files" multiple class="file-input">
-      
-      <div class="progress-bar" id="progressBar">
-        <div class="progress-fill" id="progressFill"></div>
-      </div>
+      <button type="button" class="btn" onclick="uploadFiles()">Bilgisayara Gönder 🚀</button>
       <div class="status-msg" id="statusMsg"></div>
-
-      <button type="button" class="upload-btn" id="uploadBtn" onclick="uploadFiles()">Bilgisayara Gönder 🚀</button>
     </form>
   </div>
 
-  <!-- BİLGİSAYARDAN İNDİR (EĞER PAYLAŞILAN DOSYA VARSA) -->
+  <!-- 4. BİLGİSAYARDAN DOSYA İNDİR (EĞER VARSA) -->
   __DOWNLOAD_SECTION__
 
   <div class="footer">
@@ -217,19 +232,65 @@ HTML_PAGE = """<!DOCTYPE html>
 </div>
 
 <script>
+  // Fetch PC Clipboard
+  async function refreshPcClip() {
+    try {
+      const res = await fetch('/api/clipboard');
+      const data = await res.json();
+      const text = data.clipboard || "(Bilgisayarın panosu boş)";
+      document.getElementById('pcClipText').innerText = text;
+    } catch(e) {
+      document.getElementById('pcClipText').innerText = "(Pano alınamadı)";
+    }
+  }
+  refreshPcClip();
+  setInterval(refreshPcClip, 4000);
+
+  async function copyPcClipToPhone() {
+    const text = document.getElementById('pcClipText').innerText;
+    if (navigator.clipboard) {
+      await navigator.clipboard.writeText(text);
+      alert("✅ Bilgisayarın panosu telefonunuza kopyalandı!");
+    } else {
+      alert("Metin: " + text);
+    }
+  }
+
+  async function sendTextToPc() {
+    const text = document.getElementById('mobileText').value.trim();
+    if (!text) {
+      document.getElementById('clipStatus').className = "status-msg error";
+      document.getElementById('clipStatus').innerText = "Lütfen bir metin girin!";
+      return;
+    }
+
+    try {
+      const res = await fetch('/api/clipboard', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: text })
+      });
+      if (res.ok) {
+        document.getElementById('clipStatus').className = "status-msg success";
+        document.getElementById('clipStatus').innerText = "✅ Bilgisayarın panosuna aktarıldı!";
+        document.getElementById('mobileText').value = "";
+        refreshPcClip();
+      }
+    } catch(e) {
+      document.getElementById('clipStatus').className = "status-msg error";
+      document.getElementById('clipStatus').innerText = "Hata oluştu!";
+    }
+  }
+
   const fileInput = document.getElementById('fileInput');
   const fileChosen = document.getElementById('fileChosen');
-  const progressBar = document.getElementById('progressBar');
-  const progressFill = document.getElementById('progressFill');
   const statusMsg = document.getElementById('statusMsg');
 
   fileInput.addEventListener('change', () => {
     if (fileInput.files.length > 0) {
-      if (fileInput.files.length === 1) {
-        fileChosen.innerText = fileInput.files[0].name + " (" + (fileInput.files[0].size/1024/1024).toFixed(2) + " MB)";
-      } else {
-        fileChosen.innerText = fileInput.files.length + " dosya seçildi";
-      }
+      fileChosen.innerText = fileInput.files.length === 1
+        ? fileInput.files[0].name + " (" + (fileInput.files[0].size/1024/1024).toFixed(2) + " MB)"
+        : fileInput.files.length + " dosya seçildi";
     }
   });
 
@@ -245,39 +306,22 @@ HTML_PAGE = """<!DOCTYPE html>
       formData.append('files', fileInput.files[i]);
     }
 
-    progressBar.style.display = 'block';
     statusMsg.className = "status-msg";
     statusMsg.innerText = "Yükleniyor...";
 
     const xhr = new XMLHttpRequest();
     xhr.open('POST', '/upload', true);
-
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable) {
-        const percent = Math.round((e.loaded / e.total) * 100);
-        progressFill.style.width = percent + '%';
-        statusMsg.innerText = "Yükleniyor: %" + percent;
-      }
-    };
-
     xhr.onload = () => {
       if (xhr.status === 200) {
-        progressFill.style.width = '100%';
         statusMsg.className = "status-msg success";
-        statusMsg.innerText = "✅ Dosyalar bilgisayarınıza (İndirilenler) başarıyla aktarıldı!";
+        statusMsg.innerText = "✅ Dosyalar bilgisayara aktarıldı!";
         fileInput.value = "";
         fileChosen.innerText = "Başka bir dosya seçin";
       } else {
         statusMsg.className = "status-msg error";
-        statusMsg.innerText = "❌ Hata oluştu: " + xhr.responseText;
+        statusMsg.innerText = "❌ Hata oluştu!";
       }
     };
-
-    xhr.onerror = () => {
-      statusMsg.className = "status-msg error";
-      statusMsg.innerText = "❌ Bağlantı hatası oluştu!";
-    };
-
     xhr.send(formData);
   }
 </script>
@@ -288,7 +332,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
 class OmasendHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        pass # Quiet mode
+        pass
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -301,7 +345,7 @@ class OmasendHandler(http.server.BaseHTTPRequestHandler):
                 download_section = f"""
                 <div class="card">
                   <div class="card-title">💻 ➔ 📱 Bilgisayardan Dosya İndir</div>
-                  <a href="/download/{urllib.parse.quote(filename)}" class="download-btn">
+                  <a href="/download/{urllib.parse.quote(filename)}" style="display:flex; justify-content:space-between; width:100%; background:#0f172a; color:#38bdf8; text-decoration:none; padding:12px; border-radius:8px; border:1px solid #0284c7; font-weight:600; font-size:13px;">
                     <span>📥 {filename} ({filesize} MB)</span>
                     <span>İndir ⬇️</span>
                   </a>
@@ -314,6 +358,16 @@ class OmasendHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(content)))
             self.end_headers()
             self.wfile.write(content)
+            return
+
+        elif parsed.path == "/api/clipboard":
+            clip = get_pc_clipboard()
+            data = json.dumps({"clipboard": clip}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
             return
 
         elif parsed.path.startswith("/download/"):
@@ -332,7 +386,23 @@ class OmasendHandler(http.server.BaseHTTPRequestHandler):
         self.send_error(404, "Not found")
 
     def do_POST(self):
-        if self.path == "/upload":
+        if self.path == "/api/clipboard":
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length).decode('utf-8')
+            try:
+                data = json.loads(body)
+                text = data.get("text", "")
+                if text:
+                    set_pc_clipboard(text)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"status": "ok"}')
+            except Exception as e:
+                self.send_error(500, str(e))
+            return
+
+        elif self.path == "/upload":
             content_type = self.headers.get("Content-Type")
             if not content_type or "multipart/form-data" not in content_type:
                 self.send_error(400, "Bad Request")
@@ -357,8 +427,6 @@ class OmasendHandler(http.server.BaseHTTPRequestHandler):
                     if item.filename:
                         filename = os.path.basename(item.filename)
                         out_path = os.path.join(DOWNLOAD_DIR, filename)
-                        
-                        # Handle duplicate names
                         base, ext = os.path.splitext(filename)
                         counter = 1
                         while os.path.exists(out_path):
