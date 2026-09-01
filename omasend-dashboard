@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 clear
 echo -e "\033[1;36m=================================================================\033[0m"
-echo -e "\033[1;33m  🚀 OMASEND • Omarchy Kablosuz Hava Köprüsü & Dosya Transferi \033[0m"
+echo -e "\033[1;33m  🚀 OMASEND • Omarchy Kablosuz Hava Köprüsü & Pano Transferi \033[0m"
 echo -e "\033[1;36m=================================================================\033[0m"
 echo ""
 echo -e "Lütfen yapmak istediğiniz işlemi seçin:"
 echo -e "  \033[1;32m[1]\033[0m 📱 \033[1;37mTelefondan Bilgisayara Dosya Al (QR Kod ile Tara & Yükle)\033[0m"
 echo -e "  \033[1;34m[2]\033[0m 📤 \033[1;37mBilgisayardan Telefona Dosya Gönder (QR İndirme Linki)\033[0m"
-echo -e "  \033[1;35m[3]\033[0m 📶 \033[1;37mBluetooth ile Dosya Gönder\033[0m"
+echo -e "  \033[1;33m[3]\033[0m 📋 \033[1;37mBilgisayarın Panosunu (Clipboard) Telefona Gönder\033[0m"
+echo -e "  \033[1;35m[4]\033[0m 📶 \033[1;37mBluetooth ile Dosya Gönder\033[0m"
 echo -e "  \033[1;31m[q]\033[0m Çıkış"
 echo ""
-echo -n "Seçiminiz [1/2/3/q]: "
+echo -n "Seçiminiz [1/2/3/4/q]: "
 read -r CHOICE
 
 LOCAL_IP=$(python3 -c "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(('10.255.255.255', 1)); print(s.getsockname()[0]); s.close()")
@@ -18,18 +19,16 @@ LOCAL_IP=$(python3 -c "import socket; s = socket.socket(socket.AF_INET, socket.S
 if [ "$CHOICE" == "1" ]; then
     clear
     echo -e "\033[1;36m=================================================================\033[0m"
-    echo -e "\033[1;32m  📱 TELEFONDAN DOSYA ALMA MODU (QR KODU OKUTUN) \033[0m"
+    echo -e "\033[1;32m  📱 TELEFONDAN DOSYA ALMA MODU \033[0m"
     echo -e "\033[1;36m=================================================================\033[0m"
     echo ""
     echo -e "Telefonunuzun kamerasını aşağıdaki QR koda tutun:"
     echo -e "🌐 Web Adresi: \033[1;34mhttp://${LOCAL_IP}:8844\033[0m"
     echo -e "📁 Gelen Dosyalar: \033[1;32m~/Downloads\033[0m klasörüne kaydedilir."
     echo ""
-    
     qrencode -t ANSIUTF8 "http://${LOCAL_IP}:8844"
-    
     echo ""
-    echo -e "\033[1;33m[Sunucu aktif. Çıkmak veya transferi sonlandırmak için Ctrl+C'ye basın...]\033[0m"
+    echo -e "\033[1;33m[Sunucu aktif. Çıkmak için Ctrl+C'ye basın...]\033[0m"
     python3 ~/.config/omarchy/plugins/omasend/omasend-server
 
 elif [ "$CHOICE" == "2" ]; then
@@ -52,11 +51,9 @@ elif [ "$CHOICE" == "2" ]; then
         echo -e "📦 Paylaşılan Dosya: \033[1;37m$(basename "$FILE_PATH")\033[0m"
         echo -e "Telefonunuzun kamerasını aşağıdaki QR koda tutarak anında indirin:"
         echo ""
-        
         qrencode -t ANSIUTF8 "http://${LOCAL_IP}:8844"
-        
         echo ""
-        echo -e "\033[1;33m[Sunucu aktif. İndirme tamamlanınca çıkmak için Ctrl+C'ye basın...]\033[0m"
+        echo -e "\033[1;33m[Sunucu aktif. Çıkmak için Ctrl+C'ye basın...]\033[0m"
         python3 ~/.config/omarchy/plugins/omasend/omasend-server "$FILE_PATH"
     else
         echo -e "\033[1;31mDosya seçilmedi.\033[0m"
@@ -64,6 +61,38 @@ elif [ "$CHOICE" == "2" ]; then
     fi
 
 elif [ "$CHOICE" == "3" ]; then
+    clear
+    CLIP_TEXT=$(wl-paste 2>/dev/null || true)
+    echo -e "\033[1;36m=================================================================\033[0m"
+    echo -e "\033[1;33m  📋 BİLGİSAYARIN PANOSUNU (CLIPBOARD) TELEFONA GÖNDER \033[0m"
+    echo -e "\033[1;36m=================================================================\033[0m"
+    echo ""
+    if [ -z "$CLIP_TEXT" ]; then
+        echo -e "\033[1;31m⚠️ Bilgisayarınızın panosu şu anda boş!\033[0m"
+        echo -e "Lütfen önce bir metin veya link kopyalayın (Ctrl+C)."
+    else
+        echo -e "📄 \033[1;32mPanodaki Metin:\033[0m"
+        echo -e "\033[0;90m-----------------------------------------------------------------\033[0m"
+        echo "$CLIP_TEXT" | head -n 5
+        [ $(echo "$CLIP_TEXT" | wc -l) -gt 5 ] && echo "..."
+        echo -e "\033[0;90m-----------------------------------------------------------------\033[0m"
+        echo ""
+        
+        # If clipboard text is short (<200 chars), display direct QR code for instant camera read
+        CHAR_COUNT=$(echo -n "$CLIP_TEXT" | wc -c)
+        if [ "$CHAR_COUNT" -le 200 ]; then
+            echo -e "\033[1;37mTelefon kamerasıyla okutarak metni/linki doğrudan açın:\033[0m"
+            qrencode -t ANSIUTF8 "$CLIP_TEXT"
+        else
+            echo -e "\033[1;37mMetin uzun olduğu için web köprüsü üzerinden aktarılıyor:\033[0m"
+            qrencode -t ANSIUTF8 "http://${LOCAL_IP}:8844"
+        fi
+    fi
+    echo ""
+    echo -e "\033[1;33m[Web panosu aktif. Telefonunuzdan 'http://${LOCAL_IP}:8844' adresinden de alabilirsiniz. Çıkış: Ctrl+C]\033[0m"
+    python3 ~/.config/omarchy/plugins/omasend/omasend-server
+
+elif [ "$CHOICE" == "4" ]; then
     if command -v bluetooth-sendto &>/dev/null; then
         bluetooth-sendto
     elif command -v blueman-sendto &>/dev/null; then
