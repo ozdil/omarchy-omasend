@@ -16,7 +16,7 @@ Panel {
     bar: root.bar
     text: "󰐳 omasend"
     slotSize: Style.bar.statusSlot
-    tooltipText: "omasend: Wireless AirBridge & Clipboard Sharing"
+    tooltipText: "omasend: Local Wi-Fi File & Clipboard Transfer"
     onPressed: root.toggle()
   }
 
@@ -42,7 +42,7 @@ Panel {
       }
 
       Text {
-        text: "QR kod ile iPhone/Android ve bilgisayarınız arasında sıfır kurulumla çift yönlü dosya ve pano (clipboard) aktarın."
+        text: "QR kod ile mobil cihazınız ve bilgisayarınız arasında yerel ağ üzerinden dosya ve pano aktarın."
         font.pixelSize: Style.font.body
         color: "#94a3b8"
         wrapMode: Text.WordWrap
@@ -58,16 +58,16 @@ Panel {
           text: "📱 Dosya Al / Gönder"
           onClicked: {
             root.close()
-            if (root.bar) root.bar.run("omarchy-launch-floating-terminal-with-presentation $HOME/.config/omarchy/plugins/omasend/omasend-dashboard")
+            if (root.bar) root.bar.run("omarchy-launch-floating-terminal-with-presentation omasend-dashboard")
           }
         }
 
         Button {
           Layout.fillWidth: true
-          text: "📋 Panoyu Telefona Paylaş"
+          text: "📋 Panoyu Paylaş"
           onClicked: {
             root.close()
-            if (root.bar) root.bar.run("omarchy-launch-floating-terminal-with-presentation bash -c '$HOME/.config/omarchy/plugins/omasend/omasend-dashboard <<< 3'")
+            if (root.bar) root.bar.run("omarchy-launch-floating-terminal-with-presentation bash -c 'omasend-dashboard <<< 3'")
           }
         }
       }

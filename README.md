@@ -1,6 +1,6 @@
-# 🚀 omasend • Omarchy Wireless AirBridge & File Sharing
+# 🚀 omasend • Omarchy Local Wi-Fi File & Clipboard Transfer
 
-> **Cross-device wireless file transfer, local Wi-Fi QR AirBridge, and Bluetooth sharing plugin for Omarchy 4.0.2+.**
+> **Cross-device local network file transfer and clipboard bridge plugin for Omarchy 4.0.2+.**
 
 Author: **Ozan Özdil (ozdil)**  
 License: **MIT**
@@ -9,19 +9,42 @@ License: **MIT**
 
 ## ✨ Features
 
-- 📱 **Zero-App Mobile Sharing (QR-Drop):** Any iPhone, Android, or tablet on the same Wi-Fi can scan the generated QR code to immediately upload photos, videos, or documents directly to `~/Downloads` on your PC.
-- 📤 **Instant Mobile Downloads:** Select any file on your computer to generate a single-use local QR download link for mobile devices.
-- 📶 **Bluetooth Integration:** One-click launch for system Bluetooth file exchange.
-- ⚡ **Zero External Dependencies:** Built with pure Python micro-HTTP server and native terminal ASCII QR renderer (`qrencode`).
+- 📱 **QR Mobile Transfer:** Scan the terminal QR code from any smartphone on the local Wi-Fi to upload or download files directly.
+- 📋 **Bidirectional Clipboard Bridge:** Copy Linux desktop clipboard to mobile and send mobile text back to Linux `wl-copy`.
+- 🔒 **Bounded Resource Allocation:** Enforces 100MB file limits and 10,000-character clipboard boundaries.
+- ⏱️ **Zero Hardcoded Paths:** Dynamically resolves plugin-relative components.
 
 ---
 
-## 🚀 Installation
+## 📋 Requirements
 
+- `python3` (>= 3.10)
+- `qrencode` (for terminal ASCII QR rendering)
+- `wl-clipboard` (provides `wl-copy` and `wl-paste` on Wayland)
+
+---
+
+## 🚀 Installation & Removal
+
+### Installation
 ```bash
-# Clone to Omarchy plugins directory
 git clone https://github.com/ozdil/omarchy-omasend.git ~/.config/omarchy/plugins/omasend
 chmod +x ~/.config/omarchy/plugins/omasend/omasend-*
 ```
 
-Add `{"id": "omasend", "exec": "$HOME/.config/omarchy/plugins/omasend/omasend-status", "onClick": "omarchy-launch-floating-terminal-with-presentation $HOME/.config/omarchy/plugins/omasend/omasend-dashboard"}` to `~/.config/omarchy/shell.json`.
+Add to `~/.config/omarchy/shell.json`:
+```json
+{
+  "id": "omasend",
+  "exec": "$HOME/.config/omarchy/plugins/omasend/omasend-status",
+  "interval": 5,
+  "onClick": "omarchy-launch-floating-terminal-with-presentation $HOME/.config/omarchy/plugins/omasend/omasend-dashboard"
+}
+```
+
+### Removal
+```bash
+rm -rf ~/.config/omarchy/plugins/omasend
+# Remove the "omasend" entry from ~/.config/omarchy/shell.json and run:
+omarchy-restart-shell
+```
