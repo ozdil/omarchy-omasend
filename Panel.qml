@@ -76,11 +76,8 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "\uf0c71"
-    foreground: root.serverActive ? "#38bdf8" : (root.bar ? root.bar.foreground : Color.foreground)
-    slotSize: Style.bar.statusSlot
-    tooltipText: "OmaSend AirBridge\nPortal: http://" + root.localIp + ":" + root.port + "\nStatus: Active\n\n[Left Click] Open QR AirBridge"
-
+    text: ""
+    tooltipText: "OmaSend AirBridge"
     onPressed: function(b) {
       if (root.opened) root.close()
       else root.open()
