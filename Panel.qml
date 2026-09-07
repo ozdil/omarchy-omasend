@@ -9,65 +9,236 @@ Panel {
   id: root
   moduleName: "ozdil.omasend"
   ipcTarget: "ozdil.omasend"
+  manageIpc: false
 
-  BarIconButton {
+  implicitWidth: button.implicitWidth
+  implicitHeight: button.implicitHeight
+
+  property string barText: "OMASEND: READY"
+  property string localIp: "127.0.0.1"
+  property int port: 8844
+  property string savePath: "~/Downloads/omasend"
+
+  function resolveEnginePath() {
+    return Qt.resolvedUrl("omasend-engine").toString().replace(/^file:\/\//, "")
+  }
+
+  function refresh() {
+    if (!scanProc.running) {
+      scanProc.running = true
+    }
+  }
+
+  function copyPortalUrl() {
+    copyProc.command = ["wl-copy", "http://" + root.localIp + ":" + root.port]
+    copyProc.running = true
+  }
+
+  IpcHandler {
+    target: "ozdil.omasend"
+    function open() { root.open() }
+    function close() { root.close() }
+    function toggle() { root.toggle() }
+    function refresh() { root.refresh() }
+  }
+
+  Process {
+    id: scanProc
+    command: [root.resolveEnginePath(), "--json"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var clean = String(text || "").slice(0, 65536)
+          var d = JSON.parse(clean)
+          root.localIp = String(d.local_ip || "127.0.0.1")
+          root.port = Number(d.port) || 8844
+          root.savePath = String(d.download_dir || "~/Downloads/omasend")
+          root.barText = "OMASEND: READY"
+        } catch(e) {
+          root.barText = "OMASEND: READY"
+        }
+      }
+    }
+  }
+
+  Process {
+    id: copyProc
+  }
+
+  Component.onCompleted: refresh()
+  Component.onDestruction: {
+    if (scanProc.running) scanProc.kill()
+    if (copyProc.running) copyProc.kill()
+  }
+
+  WidgetButton {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "󰐳 omasend"
-    slotSize: Style.bar.statusSlot
-    tooltipText: "omasend: Local Wi-Fi File & Clipboard Transfer"
-    onPressed: root.toggle()
+    text: root.barText
+    tooltipText: "OmaSend - Local AirBridge\nPortal: http://" + root.localIp + ":" + root.port
+
+    onPressed: function(b) {
+      if (root.opened) root.close()
+      else root.open()
+    }
   }
 
   KeyboardPanel {
     id: panel
     anchorItem: button
     owner: root
-    width: 440
-    contentHeight: panel.fittedContentHeight(mainCol.implicitHeight)
+    bar: root.bar
+    open: root.opened
+    contentWidth: panel.fittedContentWidth(Style.space(480))
+    contentHeight: panel.fittedContentHeight(contentCol.implicitHeight)
 
     Column {
-      id: mainCol
+      id: contentCol
       anchors.left: parent.left
       anchors.right: parent.right
       anchors.top: parent.top
       spacing: Style.space(12)
 
-      Text {
-        text: "🚀 omasend Hava Köprüsü"
-        font.pixelSize: Style.font.title
-        font.bold: true
-        color: root.bar ? root.bar.foreground : "#ffffff"
-      }
-
-      Text {
-        text: "QR kod ile mobil cihazınız ve bilgisayarınız arasında yerel ağ üzerinden dosya ve pano aktarın."
-        font.pixelSize: Style.font.body
-        color: "#94a3b8"
-        wrapMode: Text.WordWrap
+      // ---------- Header ----------
+      Item {
         width: parent.width
-      }
+        implicitHeight: Math.max(heroLabels.implicitHeight, heroActions.implicitHeight)
 
-      RowLayout {
-        width: parent.width
-        spacing: 8
+        Column {
+          id: heroLabels
+          anchors.left: parent.left
+          anchors.right: heroActions.left
+          anchors.rightMargin: Style.space(10)
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: Style.space(2)
 
-        Button {
-          Layout.fillWidth: true
-          text: "📱 Dosya Al / Gönder"
-          onClicked: {
-            root.close()
-            if (root.bar) root.bar.run("omarchy-launch-floating-terminal-with-presentation omasend-dashboard")
+          Text {
+            textFormat: Text.PlainText
+            text: "OMASEND AIRBRIDGE"
+            color: root.bar ? root.bar.foreground : Color.foreground
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.title
+            font.bold: true
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            text: "LOCAL NETWORK FILE & CLIPBOARD SHARING"
+            color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.caption
+            font.bold: true
+            font.letterSpacing: 1.2
           }
         }
 
-        Button {
-          Layout.fillWidth: true
-          text: "📋 Panoyu Paylaş"
-          onClicked: {
-            root.close()
-            if (root.bar) root.bar.run("omarchy-launch-floating-terminal-with-presentation bash -c 'omasend-dashboard <<< 3'")
+        RowLayout {
+          id: heroActions
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: Style.space(6)
+
+          Button {
+            text: "Copy Portal URL"
+            onClicked: root.copyPortalUrl()
+          }
+
+          Button {
+            text: "Refresh"
+            onClicked: root.refresh()
+          }
+        }
+      }
+
+      PanelSeparator {
+        foreground: root.bar ? root.bar.foreground : Color.foreground
+      }
+
+      // ---------- Telemetry Grid ----------
+      Column {
+        width: parent.width
+        spacing: Style.spacing.labelGap
+
+        GridLayout {
+          width: parent.width
+          columns: 4
+          columnSpacing: Style.space(16)
+          rowSpacing: Style.spacing.labelGap
+
+          InfoLabel { text: "Local IP" }
+          DetailValue { text: root.localIp }
+
+          InfoLabel { text: "Port" }
+          DetailValue { text: String(root.port) }
+
+          InfoLabel { text: "Protocol" }
+          DetailValue { text: "HTTP / TCP" }
+
+          InfoLabel { text: "Engine" }
+          DetailValue { text: "Native Rust (x86_64)" }
+        }
+      }
+
+      PanelSeparator {
+        foreground: root.bar ? root.bar.foreground : Color.foreground
+      }
+
+      // ---------- Web Portal URL Section ----------
+      Column {
+        width: parent.width
+        spacing: Style.space(6)
+
+        PanelSectionHeader {
+          text: "WEB TRANSFER PORTAL"
+          foreground: root.bar ? root.bar.foreground : Color.foreground
+          fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+        }
+
+        RowLayout {
+          width: parent.width
+          spacing: Style.space(10)
+
+          Text {
+            textFormat: Text.PlainText
+            text: "Open in mobile browser:"
+            color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            Layout.fillWidth: true
+            text: "http://" + root.localIp + ":" + root.port
+            color: "#38bdf8"
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.body
+            font.bold: true
+          }
+        }
+
+        RowLayout {
+          width: parent.width
+          spacing: Style.space(10)
+
+          Text {
+            textFormat: Text.PlainText
+            text: "Incoming Save Path:"
+            color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            Layout.fillWidth: true
+            text: root.savePath
+            color: root.bar ? root.bar.foreground : Color.foreground
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideMiddle
           }
         }
       }

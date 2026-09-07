@@ -2,21 +2,15 @@
   "schemaVersion": 1,
   "id": "ozdil.omasend",
   "name": "omasend",
-  "version": "1.0.1",
-  "author": "Ozan Özdil (ozdil)",
+  "description": "Wireless AirBridge, QR file transfer, and cross-device sharing plugin for Omarchy Linux",
+  "version": "1.1.0",
+  "author": "Ozan Özdil",
   "license": "MIT",
-  "description": "Local Wi-Fi QR file transfer and real-time clipboard bridge for Omarchy.",
   "kinds": ["bar-widget"],
-  "activation": "on-demand",
   "entryPoints": {
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "omasend",
-    "description": "Local Wi-Fi QR file transfer and real-time clipboard bridge.",
-    "category": "Productivity",
-    "defaultSection": "right",
-    "aliases": ["omasend", "transfer", "share", "clipboard", "wifi"],
-    "allowMultiple": false
+    "defaultSection": "right"
   }
 }
