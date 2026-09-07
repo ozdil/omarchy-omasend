@@ -1,14 +1,17 @@
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Key, Nonce,
+};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PORT: u16 = 8844;
 static RECEIVED_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -17,6 +20,7 @@ static RECEIVED_COUNTER: AtomicUsize = AtomicUsize::new(0);
 pub struct FileInfo {
     pub name: String,
     pub size_str: String,
+    pub size_bytes: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -24,12 +28,19 @@ pub struct ServerState {
     pub status: String,
     pub port: u16,
     pub local_ip: String,
+    pub tailscale_ip: Option<String>,
     pub pin: String,
+    pub session_key: String,
+    pub active_mode: String, // "LAN" or "WAN"
+    pub wan_active: bool,
+    pub wan_url: Option<String>,
     pub download_dir: String,
     pub shared_dir: String,
     pub qr_path: String,
+    pub active_url: String,
     pub total_received: usize,
     pub recent_files: Vec<FileInfo>,
+    pub shared_files: Vec<FileInfo>,
 }
 
 fn get_local_ip() -> String {
@@ -42,6 +53,18 @@ fn get_local_ip() -> String {
         }
     }
     "127.0.0.1".to_string()
+}
+
+fn get_tailscale_ip() -> Option<String> {
+    if let Ok(out) = Command::new("tailscale").args(["ip", "-4"]).output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    None
 }
 
 fn get_state_dir() -> PathBuf {
@@ -64,6 +87,8 @@ fn get_shared_dir() -> PathBuf {
     dir
 }
 
+// ------------------- PIN & E2EE KEY MANAGEMENT -------------------
+
 fn get_or_create_pin() -> String {
     let pin_file = get_state_dir().join("pin.txt");
     if let Ok(content) = fs::read_to_string(&pin_file) {
@@ -76,29 +101,284 @@ fn get_or_create_pin() -> String {
 }
 
 fn generate_new_pin() -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(12345);
-    let pin = format!("{:04}", (now % 9000) + 1000);
+    let mut rand_bytes = [0u8; 2];
+    let _ = getrandom::getrandom(&mut rand_bytes);
+    let val = ((rand_bytes[0] as u32) << 8 | (rand_bytes[1] as u32)) % 9000 + 1000;
+    let pin = format!("{:04}", val);
     let pin_file = get_state_dir().join("pin.txt");
     let _ = fs::write(&pin_file, &pin);
     pin
 }
 
-fn update_qr_code(ip: &str, pin: &str) -> String {
+fn get_or_create_session_key() -> String {
+    let key_file = get_state_dir().join("session_key.txt");
+    if let Ok(content) = fs::read_to_string(&key_file) {
+        let k = content.trim();
+        if k.len() == 64 && hex::decode(k).is_ok() {
+            return k.to_string();
+        }
+    }
+    generate_new_session_key()
+}
+
+fn generate_new_session_key() -> String {
+    let mut key_bytes = [0u8; 32];
+    let _ = getrandom::getrandom(&mut key_bytes);
+    let key_hex = hex::encode(key_bytes);
+    let key_file = get_state_dir().join("session_key.txt");
+    let _ = fs::write(&key_file, &key_hex);
+    key_hex
+}
+
+fn get_active_mode() -> String {
+    let mode_file = get_state_dir().join("mode.txt");
+    if let Ok(m) = fs::read_to_string(&mode_file) {
+        let trimmed = m.trim().to_uppercase();
+        if trimmed == "WAN" {
+            return "WAN".to_string();
+        }
+    }
+    "LAN".to_string()
+}
+
+fn set_active_mode(mode: &str) {
+    let mode_file = get_state_dir().join("mode.txt");
+    let _ = fs::write(&mode_file, mode);
+}
+
+// ------------------- AES-256-GCM CRYPTOGRAPHY -------------------
+
+fn decrypt_aes256_gcm(key_hex: &str, iv_bytes: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+    let key_bytes = hex::decode(key_hex).map_err(|e| format!("Invalid key hex: {}", e))?;
+    if key_bytes.len() != 32 {
+        return Err("Key length must be 32 bytes".to_string());
+    }
+    if iv_bytes.len() != 12 {
+        return Err("IV length must be 12 bytes".to_string());
+    }
+    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+    let cipher = Aes256Gcm::new(key);
+    let nonce = Nonce::from_slice(iv_bytes);
+    cipher.decrypt(nonce, ciphertext).map_err(|e| format!("AES-GCM decryption failed: {}", e))
+}
+
+fn encrypt_aes256_gcm(key_hex: &str, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let key_bytes = hex::decode(key_hex).map_err(|e| format!("Invalid key hex: {}", e))?;
+    if key_bytes.len() != 32 {
+        return Err("Key length must be 32 bytes".to_string());
+    }
+    let mut iv = [0u8; 12];
+    getrandom::getrandom(&mut iv).map_err(|e| format!("Random failed: {}", e))?;
+    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+    let cipher = Aes256Gcm::new(key);
+    let nonce = Nonce::from_slice(&iv);
+    let ciphertext = cipher.encrypt(nonce, plaintext).map_err(|e| format!("AES-GCM encryption failed: {}", e))?;
+    Ok((iv.to_vec(), ciphertext))
+}
+
+// ------------------- WAN TUNNEL MANAGEMENT -------------------
+
+fn get_wan_status() -> (bool, Option<String>) {
+    let pid_file = get_state_dir().join("wan_pid.txt");
+    let url_file = get_state_dir().join("wan_url.txt");
+
+    if let Ok(pid_str) = fs::read_to_string(&pid_file) {
+        if let Ok(pid) = pid_str.trim().parse::<i32>() {
+            let check = Command::new("kill").args(["-0", &pid.to_string()]).output();
+            if let Ok(out) = check {
+                if out.status.success() {
+                    if let Ok(url) = fs::read_to_string(&url_file) {
+                        let u = url.trim().to_string();
+                        if !u.is_empty() {
+                            return (true, Some(u));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let _ = fs::remove_file(&pid_file);
+    let _ = fs::remove_file(&url_file);
+    (false, None)
+}
+
+fn stop_wan_tunnel() {
+    let pid_file = get_state_dir().join("wan_pid.txt");
+    let url_file = get_state_dir().join("wan_url.txt");
+
+    if let Ok(pid_str) = fs::read_to_string(&pid_file) {
+        if let Ok(pid) = pid_str.trim().parse::<i32>() {
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+        }
+    }
+    let _ = fs::remove_file(&pid_file);
+    let _ = fs::remove_file(&url_file);
+    set_active_mode("LAN");
+    update_all_qr();
+    notify_desktop("OmaSend: Dış Ağ (WAN)", "Güvenli dış ağ tüneli kapatıldı. Yerel Wi-Fi moduna geçildi.");
+}
+
+fn start_wan_tunnel() -> Result<String, String> {
+    let (active, url) = get_wan_status();
+    if active && url.is_some() {
+        set_active_mode("WAN");
+        update_all_qr();
+        return Ok(url.unwrap());
+    }
+
+    let cloudflared_bin = if Command::new("cloudflared").arg("--version").output().is_ok() {
+        Some("cloudflared".to_string())
+    } else {
+        let home = env::var("HOME").unwrap_or_default();
+        let local_bin = format!("{}/.local/bin/cloudflared", home);
+        if Path::new(&local_bin).is_file() {
+            Some(local_bin)
+        } else {
+            None
+        }
+    };
+
+    if let Some(bin) = cloudflared_bin {
+        let log_file = get_state_dir().join("wan_tunnel.log");
+        let _ = fs::remove_file(&log_file);
+
+        let mut child = Command::new(bin)
+            .args([
+                "tunnel",
+                "--url",
+                &format!("http://127.0.0.1:{}", PORT),
+                "--logfile",
+                log_file.to_str().unwrap_or(""),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn cloudflared: {}", e))?;
+
+        let pid = child.id();
+        let start = Instant::now();
+        let mut final_url = None;
+
+        while start.elapsed() < Duration::from_secs(12) {
+            if let Ok(content) = fs::read_to_string(&log_file) {
+                for line in content.lines() {
+                    if let Some(pos) = line.find("https://") {
+                        let rest = &line[pos..];
+                        if let Some(end) = rest.find(".trycloudflare.com") {
+                            final_url = Some(rest[..end + 18].to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+            if final_url.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+
+        if let Some(u) = final_url {
+            let pid_file = get_state_dir().join("wan_pid.txt");
+            let url_file = get_state_dir().join("wan_url.txt");
+            let _ = fs::write(&pid_file, pid.to_string());
+            let _ = fs::write(&url_file, &u);
+            set_active_mode("WAN");
+            update_all_qr();
+            notify_desktop(
+                "OmaSend: Dış Ağ (WAN) Aktif",
+                &format!("Küresel AirBridge hazır!\nAdres: {}", u),
+            );
+            return Ok(u);
+        } else {
+            let _ = child.kill();
+            return Err("Timed out waiting for Cloudflare Tunnel URL".to_string());
+        }
+    }
+
+    // Fallback: localtunnel via npx
+    if Command::new("npx").arg("--version").output().is_ok() {
+        let lt_log = get_state_dir().join("localtunnel.log");
+        let _ = fs::remove_file(&lt_log);
+        let out_file = fs::File::create(&lt_log).map_err(|e| e.to_string())?;
+        let err_file = out_file.try_clone().map_err(|e| e.to_string())?;
+
+        let mut child = Command::new("npx")
+            .args(["-y", "localtunnel", "--port", &PORT.to_string()])
+            .stdout(out_file)
+            .stderr(err_file)
+            .spawn()
+            .map_err(|e| format!("Failed to spawn localtunnel: {}", e))?;
+
+        let pid = child.id();
+        let start = Instant::now();
+        let mut final_url = None;
+
+        while start.elapsed() < Duration::from_secs(12) {
+            if let Ok(content) = fs::read_to_string(&lt_log) {
+                for line in content.lines() {
+                    if let Some(pos) = line.find("https://") {
+                        let u = line[pos..].trim().to_string();
+                        if !u.is_empty() {
+                            final_url = Some(u);
+                            break;
+                        }
+                    }
+                }
+            }
+            if final_url.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+
+        if let Some(u) = final_url {
+            let pid_file = get_state_dir().join("wan_pid.txt");
+            let url_file = get_state_dir().join("wan_url.txt");
+            let _ = fs::write(&pid_file, pid.to_string());
+            let _ = fs::write(&url_file, &u);
+            set_active_mode("WAN");
+            update_all_qr();
+            notify_desktop(
+                "OmaSend: Dış Ağ (WAN) Aktif",
+                &format!("Küresel AirBridge hazır!\nAdres: {}", u),
+            );
+            return Ok(u);
+        } else {
+            let _ = child.kill();
+            return Err("Timed out waiting for localtunnel URL".to_string());
+        }
+    }
+
+    Err("No supported tunnel client found (cloudflared or npx localtunnel)".to_string())
+}
+
+// ------------------- QR CODE & URLS -------------------
+
+fn update_all_qr() {
+    let ip = get_local_ip();
+    let pin = get_or_create_pin();
+    let key = get_or_create_session_key();
+    let mode = get_active_mode();
+    let (_wan_active, wan_url) = get_wan_status();
+
+    let target_base = if mode == "WAN" && wan_url.is_some() {
+        wan_url.unwrap()
+    } else {
+        format!("http://{}:{}", ip, PORT)
+    };
+
+    let full_url = format!("{}/?pin={}#key={}", target_base, pin, key);
+
     let qr_file = get_state_dir().join("qr.svg");
     let qr_path = qr_file.to_string_lossy().to_string();
-    let url = format!("http://{}:{}/?pin={}", ip, PORT, pin);
     let _ = Command::new("qrencode")
-        .args(["-o", &qr_path, "-t", "SVG", &url])
+        .args(["-o", &qr_path, "-t", "SVG", &full_url])
         .output();
-    qr_path
 }
 
 fn notify_desktop(title: &str, body: &str) {
     let _ = Command::new("notify-send")
-        .args(["-a", "OmaSend", "-i", "network-wireless", title, body])
+        .args(["-a", "OmaSend", "-i", "document-send", title, body])
         .spawn();
 }
 
@@ -112,7 +392,7 @@ fn get_pc_clipboard() -> String {
 }
 
 fn set_pc_clipboard(text: &str) {
-    if let Ok(mut child) = Command::new("wl-copy").stdin(std::process::Stdio::piped()).spawn() {
+    if let Ok(mut child) = Command::new("wl-copy").stdin(Stdio::piped()).spawn() {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(text.as_bytes());
         }
@@ -155,16 +435,17 @@ fn get_unique_filepath(dir: &Path, filename: &str) -> PathBuf {
     dir.join(format!("{}_{}", stem, SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()))
 }
 
-fn get_recent_files() -> Vec<FileInfo> {
-    let ddir = get_download_dir();
+fn get_directory_files(dir: &Path) -> Vec<FileInfo> {
     let mut files = Vec::new();
-    if let Ok(entries) = fs::read_dir(&ddir) {
+    if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let p = entry.path();
             if p.is_file() {
                 if let Ok(meta) = entry.metadata() {
                     let size_bytes = meta.len();
-                    let size_str = if size_bytes > 1_000_000 {
+                    let size_str = if size_bytes > 1_000_000_000 {
+                        format!("{:.2} GB", size_bytes as f64 / 1_000_000_000.0)
+                    } else if size_bytes > 1_000_000 {
                         format!("{:.1} MB", size_bytes as f64 / 1_000_000.0)
                     } else if size_bytes > 1_000 {
                         format!("{:.1} KB", size_bytes as f64 / 1_000.0)
@@ -174,16 +455,18 @@ fn get_recent_files() -> Vec<FileInfo> {
                     files.push(FileInfo {
                         name: entry.file_name().to_string_lossy().to_string(),
                         size_str,
+                        size_bytes,
                     });
                 }
             }
         }
     }
-    files.truncate(8);
+    files.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
     files
 }
 
-// Simple HTTP request parsing
+// ------------------- HTTP ENGINE -------------------
+
 struct HttpRequest {
     method: String,
     path: String,
@@ -192,9 +475,56 @@ struct HttpRequest {
     body_offset: usize,
 }
 
-fn parse_http_request(raw: &[u8]) -> Option<HttpRequest> {
-    let header_end = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
-    let header_str = String::from_utf8_lossy(&raw[..header_end]);
+impl HttpRequest {
+    fn get_header(&self, name: &str) -> Option<&str> {
+        let lower = name.to_lowercase();
+        for (k, v) in &self.headers {
+            if k == &lower {
+                return Some(v.as_str());
+            }
+        }
+        None
+    }
+}
+
+fn read_full_http_request(stream: &mut TcpStream) -> Option<(HttpRequest, Vec<u8>)> {
+    let mut buffer = Vec::with_capacity(65536);
+    let mut temp = [0u8; 16384];
+    let mut header_end = None;
+    let mut content_length: usize = 0;
+
+    loop {
+        let n = match stream.read(&mut temp) {
+            Ok(bytes) if bytes > 0 => bytes,
+            _ => break,
+        };
+        buffer.extend_from_slice(&temp[..n]);
+
+        if header_end.is_none() {
+            if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = Some(pos + 4);
+                let header_str = String::from_utf8_lossy(&buffer[..pos]);
+                for line in header_str.lines() {
+                    if let Some(col) = line.find(':') {
+                        let k = line[..col].trim().to_lowercase();
+                        let v = line[col + 1..].trim();
+                        if k == "content-length" {
+                            content_length = v.parse::<usize>().unwrap_or(0);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(hend) = header_end {
+            if buffer.len() >= hend + content_length {
+                break;
+            }
+        }
+    }
+
+    let hend = header_end?;
+    let header_str = String::from_utf8_lossy(&buffer[..hend - 4]);
     let mut lines = header_str.lines();
     let req_line = lines.next()?;
     let parts: Vec<&str> = req_line.split_whitespace().collect();
@@ -218,17 +548,19 @@ fn parse_http_request(raw: &[u8]) -> Option<HttpRequest> {
         }
     }
 
-    Some(HttpRequest {
-        method,
-        path,
-        query,
-        headers,
-        body_offset: header_end + 4,
-    })
+    Some((
+        HttpRequest {
+            method,
+            path,
+            query,
+            headers,
+            body_offset: hend,
+        },
+        buffer,
+    ))
 }
 
 fn is_authorized(req: &HttpRequest, pin: &str) -> bool {
-    // Check query param pin
     for part in req.query.split('&') {
         if let Some(val) = part.strip_prefix("pin=") {
             if val == pin {
@@ -236,18 +568,17 @@ fn is_authorized(req: &HttpRequest, pin: &str) -> bool {
             }
         }
     }
-    // Check X-OmaSend-Pin header
-    for (k, v) in &req.headers {
-        if k == "x-omasend-pin" && v == pin {
+    if let Some(h) = req.get_header("x-omasend-pin") {
+        if h == pin {
             return true;
         }
-        if k == "cookie" {
-            for c in v.split(';') {
-                let ct = c.trim();
-                if let Some(val) = ct.strip_prefix("pin=") {
-                    if val == pin {
-                        return true;
-                    }
+    }
+    if let Some(cookie_val) = req.get_header("cookie") {
+        for c in cookie_val.split(';') {
+            let ct = c.trim();
+            if let Some(val) = ct.strip_prefix("pin=") {
+                if val == pin {
+                    return true;
                 }
             }
         }
@@ -255,64 +586,72 @@ fn is_authorized(req: &HttpRequest, pin: &str) -> bool {
     false
 }
 
-fn send_response(mut stream: &TcpStream, status: &str, content_type: &str, body: &[u8], cookie: Option<&str>) {
+fn send_response(mut stream: &TcpStream, status: &str, content_type: &str, body: &[u8], cookie: Option<&str>, extra_headers: Option<&[(&str, &str)]>) {
     let cookie_header = if let Some(c) = cookie {
         format!("Set-Cookie: {}; Path=/; HttpOnly; SameSite=Lax\r\n", c)
     } else {
         String::new()
     };
+    let mut extra = String::new();
+    if let Some(hdrs) = extra_headers {
+        for (k, v) in hdrs {
+            extra.push_str(&format!("{}: {}\r\n", k, v));
+        }
+    }
     let resp = format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
-        status, content_type, body.len(), cookie_header
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: *\r\n{}{}Connection: close\r\n\r\n",
+        status, content_type, body.len(), cookie_header, extra
     );
     let _ = stream.write_all(resp.as_bytes());
     let _ = stream.write_all(body);
 }
 
-fn render_login_page(ip: &str) -> String {
-    format!(
-        r#"<!DOCTYPE html>
+// ------------------- WEB PAGES -------------------
+
+fn render_login_page() -> String {
+    r#"<!DOCTYPE html>
 <html lang="tr">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
 <title>OmaSend • PIN Doğrulama</title>
 <style>
-* {{ box-sizing: border-box; margin: 0; padding: 0; }}
-body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background: #070a0e; color: #dbe4ee; display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; }}
-.card {{ background: #0e141d; border: 1px solid #1a2332; border-radius: 12px; padding: 32px 24px; width: 100%; max-width: 360px; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.5); }}
-.icon {{ font-size: 40px; margin-bottom: 12px; }}
-h1 {{ font-size: 20px; font-weight: 700; color: #dbe4ee; margin-bottom: 4px; }}
-p {{ font-size: 13px; color: #8899a6; margin-bottom: 24px; }}
-.pin-input {{ width: 100%; font-size: 28px; letter-spacing: 12px; text-align: center; background: #070a0e; border: 2px solid #00cbb8; color: #00eed9; border-radius: 8px; padding: 12px; margin-bottom: 20px; font-family: monospace; outline: none; }}
-button {{ width: 100%; background: #00cbb8; color: #070a0e; border: none; padding: 14px; font-size: 15px; font-weight: bold; border-radius: 8px; cursor: pointer; }}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background: #070a0e; color: #dbe4ee; display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; }
+.card { background: #0e141d; border: 1px solid #1a2332; border-radius: 14px; padding: 36px 24px; width: 100%; max-width: 380px; text-align: center; box-shadow: 0 12px 40px rgba(0,0,0,0.6); }
+.icon { font-size: 44px; margin-bottom: 14px; }
+h1 { font-size: 20px; font-weight: 700; color: #dbe4ee; margin-bottom: 6px; }
+p { font-size: 13px; color: #8899a6; margin-bottom: 24px; line-height: 1.5; }
+.pin-input { width: 100%; font-size: 32px; letter-spacing: 12px; text-align: center; background: #070a0e; border: 2px solid #00cbb8; color: #00eed9; border-radius: 8px; padding: 12px; margin-bottom: 20px; font-family: monospace; outline: none; transition: border-color 0.2s; }
+.pin-input:focus { border-color: #00eed9; box-shadow: 0 0 16px rgba(0,203,184,0.3); }
+button { width: 100%; background: #00cbb8; color: #070a0e; border: none; padding: 14px; font-size: 15px; font-weight: 700; border-radius: 8px; cursor: pointer; transition: opacity 0.2s; }
+button:active { opacity: 0.85; }
 </style>
 </head>
 <body>
 <div class="card">
-<div class="icon">🔒</div>
+<div class="icon" style="font-size: 24px; font-weight: bold; color: #00cbb8; margin-bottom: 12px;">[SECURE]</div>
 <h1>OmaSend AirBridge</h1>
-<p>Omarchy PC ekranında görünen 4 haneli PIN kodunu girin.</p>
+<p>Omarchy PC ekranında görünen 4 haneli güvenlik PIN kodunu girin.</p>
 <form method="GET" action="/">
 <input type="number" name="pin" class="pin-input" placeholder="••••" required autofocus pattern="[0-9]*" inputmode="numeric">
 <button type="submit">Bağlan ve Doğrula</button>
 </form>
 </div>
 </body>
-</html>"#
-    )
+</html>"#.to_string()
 }
 
-fn render_web_app(ip: &str, pin: &str, clipboard_preview: &str, shared_files: &[FileInfo]) -> String {
+fn render_web_app(active_endpoint: &str, shared_files: &[FileInfo]) -> String {
     let mut files_html = String::new();
     if shared_files.is_empty() {
-        files_html.push_str("<div class='empty'>PC'den paylaşılan dosya yok</div>");
+        files_html.push_str("<div class='empty'>PC'den paylaşılan dosya bulunamadı.<br><small style='color:#667788;'>~/Downloads/omasend/shared klasörüne dosya ekleyin.</small></div>");
     } else {
         for f in shared_files {
             files_html.push_str(&format!(
                 r#"<div class="file-item">
 <div class="file-info"><div class="file-name">{}</div><div class="file-size">{}</div></div>
-<a href="/download/{}" class="btn-sm">İndir 📥</a>
+<button onclick="downloadFile('{}')" class="btn-sm">İndir</button>
 </div>"#,
                 f.name, f.size_str, f.name
             ));
@@ -325,248 +664,594 @@ fn render_web_app(ip: &str, pin: &str, clipboard_preview: &str, shared_files: &[
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-<title>OmaSend AirBridge</title>
+<title>OmaSend • AirBridge E2EE</title>
 <style>
 * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background: #070a0e; color: #dbe4ee; padding: 16px; max-width: 540px; margin: 0 auto; }}
+body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background: #070a0e; color: #dbe4ee; padding: 16px; max-width: 560px; margin: 0 auto; }}
 .header {{ display: flex; align-items: center; justify-content: space-between; padding-bottom: 14px; border-bottom: 1px solid #1a2332; margin-bottom: 16px; }}
-.brand {{ font-size: 18px; font-weight: bold; color: #00cbb8; display: flex; align-items: center; gap: 8px; }}
-.badge {{ font-size: 11px; background: rgba(0, 203, 184, 0.15); border: 1px solid #00cbb8; color: #00cbb8; padding: 4px 8px; border-radius: 4px; font-weight: bold; }}
-.card {{ background: #0e141d; border: 1px solid #1a2332; border-radius: 10px; padding: 18px; margin-bottom: 16px; }}
-.card-title {{ font-size: 12px; font-weight: bold; letter-spacing: 1px; color: #8899a6; text-transform: uppercase; margin-bottom: 12px; }}
-.drop-zone {{ border: 2px dashed #00cbb8; border-radius: 8px; padding: 32px 16px; text-align: center; cursor: pointer; background: rgba(0, 203, 184, 0.03); transition: all 0.2s; }}
-.drop-zone:hover {{ background: rgba(0, 203, 184, 0.08); }}
-.drop-icon {{ font-size: 32px; margin-bottom: 8px; }}
-.file-item {{ display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; background: #131b26; border-radius: 6px; margin-bottom: 8px; }}
-.file-name {{ font-size: 14px; font-weight: 500; word-break: break-all; }}
+.brand {{ font-size: 19px; font-weight: 700; color: #00cbb8; display: flex; align-items: center; gap: 8px; }}
+.badges {{ display: flex; gap: 6px; flex-wrap: wrap; }}
+.badge {{ font-size: 11px; background: rgba(0, 203, 184, 0.15); border: 1px solid #00cbb8; color: #00cbb8; padding: 4px 8px; border-radius: 6px; font-weight: bold; }}
+.badge-e2ee {{ font-size: 11px; background: rgba(39, 201, 63, 0.15); border: 1px solid #27c93f; color: #27c93f; padding: 4px 8px; border-radius: 6px; font-weight: bold; display: flex; align-items: center; gap: 4px; }}
+.card {{ background: #0e141d; border: 1px solid #1a2332; border-radius: 12px; padding: 18px; margin-bottom: 16px; }}
+.card-title {{ font-size: 12px; font-weight: 700; letter-spacing: 1px; color: #8899a6; text-transform: uppercase; margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between; }}
+.drop-zone {{ border: 2px dashed #00cbb8; border-radius: 10px; padding: 36px 16px; text-align: center; cursor: pointer; background: rgba(0, 203, 184, 0.03); transition: all 0.2s; }}
+.drop-zone:hover {{ background: rgba(0, 203, 184, 0.08); border-color: #00eed9; }}
+.drop-icon {{ font-size: 36px; margin-bottom: 8px; }}
+.file-item {{ display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: #131b26; border-radius: 8px; margin-bottom: 8px; border: 1px solid #1a2536; }}
+.file-name {{ font-size: 14px; font-weight: 500; word-break: break-all; color: #dbe4ee; }}
 .file-size {{ font-size: 12px; color: #8899a6; margin-top: 2px; }}
-.btn-sm {{ background: #00cbb8; color: #070a0e; text-decoration: none; padding: 6px 12px; border-radius: 4px; font-size: 12px; font-weight: bold; }}
-textarea {{ width: 100%; height: 80px; background: #070a0e; border: 1px solid #1a2332; border-radius: 6px; color: #dbe4ee; padding: 10px; font-size: 13px; margin-bottom: 10px; resize: vertical; }}
-button {{ width: 100%; background: #00cbb8; color: #070a0e; border: none; padding: 12px; font-size: 14px; font-weight: bold; border-radius: 6px; cursor: pointer; }}
-.clipboard-box {{ background: #070a0e; border: 1px solid #1a2332; padding: 12px; border-radius: 6px; font-size: 13px; max-height: 100px; overflow-y: auto; margin-bottom: 10px; color: #00eed9; }}
-.empty {{ font-size: 13px; color: #8899a6; text-align: center; padding: 12px; }}
-#progress-bar {{ display: none; width: 100%; height: 6px; background: #1a2332; border-radius: 3px; overflow: hidden; margin-top: 12px; }}
+.btn-sm {{ background: #00cbb8; color: #070a0e; border: none; padding: 6px 14px; border-radius: 6px; font-size: 12px; font-weight: 700; cursor: pointer; }}
+textarea {{ width: 100%; height: 84px; background: #070a0e; border: 1px solid #1a2332; border-radius: 8px; color: #dbe4ee; padding: 12px; font-size: 13px; margin-bottom: 10px; resize: vertical; outline: none; }}
+textarea:focus {{ border-color: #00cbb8; }}
+button.main-btn {{ width: 100%; background: #00cbb8; color: #070a0e; border: none; padding: 12px; font-size: 14px; font-weight: 700; border-radius: 8px; cursor: pointer; }}
+.clipboard-box {{ background: #070a0e; border: 1px solid #1a2332; padding: 12px; border-radius: 8px; font-size: 13px; max-height: 110px; overflow-y: auto; margin-bottom: 10px; color: #00eed9; font-family: monospace; white-space: pre-wrap; }}
+.empty {{ font-size: 13px; color: #8899a6; text-align: center; padding: 16px; line-height: 1.6; }}
+#progress-bar {{ display: none; width: 100%; height: 8px; background: #1a2332; border-radius: 4px; overflow: hidden; margin-top: 14px; }}
 #progress-fill {{ width: 0%; height: 100%; background: #00cbb8; transition: width 0.2s; }}
+#status-msg {{ font-size: 12px; font-weight: 600; color: #00cbb8; margin-top: 10px; text-align: center; }}
 </style>
 </head>
 <body>
 <div class="header">
-<div class="brand">🚀 OmaSend AirBridge</div>
-<div class="badge">BAĞLI: {}</div>
+<div class="brand">OmaSend AirBridge</div>
+<div class="badges">
+  <div class="badge">BAĞLI: {}</div>
+  <div id="e2ee-badge" class="badge-e2ee">E2EE AKTİF</div>
+</div>
 </div>
 
 <div class="card">
-<div class="card-title">📤 PC'ye Dosya Gönder</div>
-<form id="upload-form" method="POST" action="/upload" enctype="multipart/form-data">
+<div class="card-title">
+  <span>PC'ye Dosya Gönder</span>
+  <span style="color:#27c93f; font-size:11px;">AES-256-GCM Şifreli</span>
+</div>
 <div class="drop-zone" onclick="document.getElementById('file-input').click()">
-<div class="drop-icon">📁</div>
-<div style="font-size: 14px; font-weight: bold;">Fotoğraf, Video veya Dosya Seç</div>
-<div style="font-size: 12px; color: #8899a6; margin-top: 4px;">veya buraya dokunun</div>
-<input type="file" id="file-input" name="file" style="display: none;" onchange="uploadFiles(this.files)" multiple>
+<div class="drop-icon" style="font-size: 20px; font-weight: bold; color: #00cbb8; margin-bottom: 6px;">[+]</div>
+<div style="font-size: 15px; font-weight: 700;">Fotoğraf, Video veya Dosya Seç</div>
+<div style="font-size: 12px; color: #8899a6; margin-top: 4px;">veya buraya dokunun / sürükleyin</div>
+<input type="file" id="file-input" style="display: none;" onchange="uploadFiles(this.files)" multiple>
 </div>
 <div id="progress-bar"><div id="progress-fill"></div></div>
-<div id="status-msg" style="font-size: 12px; color: #00cbb8; margin-top: 8px; text-align: center;"></div>
-</form>
+<div id="status-msg"></div>
 </div>
 
 <div class="card">
-<div class="card-title">📋 PC Panosu (Clipboard)</div>
-<div class="clipboard-box" id="pc-clip">{}</div>
-<button onclick="copyPcClipboard()">Telefona Kopyala</button>
+<div class="card-title">
+  <span>PC Panosu (Clipboard)</span>
+  <button onclick="fetchClipboard()" class="btn-sm" style="padding:3px 8px; font-size:11px;">Yenile</button>
+</div>
+<div class="clipboard-box" id="pc-clip">Pano yükleniyor...</div>
+<button class="main-btn" onclick="copyPcClipboard()">Telefona Kopyala</button>
 </div>
 
 <div class="card">
-<div class="card-title">✏️ PC Panosuna Metin Gönder</div>
-<form method="POST" action="/clipboard">
-<textarea name="text" placeholder="PC'ye anında yapıştırmak istediğiniz metni yazın..."></textarea>
-<button type="submit">PC Panosuna Gönder</button>
-</form>
+<div class="card-title">
+  <span>PC Panosuna Metin Gönder</span>
+  <span style="color:#27c93f; font-size:11px;">Şifreli İletim</span>
+</div>
+<textarea id="clip-text" placeholder="PC'ye anında yapıştırmak istediğiniz metni yazın..."></textarea>
+<button class="main-btn" onclick="sendClipboard()">PC Panosuna Gönder</button>
 </div>
 
 <div class="card">
-<div class="card-title">📥 PC'den İndirilebilecek Dosyalar</div>
+<div class="card-title">PC'den İndirilebilecek Dosyalar</div>
 {}
 </div>
 
 <script>
-function copyPcClipboard() {{
-  var text = document.getElementById('pc-clip').innerText;
-  navigator.clipboard.writeText(text).then(function() {{
-    alert('Pano telefona kopyalandı! 📋');
-  }});
+var e2eeKeyHex = null;
+var cryptoKey = null;
+
+async function initE2EE() {{
+  var hash = window.location.hash;
+  var match = hash.match(/key=([a-f0-9]{{64}})/i);
+  if (match) {{
+    e2eeKeyHex = match[1].toLowerCase();
+    sessionStorage.setItem('omasend_e2ee_key', e2eeKeyHex);
+  }} else {{
+    e2eeKeyHex = sessionStorage.getItem('omasend_e2ee_key');
+  }}
+
+  if (e2eeKeyHex && e2eeKeyHex.length === 64) {{
+    try {{
+      var rawKey = new Uint8Array(e2eeKeyHex.match(/.{{1,2}}/g).map(function(b) {{ return parseInt(b, 16); }}));
+      cryptoKey = await window.crypto.subtle.importKey(
+        "raw",
+        rawKey,
+        {{ name: "AES-GCM" }},
+        false,
+        ["encrypt", "decrypt"]
+      );
+      document.getElementById('e2ee-badge').innerText = 'E2EE AKTİF (AES-256-GCM)';
+    }} catch(e) {{
+      console.error("WebCrypto key import error:", e);
+    }}
+  }} else {{
+    document.getElementById('e2ee-badge').innerText = 'E2EE ANAHTARSIZ';
+    document.getElementById('e2ee-badge').style.color = '#ffaa00';
+    document.getElementById('e2ee-badge').style.borderColor = '#ffaa00';
+  }}
 }}
 
-function uploadFiles(files) {{
+async function uploadFiles(files) {{
   if (!files || files.length === 0) return;
-  var formData = new FormData();
-  for (var i = 0; i < files.length; i++) {{
-    formData.append('file', files[i]);
-  }}
   var pBar = document.getElementById('progress-bar');
   var pFill = document.getElementById('progress-fill');
   var sMsg = document.getElementById('status-msg');
-  pBar.style.display = 'block';
-  sMsg.innerText = 'Gönderiliyor...';
 
-  var xhr = new XMLHttpRequest();
-  xhr.open('POST', '/upload', true);
-  xhr.upload.onprogress = function(e) {{
-    if (e.lengthComputable) {{
-      var percent = Math.round((e.loaded / e.total) * 100);
-      pFill.style.width = percent + '%';
-      sMsg.innerText = 'Yükleniyor: %' + percent;
+  pBar.style.display = 'block';
+
+  for (var i = 0; i < files.length; i++) {{
+    var file = files[i];
+    sMsg.innerText = 'Şifreleniyor: ' + file.name + '...';
+    pFill.style.width = '15%';
+
+    try {{
+      var arrayBuffer = await file.arrayBuffer();
+
+      if (cryptoKey) {{
+        var iv = window.crypto.getRandomValues(new Uint8Array(12));
+        var encryptedBuffer = await window.crypto.subtle.encrypt(
+          {{ name: "AES-GCM", iv: iv }},
+          cryptoKey,
+          arrayBuffer
+        );
+        var ivHex = Array.from(iv).map(function(b) {{ return b.toString(16).padStart(2, '0'); }}).join('');
+
+        sMsg.innerText = 'Gönderiliyor: ' + file.name + ' (E2EE)...';
+        await sendEncryptedFile(file.name, ivHex, encryptedBuffer, pFill);
+      }} else {{
+        sMsg.innerText = 'Gönderiliyor: ' + file.name + '...';
+        await sendPlainFile(file, pFill);
+      }}
+    }} catch(err) {{
+      sMsg.innerText = 'Hata: ' + err.message;
+      return;
     }}
-  }};
-  xhr.onload = function() {{
-    pFill.style.width = '100%';
-    sMsg.innerText = '✅ Dosya başarıyla PC ye gönderildi!';
-    setTimeout(function() {{ location.reload(); }}, 1500);
-  }};
-  xhr.onerror = function() {{
-    sMsg.innerText = '❌ Hata oluştu!';
-  }};
-  xhr.send(formData);
+  }}
+
+  pFill.style.width = '100%';
+  sMsg.innerText = 'Dosyalar başarıyla PC ye aktarıldı.';
+  setTimeout(function() {{
+    pBar.style.display = 'none';
+    sMsg.innerText = '';
+  }}, 3000);
 }}
+
+function sendEncryptedFile(filename, ivHex, encryptedBuffer, pFill) {{
+  return new Promise(function(resolve, reject) {{
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/upload-encrypted', true);
+    xhr.setRequestHeader('X-OmaSend-Filename', encodeURIComponent(filename));
+    xhr.setRequestHeader('X-OmaSend-IV', ivHex);
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+
+    xhr.upload.onprogress = function(e) {{
+      if (e.lengthComputable) {{
+        var p = Math.round(20 + (e.loaded / e.total) * 75);
+        pFill.style.width = p + '%';
+      }}
+    }};
+    xhr.onload = function() {{
+      if (xhr.status === 200) resolve();
+      else reject(new Error('Sunucu hatası: ' + xhr.status));
+    }};
+    xhr.onerror = function() {{ reject(new Error('Ağ hatası')); }};
+    xhr.send(encryptedBuffer);
+  }});
+}}
+
+function sendPlainFile(file, pFill) {{
+  return new Promise(function(resolve, reject) {{
+    var formData = new FormData();
+    formData.append('file', file);
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/upload', true);
+    xhr.upload.onprogress = function(e) {{
+      if (e.lengthComputable) {{
+        pFill.style.width = Math.round((e.loaded / e.total) * 100) + '%';
+      }}
+    }};
+    xhr.onload = function() {{
+      if (xhr.status === 200) resolve();
+      else reject(new Error('Sunucu hatası'));
+    }};
+    xhr.onerror = function() {{ reject(new Error('Ağ hatası')); }};
+    xhr.send(formData);
+  }});
+}}
+
+async function downloadFile(filename) {{
+  if (!cryptoKey) {{
+    window.location.href = '/download/' + encodeURIComponent(filename);
+    return;
+  }}
+  try {{
+    var res = await fetch('/api/download-encrypted/' + encodeURIComponent(filename));
+    if (!res.ok) throw new Error('İndirme hatası');
+    var ivHex = res.headers.get('X-OmaSend-IV');
+    if (!ivHex || ivHex.length !== 24) throw new Error('Geçersiz IV başlığı');
+
+    var iv = new Uint8Array(ivHex.match(/.{{1,2}}/g).map(function(b) {{ return parseInt(b, 16); }}));
+    var encryptedData = await res.arrayBuffer();
+
+    var decrypted = await window.crypto.subtle.decrypt(
+      {{ name: "AES-GCM", iv: iv }},
+      cryptoKey,
+      encryptedData
+    );
+
+    var blob = new Blob([decrypted]);
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }} catch(e) {{
+    alert('Şifreli indirme hatası: ' + e.message);
+  }}
+}}
+
+async function fetchClipboard() {{
+  var box = document.getElementById('pc-clip');
+  box.innerText = 'Pano alınıyor...';
+  try {{
+    if (cryptoKey) {{
+      var res = await fetch('/api/clipboard-encrypted');
+      var data = await res.json();
+      if (data.iv && data.ciphertext) {{
+        var iv = new Uint8Array(data.iv.match(/.{{1,2}}/g).map(function(b) {{ return parseInt(b, 16); }}));
+        var cipherBytes = new Uint8Array(data.ciphertext.match(/.{{1,2}}/g).map(function(b) {{ return parseInt(b, 16); }}));
+        var decrypted = await window.crypto.subtle.decrypt(
+          {{ name: "AES-GCM", iv: iv }},
+          cryptoKey,
+          cipherBytes
+        );
+        var text = new TextDecoder().decode(decrypted);
+        box.innerText = text || "(Pano boş)";
+        return;
+      }}
+    }}
+    var r = await fetch('/api/clipboard');
+    var d = await r.json();
+    box.innerText = d.clipboard || "(Pano boş)";
+  }} catch(e) {{
+    box.innerText = "(Pano alınamadı)";
+  }}
+}}
+
+async function sendClipboard() {{
+  var text = document.getElementById('clip-text').value;
+  if (!text) return;
+  try {{
+    if (cryptoKey) {{
+      var textBytes = new TextEncoder().encode(text);
+      var iv = window.crypto.getRandomValues(new Uint8Array(12));
+      var encrypted = await window.crypto.subtle.encrypt(
+        {{ name: "AES-GCM", iv: iv }},
+        cryptoKey,
+        textBytes
+      );
+      var ivHex = Array.from(iv).map(function(b) {{ return b.toString(16).padStart(2, '0'); }}).join('');
+      var res = await fetch('/api/clipboard-encrypted', {{
+        method: 'POST',
+        headers: {{
+          'X-OmaSend-IV': ivHex,
+          'Content-Type': 'application/octet-stream'
+        }},
+        body: encrypted
+      }});
+      if (res.ok) {{
+        alert('Şifreli metin PC panosuna kopyalandı.');
+        document.getElementById('clip-text').value = '';
+        fetchClipboard();
+      }}
+    }} else {{
+      var res = await fetch('/api/clipboard', {{
+        method: 'POST',
+        body: 'text=' + encodeURIComponent(text)
+      }});
+      if (res.ok) {{
+        alert('Metin PC panosuna kopyalandı.');
+        document.getElementById('clip-text').value = '';
+        fetchClipboard();
+      }}
+    }}
+  }} catch(e) {{
+    alert('Hata: ' + e.message);
+  }}
+}}
+
+function copyPcClipboard() {{
+  var text = document.getElementById('pc-clip').innerText;
+  if (!text || text.startsWith('(')) return;
+  navigator.clipboard.writeText(text).then(function() {{
+    alert('Pano telefona kopyalandı.');
+  }});
+}}
+
+window.addEventListener('load', async function() {{
+  await initE2EE();
+  fetchClipboard();
+}});
 </script>
 </body>
 </html>"#,
-        ip,
-        if clipboard_preview.is_empty() { "(Pano boş)" } else { clipboard_preview },
+        active_endpoint,
         files_html
     )
 }
 
-fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str) {
-    let mut buffer = vec![0u8; 65536];
-    let n = match stream.read(&mut buffer) {
-        Ok(bytes) if bytes > 0 => bytes,
-        _ => return,
-    };
-    buffer.truncate(n);
+// ------------------- CONNECTION HANDLER -------------------
 
-    let req = match parse_http_request(&buffer) {
-        Some(r) => r,
+fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) {
+    let (req, buffer) = match read_full_http_request(&mut stream) {
+        Some(res) => res,
         None => return,
     };
 
     let authorized = is_authorized(&req, pin);
 
-    // If request contains ?pin=XYZ and is authorized, set cookie
-    let set_cookie = if authorized {
-        Some(format!("pin={}", pin))
-    } else {
-        None
-    };
-
-    // Public API status
     if req.path == "/api/status" {
+        let (wan_active, wan_url) = get_wan_status();
+        let mode = get_active_mode();
+        let active_url = if mode == "WAN" && wan_url.is_some() {
+            format!("{}/?pin={}#key={}", wan_url.as_ref().unwrap(), pin, key_hex)
+        } else {
+            format!("http://{}:{}/?pin={}#key={}", ip, PORT, pin, key_hex)
+        };
         let resp = serde_json::json!({
             "status": "ACTIVE",
             "port": PORT,
             "ip": ip,
+            "tailscale_ip": get_tailscale_ip(),
+            "pin": pin,
+            "mode": mode,
+            "wan_active": wan_active,
+            "wan_url": wan_url,
+            "active_url": active_url,
             "auth_required": true
         });
-        send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None);
+        send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
         return;
     }
 
     if !authorized {
-        let html = render_login_page(ip);
-        send_response(&stream, "200 OK", "text/html; charset=utf-8", html.as_bytes(), None);
+        let html = render_login_page();
+        send_response(&stream, "200 OK", "text/html; charset=utf-8", html.as_bytes(), None, None);
         return;
     }
 
-    // Authenticated routes
+    let set_cookie = Some(format!("pin={}", pin));
+
     if req.method == "GET" && req.path == "/" {
+        let shared_files = get_directory_files(&get_shared_dir());
+        let html = render_web_app(ip, &shared_files);
+        send_response(&stream, "200 OK", "text/html; charset=utf-8", html.as_bytes(), set_cookie.as_deref(), None);
+    }
+    else if req.method == "POST" && req.path == "/api/upload-encrypted" {
+        let filename_raw = req.get_header("x-omasend-filename").unwrap_or("received_file.bin");
+        let filename_decoded = urlencoding_decode(filename_raw);
+        let clean_filename = sanitize_filename(&filename_decoded);
+
+        let iv_hex = match req.get_header("x-omasend-iv") {
+            Some(iv) if iv.len() == 24 => iv,
+            _ => {
+                send_response(&stream, "400 Bad Request", "text/plain", b"Missing or invalid X-OmaSend-IV", None, None);
+                return;
+            }
+        };
+
+        let iv_bytes = match hex::decode(iv_hex) {
+            Ok(b) => b,
+            Err(_) => {
+                send_response(&stream, "400 Bad Request", "text/plain", b"Invalid IV hex", None, None);
+                return;
+            }
+        };
+
+        let body = &buffer[req.body_offset..];
+        match decrypt_aes256_gcm(key_hex, &iv_bytes, body) {
+            Ok(decrypted) => {
+                let ddir = get_download_dir();
+                let file_path = get_unique_filepath(&ddir, &clean_filename);
+                if fs::write(&file_path, &decrypted).is_ok() {
+                    RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
+                    notify_desktop(
+                        "OmaSend: E2EE Dosya Alındı",
+                        &format!("'{}' ({} bayt) başarıyla çözüldü ve Downloads/omasend klasörüne kaydedildi.", file_path.file_name().unwrap().to_string_lossy(), decrypted.len())
+                    );
+                    let resp = serde_json::json!({
+                        "status": "OK",
+                        "filename": clean_filename,
+                        "size": decrypted.len(),
+                        "encrypted": true
+                    });
+                    send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+                } else {
+                    send_response(&stream, "500 Internal Server Error", "text/plain", b"Failed to write file", None, None);
+                }
+            }
+            Err(e) => {
+                eprintln!("Decryption error: {}", e);
+                send_response(&stream, "400 Bad Request", "text/plain", e.as_bytes(), None, None);
+            }
+        }
+    }
+    else if req.method == "GET" && req.path.starts_with("/api/download-encrypted/") {
+        let raw_filename = req.path.trim_start_matches("/api/download-encrypted/");
+        let filename = sanitize_filename(&urlencoding_decode(raw_filename));
+        let target = get_shared_dir().join(&filename);
+        let actual_target = if target.is_file() {
+            target
+        } else {
+            get_download_dir().join(&filename)
+        };
+
+        if actual_target.is_file() {
+            if let Ok(content) = fs::read(&actual_target) {
+                match encrypt_aes256_gcm(key_hex, &content) {
+                    Ok((iv, ciphertext)) => {
+                        let iv_hex = hex::encode(iv);
+                        let cd_val = format!("attachment; filename=\"{}.enc\"", filename);
+                        let extra = [
+                            ("X-OmaSend-IV", iv_hex.as_str()),
+                            ("X-OmaSend-Filename", filename.as_str()),
+                            ("Content-Disposition", cd_val.as_str()),
+                        ];
+                        send_response(&stream, "200 OK", "application/octet-stream", &ciphertext, None, Some(&extra));
+                        return;
+                    }
+                    Err(e) => {
+                        send_response(&stream, "500 Internal Server Error", "text/plain", e.as_bytes(), None, None);
+                        return;
+                    }
+                }
+            }
+        }
+        send_response(&stream, "404 Not Found", "text/plain", b"File not found", None, None);
+    }
+    else if req.method == "POST" && req.path == "/api/clipboard-encrypted" {
+        let iv_hex = match req.get_header("x-omasend-iv") {
+            Some(iv) if iv.len() == 24 => iv,
+            _ => {
+                send_response(&stream, "400 Bad Request", "text/plain", b"Missing IV", None, None);
+                return;
+            }
+        };
+        let iv_bytes = match hex::decode(iv_hex) {
+            Ok(b) => b,
+            Err(_) => {
+                send_response(&stream, "400 Bad Request", "text/plain", b"Invalid IV hex", None, None);
+                return;
+            }
+        };
+
+        let body = &buffer[req.body_offset..];
+        match decrypt_aes256_gcm(key_hex, &iv_bytes, body) {
+            Ok(decrypted) => {
+                let text = String::from_utf8_lossy(&decrypted).to_string();
+                set_pc_clipboard(&text);
+                notify_desktop(
+                    "OmaSend: E2EE Pano Alındı",
+                    &format!("Telefondan şifreli pano güncellendi ({} karakter):\n{}", text.len(), text.chars().take(60).collect::<String>()),
+                );
+                let resp = serde_json::json!({ "status": "OK", "encrypted": true });
+                send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+            }
+            Err(e) => {
+                send_response(&stream, "400 Bad Request", "text/plain", e.as_bytes(), None, None);
+            }
+        }
+    }
+    else if req.method == "GET" && req.path == "/api/clipboard-encrypted" {
         let clip = get_pc_clipboard();
-        let clip_preview = clip.chars().take(200).collect::<String>();
-        let shared_files = get_recent_files();
-        let html = render_web_app(ip, pin, &clip_preview, &shared_files);
-        send_response(&stream, "200 OK", "text/html; charset=utf-8", html.as_bytes(), set_cookie.as_deref());
-    } else if req.path == "/api/clipboard" {
+        match encrypt_aes256_gcm(key_hex, clip.as_bytes()) {
+            Ok((iv, ciphertext)) => {
+                let resp = serde_json::json!({
+                    "iv": hex::encode(iv),
+                    "ciphertext": hex::encode(ciphertext),
+                    "encrypted": true
+                });
+                send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+            }
+            Err(e) => {
+                send_response(&stream, "500 Internal Server Error", "text/plain", e.as_bytes(), None, None);
+            }
+        }
+    }
+    else if req.path == "/api/clipboard" {
         if req.method == "GET" {
             let clip = get_pc_clipboard();
             let resp = serde_json::json!({ "clipboard": clip });
-            send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None);
+            send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
         } else if req.method == "POST" {
             let body = String::from_utf8_lossy(&buffer[req.body_offset..]);
             let text = if let Some(val) = body.strip_prefix("text=") {
-                val.replace('+', " ")
+                urlencoding_decode(val)
             } else {
                 body.to_string()
             };
             set_pc_clipboard(&text);
             notify_desktop("OmaSend: Pano Alındı", &format!("Telefondan pano metni güncellendi ({} karakter)", text.len()));
             let resp = serde_json::json!({ "status": "OK" });
-            send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None);
+            send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
         }
-    } else if req.method == "POST" && (req.path == "/clipboard" || req.path == "/api/clipboard-web") {
-        let body = String::from_utf8_lossy(&buffer[req.body_offset..]);
-        let clean_text = if let Some(pos) = body.find("text=") {
-            let t = &body[pos + 5..];
-            t.replace('+', " ")
-        } else {
-            body.to_string()
-        };
-        set_pc_clipboard(&clean_text);
-        notify_desktop("OmaSend: Pano Alındı", &format!("Telefondan yeni metin panoya kopyalandı:\n{}", clean_text.chars().take(60).collect::<String>()));
-        let redirect = "HTTP/1.1 303 See Other\r\nLocation: /\r\nConnection: close\r\n\r\n";
-        let _ = stream.write_all(redirect.as_bytes());
-    } else if req.method == "POST" && (req.path == "/upload" || req.path == "/api/upload") {
-        // Parse multipart/form-data or binary body
+    }
+    else if req.method == "GET" && req.path.starts_with("/download/") {
+        let filename = sanitize_filename(&urlencoding_decode(req.path.trim_start_matches("/download/")));
+        let target = get_shared_dir().join(&filename);
+        let actual_target = if target.is_file() { target } else { get_download_dir().join(&filename) };
+        if actual_target.is_file() {
+            if let Ok(content) = fs::read(&actual_target) {
+                let cd_val = format!("attachment; filename=\"{}\"", filename);
+                let extra = [("Content-Disposition", cd_val.as_str())];
+                send_response(&stream, "200 OK", "application/octet-stream", &content, None, Some(&extra));
+                return;
+            }
+        }
+        send_response(&stream, "404 Not Found", "text/plain", b"File not found", None, None);
+    }
+    else if req.method == "POST" && req.path == "/upload" {
         let ddir = get_download_dir();
         let body = &buffer[req.body_offset..];
         let mut saved_name = format!("transfer_{}.bin", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
-
-        // Extract filename from header
         let body_str = String::from_utf8_lossy(body);
         if let Some(pos) = body_str.find("filename=\"") {
             if let Some(end) = body_str[pos + 10..].find('"') {
-                let raw_name = &body_str[pos + 10..pos + 10 + end];
-                saved_name = sanitize_filename(raw_name);
+                saved_name = sanitize_filename(&body_str[pos + 10..pos + 10 + end]);
             }
         }
-
-        // Find boundary end if multipart
         let file_path = get_unique_filepath(&ddir, &saved_name);
-        // Find actual data payload
         let data_start = body.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(0);
         let data_slice = if data_start < body.len() { &body[data_start..] } else { body };
 
         let _ = fs::write(&file_path, data_slice);
         RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
         notify_desktop(
-            "OmaSend: Dosya Alındı 📥",
-            &format!("'{}' başarıyla Downloads/omasend klasörüne kaydedildi.", file_path.file_name().unwrap().to_string_lossy())
+            "OmaSend: Dosya Alındı",
+            &format!("'{}' Downloads/omasend klasörüne kaydedildi.", file_path.file_name().unwrap().to_string_lossy()),
         );
-
-        let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"status\":\"OK\"}";
-        let _ = stream.write_all(resp.as_bytes());
-    } else if req.method == "GET" && req.path.starts_with("/download/") {
-        let filename = req.path.trim_start_matches("/download/");
-        let clean_name = sanitize_filename(filename);
-        let target = get_download_dir().join(&clean_name);
-        if target.is_file() {
-            if let Ok(content) = fs::read(&target) {
-                let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"{}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    clean_name, content.len()
-                );
-                let _ = stream.write_all(header.as_bytes());
-                let _ = stream.write_all(&content);
-                return;
-            }
-        }
-        send_response(&stream, "404 Not Found", "text/plain", b"File not found", None);
+        let resp = "{\"status\":\"OK\"}";
+        send_response(&stream, "200 OK", "application/json", resp.as_bytes(), None, None);
     } else {
-        send_response(&stream, "404 Not Found", "text/plain", b"Not Found", None);
+        send_response(&stream, "404 Not Found", "text/plain", b"Not Found", None, None);
     }
 }
+
+fn urlencoding_decode(input: &str) -> String {
+    let mut out = Vec::new();
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(h) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16) {
+                out.push(h);
+                i += 3;
+                continue;
+            }
+        } else if bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+// ------------------- SERVER DAEMON -------------------
 
 fn run_server() {
     let local_ip = get_local_ip();
     let pin = get_or_create_pin();
-    update_qr_code(&local_ip, &pin);
+    let key = get_or_create_session_key();
+    update_all_qr();
 
     let addr = format!("0.0.0.0:{}", PORT);
     let listener = match TcpListener::bind(&addr) {
@@ -582,12 +1267,15 @@ fn run_server() {
         if let Ok(s) = stream {
             let ip_clone = local_ip.clone();
             let pin_clone = pin.clone();
+            let key_clone = key.clone();
             thread::spawn(move || {
-                handle_connection(s, &ip_clone, &pin_clone);
+                handle_connection(s, &ip_clone, &pin_clone, &key_clone);
             });
         }
     }
 }
+
+// ------------------- CLI ENTRYPOINT -------------------
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -597,17 +1285,81 @@ fn main() {
     } else {
         get_or_create_pin()
     };
-    let qr_path = update_qr_code(&ip, &pin);
-    let ddir = get_download_dir().to_string_lossy().to_string();
-    let sdir = get_shared_dir().to_string_lossy().to_string();
+
+    let session_key = if args.iter().any(|a| a == "--new-key") {
+        generate_new_session_key()
+    } else {
+        get_or_create_session_key()
+    };
+
+    if args.iter().any(|a| a == "--start-wan") {
+        match start_wan_tunnel() {
+            Ok(url) => println!("WAN Tunnel Started: {}", url),
+            Err(e) => eprintln!("Error starting WAN tunnel: {}", e),
+        }
+        return;
+    }
+
+    if args.iter().any(|a| a == "--stop-wan") {
+        stop_wan_tunnel();
+        println!("WAN Tunnel Stopped.");
+        return;
+    }
+
+    if args.iter().any(|a| a == "--toggle-wan") {
+        let (active, _) = get_wan_status();
+        if active {
+            stop_wan_tunnel();
+            println!("WAN Stopped");
+        } else {
+            match start_wan_tunnel() {
+                Ok(url) => println!("WAN Started: {}", url),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+        return;
+    }
+
+    if args.iter().any(|a| a == "--set-lan") {
+        set_active_mode("LAN");
+        update_all_qr();
+        println!("Mode set to LAN");
+        return;
+    }
+
+    if args.iter().any(|a| a == "--set-wan") {
+        set_active_mode("WAN");
+        update_all_qr();
+        println!("Mode set to WAN");
+        return;
+    }
+
+    update_all_qr();
 
     if args.iter().any(|a| a == "--serve") {
         run_server();
         return;
     }
 
+    let (wan_active, wan_url) = get_wan_status();
+    let active_mode = get_active_mode();
+    let qr_file = get_state_dir().join("qr.svg");
+    let qr_path = qr_file.to_string_lossy().to_string();
+    let ddir = get_download_dir().to_string_lossy().to_string();
+    let sdir = get_shared_dir().to_string_lossy().to_string();
+
+    let active_url = if active_mode == "WAN" && wan_url.is_some() {
+        format!("{}/?pin={}#key={}", wan_url.as_ref().unwrap(), pin, session_key)
+    } else {
+        format!("http://{}:{}/?pin={}#key={}", ip, PORT, pin, session_key)
+    };
+
     if args.iter().any(|a| a == "--status") {
-        println!("{{\"text\":\"\",\"tooltip\":\"OmaSend AirBridge\\nPortal: http://{}:{}\\nPIN: {}\",\"class\":\"normal\"}}", ip, PORT, pin);
+        let mode_tag = if active_mode == "WAN" { "WAN" } else { "LAN" };
+        println!(
+            "{{\"text\":\"\",\"tooltip\":\"OmaSend AirBridge [{}]\\n{}\",\"class\":\"normal\"}}",
+            mode_tag, active_url
+        );
         return;
     }
 
@@ -616,19 +1368,27 @@ fn main() {
             status: "ACTIVE".to_string(),
             port: PORT,
             local_ip: ip,
+            tailscale_ip: get_tailscale_ip(),
             pin,
+            session_key,
+            active_mode,
+            wan_active,
+            wan_url,
+            active_url,
             download_dir: ddir,
             shared_dir: sdir,
             qr_path,
             total_received: RECEIVED_COUNTER.load(Ordering::SeqCst),
-            recent_files: get_recent_files(),
+            recent_files: get_directory_files(&get_download_dir()),
+            shared_files: get_directory_files(&get_shared_dir()),
         };
         println!("{}", serde_json::to_string_pretty(&state).unwrap());
         return;
     }
 
-    println!("OMASEND - WIRELESS AIRBRIDGE & CLIPBOARD SENTINEL");
-    println!("Portal: http://{}:{} [PIN: {}]", ip, PORT, pin);
+    println!("OMASEND - WIRELESS AIRBRIDGE & E2EE CLIPBOARD SENTINEL");
+    println!("Mode: {}", active_mode);
+    println!("Active URL: {}", active_url);
     println!("QR: {}", qr_path);
-    println!("Downloads: {}", ddir);
+    println!("E2EE Key: {}", session_key);
 }
