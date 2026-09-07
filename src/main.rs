@@ -35,6 +35,7 @@ pub struct ServerState {
     pub active_mode: String, // "LAN" or "WAN"
     pub wan_active: bool,
     pub wan_connecting: bool,
+    pub wan_provider: Option<String>,
     pub wan_url: Option<String>,
     pub download_dir: String,
     pub shared_dir: String,
@@ -181,16 +182,82 @@ fn encrypt_aes256_gcm(key_hex: &str, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u
 // ------------------- WAN TUNNEL MANAGEMENT -------------------
 
 fn is_process_alive(pid: i32) -> bool {
-    let proc_path = format!("/proc/{}", pid);
-    if !Path::new(&proc_path).exists() {
-        return false;
-    }
-    if let Ok(cmdline) = fs::read_to_string(format!("{}/cmdline", proc_path)) {
-        if cmdline.contains("cloudflared") || cmdline.contains("localtunnel") || cmdline.contains("node") {
-            return true;
+    Path::new(&format!("/proc/{}", pid)).exists()
+}
+
+fn get_wan_provider() -> Option<String> {
+    let provider_file = get_state_dir().join("wan_provider.txt");
+    fs::read_to_string(&provider_file).ok().map(|s| s.trim().to_string())
+}
+
+fn is_cloudflare_rate_limited() -> bool {
+    let log_file = get_state_dir().join("wan_tunnel.log");
+    if let Ok(meta) = fs::metadata(&log_file) {
+        if let Ok(modified) = meta.modified() {
+            if let Ok(elapsed) = modified.elapsed() {
+                if elapsed.as_secs() < 900 {
+                    if let Ok(content) = fs::read_to_string(&log_file) {
+                        if content.contains("429 Too Many Requests") || content.contains("error code: 1015") {
+                            return true;
+                        }
+                    }
+                }
+            }
         }
     }
     false
+}
+
+fn get_localtunnel_bin() -> Option<(String, Vec<String>)> {
+    let home = env::var("HOME").unwrap_or_default();
+    let node_bin = format!("{}/.local/share/mise/installs/node/26.8.1/bin/node", home);
+    let lt_js = format!("{}/.local/share/mise/installs/node/26.8.1/lib/node_modules/localtunnel/bin/lt.js", home);
+    if Path::new(&node_bin).is_file() && Path::new(&lt_js).is_file() {
+        return Some((node_bin, vec![lt_js, "--port".to_string(), PORT.to_string()]));
+    }
+    let local_node = format!("{}/.local/bin/node", home);
+    if Path::new(&local_node).is_file() && Path::new(&lt_js).is_file() {
+        return Some((local_node, vec![lt_js, "--port".to_string(), PORT.to_string()]));
+    }
+    if let Ok(out) = Command::new("which").arg("node").output() {
+        if out.status.success() {
+            let npath = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if Path::new(&lt_js).is_file() {
+                return Some((npath, vec![lt_js, "--port".to_string(), PORT.to_string()]));
+            }
+        }
+    }
+    if Command::new("npx").arg("--version").output().is_ok() {
+        return Some(("npx".to_string(), vec!["-y".to_string(), "localtunnel".to_string(), "--port".to_string(), PORT.to_string()]));
+    }
+    None
+}
+
+fn launch_localtunnel() -> Result<u32, String> {
+    let (bin, args) = get_localtunnel_bin().ok_or_else(|| "No localtunnel binary found".to_string())?;
+    let lt_log = get_state_dir().join("localtunnel.log");
+    let _ = fs::remove_file(&lt_log);
+    let _ = fs::remove_file(get_state_dir().join("wan_tunnel.log"));
+    let out_file = fs::File::create(&lt_log).map_err(|e| e.to_string())?;
+    let err_file = out_file.try_clone().map_err(|e| e.to_string())?;
+
+    let mut cmd = Command::new(bin);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(out_file)
+        .stderr(err_file)
+        .process_group(0);
+
+    let child = cmd.spawn().map_err(|e| format!("Failed to spawn localtunnel: {}", e))?;
+    let pid = child.id();
+    let pid_file = get_state_dir().join("wan_pid.txt");
+    let connecting_file = get_state_dir().join("wan_connecting.txt");
+    let provider_file = get_state_dir().join("wan_provider.txt");
+    let _ = fs::write(&pid_file, pid.to_string());
+    let _ = fs::write(&connecting_file, "connecting");
+    let _ = fs::write(&provider_file, "Localtunnel");
+    set_active_mode("WAN");
+    Ok(pid)
 }
 
 fn get_wan_status() -> (bool, bool, Option<String>) {
@@ -198,6 +265,8 @@ fn get_wan_status() -> (bool, bool, Option<String>) {
     let url_file = get_state_dir().join("wan_url.txt");
     let connecting_file = get_state_dir().join("wan_connecting.txt");
     let log_file = get_state_dir().join("wan_tunnel.log");
+    let lt_log = get_state_dir().join("localtunnel.log");
+    let fallback_file = get_state_dir().join("fallback_attempted.txt");
 
     if let Ok(pid_str) = fs::read_to_string(&pid_file) {
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
@@ -211,56 +280,81 @@ fn get_wan_status() -> (bool, bool, Option<String>) {
                     }
                 }
 
-                // Process is running: scan Cloudflare log for resolved trycloudflare URL
-                if let Ok(content) = fs::read_to_string(&log_file) {
-                    for line in content.lines() {
-                        if let Some(pos) = line.find("https://") {
-                            let rest = &line[pos..];
-                            if let Some(end) = rest.find(".trycloudflare.com") {
-                                let found_url = rest[..end + 18].to_string();
-                                let _ = fs::write(&url_file, &found_url);
-                                let _ = fs::remove_file(&connecting_file);
-                                set_active_mode("WAN");
-                                update_all_qr();
-                                notify_desktop(
-                                    "OmaSend: Dış Ağ (WAN) Aktif",
-                                    &format!("Küresel AirBridge hazır!\nAdres: {}", found_url),
-                                );
-                                return (true, false, Some(found_url));
+                let provider = get_wan_provider().unwrap_or_else(|| "Cloudflare".to_string());
+
+                if provider == "Localtunnel" {
+                    // Check localtunnel log
+                    if let Ok(content) = fs::read_to_string(&lt_log) {
+                        for line in content.lines() {
+                            if let Some(pos) = line.find("https://") {
+                                let rest = &line[pos..];
+                                let end = rest.find(|c: char| c.is_whitespace() || c == '\r' || c == '\n').unwrap_or(rest.len());
+                                let u = rest[..end].trim().to_string();
+                                if !u.is_empty() && u.contains(".loca.lt") {
+                                    let _ = fs::write(&url_file, &u);
+                                    let _ = fs::remove_file(&connecting_file);
+                                    let _ = fs::remove_file(&fallback_file);
+                                    set_active_mode("WAN");
+                                    update_all_qr();
+                                    notify_desktop(
+                                        "OmaSend: Global WAN Active",
+                                        &format!("Global AirBridge ready!\nAddress: {}", u),
+                                    );
+                                    return (true, false, Some(u));
+                                }
                             }
                         }
                     }
-                }
+                    return (false, true, None);
+                } else {
+                    // Check Cloudflare log for resolved trycloudflare URL or rate limit
+                    if let Ok(content) = fs::read_to_string(&log_file) {
+                        if content.contains("429 Too Many Requests") || content.contains("error code: 1015") {
+                            let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+                            let _ = fs::remove_file(&log_file);
+                            if !fallback_file.exists() {
+                                let _ = fs::write(&fallback_file, "1");
+                                let _ = launch_localtunnel();
+                                return (false, true, None);
+                            }
+                        }
 
-                // Check localtunnel log if present
-                let lt_log = get_state_dir().join("localtunnel.log");
-                if let Ok(content) = fs::read_to_string(&lt_log) {
-                    for line in content.lines() {
-                        if let Some(pos) = line.find("https://") {
-                            let u = line[pos..].trim().to_string();
-                            if !u.is_empty() && u.contains(".loca.lt") {
-                                let _ = fs::write(&url_file, &u);
-                                let _ = fs::remove_file(&connecting_file);
-                                set_active_mode("WAN");
-                                update_all_qr();
-                                notify_desktop(
-                                    "OmaSend: Dış Ağ (WAN) Aktif",
-                                    &format!("Küresel AirBridge hazır!\nAdres: {}", u),
-                                );
-                                return (true, false, Some(u));
+                        for line in content.lines() {
+                            if let Some(pos) = line.find("https://") {
+                                let rest = &line[pos..];
+                                if let Some(end) = rest.find(".trycloudflare.com") {
+                                    let found_url = rest[..end + 18].to_string();
+                                    let _ = fs::write(&url_file, &found_url);
+                                    let _ = fs::remove_file(&connecting_file);
+                                    let _ = fs::remove_file(&fallback_file);
+                                    set_active_mode("WAN");
+                                    update_all_qr();
+                                    notify_desktop(
+                                        "OmaSend: Global WAN Active",
+                                        &format!("Global AirBridge ready!\nAddress: {}", found_url),
+                                    );
+                                    return (true, false, Some(found_url));
+                                }
                             }
                         }
                     }
+                    return (false, true, None);
                 }
-
-                // Tunnel process is still initializing
-                return (false, true, None);
+            } else {
+                // Process died while we were connecting: attempt localtunnel fallback if was Cloudflare!
+                if connecting_file.exists() && !fallback_file.exists() {
+                    let _ = fs::write(&fallback_file, "1");
+                    if launch_localtunnel().is_ok() {
+                        return (false, true, None);
+                    }
+                }
             }
         }
     }
     let _ = fs::remove_file(&pid_file);
     let _ = fs::remove_file(&url_file);
     let _ = fs::remove_file(&connecting_file);
+    let _ = fs::remove_file(&fallback_file);
     (false, false, None)
 }
 
@@ -268,6 +362,8 @@ fn stop_wan_tunnel() {
     let pid_file = get_state_dir().join("wan_pid.txt");
     let url_file = get_state_dir().join("wan_url.txt");
     let connecting_file = get_state_dir().join("wan_connecting.txt");
+    let provider_file = get_state_dir().join("wan_provider.txt");
+    let fallback_file = get_state_dir().join("fallback_attempted.txt");
 
     if let Ok(pid_str) = fs::read_to_string(&pid_file) {
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
@@ -275,14 +371,17 @@ fn stop_wan_tunnel() {
         }
     }
     let _ = Command::new("pkill").args(["-9", "-f", "cloudflared tunnel"]).output();
-    let _ = Command::new("pkill").args(["-9", "-f", "localtunnel --port"]).output();
+    let _ = Command::new("pkill").args(["-9", "-f", "localtunnel"]).output();
+    let _ = Command::new("pkill").args(["-9", "-f", "lt --port"]).output();
 
     let _ = fs::remove_file(&pid_file);
     let _ = fs::remove_file(&url_file);
     let _ = fs::remove_file(&connecting_file);
+    let _ = fs::remove_file(&provider_file);
+    let _ = fs::remove_file(&fallback_file);
     set_active_mode("LAN");
     update_all_qr();
-    notify_desktop("OmaSend: Dış Ağ (WAN)", "Güvenli dış ağ tüneli kapatıldı. Yerel Wi-Fi moduna geçildi.");
+    notify_desktop("OmaSend: Global WAN", "Secure WAN tunnel closed. Switched to local Wi-Fi mode.");
 }
 
 fn start_wan_tunnel() -> Result<String, String> {
@@ -298,7 +397,23 @@ fn start_wan_tunnel() -> Result<String, String> {
 
     // Clean up any stale instances before starting
     let _ = Command::new("pkill").args(["-9", "-f", "cloudflared tunnel"]).output();
-    let _ = Command::new("pkill").args(["-9", "-f", "localtunnel --port"]).output();
+    let _ = Command::new("pkill").args(["-9", "-f", "localtunnel"]).output();
+    let _ = Command::new("pkill").args(["-9", "-f", "lt --port"]).output();
+
+    let pid_file = get_state_dir().join("wan_pid.txt");
+    let url_file = get_state_dir().join("wan_url.txt");
+    let connecting_file = get_state_dir().join("wan_connecting.txt");
+    let provider_file = get_state_dir().join("wan_provider.txt");
+    let fallback_file = get_state_dir().join("fallback_attempted.txt");
+    let _ = fs::remove_file(&url_file);
+    let _ = fs::remove_file(&fallback_file);
+
+    // If Cloudflare is currently rate-limited on TryCloudflare, go directly to Localtunnel
+    if is_cloudflare_rate_limited() {
+        if let Ok(_) = launch_localtunnel() {
+            return Ok("Localtunnel launched (Cloudflare rate-limited)".to_string());
+        }
+    }
 
     let cloudflared_bin = if Command::new("cloudflared").arg("--version").output().is_ok() {
         Some("cloudflared".to_string())
@@ -311,11 +426,6 @@ fn start_wan_tunnel() -> Result<String, String> {
             None
         }
     };
-
-    let connecting_file = get_state_dir().join("wan_connecting.txt");
-    let pid_file = get_state_dir().join("wan_pid.txt");
-    let url_file = get_state_dir().join("wan_url.txt");
-    let _ = fs::remove_file(&url_file);
 
     if let Some(bin) = cloudflared_bin {
         let log_file = get_state_dir().join("wan_tunnel.log");
@@ -337,39 +447,27 @@ fn start_wan_tunnel() -> Result<String, String> {
         .stderr(Stdio::null())
         .process_group(0);
 
-        let child = cmd.spawn().map_err(|e| format!("Failed to spawn cloudflared: {}", e))?;
-
-        let pid = child.id();
-        let _ = fs::write(&pid_file, pid.to_string());
-        let _ = fs::write(&connecting_file, "connecting");
-        set_active_mode("WAN");
-        return Ok("Cloudflare tunnel launched in background".to_string());
+        match cmd.spawn() {
+            Ok(child) => {
+                let pid = child.id();
+                let _ = fs::write(&pid_file, pid.to_string());
+                let _ = fs::write(&connecting_file, "connecting");
+                let _ = fs::write(&provider_file, "Cloudflare");
+                set_active_mode("WAN");
+                return Ok("Cloudflare tunnel launched in background".to_string());
+            }
+            Err(e) => {
+                eprintln!("Failed to spawn cloudflared: {}, trying localtunnel fallback...", e);
+            }
+        }
     }
 
-    // Fallback: localtunnel via npx
-    if Command::new("npx").arg("--version").output().is_ok() {
-        let lt_log = get_state_dir().join("localtunnel.log");
-        let _ = fs::remove_file(&lt_log);
-        let out_file = fs::File::create(&lt_log).map_err(|e| e.to_string())?;
-        let err_file = out_file.try_clone().map_err(|e| e.to_string())?;
-
-        let mut cmd = Command::new("npx");
-        cmd.args(["-y", "localtunnel", "--port", &PORT.to_string()])
-            .stdin(Stdio::null())
-            .stdout(out_file)
-            .stderr(err_file)
-            .process_group(0);
-
-        let child = cmd.spawn().map_err(|e| format!("Failed to spawn localtunnel: {}", e))?;
-
-        let pid = child.id();
-        let _ = fs::write(&pid_file, pid.to_string());
-        let _ = fs::write(&connecting_file, "connecting");
-        set_active_mode("WAN");
-        return Ok("localtunnel launched in background".to_string());
+    // Fallback: localtunnel
+    if let Ok(_) = launch_localtunnel() {
+        return Ok("Localtunnel launched in background".to_string());
     }
 
-    Err("No supported tunnel client found (cloudflared or npx localtunnel)".to_string())
+    Err("No supported tunnel client found (cloudflared or localtunnel)".to_string())
 }
 
 // ------------------- QR CODE & URLS -------------------
@@ -641,11 +739,11 @@ fn send_response(mut stream: &TcpStream, status: &str, content_type: &str, body:
 
 fn render_login_page() -> String {
     r#"<!DOCTYPE html>
-<html lang="tr">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-<title>OmaSend • PIN Doğrulama</title>
+<title>OmaSend • PIN Verification</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background: #070a0e; color: #dbe4ee; display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; }
@@ -663,10 +761,10 @@ button:active { opacity: 0.85; }
 <div class="card">
 <div class="icon" style="font-size: 24px; font-weight: bold; color: #00cbb8; margin-bottom: 12px;">[SECURE]</div>
 <h1>OmaSend AirBridge</h1>
-<p>Omarchy PC ekranında görünen 4 haneli güvenlik PIN kodunu girin.</p>
+<p>Enter the 4-digit security PIN displayed on your PC screen.</p>
 <form method="GET" action="/">
 <input type="number" name="pin" class="pin-input" placeholder="••••" required autofocus pattern="[0-9]*" inputmode="numeric">
-<button type="submit">Bağlan ve Doğrula</button>
+<button type="submit">Verify & Connect</button>
 </form>
 </div>
 </body>
@@ -676,13 +774,13 @@ button:active { opacity: 0.85; }
 fn render_web_app(active_endpoint: &str, shared_files: &[FileInfo]) -> String {
     let mut files_html = String::new();
     if shared_files.is_empty() {
-        files_html.push_str("<div class='empty'>PC'den paylaşılan dosya bulunamadı.<br><small style='color:#667788;'>~/Downloads/omasend/shared klasörüne dosya ekleyin.</small></div>");
+        files_html.push_str("<div class='empty'>No files shared from PC.<br><small style='color:#667788;'>Add files to ~/Downloads/omasend/shared.</small></div>");
     } else {
         for f in shared_files {
             files_html.push_str(&format!(
                 r#"<div class="file-item">
 <div class="file-info"><div class="file-name">{}</div><div class="file-size">{}</div></div>
-<button onclick="downloadFile('{}')" class="btn-sm">İndir</button>
+<button onclick="downloadFile('{}')" class="btn-sm">Download</button>
 </div>"#,
                 f.name, f.size_str, f.name
             ));
@@ -691,7 +789,7 @@ fn render_web_app(active_endpoint: &str, shared_files: &[FileInfo]) -> String {
 
     format!(
         r#"<!DOCTYPE html>
-<html lang="tr">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
@@ -727,20 +825,20 @@ button.main-btn {{ width: 100%; background: #00cbb8; color: #070a0e; border: non
 <div class="header">
 <div class="brand">OmaSend AirBridge</div>
 <div class="badges">
-  <div class="badge">BAĞLI: {}</div>
-  <div id="e2ee-badge" class="badge-e2ee">E2EE AKTİF</div>
+  <div class="badge">CONNECTED: {}</div>
+  <div id="e2ee-badge" class="badge-e2ee">E2EE ACTIVE</div>
 </div>
 </div>
 
 <div class="card">
 <div class="card-title">
-  <span>PC'ye Dosya Gönder</span>
-  <span style="color:#27c93f; font-size:11px;">AES-256-GCM Şifreli</span>
+  <span>Send Files to PC</span>
+  <span style="color:#27c93f; font-size:11px;">AES-256-GCM Encrypted</span>
 </div>
 <div class="drop-zone" onclick="document.getElementById('file-input').click()">
 <div class="drop-icon" style="font-size: 20px; font-weight: bold; color: #00cbb8; margin-bottom: 6px;">[+]</div>
-<div style="font-size: 15px; font-weight: 700;">Fotoğraf, Video veya Dosya Seç</div>
-<div style="font-size: 12px; color: #8899a6; margin-top: 4px;">veya buraya dokunun / sürükleyin</div>
+<div style="font-size: 15px; font-weight: 700;">Choose Photos, Videos or Files</div>
+<div style="font-size: 12px; color: #8899a6; margin-top: 4px;">or tap / drag & drop here</div>
 <input type="file" id="file-input" style="display: none;" onchange="uploadFiles(this.files)" multiple>
 </div>
 <div id="progress-bar"><div id="progress-fill"></div></div>
@@ -749,24 +847,24 @@ button.main-btn {{ width: 100%; background: #00cbb8; color: #070a0e; border: non
 
 <div class="card">
 <div class="card-title">
-  <span>PC Panosu (Clipboard)</span>
-  <button onclick="fetchClipboard()" class="btn-sm" style="padding:3px 8px; font-size:11px;">Yenile</button>
+  <span>PC Clipboard</span>
+  <button onclick="fetchClipboard()" class="btn-sm" style="padding:3px 8px; font-size:11px;">Refresh</button>
 </div>
-<div class="clipboard-box" id="pc-clip">Pano yükleniyor...</div>
-<button class="main-btn" onclick="copyPcClipboard()">Telefona Kopyala</button>
+<div class="clipboard-box" id="pc-clip">Loading clipboard...</div>
+<button class="main-btn" onclick="copyPcClipboard()">Copy to Device</button>
 </div>
 
 <div class="card">
 <div class="card-title">
-  <span>PC Panosuna Metin Gönder</span>
-  <span style="color:#27c93f; font-size:11px;">Şifreli İletim</span>
+  <span>Send Text to PC Clipboard</span>
+  <span style="color:#27c93f; font-size:11px;">Encrypted Transfer</span>
 </div>
-<textarea id="clip-text" placeholder="PC'ye anında yapıştırmak istediğiniz metni yazın..."></textarea>
-<button class="main-btn" onclick="sendClipboard()">PC Panosuna Gönder</button>
+<textarea id="clip-text" placeholder="Type text to instantly paste to PC clipboard..."></textarea>
+<button class="main-btn" onclick="sendClipboard()">Send to PC Clipboard</button>
 </div>
 
 <div class="card">
-<div class="card-title">PC'den İndirilebilecek Dosyalar</div>
+<div class="card-title">Shared Files from PC</div>
 {}
 </div>
 
@@ -794,12 +892,12 @@ async function initE2EE() {{
         false,
         ["encrypt", "decrypt"]
       );
-      document.getElementById('e2ee-badge').innerText = 'E2EE AKTİF (AES-256-GCM)';
+      document.getElementById('e2ee-badge').innerText = 'E2EE ACTIVE (AES-256-GCM)';
     }} catch(e) {{
       console.error("WebCrypto key import error:", e);
     }}
   }} else {{
-    document.getElementById('e2ee-badge').innerText = 'E2EE ANAHTARSIZ';
+    document.getElementById('e2ee-badge').innerText = 'NO E2EE KEY';
     document.getElementById('e2ee-badge').style.color = '#ffaa00';
     document.getElementById('e2ee-badge').style.borderColor = '#ffaa00';
   }}
@@ -815,7 +913,7 @@ async function uploadFiles(files) {{
 
   for (var i = 0; i < files.length; i++) {{
     var file = files[i];
-    sMsg.innerText = 'Şifreleniyor: ' + file.name + '...';
+    sMsg.innerText = 'Encrypting: ' + file.name + '...';
     pFill.style.width = '15%';
 
     try {{
@@ -830,20 +928,20 @@ async function uploadFiles(files) {{
         );
         var ivHex = Array.from(iv).map(function(b) {{ return b.toString(16).padStart(2, '0'); }}).join('');
 
-        sMsg.innerText = 'Gönderiliyor: ' + file.name + ' (E2EE)...';
+        sMsg.innerText = 'Sending: ' + file.name + ' (E2EE)...';
         await sendEncryptedFile(file.name, ivHex, encryptedBuffer, pFill);
       }} else {{
-        sMsg.innerText = 'Gönderiliyor: ' + file.name + '...';
+        sMsg.innerText = 'Sending: ' + file.name + '...';
         await sendPlainFile(file, pFill);
       }}
     }} catch(err) {{
-      sMsg.innerText = 'Hata: ' + err.message;
+      sMsg.innerText = 'Error: ' + err.message;
       return;
     }}
   }}
 
   pFill.style.width = '100%';
-  sMsg.innerText = 'Dosyalar başarıyla PC ye aktarıldı.';
+  sMsg.innerText = 'Files transferred successfully to PC.';
   setTimeout(function() {{
     pBar.style.display = 'none';
     sMsg.innerText = '';
@@ -866,9 +964,9 @@ function sendEncryptedFile(filename, ivHex, encryptedBuffer, pFill) {{
     }};
     xhr.onload = function() {{
       if (xhr.status === 200) resolve();
-      else reject(new Error('Sunucu hatası: ' + xhr.status));
+      else reject(new Error('Server error: ' + xhr.status));
     }};
-    xhr.onerror = function() {{ reject(new Error('Ağ hatası')); }};
+    xhr.onerror = function() {{ reject(new Error('Network error')); }};
     xhr.send(encryptedBuffer);
   }});
 }}
@@ -886,9 +984,9 @@ function sendPlainFile(file, pFill) {{
     }};
     xhr.onload = function() {{
       if (xhr.status === 200) resolve();
-      else reject(new Error('Sunucu hatası'));
+      else reject(new Error('Server error'));
     }};
-    xhr.onerror = function() {{ reject(new Error('Ağ hatası')); }};
+    xhr.onerror = function() {{ reject(new Error('Network error')); }};
     xhr.send(formData);
   }});
 }}
@@ -900,9 +998,9 @@ async function downloadFile(filename) {{
   }}
   try {{
     var res = await fetch('/api/download-encrypted/' + encodeURIComponent(filename));
-    if (!res.ok) throw new Error('İndirme hatası');
+    if (!res.ok) throw new Error('Download error');
     var ivHex = res.headers.get('X-OmaSend-IV');
-    if (!ivHex || ivHex.length !== 24) throw new Error('Geçersiz IV başlığı');
+    if (!ivHex || ivHex.length !== 24) throw new Error('Invalid IV header');
 
     var iv = new Uint8Array(ivHex.match(/.{{1,2}}/g).map(function(b) {{ return parseInt(b, 16); }}));
     var encryptedData = await res.arrayBuffer();
@@ -923,13 +1021,13 @@ async function downloadFile(filename) {{
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
   }} catch(e) {{
-    alert('Şifreli indirme hatası: ' + e.message);
+    alert('Encrypted download error: ' + e.message);
   }}
 }}
 
 async function fetchClipboard() {{
   var box = document.getElementById('pc-clip');
-  box.innerText = 'Pano alınıyor...';
+  box.innerText = 'Fetching clipboard...';
   try {{
     if (cryptoKey) {{
       var res = await fetch('/api/clipboard-encrypted');
@@ -943,15 +1041,15 @@ async function fetchClipboard() {{
           cipherBytes
         );
         var text = new TextDecoder().decode(decrypted);
-        box.innerText = text || "(Pano boş)";
+        box.innerText = text || "(Clipboard empty)";
         return;
       }}
     }}
     var r = await fetch('/api/clipboard');
     var d = await r.json();
-    box.innerText = d.clipboard || "(Pano boş)";
+    box.innerText = d.clipboard || "(Clipboard empty)";
   }} catch(e) {{
-    box.innerText = "(Pano alınamadı)";
+    box.innerText = "(Failed to fetch clipboard)";
   }}
 }}
 
@@ -977,7 +1075,7 @@ async function sendClipboard() {{
         body: encrypted
       }});
       if (res.ok) {{
-        alert('Şifreli metin PC panosuna kopyalandı.');
+        alert('Encrypted text sent to PC clipboard.');
         document.getElementById('clip-text').value = '';
         fetchClipboard();
       }}
@@ -987,13 +1085,13 @@ async function sendClipboard() {{
         body: 'text=' + encodeURIComponent(text)
       }});
       if (res.ok) {{
-        alert('Metin PC panosuna kopyalandı.');
+        alert('Text sent to PC clipboard.');
         document.getElementById('clip-text').value = '';
         fetchClipboard();
       }}
     }}
   }} catch(e) {{
-    alert('Hata: ' + e.message);
+    alert('Error: ' + e.message);
   }}
 }}
 
@@ -1001,7 +1099,7 @@ function copyPcClipboard() {{
   var text = document.getElementById('pc-clip').innerText;
   if (!text || text.startsWith('(')) return;
   navigator.clipboard.writeText(text).then(function() {{
-    alert('Pano telefona kopyalandı.');
+    alert('Clipboard copied to device.');
   }});
 }}
 
@@ -1044,6 +1142,7 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             "mode": mode,
             "wan_active": wan_active,
             "wan_connecting": wan_connecting,
+            "wan_provider": if wan_active || wan_connecting { get_wan_provider() } else { None },
             "wan_url": wan_url,
             "active_url": active_url,
             "auth_required": true
@@ -1094,8 +1193,8 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
                 if fs::write(&file_path, &decrypted).is_ok() {
                     RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
                     notify_desktop(
-                        "OmaSend: E2EE Dosya Alındı",
-                        &format!("'{}' ({} bayt) başarıyla çözüldü ve Downloads/omasend klasörüne kaydedildi.", file_path.file_name().unwrap().to_string_lossy(), decrypted.len())
+                        "OmaSend: E2EE File Received",
+                        &format!("'{}' ({} bytes) decrypted and saved to Downloads/omasend.", file_path.file_name().unwrap().to_string_lossy(), decrypted.len())
                     );
                     let resp = serde_json::json!({
                         "status": "OK",
@@ -1169,8 +1268,8 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
                 let text = String::from_utf8_lossy(&decrypted).to_string();
                 set_pc_clipboard(&text);
                 notify_desktop(
-                    "OmaSend: E2EE Pano Alındı",
-                    &format!("Telefondan şifreli pano güncellendi ({} karakter):\n{}", text.len(), text.chars().take(60).collect::<String>()),
+                    "OmaSend: E2EE Clipboard Received",
+                    &format!("Encrypted clipboard updated ({} chars):\n{}", text.len(), text.chars().take(60).collect::<String>()),
                 );
                 let resp = serde_json::json!({ "status": "OK", "encrypted": true });
                 send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
@@ -1209,7 +1308,7 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
                 body.to_string()
             };
             set_pc_clipboard(&text);
-            notify_desktop("OmaSend: Pano Alındı", &format!("Telefondan pano metni güncellendi ({} karakter)", text.len()));
+            notify_desktop("OmaSend: Clipboard Received", &format!("Clipboard updated from device ({} chars)", text.len()));
             let resp = serde_json::json!({ "status": "OK" });
             send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
         }
@@ -1245,8 +1344,8 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
         let _ = fs::write(&file_path, data_slice);
         RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
         notify_desktop(
-            "OmaSend: Dosya Alındı",
-            &format!("'{}' Downloads/omasend klasörüne kaydedildi.", file_path.file_name().unwrap().to_string_lossy()),
+            "OmaSend: File Received",
+            &format!("'{}' saved to Downloads/omasend.", file_path.file_name().unwrap().to_string_lossy()),
         );
         let resp = "{\"status\":\"OK\"}";
         send_response(&stream, "200 OK", "application/json", resp.as_bytes(), None, None);
@@ -1406,6 +1505,7 @@ fn main() {
             active_mode,
             wan_active,
             wan_connecting,
+            wan_provider: if wan_active || wan_connecting { get_wan_provider() } else { None },
             wan_url,
             active_url,
             download_dir: ddir,

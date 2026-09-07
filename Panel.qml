@@ -240,7 +240,7 @@ Panel {
 
             Text {
               textFormat: Text.PlainText
-              text: (root.wanConnecting ? "DIŞ AĞ TÜNELİ KURULUYOR..." : (root.activeMode === "WAN" ? "KÜRESEL HAVA KÖPRÜSÜ (WAN)" : "YEREL AĞ KÖPRÜSÜ (LAN)")).toUpperCase()
+              text: (root.wanConnecting ? "ESTABLISHING WAN TUNNEL..." : (root.activeMode === "WAN" ? "GLOBAL AIRBRIDGE (WAN)" : "LOCAL NETWORK BRIDGE (LAN)")).toUpperCase()
               color: root.wanConnecting ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
               font.family: root.bar ? root.bar.fontFamily : Style.font.family
               font.pixelSize: Style.font.caption
@@ -250,139 +250,7 @@ Panel {
           }
         }
 
-        // ---------- Network Mode Switcher (LAN vs WAN) ----------
-        PanelSeparator {
-          foreground: root.bar ? root.bar.foreground : Color.foreground
-        }
-
-        Column {
-          width: parent.width
-          spacing: Style.space(6)
-
-          PanelSectionHeader {
-            text: "AĞ MODU & BAĞLANTI"
-            foreground: root.bar ? root.bar.foreground : Color.foreground
-            fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
-          }
-
-          RowLayout {
-            width: parent.width
-            spacing: Style.space(6)
-
-            Rectangle {
-              Layout.fillWidth: true
-              height: Style.space(32)
-              radius: Style.space(4)
-              color: root.activeMode === "LAN" ? Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent) : "transparent"
-              border.color: root.activeMode === "LAN" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
-              border.width: 1
-
-              MouseArea {
-                anchors.fill: parent
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.setLanMode()
-              }
-
-              Text {
-                anchors.centerIn: parent
-                textFormat: Text.PlainText
-                text: "  Yerel Ağ (LAN)"
-                color: root.activeMode === "LAN" ? (root.bar ? root.bar.foreground : Color.foreground) : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                font.pixelSize: Style.font.bodySmall
-                font.bold: root.activeMode === "LAN"
-              }
-            }
-
-            Rectangle {
-              Layout.fillWidth: true
-              height: Style.space(32)
-              radius: Style.space(4)
-              color: root.activeMode === "WAN" ? Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent) : "transparent"
-              border.color: root.activeMode === "WAN" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
-              border.width: 1
-
-              MouseArea {
-                anchors.fill: parent
-                cursorShape: Qt.PointingHandCursor
-                onClicked: {
-                  root.setWanMode()
-                }
-              }
-
-              Text {
-                anchors.centerIn: parent
-                textFormat: Text.PlainText
-                text: "  Dış Ağ (WAN)" + (root.wanActive ? " ●" : (root.wanConnecting ? " 󰑐" : ""))
-                color: root.activeMode === "WAN" ? (root.bar ? root.bar.foreground : Color.foreground) : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                font.pixelSize: Style.font.bodySmall
-                font.bold: root.activeMode === "WAN"
-              }
-            }
-          }
-
-          // WAN Tunnel Status Card (if WAN mode is selected)
-          Rectangle {
-            visible: root.activeMode === "WAN"
-            width: parent.width
-            implicitHeight: wanCol.implicitHeight + Style.space(16)
-            radius: Style.space(6)
-            color: Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
-
-            Column {
-              id: wanCol
-              anchors.fill: parent
-              anchors.margins: Style.space(8)
-              spacing: Style.space(6)
-
-              RowLayout {
-                width: parent.width
-                spacing: Style.space(8)
-
-                Text {
-                  Layout.fillWidth: true
-                  textFormat: Text.PlainText
-                  text: root.wanActive ? "● Dış Ağ Tüneli Aktif" : (root.wanConnecting ? "󰑐 Dış Ağ Tüneli Kuruluyor..." : "○ Tünel Kapalı")
-                  color: (root.wanActive || root.wanConnecting) ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                  font.pixelSize: Style.font.caption
-                  font.bold: true
-                }
-
-                Button {
-                  text: root.wanActive ? "Tüneli Kapat" : (root.wanConnecting ? "İptal Et" : "Tüneli Başlat")
-                  onClicked: root.toggleWan()
-                }
-              }
-
-              Text {
-                visible: root.wanConnecting
-                width: parent.width
-                textFormat: Text.PlainText
-                text: "Cloudflare Edge küresel tüneli oluşturuluyor..."
-                color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.3)
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                font.pixelSize: Style.font.caption
-                elide: Text.ElideRight
-              }
-
-              Text {
-                visible: root.wanActive
-                width: parent.width
-                textFormat: Text.PlainText
-                text: root.wanUrl
-                color: root.bar ? root.bar.foreground : Color.foreground
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                font.pixelSize: Style.font.caption
-                font.bold: true
-                elide: Text.ElideMiddle
-              }
-            }
-          }
-        }
-
-        // ---------- QR Code Pairing Section ----------
+        // ---------- Network Mode & QR Pairing (Side-by-Side) ----------
         PanelSeparator {
           foreground: root.bar ? root.bar.foreground : Color.foreground
         }
@@ -392,29 +260,173 @@ Panel {
           spacing: Style.space(8)
 
           PanelSectionHeader {
-            text: "QR KOD İLE EŞLEŞ"
+            text: "NETWORK MODE & PAIRING"
             foreground: root.bar ? root.bar.foreground : Color.foreground
             fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
           }
 
-          // Crisp QR Card
-          Rectangle {
-            anchors.horizontalCenter: parent.horizontalCenter
-            width: Style.space(154)
-            height: Style.space(154)
-            radius: Style.space(8)
-            color: "#ffffff"
-            border.color: root.bar ? root.bar.foreground : Color.foreground
-            border.width: 1
+          RowLayout {
+            width: parent.width
+            spacing: Style.space(10)
 
-            Image {
-              anchors.fill: parent
-              anchors.margins: Style.space(8)
-              source: root.qrPath ? ("file://" + root.qrPath + "?v=" + root.refreshNonce) : ""
-              sourceSize.width: Style.space(138)
-              sourceSize.height: Style.space(138)
-              fillMode: Image.PreserveAspectFit
-              cache: false
+            // Crisp QR Card (Left, 132x132)
+            Rectangle {
+              Layout.preferredWidth: Style.space(132)
+              Layout.preferredHeight: Style.space(132)
+              radius: Style.space(6)
+              color: "#ffffff"
+              border.color: root.bar ? root.bar.foreground : Color.foreground
+              border.width: 1
+
+              Image {
+                anchors.fill: parent
+                anchors.margins: Style.space(6)
+                source: root.qrPath ? ("file://" + root.qrPath + "?v=" + root.refreshNonce) : ""
+                sourceSize.width: Style.space(120)
+                sourceSize.height: Style.space(120)
+                fillMode: Image.PreserveAspectFit
+                cache: false
+              }
+            }
+
+            // Network Mode Switcher & WAN Controls (Right)
+            ColumnLayout {
+              Layout.fillWidth: true
+              Layout.preferredHeight: Style.space(132)
+              spacing: Style.space(6)
+
+              // Local Network (LAN) Button
+              Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Style.space(32)
+                radius: Style.space(4)
+                color: root.activeMode === "LAN" ? Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent) : "transparent"
+                border.color: root.activeMode === "LAN" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
+                border.width: 1
+
+                MouseArea {
+                  anchors.fill: parent
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.setLanMode()
+                }
+
+                RowLayout {
+                  anchors.fill: parent
+                  anchors.leftMargin: Style.space(10)
+                  anchors.rightMargin: Style.space(10)
+                  spacing: Style.space(6)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: ""
+                    color: root.activeMode === "LAN" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: Style.font.bodySmall
+                  }
+
+                  Text {
+                    Layout.fillWidth: true
+                    textFormat: Text.PlainText
+                    text: "Local Network (LAN)"
+                    color: root.activeMode === "LAN" ? (root.bar ? root.bar.foreground : Color.foreground) : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: Style.font.bodySmall
+                    font.bold: root.activeMode === "LAN"
+                  }
+
+                  Text {
+                    visible: root.activeMode === "LAN"
+                    textFormat: Text.PlainText
+                    text: "●"
+                    color: Color.accent
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+              }
+
+              // Global WAN Button
+              Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Style.space(32)
+                radius: Style.space(4)
+                color: root.activeMode === "WAN" ? Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent) : "transparent"
+                border.color: root.activeMode === "WAN" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
+                border.width: 1
+
+                MouseArea {
+                  anchors.fill: parent
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.setWanMode()
+                }
+
+                RowLayout {
+                  anchors.fill: parent
+                  anchors.leftMargin: Style.space(10)
+                  anchors.rightMargin: Style.space(10)
+                  spacing: Style.space(6)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: ""
+                    color: root.activeMode === "WAN" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: Style.font.bodySmall
+                  }
+
+                  Text {
+                    Layout.fillWidth: true
+                    textFormat: Text.PlainText
+                    text: "Global WAN"
+                    color: root.activeMode === "WAN" ? (root.bar ? root.bar.foreground : Color.foreground) : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: Style.font.bodySmall
+                    font.bold: root.activeMode === "WAN"
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: root.wanActive ? "●" : (root.wanConnecting ? "󰑐" : "")
+                    color: Color.accent
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+              }
+
+              // Network Status / Action Card
+              Rectangle {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                radius: Style.space(4)
+                color: Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
+
+                RowLayout {
+                  anchors.fill: parent
+                  anchors.leftMargin: Style.space(8)
+                  anchors.rightMargin: Style.space(8)
+                  spacing: Style.space(6)
+
+                  Text {
+                    Layout.fillWidth: true
+                    textFormat: Text.PlainText
+                    text: root.activeMode === "WAN" ?
+                          (root.wanActive ? "● Tunnel Active" : (root.wanConnecting ? "󰑐 Connecting..." : "○ Tunnel Offline")) :
+                          " Same Wi-Fi Network"
+                    color: (root.wanActive || root.wanConnecting) ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.3)
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                    elide: Text.ElideRight
+                  }
+
+                  Button {
+                    visible: root.activeMode === "WAN"
+                    text: root.wanActive ? "Stop" : (root.wanConnecting ? "Cancel" : "Start")
+                    onClicked: root.toggleWan()
+                  }
+                }
+              }
             }
           }
 
@@ -443,49 +455,14 @@ Panel {
               }
 
               Button {
-                text: "Linki Kopyala"
+                text: "Copy Link"
                 onClicked: root.copyPortalUrl()
-              }
-            }
-          }
-
-          // Security PIN & E2EE Info Pill
-          Rectangle {
-            width: parent.width
-            height: Style.space(34)
-            radius: Style.space(4)
-            color: Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
-
-            RowLayout {
-              anchors.fill: parent
-              anchors.leftMargin: Style.space(10)
-              anchors.rightMargin: Style.space(10)
-              spacing: Style.space(8)
-
-              Text {
-                textFormat: Text.PlainText
-                text: "GÜVENLİK PIN: " + root.pin
-                color: root.bar ? root.bar.foreground : Color.foreground
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                font.pixelSize: Style.font.bodySmall
-                font.bold: true
-              }
-
-              Item { Layout.fillWidth: true }
-
-              Text {
-                textFormat: Text.PlainText
-                text: "QR ile Otomatik E2EE"
-                color: Color.accent
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                font.pixelSize: Style.font.caption
-                font.bold: true
               }
             }
           }
         }
 
-        // ---------- E2EE Cryptography Section ----------
+        // ---------- Security PIN Section ----------
         PanelSeparator {
           foreground: root.bar ? root.bar.foreground : Color.foreground
         }
@@ -495,7 +472,7 @@ Panel {
           spacing: Style.space(6)
 
           PanelSectionHeader {
-            text: "UÇTAN UCA ŞİFRELEME (AES-256-GCM)"
+            text: "SECURITY PIN"
             foreground: root.bar ? root.bar.foreground : Color.foreground
             fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
           }
@@ -515,22 +492,22 @@ Panel {
               Text {
                 Layout.fillWidth: true
                 textFormat: Text.PlainText
-                text: "Anahtar: " + (root.sessionKey.length > 16 ? (root.sessionKey.slice(0, 8) + "..." + root.sessionKey.slice(-8)) : "Aktif")
-                color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.3)
+                text: "PIN: " + root.pin
+                color: root.bar ? root.bar.foreground : Color.foreground
                 font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                font.pixelSize: Style.font.caption
+                font.pixelSize: Style.font.bodySmall
                 font.bold: true
               }
 
               Button {
-                text: "Yeni Anahtar"
-                onClicked: root.newKey()
+                text: "New PIN"
+                onClicked: root.newPin()
               }
             }
           }
         }
 
-        // ---------- Transfer Path & Files ----------
+        // ---------- E2EE Cryptography Section ----------
         PanelSeparator {
           foreground: root.bar ? root.bar.foreground : Color.foreground
         }
@@ -540,7 +517,52 @@ Panel {
           spacing: Style.space(6)
 
           PanelSectionHeader {
-            text: "KAYIT KLASÖRÜ & DOSYALAR"
+            text: "END-TO-END ENCRYPTION (AES-256-GCM)"
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+          }
+
+          Rectangle {
+            width: parent.width
+            height: Style.space(36)
+            radius: Style.space(4)
+            color: Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
+
+            RowLayout {
+              anchors.fill: parent
+              anchors.leftMargin: Style.space(10)
+              anchors.rightMargin: Style.space(6)
+              spacing: Style.space(8)
+
+              Text {
+                Layout.fillWidth: true
+                textFormat: Text.PlainText
+                text: "Key: " + (root.sessionKey.length > 16 ? (root.sessionKey.slice(0, 8) + "..." + root.sessionKey.slice(-8)) : "Active")
+                color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.3)
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.caption
+                font.bold: true
+              }
+
+              Button {
+                text: "New Key"
+                onClicked: root.newKey()
+              }
+            }
+          }
+        }
+
+        // ---------- Download Directory Section ----------
+        PanelSeparator {
+          foreground: root.bar ? root.bar.foreground : Color.foreground
+        }
+
+        Column {
+          width: parent.width
+          spacing: Style.space(6)
+
+          PanelSectionHeader {
+            text: "DOWNLOAD DIRECTORY"
             foreground: root.bar ? root.bar.foreground : Color.foreground
             fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
           }
@@ -568,14 +590,14 @@ Panel {
               }
 
               Button {
-                text: "Klasörü Aç"
+                text: "Open Folder"
                 onClicked: root.openFolder()
               }
             }
           }
         }
 
-        // ---------- Actions Section ----------
+        // ---------- Footer / Actions Section ----------
         PanelSeparator {
           foreground: root.bar ? root.bar.foreground : Color.foreground
         }
@@ -584,15 +606,17 @@ Panel {
           width: parent.width
           spacing: Style.space(8)
 
-          Button {
+          Text {
             Layout.fillWidth: true
-            text: "Yeni PIN"
-            onClicked: root.newPin()
+            textFormat: Text.PlainText
+            text: "OmaSend AirBridge • Port " + root.port
+            color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.caption
           }
 
           Button {
-            Layout.fillWidth: true
-            text: "Yenile"
+            text: "Refresh"
             onClicked: root.refresh()
           }
         }
