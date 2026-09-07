@@ -68,8 +68,8 @@ Panel {
 
   Component.onCompleted: refresh()
   Component.onDestruction: {
-    if (scanProc.running) scanProc.kill()
-    if (copyProc.running) copyProc.kill()
+    if (scanProc.running) scanProc.running = false
+    if (copyProc.running) copyProc.running = false
   }
 
   WidgetButton {
@@ -167,17 +167,81 @@ Panel {
           columnSpacing: Style.space(16)
           rowSpacing: Style.spacing.labelGap
 
-          InfoLabel { text: "Local IP" }
-          DetailValue { text: root.localIp }
+          Text {
+            textFormat: Text.PlainText
+            text: "Local IP"
+            color: root.bar ? root.bar.foreground : Color.foreground
+            opacity: 0.6
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.bodySmall
+          }
+          Text {
+            textFormat: Text.PlainText
+            Layout.fillWidth: true
+            horizontalAlignment: Text.AlignRight
+            text: root.localIp
+            color: root.bar ? root.bar.foreground : Color.foreground
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            elide: Text.ElideRight
+          }
 
-          InfoLabel { text: "Port" }
-          DetailValue { text: String(root.port) }
+          Text {
+            textFormat: Text.PlainText
+            text: "Port"
+            color: root.bar ? root.bar.foreground : Color.foreground
+            opacity: 0.6
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.bodySmall
+          }
+          Text {
+            textFormat: Text.PlainText
+            Layout.fillWidth: true
+            horizontalAlignment: Text.AlignRight
+            text: String(root.port)
+            color: root.bar ? root.bar.foreground : Color.foreground
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            elide: Text.ElideRight
+          }
 
-          InfoLabel { text: "Protocol" }
-          DetailValue { text: "HTTP / TCP" }
+          Text {
+            textFormat: Text.PlainText
+            text: "Protocol"
+            color: root.bar ? root.bar.foreground : Color.foreground
+            opacity: 0.6
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.bodySmall
+          }
+          Text {
+            textFormat: Text.PlainText
+            Layout.fillWidth: true
+            horizontalAlignment: Text.AlignRight
+            text: "HTTP / TCP"
+            color: root.bar ? root.bar.foreground : Color.foreground
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            elide: Text.ElideRight
+          }
 
-          InfoLabel { text: "Engine" }
-          DetailValue { text: "Native Rust (x86_64)" }
+          Text {
+            textFormat: Text.PlainText
+            text: "Engine"
+            color: root.bar ? root.bar.foreground : Color.foreground
+            opacity: 0.6
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.bodySmall
+          }
+          Text {
+            textFormat: Text.PlainText
+            Layout.fillWidth: true
+            horizontalAlignment: Text.AlignRight
+            text: "Native Rust (x86_64)"
+            color: root.bar ? root.bar.foreground : Color.foreground
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            elide: Text.ElideRight
+          }
         }
       }
 
@@ -244,4 +308,5 @@ Panel {
       }
     }
   }
-}
+
+  }
