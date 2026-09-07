@@ -21,6 +21,7 @@ Panel {
   property string sessionKey: ""
   property string activeMode: "LAN"
   property bool wanActive: false
+  property bool wanConnecting: false
   property string wanUrl: ""
   property string activeUrl: ""
   property string savePath: "~/Downloads/omasend"
@@ -105,6 +106,7 @@ Panel {
           root.sessionKey = String(d.session_key || "")
           root.activeMode = String(d.active_mode || "LAN")
           root.wanActive = Boolean(d.wan_active)
+          root.wanConnecting = Boolean(d.wan_connecting)
           root.wanUrl = String(d.wan_url || "")
           root.activeUrl = String(d.active_url || "")
           root.savePath = String(d.download_dir || "~/Downloads/omasend")
@@ -127,6 +129,13 @@ Panel {
 
   Process { id: copyProc }
   Process { id: folderProc }
+
+  Timer {
+    interval: root.wanConnecting ? 1000 : 3000
+    running: root.opened || root.wanConnecting
+    repeat: true
+    onTriggered: root.refresh()
+  }
 
   Component.onCompleted: refresh()
   Component.onDestruction: {
@@ -231,8 +240,8 @@ Panel {
 
             Text {
               textFormat: Text.PlainText
-              text: (root.activeMode === "WAN" ? "KÜRESEL HAVA KÖPRÜSÜ (WAN)" : "YEREL AĞ KÖPRÜSÜ (LAN)").toUpperCase()
-              color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
+              text: (root.wanConnecting ? "DIŞ AĞ TÜNELİ KURULUYOR..." : (root.activeMode === "WAN" ? "KÜRESEL HAVA KÖPRÜSÜ (WAN)" : "YEREL AĞ KÖPRÜSÜ (LAN)")).toUpperCase()
+              color: root.wanConnecting ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
               font.family: root.bar ? root.bar.fontFamily : Style.font.family
               font.pixelSize: Style.font.caption
               font.bold: true
@@ -298,16 +307,13 @@ Panel {
                 cursorShape: Qt.PointingHandCursor
                 onClicked: {
                   root.setWanMode()
-                  if (!root.wanActive) {
-                    root.toggleWan()
-                  }
                 }
               }
 
               Text {
                 anchors.centerIn: parent
                 textFormat: Text.PlainText
-                text: "  Dış Ağ (WAN)" + (root.wanActive ? " ●" : "")
+                text: "  Dış Ağ (WAN)" + (root.wanActive ? " ●" : (root.wanConnecting ? " 󰑐" : ""))
                 color: root.activeMode === "WAN" ? (root.bar ? root.bar.foreground : Color.foreground) : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
                 font.family: root.bar ? root.bar.fontFamily : Style.font.family
                 font.pixelSize: Style.font.bodySmall
@@ -337,17 +343,28 @@ Panel {
                 Text {
                   Layout.fillWidth: true
                   textFormat: Text.PlainText
-                  text: root.wanActive ? "● Dış Ağ Tüneli Aktif" : "○ Tünel Kapalı"
-                  color: root.wanActive ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
+                  text: root.wanActive ? "● Dış Ağ Tüneli Aktif" : (root.wanConnecting ? "󰑐 Dış Ağ Tüneli Kuruluyor..." : "○ Tünel Kapalı")
+                  color: (root.wanActive || root.wanConnecting) ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
                   font.family: root.bar ? root.bar.fontFamily : Style.font.family
                   font.pixelSize: Style.font.caption
                   font.bold: true
                 }
 
                 Button {
-                  text: root.wanActive ? "Tüneli Kapat" : "Tüneli Başlat"
+                  text: root.wanActive ? "Tüneli Kapat" : (root.wanConnecting ? "İptal Et" : "Tüneli Başlat")
                   onClicked: root.toggleWan()
                 }
+              }
+
+              Text {
+                visible: root.wanConnecting
+                width: parent.width
+                textFormat: Text.PlainText
+                text: "Cloudflare Edge küresel tüneli oluşturuluyor..."
+                color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.3)
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
               }
 
               Text {
