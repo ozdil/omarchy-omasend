@@ -72,12 +72,14 @@ Panel {
     if (copyProc.running) copyProc.running = false
   }
 
-  WidgetButton {
+  BarIconButton {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.barText
-    tooltipText: "OmaSend - Local AirBridge\nPortal: http://" + root.localIp + ":" + root.port
+    text: "\uf0c71"
+    foreground: root.serverActive ? "#38bdf8" : (root.bar ? root.bar.foreground : Color.foreground)
+    slotSize: Style.bar.statusSlot
+    tooltipText: "OmaSend AirBridge\nPortal: http://" + root.localIp + ":" + root.port + "\nStatus: Active\n\n[Left Click] Open QR AirBridge"
 
     onPressed: function(b) {
       if (root.opened) root.close()
