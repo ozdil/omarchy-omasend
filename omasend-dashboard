@@ -5,11 +5,10 @@ BIN="${DIR}/omasend-engine"
 
 if [[ ! -x "${BIN}" ]]; then
     if [[ -f "${DIR}/target/release/omasend-engine" ]]; then
-        cp "${DIR}/target/release/omasend-engine" "${BIN}"
-        chmod +x "${BIN}"
+        install -m 755 "${DIR}/target/release/omasend-engine" "${BIN}"
     elif command -v cargo >/dev/null 2>&1 && [[ -f "${DIR}/Cargo.toml" ]]; then
         echo "Building omasend-engine from source..."
-        (cd "${DIR}" && cargo build --release --locked && cp target/release/omasend-engine "${BIN}" && chmod +x "${BIN}") || true
+        (cd "${DIR}" && cargo build --release --locked && install -m 755 target/release/omasend-engine "${BIN}") || true
     fi
 fi
 

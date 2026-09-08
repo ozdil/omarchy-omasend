@@ -599,17 +599,34 @@ fn update_all_qr() {
     let _ = write_secure_file(&last_qr_file, &full_url);
 }
 
-fn notify_desktop(title: &str, body: &str) {
+fn get_desktop_gui_envs() -> Vec<(&'static str, String)> {
+    let keys = [
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "WAYLAND_DISPLAY",
+        "DISPLAY",
+        "XDG_RUNTIME_DIR",
+        "XDG_CURRENT_DESKTOP",
+        "XDG_SESSION_TYPE",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "XDG_DATA_DIRS",
+    ];
     let mut envs = Vec::new();
-    let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_default();
-    let dbus = env::var("DBUS_SESSION_BUS_ADDRESS").unwrap_or_default();
-    if !xdg.is_empty() {
-        envs.push(("XDG_RUNTIME_DIR", xdg.as_str()));
+    for k in keys {
+        if let Ok(v) = env::var(k) {
+            if !v.is_empty() {
+                envs.push((k, v));
+            }
+        }
     }
-    if !dbus.is_empty() {
-        envs.push(("DBUS_SESSION_BUS_ADDRESS", dbus.as_str()));
-    }
-    let deadline = Instant::now() + Duration::from_millis(1000);
+    envs
+}
+
+fn notify_desktop(title: &str, body: &str) {
+    let env_store = get_desktop_gui_envs();
+    let envs: Vec<(&str, &str)> = env_store.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let deadline = Instant::now() + Duration::from_millis(1500);
     let _ = run_cmd_bounded(
         "/usr/bin/notify-send",
         &["-a", "OmaSend", "-i", "document-send", title, body],
@@ -620,16 +637,9 @@ fn notify_desktop(title: &str, body: &str) {
 }
 
 fn get_pc_clipboard() -> String {
-    let mut envs = Vec::new();
-    let wayland = env::var("WAYLAND_DISPLAY").unwrap_or_default();
-    let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_default();
-    if !wayland.is_empty() {
-        envs.push(("WAYLAND_DISPLAY", wayland.as_str()));
-    }
-    if !xdg.is_empty() {
-        envs.push(("XDG_RUNTIME_DIR", xdg.as_str()));
-    }
-    let deadline = Instant::now() + Duration::from_millis(400);
+    let env_store = get_desktop_gui_envs();
+    let envs: Vec<(&str, &str)> = env_store.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let deadline = Instant::now() + Duration::from_millis(600);
     if let Some(out) = run_cmd_bounded("/usr/bin/wl-paste", &["--no-newline"], &envs, deadline, 1024 * 1024) {
         return String::from_utf8_lossy(&out).to_string();
     }
@@ -637,16 +647,9 @@ fn get_pc_clipboard() -> String {
 }
 
 fn set_pc_clipboard(text: &str) {
-    let mut envs = Vec::new();
-    let wayland = env::var("WAYLAND_DISPLAY").unwrap_or_default();
-    let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_default();
-    if !wayland.is_empty() {
-        envs.push(("WAYLAND_DISPLAY", wayland.as_str()));
-    }
-    if !xdg.is_empty() {
-        envs.push(("XDG_RUNTIME_DIR", xdg.as_str()));
-    }
-    let deadline = Instant::now() + Duration::from_millis(600);
+    let env_store = get_desktop_gui_envs();
+    let envs: Vec<(&str, &str)> = env_store.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let deadline = Instant::now() + Duration::from_millis(800);
     let _ = run_cmd_write_stdin_bounded("/usr/bin/wl-copy", &[], &envs, text.as_bytes(), deadline);
 }
 
@@ -977,6 +980,10 @@ fn run_p2p_beacon_broadcaster() {
                     let subnet_bcast = format!("{}.255:{}", &ip[..dot], P2P_BEACON_PORT);
                     let _ = socket.send_to(&bytes, subnet_bcast);
                 }
+                // Unicast directly to discovered peers to bypass Wi-Fi broadcast filtering
+                for peer in get_discovered_peers() {
+                    let _ = socket.send_to(&bytes, format!("{}:{}", peer.ip, P2P_BEACON_PORT));
+                }
             }
         }
         thread::sleep(Duration::from_secs(3));
@@ -1001,6 +1008,28 @@ fn run_p2p_discovery_listener() {
     }
 }
 
+fn connect_peer_with_timeout(addr_str: &str, timeout: Duration) -> Result<TcpStream, String> {
+    use std::net::ToSocketAddrs;
+    let addrs: Vec<_> = match addr_str.to_socket_addrs() {
+        Ok(iter) => iter.collect(),
+        Err(e) => return Err(format!("Invalid address '{}': {}", addr_str, e)),
+    };
+    if addrs.is_empty() {
+        return Err(format!("No IP address resolved for '{}'", addr_str));
+    }
+    for addr in addrs {
+        if let Ok(s) = TcpStream::connect_timeout(&addr, timeout) {
+            let _ = s.set_read_timeout(Some(Duration::from_secs(15)));
+            let _ = s.set_write_timeout(Some(Duration::from_secs(15)));
+            return Ok(s);
+        }
+    }
+    Err(format!(
+        "Connection timed out to '{}'. Ensure port 8844 TCP is open in firewall (UFW).",
+        addr_str
+    ))
+}
+
 fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String> {
     let file_bytes = safe_read_file(file_path).map_err(|e| format!("Security check failed: {}", e))?;
     let file_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
@@ -1021,7 +1050,16 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
     });
 
     let addr = format!("{}:{}", target_ip, PORT);
-    let mut stream = TcpStream::connect(&addr).map_err(|e| format!("Failed to connect to peer {}: {}", addr, e))?;
+    let mut stream = match connect_peer_with_timeout(&addr, Duration::from_secs(4)) {
+        Ok(s) => s,
+        Err(e) => {
+            notify_desktop(
+                "OmaSend AirBridge",
+                &format!("Connection failed to {}. Check firewall port 8844.", target_ip),
+            );
+            return Err(e);
+        }
+    };
     let req_bytes = request_payload.to_string().into_bytes();
     let http_req = format!(
         "POST /api/p2p/request HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1046,6 +1084,7 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
     let token = val["token"].as_str().ok_or_else(|| "Peer did not return a transfer token".to_string())?.to_string();
 
     println!("Transfer request sent to {}! Waiting for user to Accept...", target_ip);
+    notify_desktop("OmaSend AirBridge", &format!("Transfer request sent to {}. Waiting for consent...", target_ip));
 
     // 2. Poll for decision (monotonic deadline of 30 seconds)
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -1053,7 +1092,7 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
 
     while std::time::Instant::now() < deadline {
         thread::sleep(Duration::from_millis(600));
-        let mut poll_stream = match TcpStream::connect(&addr) {
+        let mut poll_stream = match connect_peer_with_timeout(&addr, Duration::from_secs(4)) {
             Ok(s) => s,
             Err(_) => continue,
         };
@@ -1091,7 +1130,8 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
     println!("Peer accepted! Streaming file '{}' ({} bytes)...", file_name, size_bytes);
 
     // 3. Upload file
-    let mut upload_stream = TcpStream::connect(&addr).map_err(|e| format!("Failed to connect to peer for upload: {}", e))?;
+    let mut upload_stream = connect_peer_with_timeout(&addr, Duration::from_secs(6))
+        .map_err(|e| format!("Failed to connect to peer for upload: {}", e))?;
     let encoded_filename = urlencoding_encode(&file_name);
     let upload_header = format!(
         "POST /api/p2p/upload?token={}&filename={} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1111,6 +1151,7 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
 fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
     let text = get_pc_clipboard();
     if text.is_empty() {
+        notify_desktop("OmaSend AirBridge", "Clipboard is empty. Copy some text first.");
         return Err("Clipboard is empty".to_string());
     }
     let (my_id, _) = get_or_create_device_id();
@@ -1121,7 +1162,16 @@ fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
         "text": text
     });
     let addr = format!("{}:{}", target_ip, PORT);
-    let mut stream = TcpStream::connect(&addr).map_err(|e| format!("Failed to connect to peer {}: {}", addr, e))?;
+    let mut stream = match connect_peer_with_timeout(&addr, Duration::from_secs(4)) {
+        Ok(s) => s,
+        Err(e) => {
+            notify_desktop(
+                "OmaSend AirBridge",
+                &format!("Connection failed to {}. Check firewall port 8844.", target_ip),
+            );
+            return Err(e);
+        }
+    };
     let req_bytes = payload.to_string().into_bytes();
     let http_req = format!(
         "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1132,7 +1182,7 @@ fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
     let mut resp = String::new();
     let _ = stream.read_to_string(&mut resp);
     println!("Clipboard successfully synced to {}", target_ip);
-    notify_desktop("OmaSend AirBridge", &format!("Clipboard synced to {}.", target_ip));
+    notify_desktop("OmaSend AirBridge", &format!("Clipboard successfully synced to {}.", target_ip));
     Ok(())
 }
 
@@ -2251,16 +2301,9 @@ fn main() {
 
     if let Some(pos) = args.iter().position(|a| a == "--send-dialog") {
         if let Some(target_ip) = args.get(pos + 1) {
-            let mut envs = Vec::new();
-            let wayland = env::var("WAYLAND_DISPLAY").unwrap_or_default();
-            let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_default();
-            if !wayland.is_empty() {
-                envs.push(("WAYLAND_DISPLAY", wayland.as_str()));
-            }
-            if !xdg.is_empty() {
-                envs.push(("XDG_RUNTIME_DIR", xdg.as_str()));
-            }
-            let deadline = Instant::now() + Duration::from_secs(60);
+            let env_store = get_desktop_gui_envs();
+            let envs: Vec<(&str, &str)> = env_store.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let deadline = Instant::now() + Duration::from_secs(120);
             if let Some(out) = run_cmd_bounded(
                 "/usr/bin/zenity",
                 &["--file-selection", "--title=OmaSend: Select File to Send via AirBridge"],

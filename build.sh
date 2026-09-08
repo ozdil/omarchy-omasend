@@ -6,8 +6,7 @@ cd "$DIR"
 
 echo "🦀 Building omasend-engine from source..."
 cargo build --release --locked
-cp target/release/omasend-engine ./omasend-engine
-chmod 755 ./omasend-engine
+install -m 755 target/release/omasend-engine ./omasend-engine
 
 echo "✅ omasend-engine successfully compiled and placed at ${DIR}/omasend-engine"
 
