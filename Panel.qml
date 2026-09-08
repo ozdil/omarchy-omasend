@@ -31,6 +31,13 @@ Panel {
   property var sharedFiles: []
   property int refreshNonce: 0
 
+  // AirBridge P2P & Bluetooth properties
+  property string p2pVisibility: "KNOWN"
+  property int p2pVisibilityRemainingSecs: 0
+  property bool p2pBtAvailable: false
+  property var p2pPeers: []
+  property var p2pPendingTransfer: null
+
   function resolveEnginePath() {
     return Qt.resolvedUrl("omasend-engine").toString().replace(/^file:\/\//, "")
   }
@@ -39,6 +46,26 @@ Panel {
     if (!scanProc.running) {
       scanProc.running = true
     }
+  }
+
+  function setP2pVisibility(mode) {
+    actionProc.command = [root.resolveEnginePath(), "--set-visibility", mode]
+    actionProc.running = true
+  }
+
+  function acceptTransfer(token) {
+    actionProc.command = [root.resolveEnginePath(), "--accept-transfer", token]
+    actionProc.running = true
+  }
+
+  function rejectTransfer(token) {
+    actionProc.command = [root.resolveEnginePath(), "--reject-transfer", token]
+    actionProc.running = true
+  }
+
+  function syncClipboardTo(ip) {
+    actionProc.command = [root.resolveEnginePath(), "--sync-clipboard", ip]
+    actionProc.running = true
   }
 
   function newPin() {
@@ -114,6 +141,11 @@ Panel {
           root.totalReceived = Number(d.total_received) || 0
           root.recentFiles = d.recent_files || []
           root.sharedFiles = d.shared_files || []
+          root.p2pVisibility = String(d.p2p_visibility || "KNOWN")
+          root.p2pVisibilityRemainingSecs = Number(d.p2p_visibility_remaining_secs) || 0
+          root.p2pBtAvailable = Boolean(d.p2p_bluetooth_available)
+          root.p2pPeers = d.p2p_discovered_peers || []
+          root.p2pPendingTransfer = d.p2p_pending_transfer || null
           root.refreshNonce++
         } catch(e) {}
       }
@@ -247,6 +279,320 @@ Panel {
               font.pixelSize: Style.font.caption
               font.bold: true
               font.letterSpacing: 1.1
+            }
+          }
+        }
+
+        // ---------- Gatekeeper Transfer Request (If Pending) ----------
+        Rectangle {
+          visible: root.p2pPendingTransfer !== null && root.p2pPendingTransfer.status === "PENDING"
+          width: parent.width
+          implicitHeight: pendingCol.implicitHeight + Style.space(16)
+          radius: Style.cornerRadius
+          color: Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
+          border.color: Color.accent
+          border.width: 1
+
+          Column {
+            id: pendingCol
+            anchors.fill: parent
+            anchors.margins: Style.space(10)
+            spacing: Style.space(6)
+
+            RowLayout {
+              width: parent.width
+              spacing: Style.space(6)
+
+              Text {
+                textFormat: Text.PlainText
+                text: "📁"
+                color: Color.accent
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.body
+              }
+
+              Text {
+                Layout.fillWidth: true
+                textFormat: Text.PlainText
+                text: "INCOMING AIRBRIDGE TRANSFER"
+                color: Color.accent
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.caption
+                font.bold: true
+              }
+            }
+
+            Text {
+              width: parent.width
+              wrapMode: Text.Wrap
+              textFormat: Text.PlainText
+              text: root.p2pPendingTransfer ? ("From: " + root.p2pPendingTransfer.sender_name + " (" + root.p2pPendingTransfer.sender_ip + ")\nFiles: " + (root.p2pPendingTransfer.file_names || []).join(", ") + " (" + ((root.p2pPendingTransfer.total_size_bytes || 0) / 1024 / 1024).toFixed(1) + " MB)") : ""
+              color: root.bar ? root.bar.foreground : Color.foreground
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            RowLayout {
+              width: parent.width
+              spacing: Style.space(8)
+
+              Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Style.space(28)
+                radius: Style.cornerRadius
+                color: Color.accent
+                MouseArea {
+                  anchors.fill: parent
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    if (root.p2pPendingTransfer) root.acceptTransfer(root.p2pPendingTransfer.token)
+                  }
+                }
+                Text {
+                  anchors.centerIn: parent
+                  textFormat: Text.PlainText
+                  text: " ACCEPT"
+                  color: "#000000"
+                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                }
+              }
+
+              Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Style.space(28)
+                radius: Style.cornerRadius
+                color: "transparent"
+                border.color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
+                border.width: 1
+                MouseArea {
+                  anchors.fill: parent
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    if (root.p2pPendingTransfer) root.rejectTransfer(root.p2pPendingTransfer.token)
+                  }
+                }
+                Text {
+                  anchors.centerIn: parent
+                  textFormat: Text.PlainText
+                  text: " DECLINE"
+                  color: root.bar ? root.bar.foreground : Color.foreground
+                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                }
+              }
+            }
+          }
+        }
+
+        // ---------- AirBridge P2P & Bluetooth (AirDrop) ----------
+        PanelSeparator {
+          foreground: root.bar ? root.bar.foreground : Color.foreground
+        }
+
+        Column {
+          width: parent.width
+          spacing: Style.space(8)
+
+          RowLayout {
+            width: parent.width
+            spacing: Style.space(6)
+
+            PanelSectionHeader {
+              Layout.fillWidth: true
+              text: "AIRDROP & PEER DISCOVERY"
+              foreground: root.bar ? root.bar.foreground : Color.foreground
+              fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+            }
+
+            // Bluetooth Status Indicator
+            Rectangle {
+              visible: root.p2pBtAvailable
+              height: Style.space(18)
+              implicitWidth: btPillText.implicitWidth + Style.space(10)
+              radius: Style.cornerRadius
+              color: "transparent"
+              border.color: Color.accent
+              border.width: 1
+
+              Text {
+                id: btPillText
+                anchors.centerIn: parent
+                textFormat: Text.PlainText
+                text: " BT READY"
+                color: Color.accent
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.caption
+                font.bold: true
+              }
+            }
+          }
+
+          // 3-Tier Visibility Selector
+          RowLayout {
+            width: parent.width
+            spacing: Style.space(6)
+
+            // OFF Button
+            Rectangle {
+              Layout.fillWidth: true
+              Layout.preferredHeight: Style.space(26)
+              radius: Style.cornerRadius
+              color: root.p2pVisibility === "OFF" ? Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent) : "transparent"
+              border.color: root.p2pVisibility === "OFF" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
+              border.width: 1
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.setP2pVisibility("OFF")
+              }
+              Text {
+                anchors.centerIn: parent
+                textFormat: Text.PlainText
+                text: "OFF"
+                color: root.p2pVisibility === "OFF" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.caption
+                font.bold: root.p2pVisibility === "OFF"
+              }
+            }
+
+            // KNOWN PEERS Button
+            Rectangle {
+              Layout.fillWidth: true
+              Layout.preferredHeight: Style.space(26)
+              radius: Style.cornerRadius
+              color: root.p2pVisibility === "KNOWN" ? Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent) : "transparent"
+              border.color: root.p2pVisibility === "KNOWN" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
+              border.width: 1
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.setP2pVisibility("KNOWN")
+              }
+              Text {
+                anchors.centerIn: parent
+                textFormat: Text.PlainText
+                text: "KNOWN PEERS"
+                color: root.p2pVisibility === "KNOWN" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.caption
+                font.bold: root.p2pVisibility === "KNOWN"
+              }
+            }
+
+            // EVERYONE 10M Button
+            Rectangle {
+              Layout.fillWidth: true
+              Layout.preferredHeight: Style.space(26)
+              radius: Style.cornerRadius
+              color: root.p2pVisibility === "EVERYONE" ? Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent) : "transparent"
+              border.color: root.p2pVisibility === "EVERYONE" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
+              border.width: 1
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.setP2pVisibility("EVERYONE")
+              }
+              Text {
+                anchors.centerIn: parent
+                textFormat: Text.PlainText
+                text: root.p2pVisibility === "EVERYONE" && root.p2pVisibilityRemainingSecs > 0 ? ("EVERYONE (" + Math.floor(root.p2pVisibilityRemainingSecs / 60) + ":" + (root.p2pVisibilityRemainingSecs % 60 < 10 ? "0" : "") + (root.p2pVisibilityRemainingSecs % 60) + ")") : "EVERYONE (10M)"
+                color: root.p2pVisibility === "EVERYONE" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.caption
+                font.bold: root.p2pVisibility === "EVERYONE"
+              }
+            }
+          }
+
+          // Discovered Peers List
+          Column {
+            width: parent.width
+            spacing: Style.space(6)
+
+            Text {
+              visible: root.p2pPeers.length === 0
+              width: parent.width
+              textFormat: Text.PlainText
+              text: root.p2pVisibility === "OFF" ? "AirBridge visibility is turned off." : "Scanning for nearby Omarchy devices on local network & Bluetooth..."
+              color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.caption
+              font.italic: true
+            }
+
+            Repeater {
+              model: root.p2pPeers
+
+              Rectangle {
+                width: parent.width
+                implicitHeight: Style.space(38)
+                radius: Style.cornerRadius
+                color: "transparent"
+                border.color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
+                border.width: 1
+
+                RowLayout {
+                  anchors.fill: parent
+                  anchors.leftMargin: Style.space(8)
+                  anchors.rightMargin: Style.space(8)
+                  spacing: Style.space(8)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: modelData.transport === "BT" ? "" : "💻"
+                    color: Color.accent
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: Style.font.body
+                  }
+
+                  Column {
+                    Layout.fillWidth: true
+                    spacing: 0
+                    Text {
+                      textFormat: Text.PlainText
+                      text: modelData.name || "Omarchy Device"
+                      color: root.bar ? root.bar.foreground : Color.foreground
+                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                      font.pixelSize: Style.font.bodySmall
+                      font.bold: true
+                    }
+                    Text {
+                      textFormat: Text.PlainText
+                      text: modelData.ip + " • " + modelData.transport + (modelData.is_trusted ? " • TRUSTED" : "")
+                      color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
+                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+
+                  Rectangle {
+                    Layout.preferredWidth: Style.space(86)
+                    Layout.preferredHeight: Style.space(24)
+                    radius: Style.cornerRadius
+                    color: Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
+                    border.color: Color.accent
+                    border.width: 1
+                    MouseArea {
+                      anchors.fill: parent
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.syncClipboardTo(modelData.ip)
+                    }
+                    Text {
+                      anchors.centerIn: parent
+                      textFormat: Text.PlainText
+                      text: "📋 CLIPBOARD"
+                      color: Color.accent
+                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+                  }
+                }
+              }
             }
           }
         }

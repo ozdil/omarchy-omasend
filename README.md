@@ -17,6 +17,11 @@ Plugin ID: `ozdil.omasend`
 - 🌐 **Hybrid Network Modes (LAN & Global WAN):**
   - **🏠 Yerel Ağ (LAN):** Full-speed local transfer (300–800 Mbps) over local Wi-Fi.
   - **🌐 Dış Ağ (Global WAN Tunnel):** One-click global HTTPS tunnel (Cloudflare Quick Tunnel / SSH). Transfer files directly over cellular 4G/5G or separate Wi-Fi networks worldwide without port forwarding or public IP requirements.
+- 📡 **Omarchy AirDrop P2P & Bluetooth (PC-to-PC):**
+  - Instant zero-config peer discovery across nearby Omarchy desktops using UDP multicast beacons (`8845`) and Bluetooth (BLE).
+  - 3-tier AirDrop visibility controls: *Off*, *Known Peers Only (Default)*, and *Everyone for 10 Minutes*.
+  - **Gatekeeper Consent:** Zero silent file acceptance. Recipient gets an explicit interactive desktop alert and panel prompt with sender name, file list, and total size before any bytes are accepted.
+  - Universal bidirectional clipboard synchronization between Omarchy desktops.
 - 📱 **Zero-Install Mobile Portal:** Point your smartphone camera at the native panel QR code to open the encrypted web portal in Safari or Chrome. No apps required on mobile!
 - 🔑 **PIN & Session Security:** Generates dynamic 4-digit PINs and 256-bit cryptographic keys with one-click regeneration.
 - 🔄 **Bidirectional File Transfers:**

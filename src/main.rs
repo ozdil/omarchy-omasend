@@ -12,14 +12,16 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use sha2::{Digest, Sha256};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 extern "C" {
     fn getuid() -> u32;
 }
 
 const PORT: u16 = 8844;
+const P2P_BEACON_PORT: u16 = 8845;
 static RECEIVED_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -27,6 +29,57 @@ pub struct FileInfo {
     pub name: String,
     pub size_str: String,
     pub size_bytes: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DiscoveredPeer {
+    pub id: String,
+    pub name: String,
+    pub ip: String,
+    pub port: u16,
+    pub transport: String, // "LAN", "BT", or "HYBRID"
+    pub fingerprint: String,
+    pub is_trusted: bool,
+    pub last_seen_secs: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TrustedPeer {
+    pub id: String,
+    pub name: String,
+    pub fingerprint: String,
+    pub trusted_at: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct TrustedPeersDb {
+    pub peers: Vec<TrustedPeer>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PendingFileTransfer {
+    pub token: String,
+    pub sender_id: String,
+    pub sender_name: String,
+    pub sender_ip: String,
+    pub file_names: Vec<String>,
+    pub total_size_bytes: u64,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub status: String, // "PENDING", "ACCEPTED", "REJECTED"
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct P2pBeaconPacket {
+    pub magic: String,
+    pub v: u32,
+    pub id: String,
+    pub name: String,
+    pub ip: String,
+    pub port: u16,
+    pub mode: String,
+    pub bt: bool,
+    pub fp: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -49,6 +102,14 @@ pub struct ServerState {
     pub total_received: usize,
     pub recent_files: Vec<FileInfo>,
     pub shared_files: Vec<FileInfo>,
+    // AirBridge P2P & Bluetooth
+    pub p2p_device_id: String,
+    pub p2p_hostname: String,
+    pub p2p_visibility: String,
+    pub p2p_visibility_remaining_secs: u64,
+    pub p2p_bluetooth_available: bool,
+    pub p2p_discovered_peers: Vec<DiscoveredPeer>,
+    pub p2p_pending_transfer: Option<PendingFileTransfer>,
 }
 
 fn get_local_ip() -> String {
@@ -76,6 +137,7 @@ fn get_tailscale_ip() -> Option<String> {
 }
 
 fn get_current_uid() -> u32 {
+    // SAFETY: POSIX getuid() is thread-safe and always succeeds.
     unsafe { getuid() }
 }
 
@@ -589,6 +651,427 @@ fn get_directory_files(dir: &Path) -> Vec<FileInfo> {
     files
 }
 
+// ------------------- P2P AIRDROP & BLUETOOTH MODULE -------------------
+
+fn urlencoding_encode(input: &str) -> String {
+    let mut out = String::new();
+    for b in input.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'~' {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
+fn get_system_hostname() -> String {
+    if let Ok(content) = fs::read_to_string("/etc/hostname") {
+        let trimmed = content.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if let Ok(out) = Command::new("hostname").output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                return s;
+            }
+        }
+    }
+    "Omarchy-PC".to_string()
+}
+
+fn get_or_create_device_id() -> (String, String) {
+    let key_file = get_state_dir().join("device_id.key");
+    if let Ok(content) = read_secure_file(&key_file) {
+        let trimmed = content.trim();
+        if trimmed.len() == 64 && hex::decode(trimmed).is_ok() {
+            let mut hasher = Sha256::new();
+            hasher.update(trimmed.as_bytes());
+            let fp = hex::encode(hasher.finalize());
+            let id = fp[..16].to_string();
+            return (id, fp);
+        }
+    }
+    let mut seed = [0u8; 32];
+    let _ = getrandom::getrandom(&mut seed);
+    let seed_hex = hex::encode(seed);
+    let _ = write_secure_file(&key_file, &seed_hex);
+
+    let mut hasher = Sha256::new();
+    hasher.update(seed_hex.as_bytes());
+    let fp = hex::encode(hasher.finalize());
+    let id = fp[..16].to_string();
+    (id, fp)
+}
+
+fn get_visibility() -> (String, u64) {
+    let vis_file = get_state_dir().join("visibility.json");
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    if let Ok(content) = read_secure_file(&vis_file) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+            let mode = val["mode"].as_str().unwrap_or("KNOWN").to_uppercase();
+            let expires_at = val["expires_at"].as_u64().unwrap_or(0);
+            if mode == "EVERYONE" {
+                if now < expires_at {
+                    return ("EVERYONE".to_string(), expires_at.saturating_sub(now));
+                } else {
+                    set_visibility("KNOWN");
+                    return ("KNOWN".to_string(), 0);
+                }
+            }
+            return (mode, 0);
+        }
+    }
+    ("KNOWN".to_string(), 0)
+}
+
+fn set_visibility(mode: &str) {
+    let upper = mode.to_uppercase();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let expires_at = if upper == "EVERYONE" {
+        now.saturating_add(600) // 10 minutes
+    } else {
+        0
+    };
+    let data = serde_json::json!({
+        "mode": upper,
+        "expires_at": expires_at
+    });
+    let vis_file = get_state_dir().join("visibility.json");
+    let _ = write_secure_file(&vis_file, &data.to_string());
+}
+
+fn load_trusted_peers() -> Vec<TrustedPeer> {
+    let path = get_state_dir().join("trusted_peers.json");
+    if let Ok(content) = read_secure_file(&path) {
+        if let Ok(db) = serde_json::from_str::<TrustedPeersDb>(&content) {
+            return db.peers;
+        }
+    }
+    Vec::new()
+}
+
+fn is_peer_trusted(peer_id: &str) -> bool {
+    let peers = load_trusted_peers();
+    peers.iter().any(|p| p.id == peer_id)
+}
+
+fn add_trusted_peer(id: &str, name: &str, fingerprint: &str) {
+    let mut peers = load_trusted_peers();
+    if !peers.iter().any(|p| p.id == id) {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        peers.push(TrustedPeer {
+            id: id.to_string(),
+            name: name.to_string(),
+            fingerprint: fingerprint.to_string(),
+            trusted_at: now,
+        });
+        let db = TrustedPeersDb { peers };
+        let path = get_state_dir().join("trusted_peers.json");
+        if let Ok(s) = serde_json::to_string_pretty(&db) {
+            let _ = write_secure_file(&path, &s);
+        }
+    }
+}
+
+fn is_bluetooth_available() -> bool {
+    if let Ok(out) = Command::new("bluetoothctl").arg("show").output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            return s.contains("Powered: yes");
+        }
+    }
+    false
+}
+
+fn get_pending_transfer() -> Option<PendingFileTransfer> {
+    let path = get_state_dir().join("pending_transfer.json");
+    if let Ok(content) = read_secure_file(&path) {
+        if let Ok(t) = serde_json::from_str::<PendingFileTransfer>(&content) {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            if now <= t.expires_at {
+                return Some(t);
+            }
+        }
+    }
+    None
+}
+
+fn save_pending_transfer(t: &PendingFileTransfer) {
+    let path = get_state_dir().join("pending_transfer.json");
+    if let Ok(s) = serde_json::to_string(t) {
+        let _ = write_secure_file(&path, &s);
+    }
+}
+
+fn clear_pending_transfer() {
+    let path = get_state_dir().join("pending_transfer.json");
+    let _ = fs::remove_file(path);
+}
+
+fn get_discovered_peers() -> Vec<DiscoveredPeer> {
+    let path = get_state_dir().join("discovered_peers.json");
+    if let Ok(content) = read_secure_file(&path) {
+        if let Ok(peers) = serde_json::from_str::<Vec<DiscoveredPeer>>(&content) {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            // Prune peers older than 15s
+            return peers.into_iter().filter(|p| now.saturating_sub(p.last_seen_secs) <= 15).collect();
+        }
+    }
+    Vec::new()
+}
+
+fn save_discovered_peers(peers: &[DiscoveredPeer]) {
+    let path = get_state_dir().join("discovered_peers.json");
+    if let Ok(s) = serde_json::to_string(peers) {
+        let _ = write_secure_file(&path, &s);
+    }
+}
+
+fn update_discovered_peer(packet: &P2pBeaconPacket) {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let (my_id, _) = get_or_create_device_id();
+    if packet.id == my_id {
+        return;
+    }
+    let (vis, _) = get_visibility();
+    if vis == "OFF" {
+        return;
+    }
+    let trusted = is_peer_trusted(&packet.id);
+    if vis == "KNOWN" && !trusted && packet.mode != "EVERYONE" {
+        return;
+    }
+
+    let transport = if packet.bt && is_bluetooth_available() {
+        "HYBRID".to_string()
+    } else {
+        "LAN".to_string()
+    };
+
+    let mut peers = get_discovered_peers();
+    if let Some(existing) = peers.iter_mut().find(|p| p.id == packet.id) {
+        existing.name = packet.name.clone();
+        existing.ip = packet.ip.clone();
+        existing.port = packet.port;
+        existing.transport = transport;
+        existing.fingerprint = packet.fp.clone();
+        existing.is_trusted = trusted;
+        existing.last_seen_secs = now;
+    } else {
+        peers.push(DiscoveredPeer {
+            id: packet.id.clone(),
+            name: packet.name.clone(),
+            ip: packet.ip.clone(),
+            port: packet.port,
+            transport,
+            fingerprint: packet.fp.clone(),
+            is_trusted: trusted,
+            last_seen_secs: now,
+        });
+    }
+    save_discovered_peers(&peers);
+}
+
+fn run_p2p_beacon_broadcaster() {
+    let socket = match UdpSocket::bind("0.0.0.0:0") {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let _ = socket.set_broadcast(true);
+
+    loop {
+        let (vis, _) = get_visibility();
+        if vis != "OFF" {
+            let (device_id, fp) = get_or_create_device_id();
+            let hostname = get_system_hostname();
+            let ip = get_local_ip();
+            let bt = is_bluetooth_available();
+
+            let packet = P2pBeaconPacket {
+                magic: "OMASEND_P2P".to_string(),
+                v: 1,
+                id: device_id,
+                name: hostname,
+                ip: ip.clone(),
+                port: PORT,
+                mode: vis,
+                bt,
+                fp,
+            };
+
+            if let Ok(bytes) = serde_json::to_vec(&packet) {
+                let _ = socket.send_to(&bytes, format!("255.255.255.255:{}", P2P_BEACON_PORT));
+                // Also broadcast to local subnet
+                if let Some(dot) = ip.rfind('.') {
+                    let subnet_bcast = format!("{}.255:{}", &ip[..dot], P2P_BEACON_PORT);
+                    let _ = socket.send_to(&bytes, subnet_bcast);
+                }
+            }
+        }
+        thread::sleep(Duration::from_secs(3));
+    }
+}
+
+fn run_p2p_discovery_listener() {
+    let socket = match UdpSocket::bind(format!("0.0.0.0:{}", P2P_BEACON_PORT)) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    let mut buf = [0u8; 2048];
+    while let Ok((amt, _src)) = socket.recv_from(&mut buf) {
+        if amt > 0 && amt <= 2048 {
+            if let Ok(packet) = serde_json::from_slice::<P2pBeaconPacket>(&buf[..amt]) {
+                if packet.magic == "OMASEND_P2P" {
+                    update_discovered_peer(&packet);
+                }
+            }
+        }
+    }
+}
+
+fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String> {
+    if !file_path.is_file() {
+        return Err(format!("File {:?} does not exist or is not a regular file", file_path));
+    }
+    let file_bytes = fs::read(file_path).map_err(|e| format!("Failed to read file: {}", e))?;
+    let file_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let size_bytes = file_bytes.len() as u64;
+
+    let (my_id, _) = get_or_create_device_id();
+    let my_name = get_system_hostname();
+
+    // 1. Send transfer request
+    let request_payload = serde_json::json!({
+        "sender_id": my_id,
+        "sender_name": my_name,
+        "sender_ip": get_local_ip(),
+        "files": [
+            { "name": file_name, "size_bytes": size_bytes }
+        ],
+        "total_size_bytes": size_bytes
+    });
+
+    let addr = format!("{}:{}", target_ip, PORT);
+    let mut stream = TcpStream::connect(&addr).map_err(|e| format!("Failed to connect to peer {}: {}", addr, e))?;
+    let req_bytes = request_payload.to_string().into_bytes();
+    let http_req = format!(
+        "POST /api/p2p/request HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        addr, req_bytes.len()
+    );
+    stream.write_all(http_req.as_bytes()).map_err(|e| e.to_string())?;
+    stream.write_all(&req_bytes).map_err(|e| e.to_string())?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).map_err(|e| e.to_string())?;
+
+    let body_str = if let Some(idx) = response.find("\r\n\r\n") {
+        &response[idx + 4..]
+    } else {
+        return Err("Malformed HTTP response from peer".to_string());
+    };
+
+    let val: serde_json::Value = serde_json::from_str(body_str).map_err(|e| format!("Invalid JSON from peer: {}", e))?;
+    if let Some(err) = val.get("error") {
+        return Err(format!("Peer rejected request: {}", err));
+    }
+    let token = val["token"].as_str().ok_or_else(|| "Peer did not return a transfer token".to_string())?.to_string();
+
+    println!("Transfer request sent to {}! Waiting for user to Accept...", target_ip);
+
+    // 2. Poll for decision (monotonic deadline of 30 seconds)
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut accepted = false;
+
+    while std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(600));
+        let mut poll_stream = match TcpStream::connect(&addr) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let poll_req = format!(
+            "GET /api/p2p/decision?token={} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            token, addr
+        );
+        let _ = poll_stream.write_all(poll_req.as_bytes());
+        let mut poll_resp = String::new();
+        let _ = poll_stream.read_to_string(&mut poll_resp);
+        if let Some(idx) = poll_resp.find("\r\n\r\n") {
+            let poll_body = &poll_resp[idx + 4..];
+            if let Ok(p_val) = serde_json::from_str::<serde_json::Value>(poll_body) {
+                match p_val["status"].as_str() {
+                    Some("ACCEPTED") => {
+                        accepted = true;
+                        break;
+                    }
+                    Some("REJECTED") => {
+                        return Err("Transfer was declined by the recipient.".to_string());
+                    }
+                    Some("EXPIRED") => {
+                        return Err("Transfer request timed out.".to_string());
+                    }
+                    _ => {} // Still pending
+                }
+            }
+        }
+    }
+
+    if !accepted {
+        return Err("Transfer timed out waiting for recipient approval.".to_string());
+    }
+
+    println!("Peer accepted! Streaming file '{}' ({} bytes)...", file_name, size_bytes);
+
+    // 3. Upload file
+    let mut upload_stream = TcpStream::connect(&addr).map_err(|e| format!("Failed to connect to peer for upload: {}", e))?;
+    let encoded_filename = urlencoding_encode(&file_name);
+    let upload_header = format!(
+        "POST /api/p2p/upload?token={}&filename={} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        token, encoded_filename, addr, file_bytes.len()
+    );
+    upload_stream.write_all(upload_header.as_bytes()).map_err(|e| e.to_string())?;
+    upload_stream.write_all(&file_bytes).map_err(|e| e.to_string())?;
+
+    let mut final_resp = String::new();
+    let _ = upload_stream.read_to_string(&mut final_resp);
+
+    println!("Transfer successfully completed to {}!", target_ip);
+    notify_desktop("OmaSend AirBridge", &format!("'{}' successfully sent to {}.", file_name, target_ip));
+    Ok(())
+}
+
+fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
+    let text = get_pc_clipboard();
+    if text.is_empty() {
+        return Err("Clipboard is empty".to_string());
+    }
+    let (my_id, _) = get_or_create_device_id();
+    let my_name = get_system_hostname();
+    let payload = serde_json::json!({
+        "sender_id": my_id,
+        "sender_name": my_name,
+        "text": text
+    });
+    let addr = format!("{}:{}", target_ip, PORT);
+    let mut stream = TcpStream::connect(&addr).map_err(|e| format!("Failed to connect to peer {}: {}", addr, e))?;
+    let req_bytes = payload.to_string().into_bytes();
+    let http_req = format!(
+        "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        addr, req_bytes.len()
+    );
+    stream.write_all(http_req.as_bytes()).map_err(|e| e.to_string())?;
+    stream.write_all(&req_bytes).map_err(|e| e.to_string())?;
+    let mut resp = String::new();
+    let _ = stream.read_to_string(&mut resp);
+    println!("Clipboard successfully synced to {}", target_ip);
+    notify_desktop("OmaSend AirBridge", &format!("Clipboard synced to {}.", target_ip));
+    Ok(())
+}
+
 // ------------------- HTTP ENGINE -------------------
 
 struct HttpRequest {
@@ -605,6 +1088,16 @@ impl HttpRequest {
         for (k, v) in &self.headers {
             if k == &lower {
                 return Some(v.as_str());
+            }
+        }
+        None
+    }
+
+    fn get_param(&self, key: &str) -> Option<String> {
+        let prefix = format!("{}=", key);
+        for part in self.query.split('&') {
+            if part.starts_with(&prefix) {
+                return Some(part[prefix.len()..].to_string());
             }
         }
         None
@@ -1150,6 +1643,216 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
         return;
     }
 
+    // --- P2P AIRDROP ENDPOINTS ---
+    if req.path == "/api/p2p/ping" {
+        let (id, _) = get_or_create_device_id();
+        let (vis, _) = get_visibility();
+        let resp = serde_json::json!({
+            "status": "OK",
+            "id": id,
+            "name": get_system_hostname(),
+            "mode": vis
+        });
+        send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+        return;
+    }
+
+    if req.method == "GET" && req.path == "/api/p2p/peers" {
+        let peers = get_discovered_peers();
+        let (vis, remaining) = get_visibility();
+        let resp = serde_json::json!({
+            "peers": peers,
+            "visibility": vis,
+            "remaining_secs": remaining,
+            "bluetooth_available": is_bluetooth_available()
+        });
+        send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+        return;
+    }
+
+    if req.method == "POST" && req.path == "/api/p2p/request" {
+        let (vis, _) = get_visibility();
+        if vis == "OFF" {
+            let err = serde_json::json!({ "error": "Recipient AirBridge visibility is turned Off" });
+            send_response(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
+            return;
+        }
+
+        let body_slice = &buffer[req.body_offset..];
+        let req_data: serde_json::Value = match serde_json::from_slice(body_slice) {
+            Ok(v) => v,
+            Err(_) => {
+                send_response(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid JSON request\"}", None, None);
+                return;
+            }
+        };
+
+        let sender_id = req_data["sender_id"].as_str().unwrap_or("unknown").to_string();
+        let sender_name = req_data["sender_name"].as_str().unwrap_or("Unknown Omarchy Device").to_string();
+        let sender_ip = req_data["sender_ip"].as_str().unwrap_or("").to_string();
+        let is_trusted = is_peer_trusted(&sender_id);
+
+        if vis == "KNOWN" && !is_trusted {
+            let err = serde_json::json!({ "error": "Peer is not in trusted peers list and visibility is set to Known Only" });
+            send_response(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
+            return;
+        }
+
+        let mut file_names = Vec::new();
+        let mut total_size_bytes = 0u64;
+        if let Some(arr) = req_data["files"].as_array() {
+            for item in arr {
+                if let Some(n) = item["name"].as_str() {
+                    file_names.push(sanitize_filename(n));
+                }
+                if let Some(sz) = item["size_bytes"].as_u64() {
+                    total_size_bytes = total_size_bytes.saturating_add(sz);
+                }
+            }
+        }
+
+        let mut token_bytes = [0u8; 16];
+        let _ = getrandom::getrandom(&mut token_bytes);
+        let token = hex::encode(token_bytes);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+        let transfer = PendingFileTransfer {
+            token: token.clone(),
+            sender_id,
+            sender_name: sender_name.clone(),
+            sender_ip,
+            file_names: file_names.clone(),
+            total_size_bytes,
+            created_at: now,
+            expires_at: now.saturating_add(30),
+            status: "PENDING".to_string(),
+        };
+        save_pending_transfer(&transfer);
+
+        let size_mb = (total_size_bytes as f64) / 1024.0 / 1024.0;
+        notify_desktop(
+            "OmaSend AirBridge: Transfer Request",
+            &format!("'{}' wants to send {} file(s) ({:.1} MB).\nOpen OmaSend panel to Accept or Decline.", sender_name, file_names.len(), size_mb),
+        );
+
+        let resp = serde_json::json!({
+            "status": "PENDING",
+            "token": token
+        });
+        send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+        return;
+    }
+
+    if req.path.starts_with("/api/p2p/decision") {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        if req.method == "GET" {
+            let token = req.get_param("token").unwrap_or_default();
+            if let Some(pending) = get_pending_transfer() {
+                if pending.token == token {
+                    if now > pending.expires_at {
+                        send_response(&stream, "200 OK", "application/json", b"{\"status\":\"EXPIRED\"}", None, None);
+                    } else {
+                        let resp = serde_json::json!({ "status": pending.status });
+                        send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+                    }
+                    return;
+                }
+            }
+            send_response(&stream, "404 Not Found", "application/json", b"{\"status\":\"NOT_FOUND\"}", None, None);
+            return;
+        } else if req.method == "POST" {
+            let body_slice = &buffer[req.body_offset..];
+            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(body_slice) {
+                let token = val["token"].as_str().unwrap_or_default();
+                let action = val["action"].as_str().unwrap_or_default();
+                if let Some(mut pending) = get_pending_transfer() {
+                    if pending.token == token {
+                        if action == "accept" {
+                            pending.status = "ACCEPTED".to_string();
+                            save_pending_transfer(&pending);
+                            add_trusted_peer(&pending.sender_id, &pending.sender_name, "");
+                            notify_desktop("OmaSend AirBridge", "Transfer accepted. Receiving files...");
+                            send_response(&stream, "200 OK", "application/json", b"{\"status\":\"ACCEPTED\"}", None, None);
+                            return;
+                        } else if action == "reject" {
+                            pending.status = "REJECTED".to_string();
+                            save_pending_transfer(&pending);
+                            notify_desktop("OmaSend AirBridge", "Transfer declined.");
+                            send_response(&stream, "200 OK", "application/json", b"{\"status\":\"REJECTED\"}", None, None);
+                            return;
+                        }
+                    }
+                }
+            }
+            send_response(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid token or action\"}", None, None);
+            return;
+        }
+    }
+
+    if req.method == "POST" && req.path.starts_with("/api/p2p/upload") {
+        let token = req.get_param("token").unwrap_or_default();
+        let filename_raw = req.get_param("filename").unwrap_or_default();
+        let clean_filename = sanitize_filename(&urlencoding_decode(&filename_raw));
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+        if let Some(pending) = get_pending_transfer() {
+            if pending.token == token && pending.status == "ACCEPTED" && now <= pending.expires_at {
+                let body = &buffer[req.body_offset..];
+                let ddir = get_download_dir();
+                let file_path = get_unique_filepath(&ddir, &clean_filename);
+                if fs::write(&file_path, body).is_ok() {
+                    RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
+                    clear_pending_transfer();
+                    let final_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    notify_desktop(
+                        "OmaSend: AirBridge Transfer Complete",
+                        &format!("'{}' ({} bytes) received and saved to Downloads/omasend.", final_name, body.len())
+                    );
+                    let resp = serde_json::json!({
+                        "status": "OK",
+                        "filename": final_name,
+                        "size": body.len()
+                    });
+                    send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+                    return;
+                } else {
+                    send_response(&stream, "500 Internal Server Error", "text/plain", b"Failed to write file to disk", None, None);
+                    return;
+                }
+            }
+        }
+        send_response(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Unauthorized or expired transfer token\"}", None, None);
+        return;
+    }
+
+    if req.method == "POST" && req.path == "/api/p2p/clipboard" {
+        let (vis, _) = get_visibility();
+        if vis == "OFF" {
+            send_response(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Visibility is Off\"}", None, None);
+            return;
+        }
+        let body_slice = &buffer[req.body_offset..];
+        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(body_slice) {
+            let sender_id = val["sender_id"].as_str().unwrap_or_default();
+            let sender_name = val["sender_name"].as_str().unwrap_or("Nearby Device");
+            let is_trusted = is_peer_trusted(sender_id);
+            if vis == "KNOWN" && !is_trusted {
+                send_response(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Peer not trusted\"}", None, None);
+                return;
+            }
+            if let Some(text) = val["text"].as_str() {
+                if text.len() <= 1_048_576 {
+                    set_pc_clipboard(text);
+                    notify_desktop("OmaSend: Universal Clipboard", &format!("Received clipboard text from {}.", sender_name));
+                    send_response(&stream, "200 OK", "application/json", b"{\"status\":\"OK\"}", None, None);
+                    return;
+                }
+            }
+        }
+        send_response(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid clipboard payload\"}", None, None);
+        return;
+    }
+
     if !authorized {
         let html = render_login_page();
         send_response(&stream, "200 OK", "text/html; charset=utf-8", html.as_bytes(), None, None);
@@ -1393,6 +2096,10 @@ fn run_server() {
     };
     println!("OmaSend listening on http://{}:{} [PIN: {}]", local_ip, PORT, pin);
 
+    // Spawn P2P AirBridge discovery threads
+    thread::spawn(run_p2p_discovery_listener);
+    thread::spawn(run_p2p_beacon_broadcaster);
+
     for s in listener.incoming().flatten() {
         let ip_clone = local_ip.clone();
         let pin_clone = pin.clone();
@@ -1419,6 +2126,74 @@ fn main() {
     } else {
         get_or_create_session_key()
     };
+
+    if let Some(pos) = args.iter().position(|a| a == "--set-visibility") {
+        if let Some(mode) = args.get(pos + 1) {
+            set_visibility(mode);
+            println!("AirBridge visibility set to {}", mode.to_uppercase());
+            return;
+        }
+    }
+
+    if let Some(pos) = args.iter().position(|a| a == "--accept-transfer") {
+        if let Some(token) = args.get(pos + 1) {
+            if let Some(mut pending) = get_pending_transfer() {
+                if pending.token == *token {
+                    pending.status = "ACCEPTED".to_string();
+                    save_pending_transfer(&pending);
+                    add_trusted_peer(&pending.sender_id, &pending.sender_name, "");
+                    notify_desktop("OmaSend AirBridge", "Transfer accepted. Receiving files...");
+                    println!("Transfer accepted");
+                    return;
+                }
+            }
+            eprintln!("Invalid or expired transfer token");
+            return;
+        }
+    }
+
+    if let Some(pos) = args.iter().position(|a| a == "--reject-transfer") {
+        if let Some(token) = args.get(pos + 1) {
+            if let Some(mut pending) = get_pending_transfer() {
+                if pending.token == *token {
+                    pending.status = "REJECTED".to_string();
+                    save_pending_transfer(&pending);
+                    notify_desktop("OmaSend AirBridge", "Transfer declined.");
+                    println!("Transfer declined");
+                    return;
+                }
+            }
+            eprintln!("Invalid or expired transfer token");
+            return;
+        }
+    }
+
+    if let Some(pos) = args.iter().position(|a| a == "--send-p2p") {
+        if let (Some(target_ip), Some(file_path_str)) = (args.get(pos + 1), args.get(pos + 2)) {
+            let path = Path::new(file_path_str);
+            match p2p_send_file_to_peer(target_ip, path) {
+                Ok(()) => println!("File sent successfully to {}", target_ip),
+                Err(e) => eprintln!("Error sending file: {}", e),
+            }
+            return;
+        }
+    }
+
+    if let Some(pos) = args.iter().position(|a| a == "--sync-clipboard") {
+        if let Some(target_ip) = args.get(pos + 1) {
+            match p2p_sync_clipboard_to_peer(target_ip) {
+                Ok(()) => println!("Clipboard synced successfully to {}", target_ip),
+                Err(e) => eprintln!("Error syncing clipboard: {}", e),
+            }
+            return;
+        }
+    }
+
+    if args.iter().any(|a| a == "--p2p-peers") {
+        let peers = get_discovered_peers();
+        println!("{}", serde_json::to_string_pretty(&peers).unwrap_or_default());
+        return;
+    }
 
     if args.iter().any(|a| a == "--start-wan") {
         match start_wan_tunnel() {
@@ -1496,6 +2271,8 @@ fn main() {
     }
 
     if args.iter().any(|a| a == "--json") {
+        let (vis, rem) = get_visibility();
+        let (dev_id, _) = get_or_create_device_id();
         let state = ServerState {
             status: "ACTIVE".to_string(),
             port: PORT,
@@ -1515,6 +2292,13 @@ fn main() {
             total_received: RECEIVED_COUNTER.load(Ordering::SeqCst),
             recent_files: get_directory_files(&get_download_dir()),
             shared_files: get_directory_files(&get_shared_dir()),
+            p2p_device_id: dev_id,
+            p2p_hostname: get_system_hostname(),
+            p2p_visibility: vis,
+            p2p_visibility_remaining_secs: rem,
+            p2p_bluetooth_available: is_bluetooth_available(),
+            p2p_discovered_peers: get_discovered_peers(),
+            p2p_pending_transfer: get_pending_transfer(),
         };
         println!("{}", serde_json::to_string_pretty(&state).unwrap());
         return;
@@ -1613,5 +2397,65 @@ mod tests {
         let key_file = state_dir.join("session_key.txt");
         let key_meta = fs::symlink_metadata(&key_file).expect("session_key.txt must exist");
         assert_eq!(key_meta.mode() & 0o777, 0o600, "session_key.txt must have 0600 permissions");
+    }
+
+    #[test]
+    fn test_path_traversal_sanitization() {
+        assert!(sanitize_filename("../../etc/passwd").starts_with("file_"));
+        assert_eq!(sanitize_filename("/root/some_file.txt"), "rootsome_file.txt");
+        assert!(sanitize_filename("../../../malicious.sh").starts_with("file_"));
+        assert_eq!(sanitize_filename("valid_document.pdf"), "valid_document.pdf");
+        assert_eq!(sanitize_filename("my photo (1).jpg"), "my photo 1.jpg");
+
+        // Leading dot files must be renamed to safe file_TIMESTAMP
+        let hidden = sanitize_filename(".hidden_config");
+        assert!(hidden.starts_with("file_"));
+    }
+
+    #[test]
+    fn test_visibility_modes() {
+        set_visibility("OFF");
+        let (vis_off, _) = get_visibility();
+        assert_eq!(vis_off, "OFF");
+
+        set_visibility("EVERYONE");
+        let (vis_every, rem) = get_visibility();
+        assert_eq!(vis_every, "EVERYONE");
+        assert!(rem > 0 && rem <= 600);
+
+        set_visibility("KNOWN");
+        let (vis_known, _) = get_visibility();
+        assert_eq!(vis_known, "KNOWN");
+    }
+
+    #[test]
+    fn test_trusted_peers_db_enforces_0600() {
+        let peer_id = format!("test_peer_{}", std::process::id());
+        add_trusted_peer(&peer_id, "Test Laptop", "abcdef1234567890");
+        assert!(is_peer_trusted(&peer_id));
+
+        let peers_file = get_state_dir().join("trusted_peers.json");
+        let meta = fs::symlink_metadata(&peers_file).expect("trusted_peers.json must exist");
+        assert_eq!(meta.mode() & 0o777, 0o600, "trusted_peers.json must have 0600 permissions");
+    }
+
+    #[test]
+    fn test_p2p_beacon_packet_serialization() {
+        let packet = P2pBeaconPacket {
+            magic: "OMASEND_P2P".to_string(),
+            v: 1,
+            id: "abc123".to_string(),
+            name: "Omarchy-PC".to_string(),
+            ip: "192.168.1.81".to_string(),
+            port: 8844,
+            mode: "KNOWN".to_string(),
+            bt: true,
+            fp: "deadbeef".to_string(),
+        };
+        let serialized = serde_json::to_string(&packet).expect("Must serialize");
+        let deserialized: P2pBeaconPacket = serde_json::from_str(&serialized).expect("Must deserialize");
+        assert_eq!(deserialized.magic, "OMASEND_P2P");
+        assert_eq!(deserialized.id, "abc123");
+        assert!(deserialized.bt);
     }
 }
