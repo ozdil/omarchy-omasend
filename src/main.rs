@@ -914,6 +914,22 @@ fn save_discovered_peers(peers: &[DiscoveredPeer]) {
     }
 }
 
+fn is_local_subnet_or_private_ip(ip: &str) -> bool {
+    if ip.starts_with("192.168.") || ip.starts_with("10.") || ip == "127.0.0.1" {
+        return true;
+    }
+    if ip.starts_with("172.") {
+        if let Some(second) = ip.split('.').nth(1) {
+            if let Ok(num) = second.parse::<u8>() {
+                if (16..=31).contains(&num) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn update_discovered_peer(packet: &P2pBeaconPacket) {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let (my_id, _) = get_or_create_device_id();
@@ -925,7 +941,8 @@ fn update_discovered_peer(packet: &P2pBeaconPacket) {
         return;
     }
     let trusted = is_peer_trusted(&packet.id);
-    if vis == "KNOWN" && !trusted && packet.mode != "EVERYONE" {
+    let is_local_net = is_local_subnet_or_private_ip(&packet.ip);
+    if vis == "KNOWN" && !trusted && !is_local_net && packet.mode != "EVERYONE" {
         return;
     }
 
@@ -2273,6 +2290,15 @@ fn main() {
         if let Some(mode) = args.get(pos + 1) {
             set_visibility(mode);
             println!("AirBridge visibility set to {}", mode.to_uppercase());
+            return;
+        }
+    }
+
+    if let Some(pos) = args.iter().position(|a| a == "--trust-peer") {
+        if let (Some(id), Some(name)) = (args.get(pos + 1), args.get(pos + 2)) {
+            let fp = args.get(pos + 3).map(|s| s.as_str()).unwrap_or("");
+            add_trusted_peer(id, name, fp);
+            println!("Peer '{}' ({}) trusted successfully.", name, id);
             return;
         }
     }

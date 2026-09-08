@@ -43,6 +43,9 @@ Panel {
   }
 
   function refresh() {
+    if (!serverProc.running) {
+      serverProc.running = true
+    }
     if (!scanProc.running) {
       scanProc.running = true
     }
@@ -172,6 +175,21 @@ Panel {
     running: root.opened || root.wanConnecting
     repeat: true
     onTriggered: root.refresh()
+  }
+
+  // Background watchdog to restart engine if terminated
+  Timer {
+    interval: 5000
+    running: true
+    repeat: true
+    onTriggered: {
+      if (!serverProc.running) {
+        serverProc.running = true
+      }
+      if (root.opened) {
+        root.refresh()
+      }
+    }
   }
 
   Component.onCompleted: refresh()
