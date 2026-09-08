@@ -10,11 +10,12 @@ Plugin ID: ozdil.omasend
 
 ## Features
 
-- Omarchy AirDrop P2P (PC-to-PC Direct Transfer):
-  - Zero-Config Discovery: Automatically discovers neighboring Omarchy Linux desktops on the same local network using UDP beacons (port 8845) and Bluetooth (BLE).
+- Omarchy AirDrop P2P (PC-to-PC and Mobile Direct Transfer):
+  - Zero-Config Discovery: Automatically discovers neighboring Omarchy Linux desktops and Android devices on the same local network using UDP beacons (port 53317).
+  - Native Android Companion: Dedicated Kotlin and Jetpack Compose mobile app providing system share sheet integration, bidirectional transfers, and universal clipboard bridge.
   - 3-Tier Visibility Control: Off, Known (Trusted Peers Only - Default), and Everyone (10 Minutes Temporary Discovery).
   - Gatekeeper Consent: No files are accepted silently. Recipient receives an interactive desktop notification and panel prompt with sender name, file list, and total transfer size. Transfer begins only after explicit approval.
-  - Universal Clipboard Sync: Bidirectional encrypted Wayland clipboard synchronization between Omarchy desktops with a single click.
+  - Universal Clipboard Sync: Bidirectional encrypted Wayland and Android clipboard synchronization between Omarchy desktops and mobile devices with a single click.
 - Zero-Knowledge End-to-End Encryption (E2EE):
   - Hardware-accelerated AES-256-GCM encryption via the native Web Crypto API (crypto.subtle).
   - Cryptographic session key is passed strictly inside the URL hash fragment (#key=...), which never reaches HTTP request headers or server logs (RFC 3986).
@@ -81,22 +82,41 @@ Then restart the shell:
 omarchy-restart-shell
 ```
 
+### 3. OmaSend for Android (Companion Application)
+The `android/` directory contains the native Android companion app built with Kotlin, Jetpack Compose, and Material 3.
+
+To compile the Android debug package:
+```bash
+cd ~/.config/omarchy/plugins/ozdil.omasend && ./build-android.sh
+```
+This generates `omasend-debug.apk` in the project root.
+
+To install directly to a connected Android phone via ADB:
+```bash
+adb install -r omasend-debug.apk
+```
+
 ---
 
 ## How It Works and Usage Guide
 
 Click the paper plane icon in the Omarchy top bar to open the OmaSend panel.
 
-### 1. Omarchy AirDrop P2P (PC-to-PC Sharing)
-- Device Discovery: Computers running OmaSend on the same local network automatically appear under "AIRBRIDGE DISCOVERED DEVICES" with their hostname and IP.
+### 1. Omarchy AirDrop P2P (PC-to-PC and Mobile Sharing)
+- Device Discovery: Computers and Android phones running OmaSend on the same local network automatically appear under "AIRBRIDGE DISCOVERED DEVICES" with their hostname, device model, and IP.
 - Visibility Modes:
   - KNOWN PEERS ONLY (Default): Only previously paired devices can see you.
   - EVERYONE (10M): Temporarily visible to all nearby devices for 10 minutes.
 - Sending Files: Click the "SEND" button next to any discovered peer to open the file picker. Selected files will be transmitted directly.
-- Syncing Clipboard: Click the "CLIPBOARD" button to instantly sync your current Wayland desktop clipboard to the target computer.
-- Recipient Consent: Incoming transfers show an interactive prompt with sender information and file details. Approved transfers are downloaded directly to `~/Downloads/omasend/`.
+- Syncing Clipboard: Click the "CLIPBOARD" button to instantly sync your current Wayland desktop clipboard to the target computer or phone.
+- Recipient Consent: Incoming transfers show an interactive prompt with sender information and file details. Approved transfers are downloaded directly to `~/Downloads/omasend/` (or `Downloads/OmaSend` on Android).
 
-### 2. Mobile to PC Transfer (Web Portal)
+### 2. Android System Share Sheet Integration
+- In any Android app (Google Photos, Gallery, Files, Chrome), tap "Share".
+- Select "Send via OmaSend" from the system share sheet.
+- Tap your Omarchy PC (`ggs4`, `jonsbo`) to stream the file or photo directly to your desktop.
+
+### 3. Mobile to PC Transfer via Browser (Zero-Install Web Portal)
 1. Open the OmaSend panel and select LAN mode.
 2. Scan the displayed QR code with your smartphone camera.
 3. The portal automatically pairs with the 4-digit PIN and loads the AES-256 encryption key.
@@ -104,7 +124,7 @@ Click the paper plane icon in the Omarchy top bar to open the OmaSend panel.
 5. Files placed in `~/Downloads/omasend/shared/` on your PC can be downloaded from the mobile portal.
 6. Use the clipboard box to send text between mobile and PC in real time.
 
-### 3. Global WAN Tunnel
+### 4. Global WAN Tunnel
 - When devices are on different networks or cellular data, switch to "WAN" mode in the panel.
 - OmaSend initiates an end-to-end encrypted HTTPS tunnel through cloudflared.
 - Transfer files securely across the internet without opening ports.

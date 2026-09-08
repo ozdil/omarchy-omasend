@@ -1,2 +1,6 @@
 target/
 omasend-engine
+*.apk
+.gradle/
+android/local.properties
+android/**/build/
