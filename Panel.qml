@@ -16,7 +16,7 @@ Panel {
   implicitHeight: button.implicitHeight
 
   property string localIp: "127.0.0.1"
-  property int port: 8844
+  property int port: 53317
   property string pin: "----"
   property string sessionKey: ""
   property string activeMode: "LAN"
@@ -133,7 +133,7 @@ Panel {
           var clean = String(text || "").slice(0, 65536)
           var d = JSON.parse(clean)
           root.localIp = String(d.local_ip || "127.0.0.1")
-          root.port = Number(d.port) || 8844
+          root.port = Number(d.port) || 53317
           root.pin = String(d.pin || "----")
           root.sessionKey = String(d.session_key || "")
           root.activeMode = String(d.active_mode || "LAN")

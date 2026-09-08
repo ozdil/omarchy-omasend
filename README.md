@@ -60,14 +60,13 @@ cd ~/.config/omarchy/plugins/ozdil.omasend && ./build.sh
 ```
 This script compiles the engine using `cargo build --release --locked`, installs the binary (`omasend-engine`) with proper permissions, and restarts the Omarchy shell automatically.
 
-### Step 3: Configure Firewall (UFW)
-To allow discovery and transfer between Omarchy machines on your local subnet (adjust the subnet to match your network, e.g., `192.168.1.0/24`):
-```bash
-# TCP 8844: File transfer and encrypted HTTP portal
-sudo ufw allow from 192.168.1.0/24 to any port 8844 proto tcp
+### Step 3: Firewall Configuration (Zero Configuration on Omarchy Linux)
+Omarchy Linux pre-configures and permits port 53317 (TCP and UDP) out of the box in UFW for local network sharing, meaning OmaSend requires zero manual firewall configuration under standard Omarchy installations.
 
-# UDP 8845: AirBridge P2P peer discovery beacons
-sudo ufw allow from 192.168.1.0/24 to any port 8845 proto udp
+If your machine uses custom firewall rules or a non-default setup, you can verify or allow port 53317:
+```bash
+sudo ufw allow 53317/tcp
+sudo ufw allow 53317/udp
 ```
 
 ### Step 4: Add to Top Bar (Optional)

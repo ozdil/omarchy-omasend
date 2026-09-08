@@ -23,8 +23,8 @@ extern "C" {
     fn getuid() -> u32;
 }
 
-const PORT: u16 = 8844;
-const P2P_BEACON_PORT: u16 = 8845;
+const PORT: u16 = 53317;
+const P2P_BEACON_PORT: u16 = 53317;
 static RECEIVED_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1030,6 +1030,15 @@ fn connect_peer_with_timeout(addr_str: &str, timeout: Duration) -> Result<TcpStr
     ))
 }
 
+fn resolve_peer_addr(target_ip: &str) -> String {
+    for peer in get_discovered_peers() {
+        if peer.ip == target_ip {
+            return format!("{}:{}", peer.ip, peer.port);
+        }
+    }
+    format!("{}:{}", target_ip, PORT)
+}
+
 fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String> {
     let file_bytes = safe_read_file(file_path).map_err(|e| format!("Security check failed: {}", e))?;
     let file_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
@@ -1049,13 +1058,13 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
         "total_size_bytes": size_bytes
     });
 
-    let addr = format!("{}:{}", target_ip, PORT);
+    let addr = resolve_peer_addr(target_ip);
     let mut stream = match connect_peer_with_timeout(&addr, Duration::from_secs(4)) {
         Ok(s) => s,
         Err(e) => {
             notify_desktop(
                 "OmaSend AirBridge",
-                &format!("Connection failed to {}. Check firewall port 8844.", target_ip),
+                &format!("Connection failed to {}. Ensure peer is online.", target_ip),
             );
             return Err(e);
         }
@@ -1161,13 +1170,13 @@ fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
         "sender_name": my_name,
         "text": text
     });
-    let addr = format!("{}:{}", target_ip, PORT);
+    let addr = resolve_peer_addr(target_ip);
     let mut stream = match connect_peer_with_timeout(&addr, Duration::from_secs(4)) {
         Ok(s) => s,
         Err(e) => {
             notify_desktop(
                 "OmaSend AirBridge",
-                &format!("Connection failed to {}. Check firewall port 8844.", target_ip),
+                &format!("Connection failed to {}. Ensure peer is online.", target_ip),
             );
             return Err(e);
         }
