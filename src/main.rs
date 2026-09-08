@@ -1,3 +1,5 @@
+mod subproc;
+
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Key, Nonce,
@@ -14,7 +16,8 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use sha2::{Digest, Sha256};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use subproc::{kill_process_group, run_cmd_bounded, run_cmd_write_stdin_bounded};
 
 extern "C" {
     fn getuid() -> u32;
@@ -125,12 +128,11 @@ fn get_local_ip() -> String {
 }
 
 fn get_tailscale_ip() -> Option<String> {
-    if let Ok(out) = Command::new("tailscale").args(["ip", "-4"]).output() {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !s.is_empty() {
-                return Some(s);
-            }
+    let deadline = Instant::now() + Duration::from_millis(400);
+    if let Some(out) = run_cmd_bounded("/usr/bin/tailscale", &["ip", "-4"], &[], deadline, 512) {
+        let s = String::from_utf8_lossy(&out).trim().to_string();
+        if !s.is_empty() && !s.contains("error") {
+            return Some(s);
         }
     }
     None
@@ -200,13 +202,37 @@ fn read_secure_file(path: &Path) -> Result<String, String> {
     fs::read_to_string(path).map_err(|e| format!("Failed to read {:?}: {}", path, e))
 }
 
-/// Atomically writes a sensitive file with mode 0600:
+/// Reads any normal file safely:
+/// - Rejects untrusted symlinks
+/// - Must be regular file
+/// - Must be owned by the current running user
+pub fn safe_read_file(path: &Path) -> Result<Vec<u8>, String> {
+    let meta = fs::symlink_metadata(path).map_err(|e| format!("Failed to stat {:?}: {}", path, e))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!("Security violation: {:?} is a symlink", path));
+    }
+    if !meta.file_type().is_file() {
+        return Err(format!("Security violation: {:?} is not a regular file", path));
+    }
+    let current_uid = get_current_uid();
+    if meta.uid() != current_uid {
+        return Err(format!(
+            "Security violation: {:?} is owned by UID {}, expected current user UID {}",
+            path,
+            meta.uid(),
+            current_uid
+        ));
+    }
+    fs::read(path).map_err(|e| format!("Failed to read {:?}: {}", path, e))
+}
+
+/// Atomically writes a secure file with mode 0600:
 /// - Verifies that existing target is not an untrusted symlink or foreign file
 /// - Creates a temporary file in the same directory with mode 0600
 /// - Writes data and syncs
 /// - Atomically replaces destination file via rename
 /// - Re-asserts mode 0600 on destination
-fn write_secure_file(path: &Path, content: &str) -> Result<(), String> {
+pub fn write_secure_bytes(path: &Path, data: &[u8]) -> Result<(), String> {
     let dir = path.parent().ok_or_else(|| "Target path has no parent directory".to_string())?;
     let _ = fs::create_dir_all(dir);
     let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
@@ -251,7 +277,7 @@ fn write_secure_file(path: &Path, content: &str) -> Result<(), String> {
 
         let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
 
-        file.write_all(content.as_bytes())
+        file.write_all(data)
             .map_err(|e| format!("Failed to write data to {:?}: {}", tmp_path, e))?;
         file.sync_all()
             .map_err(|e| format!("Failed to sync {:?}: {}", tmp_path, e))?;
@@ -264,6 +290,10 @@ fn write_secure_file(path: &Path, content: &str) -> Result<(), String> {
 
     let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
     Ok(())
+}
+
+pub fn write_secure_file(path: &Path, content: &str) -> Result<(), String> {
+    write_secure_bytes(path, content.as_bytes())
 }
 
 fn get_or_create_pin() -> String {
@@ -324,7 +354,7 @@ fn get_active_mode() -> String {
 
 fn set_active_mode(mode: &str) {
     let mode_file = get_state_dir().join("mode.txt");
-    let _ = fs::write(&mode_file, mode);
+    let _ = write_secure_file(&mode_file, mode);
 }
 
 // ------------------- AES-256-GCM CRYPTOGRAPHY -------------------
@@ -365,7 +395,7 @@ fn is_process_alive(pid: i32) -> bool {
 
 fn get_wan_provider() -> Option<String> {
     let provider_file = get_state_dir().join("wan_provider.txt");
-    fs::read_to_string(&provider_file).ok().map(|s| s.trim().to_string())
+    read_secure_file(&provider_file).ok().map(|s| s.trim().to_string())
 }
 
 fn get_cloudflared_bin() -> Option<String> {
@@ -380,12 +410,11 @@ fn get_cloudflared_bin() -> Option<String> {
             return Some(local_bin);
         }
     }
-    if let Ok(out) = Command::new("which").arg("cloudflared").output() {
-        if out.status.success() {
-            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !path.is_empty() && Path::new(&path).is_file() {
-                return Some(path);
-            }
+    let deadline = Instant::now() + Duration::from_millis(300);
+    if let Some(out) = run_cmd_bounded("/usr/bin/which", &["cloudflared"], &[], deadline, 256) {
+        let path = String::from_utf8_lossy(&out).trim().to_string();
+        if !path.is_empty() && Path::new(&path).is_file() {
+            return Some(path);
         }
     }
     None
@@ -397,11 +426,11 @@ fn get_wan_status() -> (bool, bool, Option<String>) {
     let connecting_file = get_state_dir().join("wan_connecting.txt");
     let log_file = get_state_dir().join("wan_tunnel.log");
 
-    if let Ok(pid_str) = fs::read_to_string(&pid_file) {
+    if let Ok(pid_str) = read_secure_file(&pid_file) {
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
             if is_process_alive(pid) {
                 // If URL is already recorded, return immediately
-                if let Ok(url) = fs::read_to_string(&url_file) {
+                if let Ok(url) = read_secure_file(&url_file) {
                     let u = url.trim().to_string();
                     if !u.is_empty() {
                         let _ = fs::remove_file(&connecting_file);
@@ -416,7 +445,7 @@ fn get_wan_status() -> (bool, bool, Option<String>) {
                             let rest = &line[pos..];
                             if let Some(end) = rest.find(".trycloudflare.com") {
                                 let found_url = rest[..end + 18].to_string();
-                                let _ = fs::write(&url_file, &found_url);
+                                let _ = write_secure_file(&url_file, &found_url);
                                 let _ = fs::remove_file(&connecting_file);
                                 set_active_mode("WAN");
                                 update_all_qr();
@@ -446,12 +475,11 @@ fn stop_wan_tunnel() {
     let provider_file = get_state_dir().join("wan_provider.txt");
     let log_file = get_state_dir().join("wan_tunnel.log");
 
-    if let Ok(pid_str) = fs::read_to_string(&pid_file) {
+    if let Ok(pid_str) = read_secure_file(&pid_file) {
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+            kill_process_group(pid);
         }
     }
-    let _ = Command::new("pkill").args(["-9", "-f", "cloudflared tunnel"]).output();
 
     let _ = fs::remove_file(&pid_file);
     let _ = fs::remove_file(&url_file);
@@ -476,14 +504,18 @@ fn start_wan_tunnel() -> Result<String, String> {
         return Ok("Tunnel already initializing...".to_string());
     }
 
-    // Clean up any stale instances before starting
-    let _ = Command::new("pkill").args(["-9", "-f", "cloudflared tunnel"]).output();
-
     let pid_file = get_state_dir().join("wan_pid.txt");
     let url_file = get_state_dir().join("wan_url.txt");
     let connecting_file = get_state_dir().join("wan_connecting.txt");
     let provider_file = get_state_dir().join("wan_provider.txt");
     let _ = fs::remove_file(&url_file);
+
+    // Stop any dangling previous process
+    if let Ok(pid_str) = read_secure_file(&pid_file) {
+        if let Ok(pid) = pid_str.trim().parse::<i32>() {
+            kill_process_group(pid);
+        }
+    }
 
     if let Some(bin) = get_cloudflared_bin() {
         let log_file = get_state_dir().join("wan_tunnel.log");
@@ -508,9 +540,9 @@ fn start_wan_tunnel() -> Result<String, String> {
         match cmd.spawn() {
             Ok(child) => {
                 let pid = child.id();
-                let _ = fs::write(&pid_file, pid.to_string());
-                let _ = fs::write(&connecting_file, "connecting");
-                let _ = fs::write(&provider_file, "Cloudflare");
+                let _ = write_secure_file(&pid_file, &pid.to_string());
+                let _ = write_secure_file(&connecting_file, "connecting");
+                let _ = write_secure_file(&provider_file, "Cloudflare");
                 set_active_mode("WAN");
                 return Ok("Cloudflare tunnel launched in background".to_string());
             }
@@ -548,7 +580,7 @@ fn update_all_qr() {
     let qr_file = get_state_dir().join("qr.svg");
 
     if qr_file.exists() {
-        if let Ok(last_url) = fs::read_to_string(&last_qr_file) {
+        if let Ok(last_url) = read_secure_file(&last_qr_file) {
             if last_url.trim() == full_url {
                 return; // Cached: URL has not changed
             }
@@ -556,34 +588,66 @@ fn update_all_qr() {
     }
 
     let qr_path = qr_file.to_string_lossy().to_string();
-    let _ = Command::new("qrencode")
-        .args(["-o", &qr_path, "-t", "SVG", &full_url])
-        .output();
-    let _ = fs::write(&last_qr_file, &full_url);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let _ = run_cmd_bounded(
+        "/usr/bin/qrencode",
+        &["-o", &qr_path, "-t", "SVG", &full_url],
+        &[],
+        deadline,
+        1024,
+    );
+    let _ = write_secure_file(&last_qr_file, &full_url);
 }
 
 fn notify_desktop(title: &str, body: &str) {
-    let _ = Command::new("notify-send")
-        .args(["-a", "OmaSend", "-i", "document-send", title, body])
-        .spawn();
+    let mut envs = Vec::new();
+    let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_default();
+    let dbus = env::var("DBUS_SESSION_BUS_ADDRESS").unwrap_or_default();
+    if !xdg.is_empty() {
+        envs.push(("XDG_RUNTIME_DIR", xdg.as_str()));
+    }
+    if !dbus.is_empty() {
+        envs.push(("DBUS_SESSION_BUS_ADDRESS", dbus.as_str()));
+    }
+    let deadline = Instant::now() + Duration::from_millis(1000);
+    let _ = run_cmd_bounded(
+        "/usr/bin/notify-send",
+        &["-a", "OmaSend", "-i", "document-send", title, body],
+        &envs,
+        deadline,
+        1024,
+    );
 }
 
 fn get_pc_clipboard() -> String {
-    if let Ok(output) = Command::new("wl-paste").args(["--no-newline"]).output() {
-        if output.status.success() {
-            return String::from_utf8_lossy(&output.stdout).to_string();
-        }
+    let mut envs = Vec::new();
+    let wayland = env::var("WAYLAND_DISPLAY").unwrap_or_default();
+    let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_default();
+    if !wayland.is_empty() {
+        envs.push(("WAYLAND_DISPLAY", wayland.as_str()));
+    }
+    if !xdg.is_empty() {
+        envs.push(("XDG_RUNTIME_DIR", xdg.as_str()));
+    }
+    let deadline = Instant::now() + Duration::from_millis(400);
+    if let Some(out) = run_cmd_bounded("/usr/bin/wl-paste", &["--no-newline"], &envs, deadline, 1024 * 1024) {
+        return String::from_utf8_lossy(&out).to_string();
     }
     String::new()
 }
 
 fn set_pc_clipboard(text: &str) {
-    if let Ok(mut child) = Command::new("wl-copy").stdin(Stdio::piped()).spawn() {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
-        }
-        let _ = child.wait();
+    let mut envs = Vec::new();
+    let wayland = env::var("WAYLAND_DISPLAY").unwrap_or_default();
+    let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_default();
+    if !wayland.is_empty() {
+        envs.push(("WAYLAND_DISPLAY", wayland.as_str()));
     }
+    if !xdg.is_empty() {
+        envs.push(("XDG_RUNTIME_DIR", xdg.as_str()));
+    }
+    let deadline = Instant::now() + Duration::from_millis(600);
+    let _ = run_cmd_write_stdin_bounded("/usr/bin/wl-copy", &[], &envs, text.as_bytes(), deadline);
 }
 
 fn sanitize_filename(raw: &str) -> String {
@@ -592,10 +656,14 @@ fn sanitize_filename(raw: &str) -> String {
         .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '-' || *c == '_' || *c == ' ')
         .collect();
     let trimmed = cleaned.trim();
-    if trimmed.is_empty() || trimmed.starts_with('.') {
-        format!("file_{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs())
+    if trimmed.is_empty() || trimmed.starts_with('.') || trimmed.contains("..") {
+        format!("file_{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
     } else {
-        trimmed.to_string()
+        if trimmed.len() > 180 {
+            trimmed[..180].to_string()
+        } else {
+            trimmed.to_string()
+        }
     }
 }
 
@@ -623,11 +691,12 @@ fn get_unique_filepath(dir: &Path, filename: &str) -> PathBuf {
 
 fn get_directory_files(dir: &Path) -> Vec<FileInfo> {
     let mut files = Vec::new();
+    let current_uid = get_current_uid();
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.is_file() {
-                if let Ok(meta) = entry.metadata() {
+            if let Ok(meta) = fs::symlink_metadata(&p) {
+                if !meta.file_type().is_symlink() && meta.file_type().is_file() && meta.uid() == current_uid {
                     let size_bytes = meta.len();
                     let size_str = if size_bytes > 1_000_000_000 {
                         format!("{:.2} GB", size_bytes as f64 / 1_000_000_000.0)
@@ -672,12 +741,11 @@ fn get_system_hostname() -> String {
             return trimmed.to_string();
         }
     }
-    if let Ok(out) = Command::new("hostname").output() {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !s.is_empty() {
-                return s;
-            }
+    let deadline = Instant::now() + Duration::from_millis(200);
+    if let Some(out) = run_cmd_bounded("/usr/bin/hostname", &[], &[], deadline, 256) {
+        let s = String::from_utf8_lossy(&out).trim().to_string();
+        if !s.is_empty() {
+            return s;
         }
     }
     "Omarchy-PC".to_string()
@@ -778,11 +846,10 @@ fn add_trusted_peer(id: &str, name: &str, fingerprint: &str) {
 }
 
 fn is_bluetooth_available() -> bool {
-    if let Ok(out) = Command::new("bluetoothctl").arg("show").output() {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout);
-            return s.contains("Powered: yes");
-        }
+    let deadline = Instant::now() + Duration::from_millis(400);
+    if let Some(out) = run_cmd_bounded("/usr/bin/bluetoothctl", &["show"], &[], deadline, 4096) {
+        let s = String::from_utf8_lossy(&out);
+        return s.contains("Powered: yes");
     }
     false
 }
@@ -935,10 +1002,7 @@ fn run_p2p_discovery_listener() {
 }
 
 fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String> {
-    if !file_path.is_file() {
-        return Err(format!("File {:?} does not exist or is not a regular file", file_path));
-    }
-    let file_bytes = fs::read(file_path).map_err(|e| format!("Failed to read file: {}", e))?;
+    let file_bytes = safe_read_file(file_path).map_err(|e| format!("Security check failed: {}", e))?;
     let file_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
     let size_bytes = file_bytes.len() as u64;
 
@@ -1105,10 +1169,15 @@ impl HttpRequest {
 }
 
 fn read_full_http_request(stream: &mut TcpStream) -> Option<(HttpRequest, Vec<u8>)> {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
+
     let mut buffer = Vec::with_capacity(65536);
     let mut temp = [0u8; 16384];
     let mut header_end = None;
     let mut content_length: usize = 0;
+    const MAX_HEADER_SIZE: usize = 65536; // 64 KiB
+    const MAX_BODY_SIZE: usize = 250 * 1024 * 1024; // 250 MiB limit for uploads
 
     loop {
         let n = match stream.read(&mut temp) {
@@ -1127,14 +1196,19 @@ fn read_full_http_request(stream: &mut TcpStream) -> Option<(HttpRequest, Vec<u8
                         let v = line[col + 1..].trim();
                         if k == "content-length" {
                             content_length = v.parse::<usize>().unwrap_or(0);
+                            if content_length > MAX_BODY_SIZE {
+                                return None; // Reject oversized payload
+                            }
                         }
                     }
                 }
+            } else if buffer.len() > MAX_HEADER_SIZE {
+                return None; // Header overrun protection
             }
         }
 
         if let Some(hend) = header_end {
-            if buffer.len() >= hend + content_length {
+            if buffer.len() >= hend.saturating_add(content_length) {
                 break;
             }
         }
@@ -1800,7 +1874,7 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
                 let body = &buffer[req.body_offset..];
                 let ddir = get_download_dir();
                 let file_path = get_unique_filepath(&ddir, &clean_filename);
-                if fs::write(&file_path, body).is_ok() {
+                if write_secure_bytes(&file_path, body).is_ok() {
                     RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
                     clear_pending_transfer();
                     let final_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
@@ -1892,7 +1966,7 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             Ok(decrypted) => {
                 let ddir = get_download_dir();
                 let file_path = get_unique_filepath(&ddir, &clean_filename);
-                if fs::write(&file_path, &decrypted).is_ok() {
+                if write_secure_bytes(&file_path, &decrypted).is_ok() {
                     RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
                     notify_desktop(
                         "OmaSend: E2EE File Received",
@@ -1919,34 +1993,32 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
         let raw_filename = req.path.trim_start_matches("/api/download-encrypted/");
         let filename = sanitize_filename(&urlencoding_decode(raw_filename));
         let target = get_shared_dir().join(&filename);
-        let actual_target = if target.is_file() {
+        let actual_target = if target.exists() {
             target
         } else {
             get_download_dir().join(&filename)
         };
 
-        if actual_target.is_file() {
-            if let Ok(content) = fs::read(&actual_target) {
-                match encrypt_aes256_gcm(key_hex, &content) {
-                    Ok((iv, ciphertext)) => {
-                        let iv_hex = hex::encode(iv);
-                        let cd_val = format!("attachment; filename=\"{}.enc\"", filename);
-                        let extra = [
-                            ("X-OmaSend-IV", iv_hex.as_str()),
-                            ("X-OmaSend-Filename", filename.as_str()),
-                            ("Content-Disposition", cd_val.as_str()),
-                        ];
-                        send_response(&stream, "200 OK", "application/octet-stream", &ciphertext, None, Some(&extra));
-                        return;
-                    }
-                    Err(e) => {
-                        send_response(&stream, "500 Internal Server Error", "text/plain", e.as_bytes(), None, None);
-                        return;
-                    }
+        if let Ok(content) = safe_read_file(&actual_target) {
+            match encrypt_aes256_gcm(key_hex, &content) {
+                Ok((iv, ciphertext)) => {
+                    let iv_hex = hex::encode(iv);
+                    let cd_val = format!("attachment; filename=\"{}.enc\"", filename);
+                    let extra = [
+                        ("X-OmaSend-IV", iv_hex.as_str()),
+                        ("X-OmaSend-Filename", filename.as_str()),
+                        ("Content-Disposition", cd_val.as_str()),
+                    ];
+                    send_response(&stream, "200 OK", "application/octet-stream", &ciphertext, None, Some(&extra));
+                    return;
+                }
+                Err(e) => {
+                    send_response(&stream, "500 Internal Server Error", "text/plain", e.as_bytes(), None, None);
+                    return;
                 }
             }
         }
-        send_response(&stream, "404 Not Found", "text/plain", b"File not found", None, None);
+        send_response(&stream, "404 Not Found", "text/plain", b"File not found or access denied", None, None);
     }
     else if req.method == "POST" && req.path == "/api/clipboard-encrypted" {
         let iv_hex = match req.get_header("x-omasend-iv") {
@@ -2018,16 +2090,14 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
     else if req.method == "GET" && req.path.starts_with("/download/") {
         let filename = sanitize_filename(&urlencoding_decode(req.path.trim_start_matches("/download/")));
         let target = get_shared_dir().join(&filename);
-        let actual_target = if target.is_file() { target } else { get_download_dir().join(&filename) };
-        if actual_target.is_file() {
-            if let Ok(content) = fs::read(&actual_target) {
-                let cd_val = format!("attachment; filename=\"{}\"", filename);
-                let extra = [("Content-Disposition", cd_val.as_str())];
-                send_response(&stream, "200 OK", "application/octet-stream", &content, None, Some(&extra));
-                return;
-            }
+        let actual_target = if target.exists() { target } else { get_download_dir().join(&filename) };
+        if let Ok(content) = safe_read_file(&actual_target) {
+            let cd_val = format!("attachment; filename=\"{}\"", filename);
+            let extra = [("Content-Disposition", cd_val.as_str())];
+            send_response(&stream, "200 OK", "application/octet-stream", &content, None, Some(&extra));
+            return;
         }
-        send_response(&stream, "404 Not Found", "text/plain", b"File not found", None, None);
+        send_response(&stream, "404 Not Found", "text/plain", b"File not found or access denied", None, None);
     }
     else if req.method == "POST" && req.path == "/upload" {
         let ddir = get_download_dir();
@@ -2043,7 +2113,7 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
         let data_start = body.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(0);
         let data_slice = if data_start < body.len() { &body[data_start..] } else { body };
 
-        let _ = fs::write(&file_path, data_slice);
+        let _ = write_secure_bytes(&file_path, data_slice);
         RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
         notify_desktop(
             "OmaSend: File Received",
@@ -2174,6 +2244,38 @@ fn main() {
             match p2p_send_file_to_peer(target_ip, path) {
                 Ok(()) => println!("File sent successfully to {}", target_ip),
                 Err(e) => eprintln!("Error sending file: {}", e),
+            }
+            return;
+        }
+    }
+
+    if let Some(pos) = args.iter().position(|a| a == "--send-dialog") {
+        if let Some(target_ip) = args.get(pos + 1) {
+            let mut envs = Vec::new();
+            let wayland = env::var("WAYLAND_DISPLAY").unwrap_or_default();
+            let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_default();
+            if !wayland.is_empty() {
+                envs.push(("WAYLAND_DISPLAY", wayland.as_str()));
+            }
+            if !xdg.is_empty() {
+                envs.push(("XDG_RUNTIME_DIR", xdg.as_str()));
+            }
+            let deadline = Instant::now() + Duration::from_secs(60);
+            if let Some(out) = run_cmd_bounded(
+                "/usr/bin/zenity",
+                &["--file-selection", "--title=OmaSend: Select File to Send via AirBridge"],
+                &envs,
+                deadline,
+                4096,
+            ) {
+                let chosen = String::from_utf8_lossy(&out).trim().to_string();
+                if !chosen.is_empty() {
+                    let path = Path::new(&chosen);
+                    match p2p_send_file_to_peer(target_ip, path) {
+                        Ok(()) => println!("File successfully sent to {}", target_ip),
+                        Err(e) => eprintln!("Error sending file: {}", e),
+                    }
+                }
             }
             return;
         }
@@ -2457,5 +2559,56 @@ mod tests {
         assert_eq!(deserialized.magic, "OMASEND_P2P");
         assert_eq!(deserialized.id, "abc123");
         assert!(deserialized.bt);
+    }
+
+    #[test]
+    fn test_safe_read_file_rejects_symlinks_and_non_files() {
+        let temp_dir = env::temp_dir().join(format!("omasend_safe_read_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let real_file = temp_dir.join("payload.bin");
+        write_secure_bytes(&real_file, b"binary\x00data\xff").unwrap();
+
+        // 1. Valid file reads safely
+        let data = safe_read_file(&real_file).expect("Must read valid file");
+        assert_eq!(data, b"binary\x00data\xff");
+
+        // 2. Symlink must be rejected
+        let sym = temp_dir.join("symlink.bin");
+        std::os::unix::fs::symlink(&real_file, &sym).unwrap();
+        assert!(safe_read_file(&sym).is_err(), "Symlinks must be rejected");
+
+        // 3. Directory must be rejected
+        assert!(safe_read_file(&temp_dir).is_err(), "Directory must be rejected");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_write_secure_bytes_binary_and_0600() {
+        let temp_dir = env::temp_dir().join(format!("omasend_bytes_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let target = temp_dir.join("data.bin");
+        let payload = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x42];
+        write_secure_bytes(&target, &payload).expect("write_secure_bytes must succeed");
+
+        let meta = fs::symlink_metadata(&target).unwrap();
+        assert_eq!(meta.mode() & 0o777, 0o600, "Must be 0600");
+        let read_back = fs::read(&target).unwrap();
+        assert_eq!(read_back, payload);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_filename_length_and_traversal_caps() {
+        let long_name = "a".repeat(300) + ".txt";
+        let sanitized = sanitize_filename(&long_name);
+        assert!(sanitized.len() <= 180, "Filename must be capped at 180 chars");
+
+        assert!(sanitize_filename("foo/../../bar").starts_with("file_") || !sanitize_filename("foo/../../bar").contains(".."));
     }
 }

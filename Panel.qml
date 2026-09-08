@@ -68,6 +68,11 @@ Panel {
     actionProc.running = true
   }
 
+  function sendFileTo(ip) {
+    actionProc.command = [root.resolveEnginePath(), "--send-dialog", ip]
+    actionProc.running = true
+  }
+
   function newPin() {
     actionProc.command = [root.resolveEnginePath(), "--new-pin"]
     actionProc.running = true
@@ -566,6 +571,27 @@ Panel {
                       color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
                       font.family: root.bar ? root.bar.fontFamily : Style.font.family
                       font.pixelSize: Style.font.caption
+                    }
+                  }
+
+                  Rectangle {
+                    Layout.preferredWidth: Style.space(64)
+                    Layout.preferredHeight: Style.space(24)
+                    radius: Style.cornerRadius
+                    color: Color.accent
+                    MouseArea {
+                      anchors.fill: parent
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.sendFileTo(modelData.ip)
+                    }
+                    Text {
+                      anchors.centerIn: parent
+                      textFormat: Text.PlainText
+                      text: "📁 SEND"
+                      color: "#000000"
+                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
                     }
                   }
 
