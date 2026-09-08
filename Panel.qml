@@ -151,7 +151,8 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     text: ""
-    tooltipText: "OmaSend AirBridge (" + (root.activeMode === "WAN" ? "WAN" : "LAN") + " • E2EE)"
+    foreground: root.wanActive ? "#f59e0b" : (root.bar ? root.bar.foreground : Color.foreground)
+    tooltipText: "OmaSend AirBridge (" + (root.activeMode === "WAN" ? "WAN Active (Tunnel)" : "LAN (Local Only)") + " • E2EE)"
     onPressed: function(b) {
       root.toggle()
     }
