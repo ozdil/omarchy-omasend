@@ -264,6 +264,7 @@ pub fn run_cmd_bounded(
 }
 
 /// Safely pipes data to stdin of a process (e.g. wl-copy) with deadline and process group isolation
+#[allow(dead_code)]
 pub fn run_cmd_write_stdin_bounded(
     cmd_path: &str,
     args: &[&str],

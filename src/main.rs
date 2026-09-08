@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use sha2::{Digest, Sha256};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use subproc::{kill_process_group, run_cmd_bounded, run_cmd_write_stdin_bounded};
+use subproc::{kill_process_group, run_cmd_bounded};
 
 extern "C" {
     fn getuid() -> u32;
@@ -648,9 +648,22 @@ fn get_pc_clipboard() -> String {
 
 fn set_pc_clipboard(text: &str) {
     let env_store = get_desktop_gui_envs();
-    let envs: Vec<(&str, &str)> = env_store.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    let deadline = Instant::now() + Duration::from_millis(800);
-    let _ = run_cmd_write_stdin_bounded("/usr/bin/wl-copy", &[], &envs, text.as_bytes(), deadline);
+    let mut cmd = Command::new("/usr/bin/wl-copy");
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    for (k, v) in env_store {
+        cmd.env(k, v);
+    }
+
+    if let Ok(mut child) = cmd.spawn() {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+            drop(stdin);
+        }
+        let _ = child.wait();
+    }
 }
 
 fn sanitize_filename(raw: &str) -> String {
