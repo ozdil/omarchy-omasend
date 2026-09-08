@@ -306,68 +306,27 @@ fn get_wan_provider() -> Option<String> {
     fs::read_to_string(&provider_file).ok().map(|s| s.trim().to_string())
 }
 
-fn is_cloudflare_rate_limited() -> bool {
-    let log_file = get_state_dir().join("wan_tunnel.log");
-    if let Ok(meta) = fs::metadata(&log_file) {
-        if let Ok(modified) = meta.modified() {
-            if let Ok(elapsed) = modified.elapsed() {
-                if elapsed.as_secs() < 900 {
-                    if let Ok(content) = fs::read_to_string(&log_file) {
-                        if content.contains("429 Too Many Requests") || content.contains("error code: 1015") {
-                            return true;
-                        }
-                    }
-                }
-            }
+fn get_cloudflared_bin() -> Option<String> {
+    for candidate in &["/usr/bin/cloudflared", "/usr/local/bin/cloudflared"] {
+        if Path::new(candidate).is_file() {
+            return Some(candidate.to_string());
         }
     }
-    false
-}
-
-fn get_localtunnel_bin() -> Option<(String, Vec<String>)> {
-    // Look for fixed immutable localtunnel binary pre-installed in PATH or ~/.local/bin.
-    // Never executes mutable runtime npm packages via npx.
-    if let Ok(out) = Command::new("which").arg("localtunnel").output() {
+    if let Ok(home) = env::var("HOME") {
+        let local_bin = format!("{}/.local/bin/cloudflared", home);
+        if Path::new(&local_bin).is_file() {
+            return Some(local_bin);
+        }
+    }
+    if let Ok(out) = Command::new("which").arg("cloudflared").output() {
         if out.status.success() {
             let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if !path.is_empty() && Path::new(&path).is_file() {
-                return Some((path, vec!["--port".to_string(), PORT.to_string()]));
+                return Some(path);
             }
         }
     }
-    let home = env::var("HOME").unwrap_or_default();
-    let local_bin = format!("{}/.local/bin/localtunnel", home);
-    if Path::new(&local_bin).is_file() {
-        return Some((local_bin, vec!["--port".to_string(), PORT.to_string()]));
-    }
     None
-}
-
-fn launch_localtunnel() -> Result<u32, String> {
-    let (bin, args) = get_localtunnel_bin().ok_or_else(|| "No localtunnel binary found".to_string())?;
-    let lt_log = get_state_dir().join("localtunnel.log");
-    let _ = fs::remove_file(&lt_log);
-    let _ = fs::remove_file(get_state_dir().join("wan_tunnel.log"));
-    let out_file = fs::File::create(&lt_log).map_err(|e| e.to_string())?;
-    let err_file = out_file.try_clone().map_err(|e| e.to_string())?;
-
-    let mut cmd = Command::new(bin);
-    cmd.args(args)
-        .stdin(Stdio::null())
-        .stdout(out_file)
-        .stderr(err_file)
-        .process_group(0);
-
-    let child = cmd.spawn().map_err(|e| format!("Failed to spawn localtunnel: {}", e))?;
-    let pid = child.id();
-    let pid_file = get_state_dir().join("wan_pid.txt");
-    let connecting_file = get_state_dir().join("wan_connecting.txt");
-    let provider_file = get_state_dir().join("wan_provider.txt");
-    let _ = fs::write(&pid_file, pid.to_string());
-    let _ = fs::write(&connecting_file, "connecting");
-    let _ = fs::write(&provider_file, "Localtunnel");
-    set_active_mode("WAN");
-    Ok(pid)
 }
 
 fn get_wan_status() -> (bool, bool, Option<String>) {
@@ -375,8 +334,6 @@ fn get_wan_status() -> (bool, bool, Option<String>) {
     let url_file = get_state_dir().join("wan_url.txt");
     let connecting_file = get_state_dir().join("wan_connecting.txt");
     let log_file = get_state_dir().join("wan_tunnel.log");
-    let lt_log = get_state_dir().join("localtunnel.log");
-    let fallback_file = get_state_dir().join("fallback_attempted.txt");
 
     if let Ok(pid_str) = fs::read_to_string(&pid_file) {
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
@@ -390,81 +347,33 @@ fn get_wan_status() -> (bool, bool, Option<String>) {
                     }
                 }
 
-                let provider = get_wan_provider().unwrap_or_else(|| "Cloudflare".to_string());
-
-                if provider == "Localtunnel" {
-                    // Check localtunnel log
-                    if let Ok(content) = fs::read_to_string(&lt_log) {
-                        for line in content.lines() {
-                            if let Some(pos) = line.find("https://") {
-                                let rest = &line[pos..];
-                                let end = rest.find(|c: char| c.is_whitespace() || c == '\r' || c == '\n').unwrap_or(rest.len());
-                                let u = rest[..end].trim().to_string();
-                                if !u.is_empty() && u.contains(".loca.lt") {
-                                    let _ = fs::write(&url_file, &u);
-                                    let _ = fs::remove_file(&connecting_file);
-                                    let _ = fs::remove_file(&fallback_file);
-                                    set_active_mode("WAN");
-                                    update_all_qr();
-                                    notify_desktop(
-                                        "OmaSend: Global WAN Active",
-                                        &format!("Global AirBridge ready!\nAddress: {}", u),
-                                    );
-                                    return (true, false, Some(u));
-                                }
+                // Check Cloudflare log for resolved trycloudflare URL
+                if let Ok(content) = fs::read_to_string(&log_file) {
+                    for line in content.lines() {
+                        if let Some(pos) = line.find("https://") {
+                            let rest = &line[pos..];
+                            if let Some(end) = rest.find(".trycloudflare.com") {
+                                let found_url = rest[..end + 18].to_string();
+                                let _ = fs::write(&url_file, &found_url);
+                                let _ = fs::remove_file(&connecting_file);
+                                set_active_mode("WAN");
+                                update_all_qr();
+                                notify_desktop(
+                                    "OmaSend: Global WAN Active",
+                                    &format!("Global AirBridge ready!\nAddress: {}", found_url),
+                                );
+                                return (true, false, Some(found_url));
                             }
                         }
-                    }
-                    return (false, true, None);
-                } else {
-                    // Check Cloudflare log for resolved trycloudflare URL or rate limit
-                    if let Ok(content) = fs::read_to_string(&log_file) {
-                        if content.contains("429 Too Many Requests") || content.contains("error code: 1015") {
-                            let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
-                            let _ = fs::remove_file(&log_file);
-                            if !fallback_file.exists() {
-                                let _ = fs::write(&fallback_file, "1");
-                                let _ = launch_localtunnel();
-                                return (false, true, None);
-                            }
-                        }
-
-                        for line in content.lines() {
-                            if let Some(pos) = line.find("https://") {
-                                let rest = &line[pos..];
-                                if let Some(end) = rest.find(".trycloudflare.com") {
-                                    let found_url = rest[..end + 18].to_string();
-                                    let _ = fs::write(&url_file, &found_url);
-                                    let _ = fs::remove_file(&connecting_file);
-                                    let _ = fs::remove_file(&fallback_file);
-                                    set_active_mode("WAN");
-                                    update_all_qr();
-                                    notify_desktop(
-                                        "OmaSend: Global WAN Active",
-                                        &format!("Global AirBridge ready!\nAddress: {}", found_url),
-                                    );
-                                    return (true, false, Some(found_url));
-                                }
-                            }
-                        }
-                    }
-                    return (false, true, None);
-                }
-            } else {
-                // Process died while we were connecting: attempt localtunnel fallback if was Cloudflare!
-                if connecting_file.exists() && !fallback_file.exists() {
-                    let _ = fs::write(&fallback_file, "1");
-                    if launch_localtunnel().is_ok() {
-                        return (false, true, None);
                     }
                 }
+                return (false, true, None);
             }
         }
     }
     let _ = fs::remove_file(&pid_file);
     let _ = fs::remove_file(&url_file);
     let _ = fs::remove_file(&connecting_file);
-    let _ = fs::remove_file(&fallback_file);
     (false, false, None)
 }
 
@@ -473,7 +382,7 @@ fn stop_wan_tunnel() {
     let url_file = get_state_dir().join("wan_url.txt");
     let connecting_file = get_state_dir().join("wan_connecting.txt");
     let provider_file = get_state_dir().join("wan_provider.txt");
-    let fallback_file = get_state_dir().join("fallback_attempted.txt");
+    let log_file = get_state_dir().join("wan_tunnel.log");
 
     if let Ok(pid_str) = fs::read_to_string(&pid_file) {
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
@@ -481,14 +390,12 @@ fn stop_wan_tunnel() {
         }
     }
     let _ = Command::new("pkill").args(["-9", "-f", "cloudflared tunnel"]).output();
-    let _ = Command::new("pkill").args(["-9", "-f", "localtunnel"]).output();
-    let _ = Command::new("pkill").args(["-9", "-f", "lt --port"]).output();
 
     let _ = fs::remove_file(&pid_file);
     let _ = fs::remove_file(&url_file);
     let _ = fs::remove_file(&connecting_file);
     let _ = fs::remove_file(&provider_file);
-    let _ = fs::remove_file(&fallback_file);
+    let _ = fs::remove_file(&log_file);
     set_active_mode("LAN");
     update_all_qr();
     notify_desktop("OmaSend: Global WAN", "Secure WAN tunnel closed. Switched to local Wi-Fi mode.");
@@ -496,10 +403,12 @@ fn stop_wan_tunnel() {
 
 fn start_wan_tunnel() -> Result<String, String> {
     let (active, connecting, url) = get_wan_status();
-    if active && url.is_some() {
-        set_active_mode("WAN");
-        update_all_qr();
-        return Ok(url.unwrap());
+    if active {
+        if let Some(u) = url {
+            set_active_mode("WAN");
+            update_all_qr();
+            return Ok(u);
+        }
     }
     if connecting {
         return Ok("Tunnel already initializing...".to_string());
@@ -507,46 +416,14 @@ fn start_wan_tunnel() -> Result<String, String> {
 
     // Clean up any stale instances before starting
     let _ = Command::new("pkill").args(["-9", "-f", "cloudflared tunnel"]).output();
-    let _ = Command::new("pkill").args(["-9", "-f", "localtunnel"]).output();
-    let _ = Command::new("pkill").args(["-9", "-f", "lt --port"]).output();
 
     let pid_file = get_state_dir().join("wan_pid.txt");
     let url_file = get_state_dir().join("wan_url.txt");
     let connecting_file = get_state_dir().join("wan_connecting.txt");
     let provider_file = get_state_dir().join("wan_provider.txt");
-    let fallback_file = get_state_dir().join("fallback_attempted.txt");
     let _ = fs::remove_file(&url_file);
-    let _ = fs::remove_file(&fallback_file);
 
-    // If Cloudflare is currently rate-limited on TryCloudflare, go directly to Localtunnel
-    if is_cloudflare_rate_limited() {
-        if let Ok(_) = launch_localtunnel() {
-            return Ok("Localtunnel launched (Cloudflare rate-limited)".to_string());
-        }
-    }
-
-    let cloudflared_bin = if let Ok(out) = Command::new("which").arg("cloudflared").output() {
-        if out.status.success() {
-            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !path.is_empty() && Path::new(&path).is_file() {
-                Some(path)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        let home = env::var("HOME").unwrap_or_default();
-        let local_bin = format!("{}/.local/bin/cloudflared", home);
-        if Path::new(&local_bin).is_file() {
-            Some(local_bin)
-        } else {
-            None
-        }
-    };
-
-    if let Some(bin) = cloudflared_bin {
+    if let Some(bin) = get_cloudflared_bin() {
         let log_file = get_state_dir().join("wan_tunnel.log");
         let _ = fs::remove_file(&log_file);
 
@@ -576,17 +453,12 @@ fn start_wan_tunnel() -> Result<String, String> {
                 return Ok("Cloudflare tunnel launched in background".to_string());
             }
             Err(e) => {
-                eprintln!("Failed to spawn cloudflared: {}, trying localtunnel fallback...", e);
+                return Err(format!("Failed to spawn cloudflared: {}", e));
             }
         }
     }
 
-    // Fallback: localtunnel
-    if let Ok(_) = launch_localtunnel() {
-        return Ok("Localtunnel launched in background".to_string());
-    }
-
-    Err("No supported WAN tunnel client installed. Please install cloudflared ('sudo pacman -S cloudflared') or localtunnel ('npm install -g localtunnel@2.0.2'). See README.md.".to_string())
+    Err("WAN Tunneling requires cloudflared. Please install the trusted system package: sudo pacman -S cloudflared (see README.md)".to_string())
 }
 
 // ------------------- QR CODE & URLS -------------------
@@ -598,8 +470,12 @@ fn update_all_qr() {
     let mode = get_active_mode();
     let (_wan_active, _wan_connecting, wan_url) = get_wan_status();
 
-    let target_base = if mode == "WAN" && wan_url.is_some() {
-        wan_url.unwrap()
+    let target_base = if mode == "WAN" {
+        if let Some(ref u) = wan_url {
+            u.clone()
+        } else {
+            format!("http://{}:{}", ip, PORT)
+        }
     } else {
         format!("http://{}:{}", ip, PORT)
     };
@@ -709,7 +585,7 @@ fn get_directory_files(dir: &Path) -> Vec<FileInfo> {
             }
         }
     }
-    files.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+    files.sort_by_key(|a| std::cmp::Reverse(a.size_bytes));
     files
 }
 
@@ -1247,8 +1123,12 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
     if req.path == "/api/status" {
         let (wan_active, wan_connecting, wan_url) = get_wan_status();
         let mode = get_active_mode();
-        let active_url = if mode == "WAN" && wan_url.is_some() {
-            format!("{}/?pin={}#key={}", wan_url.as_ref().unwrap(), pin, key_hex)
+        let active_url = if mode == "WAN" {
+            if let Some(ref u) = wan_url {
+                format!("{}/?pin={}#key={}", u, pin, key_hex)
+            } else {
+                format!("http://{}:{}/?pin={}#key={}", ip, PORT, pin, key_hex)
+            }
         } else {
             format!("http://{}:{}/?pin={}#key={}", ip, PORT, pin, key_hex)
         };
@@ -1513,15 +1393,13 @@ fn run_server() {
     };
     println!("OmaSend listening on http://{}:{} [PIN: {}]", local_ip, PORT, pin);
 
-    for stream in listener.incoming() {
-        if let Ok(s) = stream {
-            let ip_clone = local_ip.clone();
-            let pin_clone = pin.clone();
-            let key_clone = key.clone();
-            thread::spawn(move || {
-                handle_connection(s, &ip_clone, &pin_clone, &key_clone);
-            });
-        }
+    for s in listener.incoming().flatten() {
+        let ip_clone = local_ip.clone();
+        let pin_clone = pin.clone();
+        let key_clone = key.clone();
+        thread::spawn(move || {
+            handle_connection(s, &ip_clone, &pin_clone, &key_clone);
+        });
     }
 }
 
@@ -1598,8 +1476,12 @@ fn main() {
     let ddir = get_download_dir().to_string_lossy().to_string();
     let sdir = get_shared_dir().to_string_lossy().to_string();
 
-    let active_url = if active_mode == "WAN" && wan_url.is_some() {
-        format!("{}/?pin={}#key={}", wan_url.as_ref().unwrap(), pin, session_key)
+    let active_url = if active_mode == "WAN" {
+        if let Some(ref u) = wan_url {
+            format!("{}/?pin={}#key={}", u, pin, session_key)
+        } else {
+            format!("http://{}:{}/?pin={}#key={}", ip, PORT, pin, session_key)
+        }
     } else {
         format!("http://{}:{}/?pin={}#key={}", ip, PORT, pin, session_key)
     };
