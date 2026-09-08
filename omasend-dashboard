@@ -3,8 +3,14 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="${DIR}/omasend-engine"
 
-if [[ ! -x "${BIN}" && -f "${DIR}/Cargo.toml" ]]; then
-  (cd "${DIR}" && cargo build --release --locked && cp target/release/omasend-engine ./omasend-engine) >/dev/null 2>&1 || true
+if [[ ! -x "${BIN}" ]]; then
+    if [[ -f "${DIR}/target/release/omasend-engine" ]]; then
+        cp "${DIR}/target/release/omasend-engine" "${BIN}"
+        chmod +x "${BIN}"
+    elif command -v cargo >/dev/null 2>&1 && [[ -f "${DIR}/Cargo.toml" ]]; then
+        echo "Building omasend-engine from source..."
+        (cd "${DIR}" && cargo build --release --locked && cp target/release/omasend-engine "${BIN}" && chmod +x "${BIN}") || true
+    fi
 fi
 
 if [[ -x "${BIN}" ]]; then
@@ -13,6 +19,6 @@ if [[ -x "${BIN}" ]]; then
     echo ""
     read -r -p "Press Enter to exit..." || true
 else
-    echo "Engine binary not found."
+    echo "Engine binary not found. Please run 'cargo build --release --locked && cp target/release/omasend-engine .' in ${DIR}"
     exit 1
 fi
