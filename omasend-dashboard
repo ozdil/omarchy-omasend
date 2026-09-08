@@ -2,6 +2,11 @@
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="${DIR}/omasend-engine"
+
+if [[ ! -x "${BIN}" && -f "${DIR}/Cargo.toml" ]]; then
+  (cd "${DIR}" && cargo build --release --locked && cp target/release/omasend-engine ./omasend-engine) >/dev/null 2>&1 || true
+fi
+
 if [[ -x "${BIN}" ]]; then
     clear
     "${BIN}"

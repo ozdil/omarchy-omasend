@@ -41,19 +41,17 @@ Plugin ID: `ozdil.omasend`
 
 ## 🚀 Installation & Setup
 
-### 1. Clone to Omarchy Plugins Directory
+### Install via Omarchy Marketplace
 ```bash
-git clone https://github.com/ozdil/omarchy-omasend.git ~/.config/omarchy/plugins/ozdil.omasend
+omarchy plugin add ozdil.omasend
 ```
 
-### 2. Build and Install Native Rust Engine
+### Or Build from Source
 ```bash
-cd ~/.config/omarchy/plugins/ozdil.omasend
-cargo build --release
-install -m 755 target/release/omasend-engine ~/.local/bin/omasend-engine
+cargo build --release --locked
 ```
 
-### 3. Add to Omarchy Shell Configuration
+### Configuration
 Add `ozdil.omasend` to `bar.layout.right` in `~/.config/omarchy/shell.json`:
 ```json
 {
@@ -61,7 +59,7 @@ Add `ozdil.omasend` to `bar.layout.right` in `~/.config/omarchy/shell.json`:
 }
 ```
 
-### 4. Restart Shell
+Then restart the shell:
 ```bash
 omarchy-restart-shell
 ```
