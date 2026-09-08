@@ -35,7 +35,19 @@ Plugin ID: `ozdil.omasend`
 - `wl-clipboard` (provides `wl-copy` and `wl-paste` on Wayland)
 - `libnotify` (provides `notify-send` for desktop alerts)
 - `cargo` (Rust toolchain, for building from source)
-- `cloudflared` (optional, for global WAN tunnel mode)
+
+### WAN Tunnel Clients (Optional, for Global WAN Tunnel mode)
+For transferring files outside local Wi-Fi across the internet, OmaSend supports pre-installed immutable tunnel clients:
+- **Cloudflare Tunnel (`cloudflared`)** (Recommended):
+  ```bash
+  sudo pacman -S cloudflared
+  ```
+- **Localtunnel (`localtunnel`)**:
+  Install with immutable version pinning:
+  ```bash
+  npm install -g localtunnel@2.0.2
+  ```
+*Note: OmaSend strictly resolves and executes pre-installed immutable binaries from PATH and never downloads or executes mutable packages at runtime.*
 
 ---
 

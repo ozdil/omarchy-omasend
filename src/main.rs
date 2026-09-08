@@ -4,15 +4,20 @@ use aes_gcm::{
 };
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+extern "C" {
+    fn getuid() -> u32;
+}
 
 const PORT: u16 = 8844;
 static RECEIVED_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -70,10 +75,15 @@ fn get_tailscale_ip() -> Option<String> {
     None
 }
 
+fn get_current_uid() -> u32 {
+    unsafe { getuid() }
+}
+
 fn get_state_dir() -> PathBuf {
     let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let dir = Path::new(&home).join(".local/state/omarchy/omasend");
     let _ = fs::create_dir_all(&dir);
+    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
     dir
 }
 
@@ -81,20 +91,122 @@ fn get_download_dir() -> PathBuf {
     let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let dir = Path::new(&home).join("Downloads/omasend");
     let _ = fs::create_dir_all(&dir);
+    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
     dir
 }
 
 fn get_shared_dir() -> PathBuf {
     let dir = get_download_dir().join("shared");
     let _ = fs::create_dir_all(&dir);
+    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
     dir
 }
 
-// ------------------- PIN & E2EE KEY MANAGEMENT -------------------
+// ------------------- PIN & E2EE KEY MANAGEMENT (SECURE 0600) -------------------
+
+/// Reads a sensitive file (pin.txt or session_key.txt) verifying:
+/// - Target is not a symlink
+/// - Target is a regular file
+/// - Target is owned by the current running user
+/// - Target permissions are strictly 0600 (owner read/write only)
+fn read_secure_file(path: &Path) -> Result<String, String> {
+    let meta = fs::symlink_metadata(path).map_err(|e| format!("Failed to stat {:?}: {}", path, e))?;
+
+    if meta.file_type().is_symlink() {
+        return Err(format!("Security violation: {:?} is a symlink", path));
+    }
+    if !meta.file_type().is_file() {
+        return Err(format!("Security violation: {:?} is not a regular file", path));
+    }
+    let current_uid = get_current_uid();
+    if meta.uid() != current_uid {
+        return Err(format!(
+            "Security violation: {:?} is owned by UID {}, expected current user UID {}",
+            path,
+            meta.uid(),
+            current_uid
+        ));
+    }
+    let mode = meta.mode() & 0o777;
+    if mode != 0o600 {
+        return Err(format!(
+            "Security violation: {:?} has permissions {:o}, expected strictly 0600",
+            path, mode
+        ));
+    }
+
+    fs::read_to_string(path).map_err(|e| format!("Failed to read {:?}: {}", path, e))
+}
+
+/// Atomically writes a sensitive file with mode 0600:
+/// - Verifies that existing target is not an untrusted symlink or foreign file
+/// - Creates a temporary file in the same directory with mode 0600
+/// - Writes data and syncs
+/// - Atomically replaces destination file via rename
+/// - Re-asserts mode 0600 on destination
+fn write_secure_file(path: &Path, content: &str) -> Result<(), String> {
+    let dir = path.parent().ok_or_else(|| "Target path has no parent directory".to_string())?;
+    let _ = fs::create_dir_all(dir);
+    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+
+    // Verify existing target file before replacement
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            let _ = fs::remove_file(path);
+        } else {
+            if !meta.file_type().is_file() {
+                return Err(format!("Security violation: target {:?} is not a regular file", path));
+            }
+            let current_uid = get_current_uid();
+            if meta.uid() != current_uid {
+                return Err(format!(
+                    "Security violation: target {:?} is owned by UID {}, expected current user UID {}",
+                    path,
+                    meta.uid(),
+                    current_uid
+                ));
+            }
+        }
+    }
+
+    let mut rand_bytes = [0u8; 8];
+    let _ = getrandom::getrandom(&mut rand_bytes);
+    let tmp_name = format!(
+        ".tmp_{}_{}_{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id(),
+        hex::encode(rand_bytes)
+    );
+    let tmp_path = dir.join(tmp_name);
+
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .map_err(|e| format!("Failed to create temporary secure file {:?}: {}", tmp_path, e))?;
+
+        let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
+
+        file.write_all(content.as_bytes())
+            .map_err(|e| format!("Failed to write data to {:?}: {}", tmp_path, e))?;
+        file.sync_all()
+            .map_err(|e| format!("Failed to sync {:?}: {}", tmp_path, e))?;
+    }
+
+    fs::rename(&tmp_path, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        format!("Failed to atomically rename {:?} to {:?}: {}", tmp_path, path, e)
+    })?;
+
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    Ok(())
+}
 
 fn get_or_create_pin() -> String {
     let pin_file = get_state_dir().join("pin.txt");
-    if let Ok(content) = fs::read_to_string(&pin_file) {
+    if let Ok(content) = read_secure_file(&pin_file) {
         let p = content.trim();
         if p.len() == 4 && p.chars().all(|c| c.is_ascii_digit()) {
             return p.to_string();
@@ -109,13 +221,15 @@ fn generate_new_pin() -> String {
     let val = ((rand_bytes[0] as u32) << 8 | (rand_bytes[1] as u32)) % 9000 + 1000;
     let pin = format!("{:04}", val);
     let pin_file = get_state_dir().join("pin.txt");
-    let _ = fs::write(&pin_file, &pin);
+    if let Err(e) = write_secure_file(&pin_file, &pin) {
+        eprintln!("Error writing secure pin file: {}", e);
+    }
     pin
 }
 
 fn get_or_create_session_key() -> String {
     let key_file = get_state_dir().join("session_key.txt");
-    if let Ok(content) = fs::read_to_string(&key_file) {
+    if let Ok(content) = read_secure_file(&key_file) {
         let k = content.trim();
         if k.len() == 64 && hex::decode(k).is_ok() {
             return k.to_string();
@@ -129,7 +243,9 @@ fn generate_new_session_key() -> String {
     let _ = getrandom::getrandom(&mut key_bytes);
     let key_hex = hex::encode(key_bytes);
     let key_file = get_state_dir().join("session_key.txt");
-    let _ = fs::write(&key_file, &key_hex);
+    if let Err(e) = write_secure_file(&key_file, &key_hex) {
+        eprintln!("Error writing secure session key file: {}", e);
+    }
     key_hex
 }
 
@@ -209,26 +325,20 @@ fn is_cloudflare_rate_limited() -> bool {
 }
 
 fn get_localtunnel_bin() -> Option<(String, Vec<String>)> {
-    let home = env::var("HOME").unwrap_or_default();
-    let node_bin = format!("{}/.local/share/mise/installs/node/26.8.1/bin/node", home);
-    let lt_js = format!("{}/.local/share/mise/installs/node/26.8.1/lib/node_modules/localtunnel/bin/lt.js", home);
-    if Path::new(&node_bin).is_file() && Path::new(&lt_js).is_file() {
-        return Some((node_bin, vec![lt_js, "--port".to_string(), PORT.to_string()]));
-    }
-    let local_node = format!("{}/.local/bin/node", home);
-    if Path::new(&local_node).is_file() && Path::new(&lt_js).is_file() {
-        return Some((local_node, vec![lt_js, "--port".to_string(), PORT.to_string()]));
-    }
-    if let Ok(out) = Command::new("which").arg("node").output() {
+    // Look for fixed immutable localtunnel binary pre-installed in PATH or ~/.local/bin.
+    // Never executes mutable runtime npm packages via npx.
+    if let Ok(out) = Command::new("which").arg("localtunnel").output() {
         if out.status.success() {
-            let npath = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if Path::new(&lt_js).is_file() {
-                return Some((npath, vec![lt_js, "--port".to_string(), PORT.to_string()]));
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !path.is_empty() && Path::new(&path).is_file() {
+                return Some((path, vec!["--port".to_string(), PORT.to_string()]));
             }
         }
     }
-    if Command::new("npx").arg("--version").output().is_ok() {
-        return Some(("npx".to_string(), vec!["-y".to_string(), "localtunnel".to_string(), "--port".to_string(), PORT.to_string()]));
+    let home = env::var("HOME").unwrap_or_default();
+    let local_bin = format!("{}/.local/bin/localtunnel", home);
+    if Path::new(&local_bin).is_file() {
+        return Some((local_bin, vec!["--port".to_string(), PORT.to_string()]));
     }
     None
 }
@@ -415,8 +525,17 @@ fn start_wan_tunnel() -> Result<String, String> {
         }
     }
 
-    let cloudflared_bin = if Command::new("cloudflared").arg("--version").output().is_ok() {
-        Some("cloudflared".to_string())
+    let cloudflared_bin = if let Ok(out) = Command::new("which").arg("cloudflared").output() {
+        if out.status.success() {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !path.is_empty() && Path::new(&path).is_file() {
+                Some(path)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     } else {
         let home = env::var("HOME").unwrap_or_default();
         let local_bin = format!("{}/.local/bin/cloudflared", home);
@@ -467,7 +586,7 @@ fn start_wan_tunnel() -> Result<String, String> {
         return Ok("Localtunnel launched in background".to_string());
     }
 
-    Err("No supported tunnel client found (cloudflared or localtunnel)".to_string())
+    Err("No supported WAN tunnel client installed. Please install cloudflared ('sudo pacman -S cloudflared') or localtunnel ('npm install -g localtunnel@2.0.2'). See README.md.".to_string())
 }
 
 // ------------------- QR CODE & URLS -------------------
@@ -1524,4 +1643,93 @@ fn main() {
     println!("Active URL: {}", active_url);
     println!("QR: {}", qr_path);
     println!("E2EE Key: {}", session_key);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_secure_file_atomic_write_and_mode_0600() {
+        let temp_dir = env::temp_dir().join(format!("omasend_sec_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let target_file = temp_dir.join("test_key.txt");
+        let content = "secret_session_key_1234567890abcdef";
+
+        // 1. Write secure file atomically
+        write_secure_file(&target_file, content).expect("write_secure_file must succeed");
+
+        // Verify mode is strictly 0600
+        let meta = fs::symlink_metadata(&target_file).expect("metadata must succeed");
+        assert_eq!(
+            meta.mode() & 0o777,
+            0o600,
+            "File permissions must be strictly 0600 (owner-only)"
+        );
+
+        // 2. Verify reading works with 0600
+        let read_content = read_secure_file(&target_file).expect("read_secure_file must succeed");
+        assert_eq!(read_content, content);
+
+        // 3. Verify reading is rejected if permissions are insecure (e.g. 0644)
+        fs::set_permissions(&target_file, fs::Permissions::from_mode(0o644)).unwrap();
+        let read_insecure = read_secure_file(&target_file);
+        assert!(read_insecure.is_err(), "Insecure permissions (0644) must be rejected");
+
+        // 4. Verify atomic write safely overwrites with proper 0600
+        let new_content = "updated_secure_key_abcdef123456";
+        write_secure_file(&target_file, new_content).expect("overwrite must succeed");
+        let meta_after = fs::symlink_metadata(&target_file).expect("metadata must succeed");
+        assert_eq!(meta_after.mode() & 0o777, 0o600);
+        let read_new = read_secure_file(&target_file).expect("read after overwrite must succeed");
+        assert_eq!(read_new, new_content);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_secure_file_rejects_symlinks() {
+        let temp_dir = env::temp_dir().join(format!("omasend_sym_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let real_file = temp_dir.join("real.txt");
+        fs::write(&real_file, "real content").unwrap();
+
+        let symlink_file = temp_dir.join("symlink.txt");
+        std::os::unix::fs::symlink(&real_file, &symlink_file).unwrap();
+
+        // Reading a symlink MUST be rejected
+        let read_res = read_secure_file(&symlink_file);
+        assert!(read_res.is_err(), "Symlinks must be rejected by read_secure_file");
+
+        // Writing over a symlink must remove the symlink itself and write with 0600 without following it
+        write_secure_file(&symlink_file, "new_secure_content").expect("write over symlink must succeed");
+        assert!(!symlink_file.is_symlink(), "Target must no longer be a symlink");
+        let meta = fs::symlink_metadata(&symlink_file).unwrap();
+        assert_eq!(meta.mode() & 0o777, 0o600);
+        assert_eq!(fs::read_to_string(&real_file).unwrap(), "real content", "Symlink target must not be overwritten");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_pin_and_session_key_lifecycle_enforces_0600() {
+        let state_dir = get_state_dir();
+        let pin = get_or_create_pin();
+        assert_eq!(pin.len(), 4);
+
+        let pin_file = state_dir.join("pin.txt");
+        let pin_meta = fs::symlink_metadata(&pin_file).expect("pin.txt must exist");
+        assert_eq!(pin_meta.mode() & 0o777, 0o600, "pin.txt must have 0600 permissions");
+
+        let session_key = get_or_create_session_key();
+        assert_eq!(session_key.len(), 64);
+
+        let key_file = state_dir.join("session_key.txt");
+        let key_meta = fs::symlink_metadata(&key_file).expect("session_key.txt must exist");
+        assert_eq!(key_meta.mode() & 0o777, 0o600, "session_key.txt must have 0600 permissions");
+    }
 }
