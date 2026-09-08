@@ -221,7 +221,7 @@ Panel {
               Rectangle {
                 height: Style.space(20)
                 implicitWidth: e2eeBadgeText.implicitWidth + Style.space(12)
-                radius: Style.space(10)
+                radius: Style.cornerRadius
                 color: "transparent"
                 border.color: Color.accent
                 border.width: 1
@@ -274,7 +274,7 @@ Panel {
             Rectangle {
               Layout.preferredWidth: Style.space(132)
               Layout.preferredHeight: Style.space(132)
-              radius: Style.space(6)
+              radius: Style.cornerRadius
               color: "#ffffff"
               border.color: root.bar ? root.bar.foreground : Color.foreground
               border.width: 1
@@ -300,7 +300,7 @@ Panel {
               Rectangle {
                 Layout.fillWidth: true
                 Layout.preferredHeight: Style.space(32)
-                radius: Style.space(4)
+                radius: Style.cornerRadius
                 color: root.activeMode === "LAN" ? Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent) : "transparent"
                 border.color: root.activeMode === "LAN" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
                 border.width: 1
@@ -350,7 +350,7 @@ Panel {
               Rectangle {
                 Layout.fillWidth: true
                 Layout.preferredHeight: Style.space(32)
-                radius: Style.space(4)
+                radius: Style.cornerRadius
                 color: root.activeMode === "WAN" ? Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent) : "transparent"
                 border.color: root.activeMode === "WAN" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
                 border.width: 1
@@ -399,7 +399,7 @@ Panel {
               Rectangle {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                radius: Style.space(4)
+                radius: Style.cornerRadius
                 color: Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
 
                 RowLayout {
@@ -435,7 +435,7 @@ Panel {
           Rectangle {
             width: parent.width
             height: Style.space(36)
-            radius: Style.space(4)
+            radius: Style.cornerRadius
             color: Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
 
             RowLayout {
@@ -481,7 +481,7 @@ Panel {
           Rectangle {
             width: parent.width
             height: Style.space(36)
-            radius: Style.space(4)
+            radius: Style.cornerRadius
             color: Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
 
             RowLayout {
@@ -526,7 +526,7 @@ Panel {
           Rectangle {
             width: parent.width
             height: Style.space(36)
-            radius: Style.space(4)
+            radius: Style.cornerRadius
             color: Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
 
             RowLayout {
@@ -571,7 +571,7 @@ Panel {
           Rectangle {
             width: parent.width
             height: Style.space(36)
-            radius: Style.space(4)
+            radius: Style.cornerRadius
             color: Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
 
             RowLayout {

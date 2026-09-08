@@ -866,13 +866,13 @@ fn render_login_page() -> String {
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background: #070a0e; color: #dbe4ee; display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; }
-.card { background: #0e141d; border: 1px solid #1a2332; border-radius: 14px; padding: 36px 24px; width: 100%; max-width: 380px; text-align: center; box-shadow: 0 12px 40px rgba(0,0,0,0.6); }
+.card { background: #0e141d; border: 1px solid #1a2332; border-radius: 0; padding: 36px 24px; width: 100%; max-width: 380px; text-align: center; box-shadow: 0 12px 40px rgba(0,0,0,0.6); }
 .icon { font-size: 44px; margin-bottom: 14px; }
 h1 { font-size: 20px; font-weight: 700; color: #dbe4ee; margin-bottom: 6px; }
 p { font-size: 13px; color: #8899a6; margin-bottom: 24px; line-height: 1.5; }
-.pin-input { width: 100%; font-size: 32px; letter-spacing: 12px; text-align: center; background: #070a0e; border: 2px solid #00cbb8; color: #00eed9; border-radius: 8px; padding: 12px; margin-bottom: 20px; font-family: monospace; outline: none; transition: border-color 0.2s; }
+.pin-input { width: 100%; font-size: 32px; letter-spacing: 12px; text-align: center; background: #070a0e; border: 2px solid #00cbb8; color: #00eed9; border-radius: 0; padding: 12px; margin-bottom: 20px; font-family: monospace; outline: none; transition: border-color 0.2s; }
 .pin-input:focus { border-color: #00eed9; box-shadow: 0 0 16px rgba(0,203,184,0.3); }
-button { width: 100%; background: #00cbb8; color: #070a0e; border: none; padding: 14px; font-size: 15px; font-weight: 700; border-radius: 8px; cursor: pointer; transition: opacity 0.2s; }
+button { width: 100%; background: #00cbb8; color: #070a0e; border: none; padding: 14px; font-size: 15px; font-weight: 700; border-radius: 0; cursor: pointer; transition: opacity 0.2s; }
 button:active { opacity: 0.85; }
 </style>
 </head>
@@ -919,23 +919,23 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, mono
 .header {{ display: flex; align-items: center; justify-content: space-between; padding-bottom: 14px; border-bottom: 1px solid #1a2332; margin-bottom: 16px; }}
 .brand {{ font-size: 19px; font-weight: 700; color: #00cbb8; display: flex; align-items: center; gap: 8px; }}
 .badges {{ display: flex; gap: 6px; flex-wrap: wrap; }}
-.badge {{ font-size: 11px; background: rgba(0, 203, 184, 0.15); border: 1px solid #00cbb8; color: #00cbb8; padding: 4px 8px; border-radius: 6px; font-weight: bold; }}
-.badge-e2ee {{ font-size: 11px; background: rgba(39, 201, 63, 0.15); border: 1px solid #27c93f; color: #27c93f; padding: 4px 8px; border-radius: 6px; font-weight: bold; display: flex; align-items: center; gap: 4px; }}
-.card {{ background: #0e141d; border: 1px solid #1a2332; border-radius: 12px; padding: 18px; margin-bottom: 16px; }}
+.badge {{ font-size: 11px; background: rgba(0, 203, 184, 0.15); border: 1px solid #00cbb8; color: #00cbb8; padding: 4px 8px; border-radius: 0; font-weight: bold; }}
+.badge-e2ee {{ font-size: 11px; background: rgba(39, 201, 63, 0.15); border: 1px solid #27c93f; color: #27c93f; padding: 4px 8px; border-radius: 0; font-weight: bold; display: flex; align-items: center; gap: 4px; }}
+.card {{ background: #0e141d; border: 1px solid #1a2332; border-radius: 0; padding: 18px; margin-bottom: 16px; }}
 .card-title {{ font-size: 12px; font-weight: 700; letter-spacing: 1px; color: #8899a6; text-transform: uppercase; margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between; }}
-.drop-zone {{ border: 2px dashed #00cbb8; border-radius: 10px; padding: 36px 16px; text-align: center; cursor: pointer; background: rgba(0, 203, 184, 0.03); transition: all 0.2s; }}
+.drop-zone {{ border: 2px dashed #00cbb8; border-radius: 0; padding: 36px 16px; text-align: center; cursor: pointer; background: rgba(0, 203, 184, 0.03); transition: all 0.2s; }}
 .drop-zone:hover {{ background: rgba(0, 203, 184, 0.08); border-color: #00eed9; }}
 .drop-icon {{ font-size: 36px; margin-bottom: 8px; }}
-.file-item {{ display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: #131b26; border-radius: 8px; margin-bottom: 8px; border: 1px solid #1a2536; }}
+.file-item {{ display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: #131b26; border-radius: 0; margin-bottom: 8px; border: 1px solid #1a2536; }}
 .file-name {{ font-size: 14px; font-weight: 500; word-break: break-all; color: #dbe4ee; }}
 .file-size {{ font-size: 12px; color: #8899a6; margin-top: 2px; }}
-.btn-sm {{ background: #00cbb8; color: #070a0e; border: none; padding: 6px 14px; border-radius: 6px; font-size: 12px; font-weight: 700; cursor: pointer; }}
-textarea {{ width: 100%; height: 84px; background: #070a0e; border: 1px solid #1a2332; border-radius: 8px; color: #dbe4ee; padding: 12px; font-size: 13px; margin-bottom: 10px; resize: vertical; outline: none; }}
+.btn-sm {{ background: #00cbb8; color: #070a0e; border: none; padding: 6px 14px; border-radius: 0; font-size: 12px; font-weight: 700; cursor: pointer; }}
+textarea {{ width: 100%; height: 84px; background: #070a0e; border: 1px solid #1a2332; border-radius: 0; color: #dbe4ee; padding: 12px; font-size: 13px; margin-bottom: 10px; resize: vertical; outline: none; }}
 textarea:focus {{ border-color: #00cbb8; }}
-button.main-btn {{ width: 100%; background: #00cbb8; color: #070a0e; border: none; padding: 12px; font-size: 14px; font-weight: 700; border-radius: 8px; cursor: pointer; }}
-.clipboard-box {{ background: #070a0e; border: 1px solid #1a2332; padding: 12px; border-radius: 8px; font-size: 13px; max-height: 110px; overflow-y: auto; margin-bottom: 10px; color: #00eed9; font-family: monospace; white-space: pre-wrap; }}
+button.main-btn {{ width: 100%; background: #00cbb8; color: #070a0e; border: none; padding: 12px; font-size: 14px; font-weight: 700; border-radius: 0; cursor: pointer; }}
+.clipboard-box {{ background: #070a0e; border: 1px solid #1a2332; padding: 12px; border-radius: 0; font-size: 13px; max-height: 110px; overflow-y: auto; margin-bottom: 10px; color: #00eed9; font-family: monospace; white-space: pre-wrap; }}
 .empty {{ font-size: 13px; color: #8899a6; text-align: center; padding: 16px; line-height: 1.6; }}
-#progress-bar {{ display: none; width: 100%; height: 8px; background: #1a2332; border-radius: 4px; overflow: hidden; margin-top: 14px; }}
+#progress-bar {{ display: none; width: 100%; height: 8px; background: #1a2332; border-radius: 0; overflow: hidden; margin-top: 14px; }}
 #progress-fill {{ width: 0%; height: 100%; background: #00cbb8; transition: width 0.2s; }}
 #status-msg {{ font-size: 12px; font-weight: 600; color: #00cbb8; margin-top: 10px; text-align: center; }}
 </style>
