@@ -1,3 +1,7 @@
+import java.io.File
+import java.io.FileInputStream
+import java.util.Properties
+
 plugins {
   alias(libs.plugins.android.application)
   alias(libs.plugins.compose.compiler)
@@ -15,10 +19,34 @@ android {
         versionName = "1.0.0"
     }
 
+    val keystorePropsFile: File? = listOf(
+        rootProject.file("keystore.properties"),
+        File(System.getProperty("user.home"), ".local/share/omarchy/keystores/omasend-keystore.properties")
+    ).firstOrNull { it.exists() }
+
+    val keystoreProperties = Properties()
+    if (keystorePropsFile != null) {
+        FileInputStream(keystorePropsFile).use { keystoreProperties.load(it) }
+    }
+
+    signingConfigs {
+        if (keystorePropsFile != null) {
+            create("release") {
+                storeFile = file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            if (keystorePropsFile != null) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
     compileOptions {
