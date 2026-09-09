@@ -5,15 +5,17 @@ use aes_gcm::{
     Aes256Gcm, Key, Nonce,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use sha2::{Digest, Sha256};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1227,6 +1229,7 @@ fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
 
 // ------------------- HTTP ENGINE -------------------
 
+#[derive(Default)]
 struct HttpRequest {
     method: String,
     path: String,
@@ -1340,33 +1343,126 @@ fn read_full_http_request(stream: &mut TcpStream) -> Option<(HttpRequest, Vec<u8
     ))
 }
 
-fn is_authorized(req: &HttpRequest, pin: &str) -> bool {
-    for part in req.query.split('&') {
-        if let Some(val) = part.strip_prefix("pin=") {
-            if val == pin {
+struct PinAttemptState {
+    failed_count: u32,
+    window_start: Instant,
+    blocked_until: Option<Instant>,
+}
+
+static PIN_RATE_LIMITER: Mutex<Option<HashMap<IpAddr, PinAttemptState>>> = Mutex::new(None);
+
+pub fn is_pin_rate_limited(ip: IpAddr) -> bool {
+    let mut guard = match PIN_RATE_LIMITER.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let map = guard.get_or_insert_with(HashMap::new);
+    let now = Instant::now();
+    if let Some(state) = map.get(&ip) {
+        if let Some(blocked) = state.blocked_until {
+            if now < blocked {
                 return true;
-            }
-        }
-    }
-    if let Some(h) = req.get_header("x-omasend-pin") {
-        if h == pin {
-            return true;
-        }
-    }
-    if let Some(cookie_val) = req.get_header("cookie") {
-        for c in cookie_val.split(';') {
-            let ct = c.trim();
-            if let Some(val) = ct.strip_prefix("pin=") {
-                if val == pin {
-                    return true;
-                }
             }
         }
     }
     false
 }
 
-fn send_response(mut stream: &TcpStream, status: &str, content_type: &str, body: &[u8], cookie: Option<&str>, extra_headers: Option<&[(&str, &str)]>) {
+pub fn record_pin_attempt(ip: IpAddr, success: bool) -> bool {
+    let mut guard = match PIN_RATE_LIMITER.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let map = guard.get_or_insert_with(HashMap::new);
+    let now = Instant::now();
+
+    if map.len() > 1000 {
+        map.retain(|_, s| now.duration_since(s.window_start) < Duration::from_secs(300));
+    }
+
+    if success {
+        map.remove(&ip);
+        return true;
+    }
+
+    let state = map.entry(ip).or_insert(PinAttemptState {
+        failed_count: 0,
+        window_start: now,
+        blocked_until: None,
+    });
+
+    if state.blocked_until.is_none() && now.duration_since(state.window_start) > Duration::from_secs(60) {
+        state.failed_count = 0;
+        state.window_start = now;
+    }
+
+    state.failed_count = state.failed_count.saturating_add(1);
+    if state.failed_count >= 5 {
+        state.blocked_until = Some(now + Duration::from_secs(60));
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+pub fn reset_pin_rate_limiter() {
+    let mut guard = match PIN_RATE_LIMITER.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(ref mut map) = *guard {
+        map.clear();
+    }
+}
+
+fn extract_provided_pin(req: &HttpRequest) -> Option<String> {
+    for part in req.query.split('&') {
+        if let Some(val) = part.strip_prefix("pin=") {
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    if let Some(h) = req.get_header("x-omasend-pin") {
+        if !h.is_empty() {
+            return Some(h.to_string());
+        }
+    }
+    if let Some(cookie_val) = req.get_header("cookie") {
+        for c in cookie_val.split(';') {
+            let ct = c.trim();
+            if let Some(val) = ct.strip_prefix("pin=") {
+                if !val.is_empty() {
+                    return Some(val.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn is_trusted_origin(origin: &str, local_ip: &str) -> bool {
+    let clean = origin.trim();
+    if clean == "http://localhost" || clean.starts_with("http://localhost:")
+        || clean == "http://127.0.0.1" || clean.starts_with("http://127.0.0.1:") {
+        return true;
+    }
+    let expected_local = format!("http://{}", local_ip);
+    if clean == expected_local || clean.starts_with(&format!("{}:", expected_local)) {
+        return true;
+    }
+    false
+}
+
+fn send_response(
+    mut stream: &TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+    cookie: Option<&str>,
+    extra_headers: Option<&[(&str, &str)]>,
+    cors_origin: Option<&str>,
+) {
     let cookie_header = if let Some(c) = cookie {
         format!("Set-Cookie: {}; Path=/; HttpOnly; SameSite=Lax\r\n", c)
     } else {
@@ -1378,9 +1474,14 @@ fn send_response(mut stream: &TcpStream, status: &str, content_type: &str, body:
             extra.push_str(&format!("{}: {}\r\n", k, v));
         }
     }
+    let cors_header = if let Some(origin) = cors_origin {
+        format!("Access-Control-Allow-Origin: {}\r\nVary: Origin\r\n", origin)
+    } else {
+        String::new()
+    };
     let resp = format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: *\r\n{}{}Connection: close\r\n\r\n",
-        status, content_type, body.len(), cookie_header, extra
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}{}{}Connection: close\r\n\r\n",
+        status, content_type, body.len(), cors_header, cookie_header, extra
     );
     let _ = stream.write_all(resp.as_bytes());
     let _ = stream.write_all(body);
@@ -1774,35 +1875,91 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
         None => return,
     };
 
-    let authorized = is_authorized(&req, pin);
+    let client_ip = stream
+        .peer_addr()
+        .map(|a| a.ip())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let origin = req.get_header("origin");
+    let allowed_cors = origin.filter(|&o| is_trusted_origin(o, ip));
+
+    let respond = |s: &TcpStream, status: &str, content_type: &str, body: &[u8], cookie: Option<&str>, extra: Option<&[(&str, &str)]>| {
+        send_response(s, status, content_type, body, cookie, extra, allowed_cors);
+    };
+
+    if req.method == "OPTIONS" {
+        respond(
+            &stream,
+            "204 No Content",
+            "text/plain",
+            b"",
+            None,
+            Some(&[
+                ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
+                ("Access-Control-Allow-Headers", "Content-Type, X-OmaSend-PIN, X-OmaSend-IV, X-OmaSend-Filename"),
+            ]),
+        );
+        return;
+    }
+
+    if is_pin_rate_limited(client_ip) {
+        let err = b"{\"error\":\"Too many failed PIN attempts. Please wait 60 seconds.\"}";
+        respond(
+            &stream,
+            "429 Too Many Requests",
+            "application/json",
+            err,
+            None,
+            Some(&[("Retry-After", "60")]),
+        );
+        return;
+    }
+
+    let maybe_pin = extract_provided_pin(&req);
+    let authorized = match maybe_pin {
+        Some(ref p) if p == pin => {
+            record_pin_attempt(client_ip, true);
+            true
+        }
+        Some(_) => {
+            let not_blocked = record_pin_attempt(client_ip, false);
+            if !not_blocked {
+                let err = b"{\"error\":\"Too many failed PIN attempts. Please wait 60 seconds.\"}";
+                respond(
+                    &stream,
+                    "429 Too Many Requests",
+                    "application/json",
+                    err,
+                    None,
+                    Some(&[("Retry-After", "60")]),
+                );
+                return;
+            }
+            false
+        }
+        None => false,
+    };
 
     if req.path == "/api/status" {
-        let (wan_active, wan_connecting, wan_url) = get_wan_status();
+        let (wan_active, wan_connecting, _wan_url) = get_wan_status();
         let mode = get_active_mode();
-        let active_url = if mode == "WAN" {
-            if let Some(ref u) = wan_url {
-                format!("{}/?pin={}#key={}", u, pin, key_hex)
-            } else {
-                format!("http://{}:{}/?pin={}#key={}", ip, PORT, pin, key_hex)
-            }
+        let resp = if authorized {
+            serde_json::json!({
+                "status": "ACTIVE",
+                "port": PORT,
+                "ip": ip,
+                "mode": mode,
+                "wan_active": wan_active,
+                "wan_connecting": wan_connecting,
+                "auth_required": true
+            })
         } else {
-            format!("http://{}:{}/?pin={}#key={}", ip, PORT, pin, key_hex)
+            serde_json::json!({
+                "status": "ACTIVE",
+                "port": PORT,
+                "auth_required": true
+            })
         };
-        let resp = serde_json::json!({
-            "status": "ACTIVE",
-            "port": PORT,
-            "ip": ip,
-            "tailscale_ip": get_tailscale_ip(),
-            "pin": pin,
-            "mode": mode,
-            "wan_active": wan_active,
-            "wan_connecting": wan_connecting,
-            "wan_provider": if wan_active || wan_connecting { get_wan_provider() } else { None },
-            "wan_url": wan_url,
-            "active_url": active_url,
-            "auth_required": true
-        });
-        send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+        respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
         return;
     }
 
@@ -1816,7 +1973,7 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             "name": get_system_hostname(),
             "mode": vis
         });
-        send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+        respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
         return;
     }
 
@@ -1829,7 +1986,7 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             "remaining_secs": remaining,
             "bluetooth_available": is_bluetooth_available()
         });
-        send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+        respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
         return;
     }
 
@@ -1837,7 +1994,7 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
         let (vis, _) = get_visibility();
         if vis == "OFF" {
             let err = serde_json::json!({ "error": "Recipient AirBridge visibility is turned Off" });
-            send_response(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
+            respond(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
             return;
         }
 
@@ -1845,7 +2002,7 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
         let req_data: serde_json::Value = match serde_json::from_slice(body_slice) {
             Ok(v) => v,
             Err(_) => {
-                send_response(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid JSON request\"}", None, None);
+                respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid JSON request\"}", None, None);
                 return;
             }
         };
@@ -1857,7 +2014,7 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
 
         if vis == "KNOWN" && !is_trusted {
             let err = serde_json::json!({ "error": "Peer is not in trusted peers list and visibility is set to Known Only" });
-            send_response(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
+            respond(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
             return;
         }
 
@@ -1902,7 +2059,7 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             "status": "PENDING",
             "token": token
         });
-        send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+        respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
         return;
     }
 
@@ -1913,15 +2070,15 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             if let Some(pending) = get_pending_transfer() {
                 if pending.token == token {
                     if now > pending.expires_at {
-                        send_response(&stream, "200 OK", "application/json", b"{\"status\":\"EXPIRED\"}", None, None);
+                        respond(&stream, "200 OK", "application/json", b"{\"status\":\"EXPIRED\"}", None, None);
                     } else {
                         let resp = serde_json::json!({ "status": pending.status });
-                        send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+                        respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
                     }
                     return;
                 }
             }
-            send_response(&stream, "404 Not Found", "application/json", b"{\"status\":\"NOT_FOUND\"}", None, None);
+            respond(&stream, "404 Not Found", "application/json", b"{\"status\":\"NOT_FOUND\"}", None, None);
             return;
         } else if req.method == "POST" {
             let body_slice = &buffer[req.body_offset..];
@@ -1935,19 +2092,19 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
                             save_pending_transfer(&pending);
                             add_trusted_peer(&pending.sender_id, &pending.sender_name, "");
                             notify_desktop("OmaSend AirBridge", "Transfer accepted. Receiving files...");
-                            send_response(&stream, "200 OK", "application/json", b"{\"status\":\"ACCEPTED\"}", None, None);
+                            respond(&stream, "200 OK", "application/json", b"{\"status\":\"ACCEPTED\"}", None, None);
                             return;
                         } else if action == "reject" {
                             pending.status = "REJECTED".to_string();
                             save_pending_transfer(&pending);
                             notify_desktop("OmaSend AirBridge", "Transfer declined.");
-                            send_response(&stream, "200 OK", "application/json", b"{\"status\":\"REJECTED\"}", None, None);
+                            respond(&stream, "200 OK", "application/json", b"{\"status\":\"REJECTED\"}", None, None);
                             return;
                         }
                     }
                 }
             }
-            send_response(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid token or action\"}", None, None);
+            respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid token or action\"}", None, None);
             return;
         }
     }
@@ -1976,22 +2133,22 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
                         "filename": final_name,
                         "size": body.len()
                     });
-                    send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+                    respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
                     return;
                 } else {
-                    send_response(&stream, "500 Internal Server Error", "text/plain", b"Failed to write file to disk", None, None);
+                    respond(&stream, "500 Internal Server Error", "text/plain", b"Failed to write file to disk", None, None);
                     return;
                 }
             }
         }
-        send_response(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Unauthorized or expired transfer token\"}", None, None);
+        respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Unauthorized or expired transfer token\"}", None, None);
         return;
     }
 
     if req.method == "POST" && req.path == "/api/p2p/clipboard" {
         let (vis, _) = get_visibility();
         if vis == "OFF" {
-            send_response(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Visibility is Off\"}", None, None);
+            respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Visibility is Off\"}", None, None);
             return;
         }
         let body_slice = &buffer[req.body_offset..];
@@ -2000,25 +2157,25 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             let sender_name = val["sender_name"].as_str().unwrap_or("Nearby Device");
             let is_trusted = is_peer_trusted(sender_id);
             if vis == "KNOWN" && !is_trusted {
-                send_response(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Peer not trusted\"}", None, None);
+                respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Peer not trusted\"}", None, None);
                 return;
             }
             if let Some(text) = val["text"].as_str() {
                 if text.len() <= 1_048_576 {
                     set_pc_clipboard(text);
                     notify_desktop("OmaSend: Universal Clipboard", &format!("Received clipboard text from {}.", sender_name));
-                    send_response(&stream, "200 OK", "application/json", b"{\"status\":\"OK\"}", None, None);
+                    respond(&stream, "200 OK", "application/json", b"{\"status\":\"OK\"}", None, None);
                     return;
                 }
             }
         }
-        send_response(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid clipboard payload\"}", None, None);
+        respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid clipboard payload\"}", None, None);
         return;
     }
 
     if !authorized {
         let html = render_login_page();
-        send_response(&stream, "200 OK", "text/html; charset=utf-8", html.as_bytes(), None, None);
+        respond(&stream, "200 OK", "text/html; charset=utf-8", html.as_bytes(), None, None);
         return;
     }
 
@@ -2027,7 +2184,7 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
     if req.method == "GET" && req.path == "/" {
         let shared_files = get_directory_files(&get_shared_dir());
         let html = render_web_app(ip, &shared_files);
-        send_response(&stream, "200 OK", "text/html; charset=utf-8", html.as_bytes(), set_cookie.as_deref(), None);
+        respond(&stream, "200 OK", "text/html; charset=utf-8", html.as_bytes(), set_cookie.as_deref(), None);
     }
     else if req.method == "POST" && req.path == "/api/upload-encrypted" {
         let filename_raw = req.get_header("x-omasend-filename").unwrap_or("received_file.bin");
@@ -2037,7 +2194,7 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
         let iv_hex = match req.get_header("x-omasend-iv") {
             Some(iv) if iv.len() == 24 => iv,
             _ => {
-                send_response(&stream, "400 Bad Request", "text/plain", b"Missing or invalid X-OmaSend-IV", None, None);
+                respond(&stream, "400 Bad Request", "text/plain", b"Missing or invalid X-OmaSend-IV", None, None);
                 return;
             }
         };
@@ -2045,7 +2202,7 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
         let iv_bytes = match hex::decode(iv_hex) {
             Ok(b) => b,
             Err(_) => {
-                send_response(&stream, "400 Bad Request", "text/plain", b"Invalid IV hex", None, None);
+                respond(&stream, "400 Bad Request", "text/plain", b"Invalid IV hex", None, None);
                 return;
             }
         };
@@ -2067,14 +2224,14 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
                         "size": decrypted.len(),
                         "encrypted": true
                     });
-                    send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+                    respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
                 } else {
-                    send_response(&stream, "500 Internal Server Error", "text/plain", b"Failed to write file", None, None);
+                    respond(&stream, "500 Internal Server Error", "text/plain", b"Failed to write file", None, None);
                 }
             }
             Err(e) => {
                 eprintln!("Decryption error: {}", e);
-                send_response(&stream, "400 Bad Request", "text/plain", e.as_bytes(), None, None);
+                respond(&stream, "400 Bad Request", "text/plain", e.as_bytes(), None, None);
             }
         }
     }
@@ -2098,29 +2255,29 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
                         ("X-OmaSend-Filename", filename.as_str()),
                         ("Content-Disposition", cd_val.as_str()),
                     ];
-                    send_response(&stream, "200 OK", "application/octet-stream", &ciphertext, None, Some(&extra));
+                    respond(&stream, "200 OK", "application/octet-stream", &ciphertext, None, Some(&extra));
                     return;
                 }
                 Err(e) => {
-                    send_response(&stream, "500 Internal Server Error", "text/plain", e.as_bytes(), None, None);
+                    respond(&stream, "500 Internal Server Error", "text/plain", e.as_bytes(), None, None);
                     return;
                 }
             }
         }
-        send_response(&stream, "404 Not Found", "text/plain", b"File not found or access denied", None, None);
+        respond(&stream, "404 Not Found", "text/plain", b"File not found or access denied", None, None);
     }
     else if req.method == "POST" && req.path == "/api/clipboard-encrypted" {
         let iv_hex = match req.get_header("x-omasend-iv") {
             Some(iv) if iv.len() == 24 => iv,
             _ => {
-                send_response(&stream, "400 Bad Request", "text/plain", b"Missing IV", None, None);
+                respond(&stream, "400 Bad Request", "text/plain", b"Missing IV", None, None);
                 return;
             }
         };
         let iv_bytes = match hex::decode(iv_hex) {
             Ok(b) => b,
             Err(_) => {
-                send_response(&stream, "400 Bad Request", "text/plain", b"Invalid IV hex", None, None);
+                respond(&stream, "400 Bad Request", "text/plain", b"Invalid IV hex", None, None);
                 return;
             }
         };
@@ -2135,10 +2292,10 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
                     &format!("Encrypted clipboard updated ({} chars):\n{}", text.len(), text.chars().take(60).collect::<String>()),
                 );
                 let resp = serde_json::json!({ "status": "OK", "encrypted": true });
-                send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+                respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
             }
             Err(e) => {
-                send_response(&stream, "400 Bad Request", "text/plain", e.as_bytes(), None, None);
+                respond(&stream, "400 Bad Request", "text/plain", e.as_bytes(), None, None);
             }
         }
     }
@@ -2151,10 +2308,10 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
                     "ciphertext": hex::encode(ciphertext),
                     "encrypted": true
                 });
-                send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+                respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
             }
             Err(e) => {
-                send_response(&stream, "500 Internal Server Error", "text/plain", e.as_bytes(), None, None);
+                respond(&stream, "500 Internal Server Error", "text/plain", e.as_bytes(), None, None);
             }
         }
     }
@@ -2162,7 +2319,7 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
         if req.method == "GET" {
             let clip = get_pc_clipboard();
             let resp = serde_json::json!({ "clipboard": clip });
-            send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+            respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
         } else if req.method == "POST" {
             let body = String::from_utf8_lossy(&buffer[req.body_offset..]);
             let text = if let Some(val) = body.strip_prefix("text=") {
@@ -2173,7 +2330,7 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             set_pc_clipboard(&text);
             notify_desktop("OmaSend: Clipboard Received", &format!("Clipboard updated from device ({} chars)", text.len()));
             let resp = serde_json::json!({ "status": "OK" });
-            send_response(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+            respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
         }
     }
     else if req.method == "GET" && req.path.starts_with("/download/") {
@@ -2183,10 +2340,10 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
         if let Ok(content) = safe_read_file(&actual_target) {
             let cd_val = format!("attachment; filename=\"{}\"", filename);
             let extra = [("Content-Disposition", cd_val.as_str())];
-            send_response(&stream, "200 OK", "application/octet-stream", &content, None, Some(&extra));
+            respond(&stream, "200 OK", "application/octet-stream", &content, None, Some(&extra));
             return;
         }
-        send_response(&stream, "404 Not Found", "text/plain", b"File not found or access denied", None, None);
+        respond(&stream, "404 Not Found", "text/plain", b"File not found or access denied", None, None);
     }
     else if req.method == "POST" && req.path == "/upload" {
         let ddir = get_download_dir();
@@ -2209,9 +2366,9 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             &format!("'{}' saved to Downloads/omasend.", file_path.file_name().unwrap().to_string_lossy()),
         );
         let resp = "{\"status\":\"OK\"}";
-        send_response(&stream, "200 OK", "application/json", resp.as_bytes(), None, None);
+        respond(&stream, "200 OK", "application/json", resp.as_bytes(), None, None);
     } else {
-        send_response(&stream, "404 Not Found", "text/plain", b"Not Found", None, None);
+        respond(&stream, "404 Not Found", "text/plain", b"Not Found", None, None);
     }
 }
 
@@ -2702,4 +2859,77 @@ mod tests {
 
         assert!(sanitize_filename("foo/../../bar").starts_with("file_") || !sanitize_filename("foo/../../bar").contains(".."));
     }
+
+    #[test]
+    fn test_pin_rate_limiter_triggers_after_5_failures() {
+        reset_pin_rate_limiter();
+        let test_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99));
+
+        assert!(!is_pin_rate_limited(test_ip));
+
+        for _ in 0..4 {
+            let ok = record_pin_attempt(test_ip, false);
+            assert!(ok, "Attempts 1-4 should not trigger lock");
+            assert!(!is_pin_rate_limited(test_ip));
+        }
+
+        // 5th failed attempt triggers block
+        let ok5 = record_pin_attempt(test_ip, false);
+        assert!(!ok5, "5th attempt must return false (blocked)");
+        assert!(is_pin_rate_limited(test_ip), "IP must now be rate limited");
+
+        // Another IP should not be affected
+        let other_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100));
+        assert!(!is_pin_rate_limited(other_ip));
+
+        // Successful PIN clears failure count for that IP
+        record_pin_attempt(other_ip, false);
+        assert!(record_pin_attempt(other_ip, true));
+        assert!(!is_pin_rate_limited(other_ip));
+
+        reset_pin_rate_limiter();
+    }
+
+    #[test]
+    fn test_cors_trusted_origin_whitelist() {
+        let local_ip = "192.168.1.50";
+
+        assert!(is_trusted_origin("http://localhost", local_ip));
+        assert!(is_trusted_origin("http://localhost:53317", local_ip));
+        assert!(is_trusted_origin("http://127.0.0.1", local_ip));
+        assert!(is_trusted_origin("http://127.0.0.1:53317", local_ip));
+        assert!(is_trusted_origin("http://192.168.1.50", local_ip));
+        assert!(is_trusted_origin("http://192.168.1.50:53317", local_ip));
+
+        // Malicious or third-party origins must be rejected
+        assert!(!is_trusted_origin("https://evil.attacker.com", local_ip));
+        assert!(!is_trusted_origin("http://192.168.1.55:53317", local_ip));
+        assert!(!is_trusted_origin("null", local_ip));
+        assert!(!is_trusted_origin("", local_ip));
+    }
+
+    #[test]
+    fn test_extract_provided_pin() {
+        let req_query = HttpRequest {
+            query: "foo=bar&pin=4321&baz=1".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(extract_provided_pin(&req_query), Some("4321".to_string()));
+
+        let req_header = HttpRequest {
+            headers: vec![("x-omasend-pin".to_string(), "9988".to_string())],
+            ..Default::default()
+        };
+        assert_eq!(extract_provided_pin(&req_header), Some("9988".to_string()));
+
+        let req_cookie = HttpRequest {
+            headers: vec![("cookie".to_string(), "session=abc; pin=1122; test=1".to_string())],
+            ..Default::default()
+        };
+        assert_eq!(extract_provided_pin(&req_cookie), Some("1122".to_string()));
+
+        let req_empty = HttpRequest::default();
+        assert_eq!(extract_provided_pin(&req_empty), None);
+    }
 }
+
