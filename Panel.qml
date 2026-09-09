@@ -264,6 +264,7 @@ Panel {
 
               Text {
                 text: "OmaSend"
+                textFormat: Text.PlainText
                 color: root.bar ? root.bar.foreground : Color.foreground
                 font.family: root.bar ? root.bar.fontFamily : Style.font.family
                 font.pixelSize: Style.font.title
