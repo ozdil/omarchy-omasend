@@ -48,6 +48,20 @@ class DiscoveryManager(private val context: Context) {
         releaseMulticastLock()
     }
 
+    fun addManualPeer(ip: String, port: Int = NetworkUtils.PORT, name: String = "Direct ($ip)") {
+        val peer = DiscoveredPeer(
+            id = "manual_${ip.replace('.', '_')}_$port",
+            name = name,
+            ip = ip,
+            port = port,
+            transport = "DIRECT",
+            fingerprint = "",
+            lastSeen = System.currentTimeMillis() + 3600000L // 1 hour persistent
+        )
+        peerMap[peer.id] = peer
+        _peers.value = peerMap.values.toList().sortedBy { it.name }
+    }
+
     private fun acquireMulticastLock() {
         try {
             val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager

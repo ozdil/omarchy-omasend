@@ -7,7 +7,7 @@ This document contains all official store metadata, textual assets, and regulato
 ## 1. App Identity & Category
 
 - **App Name**: OmaSend - Local P2P Transfer
-- **Package Name**: `ozdil.omasend`
+- **Package Name**: `io.omarchy.omasend`
 - **Default Language**: English (United States) - `en-US`
 - **Secondary Language**: Turkish - `tr-TR`
 - **Category**: Tools / Productivity
@@ -114,9 +114,11 @@ Google Play Console'da "Data safety" (Veri güvenliği) adımı için resmi yan�
 ---
 
 ## 4. Permissions & Justifications
-
+ 
 - `android.permission.INTERNET`: Required to create local HTTP/TCP sockets and stream files across the local Wi-Fi network.
 - `android.permission.ACCESS_NETWORK_STATE` & `ACCESS_WIFI_STATE`: Required to verify Wi-Fi connectivity and bind to local network interfaces.
 - `android.permission.CHANGE_WIFI_MULTICAST_STATE`: Required to receive UDP multicast beacons for local peer discovery on port 53317.
-- `android.permission.FOREGROUND_SERVICE` & `FOREGROUND_SERVICE_CONNECTED_DEVICE`: Required to maintain reliable background peer discovery and receive incoming files when screen is locked or app is in background.
+- `android.permission.FOREGROUND_SERVICE` & `FOREGROUND_SERVICE_DATA_SYNC`: Required to maintain reliable background peer discovery and receive incoming files when screen is locked or app is in background.
 - `android.permission.POST_NOTIFICATIONS`: Required on Android 13+ to show persistent service status and transfer progress indicators.
+- `android.permission.BLUETOOTH`, `BLUETOOTH_ADMIN`, `BLUETOOTH_CONNECT`: Required to support alternative direct Bluetooth file sharing when local Wi-Fi networks have AP client isolation or are unavailable.
+

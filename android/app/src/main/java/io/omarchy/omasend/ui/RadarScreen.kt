@@ -10,13 +10,16 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -35,31 +38,44 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.AddLink
+import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.Folder
-import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.Laptop
 import androidx.compose.material.icons.filled.PhoneAndroid
+import androidx.compose.material.icons.filled.QrCode
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Wifi
+import androidx.compose.material.icons.filled.WifiTethering
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilledTonalIconButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -73,6 +89,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -84,15 +102,7 @@ import io.omarchy.omasend.model.IncomingTransferPrompt
 import io.omarchy.omasend.model.TransferFileInfo
 import io.omarchy.omasend.model.TransferProgressState
 import io.omarchy.omasend.network.NetworkUtils
-import io.omarchy.omasend.ui.theme.OmarchyBlue
-import io.omarchy.omasend.ui.theme.OmarchyBorder
-import io.omarchy.omasend.ui.theme.OmarchyCardBg
-import io.omarchy.omasend.ui.theme.OmarchyCyan
-import io.omarchy.omasend.ui.theme.OmarchyDarkBg
-import io.omarchy.omasend.ui.theme.OmarchyGreen
-import io.omarchy.omasend.ui.theme.OmarchyRed
-import io.omarchy.omasend.ui.theme.OmarchyTextPrimary
-import io.omarchy.omasend.ui.theme.OmarchyTextSecondary
+import io.omarchy.omasend.network.TransferBridge
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -112,6 +122,8 @@ fun RadarScreen(
     var selectedPeer by remember { mutableStateOf<DiscoveredPeer?>(null) }
     var transferState by remember { mutableStateOf<TransferProgressState>(TransferProgressState.Idle) }
     var showSettingsDialog by remember { mutableStateOf(false) }
+    var showQrDialog by remember { mutableStateOf(false) }
+    var showDirectIpDialog by remember { mutableStateOf(false) }
 
     val filePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
@@ -126,116 +138,141 @@ fun RadarScreen(
         }
     }
 
+    val bluetoothFilePicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetMultipleContents()
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            TransferBridge.sendViaBluetooth(context, uris)
+        }
+    }
+
     Scaffold(
         topBar = {
-            TopAppBar(
+            CenterAlignedTopAppBar(
                 title = {
-                    Column {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                text = "OmaSend",
-                                fontWeight = FontWeight.Bold,
-                                color = OmarchyCyan,
-                                fontSize = 20.sp
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        Text(
+                            text = "OmaSend",
+                            fontWeight = FontWeight.Bold,
+                            style = MaterialTheme.typography.titleLarge,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = MaterialTheme.colorScheme.secondaryContainer
+                        ) {
                             Text(
                                 text = "AirBridge",
-                                fontWeight = FontWeight.Medium,
-                                color = OmarchyTextSecondary,
-                                fontSize = 14.sp
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
                             )
                         }
-                        Text(
-                            text = "${NetworkUtils.getDeviceName(context)} (${NetworkUtils.getLocalIpAddress()}:53317)",
-                            color = OmarchyTextSecondary,
-                            fontSize = 12.sp,
-                            fontFamily = FontFamily.Monospace
-                        )
                     }
                 },
                 actions = {
+                    IconButton(onClick = { showQrDialog = true }) {
+                        Icon(
+                            Icons.Default.QrCode,
+                            contentDescription = "QR / Barkod",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    IconButton(onClick = { showDirectIpDialog = true }) {
+                        Icon(
+                            Icons.Default.AddLink,
+                            contentDescription = "Doğrudan IP",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                     IconButton(onClick = {
                         app.discoveryManager.stop()
                         app.discoveryManager.start()
-                        Toast.makeText(context, "Refreshing nearby peers...", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "Scanning local network...", Toast.LENGTH_SHORT).show()
                     }) {
-                        Icon(Icons.Default.Refresh, contentDescription = "Refresh", tint = OmarchyCyan)
+                        Icon(
+                            Icons.Default.Refresh,
+                            contentDescription = "Scan",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
                     IconButton(onClick = { showSettingsDialog = true }) {
-                        Icon(Icons.Default.Settings, contentDescription = "Settings", tint = OmarchyTextSecondary)
+                        Icon(
+                            Icons.Default.Settings,
+                            contentDescription = "Settings",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = OmarchyDarkBg
+                    containerColor = MaterialTheme.colorScheme.surface
                 )
             )
         },
-        containerColor = OmarchyDarkBg
+        containerColor = MaterialTheme.colorScheme.background
     ) { padding ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .padding(16.dp)
+                .padding(horizontal = 16.dp, vertical = 8.dp)
         ) {
-            // Transfer Progress Indicator
+            // Local Device Status Banner
+            LocalDeviceHeroCard(context = context)
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            // Active Transfer Status Indicator
             AnimatedVisibility(visible = transferState !is TransferProgressState.Idle) {
-                TransferStatusCard(
-                    state = transferState,
-                    onDismiss = { transferState = TransferProgressState.Idle }
-                )
-                Spacer(modifier = Modifier.height(16.dp))
+                Column {
+                    TransferStatusCard(
+                        state = transferState,
+                        onDismiss = { transferState = TransferProgressState.Idle }
+                    )
+                    Spacer(modifier = Modifier.height(14.dp))
+                }
             }
 
-            // Radar Scan Header
+            // Radar Scan Header with Badge
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    text = "DISCOVERED PEERS (${peers.size})",
-                    color = OmarchyCyan,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Bold,
-                    letterSpacing = 1.sp
-                )
-                PulseBeaconIndicator()
-            }
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            if (peers.isEmpty()) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(OmarchyCardBg)
-                        .border(1.dp, OmarchyBorder, RoundedCornerShape(12.dp)),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(36.dp),
-                            color = OmarchyCyan,
-                            strokeWidth = 3.dp
-                        )
-                        Spacer(modifier = Modifier.height(16.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = "NEARBY PEERS",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary,
+                        letterSpacing = 1.sp
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Surface(
+                        shape = CircleShape,
+                        color = if (peers.isNotEmpty()) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
+                    ) {
                         Text(
-                            text = "Scanning network on port 53317...",
-                            color = OmarchyTextPrimary,
-                            fontSize = 14.sp
-                        )
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            text = "Ensure other PCs have OmaSend running",
-                            color = OmarchyTextSecondary,
-                            fontSize = 12.sp
+                            text = "${peers.size}",
+                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = if (peers.isNotEmpty()) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 }
+                PulseBeaconIndicator()
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            if (peers.isEmpty()) {
+                ModernRadarEmptyState(modifier = Modifier.weight(1f))
             } else {
                 LazyColumn(
                     modifier = Modifier
@@ -266,40 +303,53 @@ fun RadarScreen(
                 }
             }
 
-            // Selected Peer Action Panel
+            // Selected Peer Quick Actions Sheet
             AnimatedVisibility(visible = selectedPeer != null) {
                 selectedPeer?.let { peer ->
-                    Card(
+                    ElevatedCard(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(top = 16.dp),
-                        colors = CardDefaults.cardColors(containerColor = OmarchyCardBg),
-                        shape = RoundedCornerShape(12.dp),
-                        border = androidx.compose.foundation.BorderStroke(1.dp, OmarchyCyan)
+                            .padding(top = 12.dp),
+                        shape = RoundedCornerShape(20.dp),
+                        colors = CardDefaults.elevatedCardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
+                        )
                     ) {
                         Column(modifier = Modifier.padding(16.dp)) {
-                            Text(
-                                text = "Quick Actions: ${peer.name}",
-                                color = OmarchyTextPrimary,
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 14.sp
-                            )
-                            Spacer(modifier = Modifier.height(12.dp))
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Send to ${peer.name}",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                TextButton(onClick = { selectedPeer = null }) {
+                                    Text("Close", color = MaterialTheme.colorScheme.primary)
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
                                 Button(
                                     onClick = { filePickerLauncher.launch("*/*") },
                                     modifier = Modifier.weight(1f),
-                                    colors = ButtonDefaults.buttonColors(containerColor = OmarchyCyan),
-                                    shape = RoundedCornerShape(8.dp)
+                                    shape = RoundedCornerShape(14.dp)
                                 ) {
-                                    Icon(Icons.Default.Folder, contentDescription = null, tint = OmarchyDarkBg, modifier = Modifier.size(16.dp))
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text("Send File", color = OmarchyDarkBg, fontWeight = FontWeight.Bold)
+                                    Icon(
+                                        Icons.Default.Folder,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text("Send File", fontWeight = FontWeight.SemiBold)
                                 }
-                                Button(
+                                FilledTonalButton(
                                     onClick = {
                                         scope.launch {
                                             sendClipboardToPeer(context, app, peer) { state ->
@@ -308,15 +358,90 @@ fun RadarScreen(
                                         }
                                     },
                                     modifier = Modifier.weight(1f),
-                                    colors = ButtonDefaults.buttonColors(containerColor = OmarchyBlue),
-                                    shape = RoundedCornerShape(8.dp)
+                                    shape = RoundedCornerShape(14.dp)
                                 ) {
-                                    Icon(Icons.Default.ContentCopy, contentDescription = null, tint = OmarchyDarkBg, modifier = Modifier.size(16.dp))
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text("Clipboard", color = OmarchyDarkBg, fontWeight = FontWeight.Bold)
+                                    Icon(
+                                        Icons.Default.ContentCopy,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text("Clipboard", fontWeight = FontWeight.SemiBold)
                                 }
                             }
                         }
+                    }
+                }
+            }
+
+            // Alternative Transfer Channels Row (Bluetooth, QR Code, Direct IP)
+            Surface(
+                shape = RoundedCornerShape(16.dp),
+                color = MaterialTheme.colorScheme.surfaceContainer,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 10.dp)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 4.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    TextButton(
+                        onClick = { bluetoothFilePicker.launch("*/*") }
+                    ) {
+                        Icon(
+                            Icons.Default.Bluetooth,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Bluetooth",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+
+                    TextButton(
+                        onClick = { showQrDialog = true }
+                    ) {
+                        Icon(
+                            Icons.Default.QrCode,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "QR / Barkod",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+
+                    TextButton(
+                        onClick = { showDirectIpDialog = true }
+                    ) {
+                        Icon(
+                            Icons.Default.AddLink,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Manuel IP",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
                     }
                 }
             }
@@ -326,51 +451,97 @@ fun RadarScreen(
         if (incomingPrompt != null) {
             AlertDialog(
                 onDismissRequest = { onDeclinePrompt(incomingPrompt.token) },
-                containerColor = OmarchyCardBg,
-                title = {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.PhoneAndroid, contentDescription = null, tint = OmarchyCyan)
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text("Incoming File Request", color = OmarchyTextPrimary, fontWeight = FontWeight.Bold)
+                shape = RoundedCornerShape(28.dp),
+                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                icon = {
+                    Surface(
+                        shape = CircleShape,
+                        color = MaterialTheme.colorScheme.primaryContainer,
+                        modifier = Modifier.size(48.dp)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                Icons.Default.PhoneAndroid,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
                     }
+                },
+                title = {
+                    Text(
+                        text = "Incoming Transfer",
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
                 },
                 text = {
                     Column {
                         Text(
-                            text = "'${incomingPrompt.senderName}' wants to send you files:",
-                            color = OmarchyTextPrimary,
-                            fontSize = 14.sp
+                            text = "${incomingPrompt.senderName} wants to share files with you:",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        incomingPrompt.files.forEach { file ->
-                            Text(
-                                text = "- ${file.name} (${NetworkUtils.formatBytes(file.size_bytes)})",
-                                color = OmarchyCyan,
-                                fontSize = 13.sp,
-                                fontFamily = FontFamily.Monospace
-                            )
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Surface(
+                            shape = RoundedCornerShape(16.dp),
+                            color = MaterialTheme.colorScheme.surfaceContainer,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(modifier = Modifier.padding(12.dp)) {
+                                incomingPrompt.files.forEach { file ->
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.padding(vertical = 2.dp)
+                                    ) {
+                                        Icon(
+                                            Icons.Default.Folder,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            text = file.name,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            fontWeight = FontWeight.Medium,
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
+                                        Spacer(modifier = Modifier.weight(1f))
+                                        Text(
+                                            text = NetworkUtils.formatBytes(file.size_bytes),
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            fontFamily = FontFamily.Monospace
+                                        )
+                                    }
+                                }
+                            }
                         }
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = "Total Size: ${NetworkUtils.formatBytes(incomingPrompt.totalSizeBytes)}",
-                            color = OmarchyTextSecondary,
-                            fontSize = 12.sp
+                            text = "Total Payload: ${NetworkUtils.formatBytes(incomingPrompt.totalSizeBytes)}",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 },
                 confirmButton = {
                     Button(
                         onClick = { onAcceptPrompt(incomingPrompt.token) },
-                        colors = ButtonDefaults.buttonColors(containerColor = OmarchyGreen)
+                        shape = RoundedCornerShape(12.dp)
                     ) {
-                        Text("Accept", color = Color.White, fontWeight = FontWeight.Bold)
+                        Text("Accept", fontWeight = FontWeight.Bold)
                     }
                 },
                 dismissButton = {
                     OutlinedButton(
-                        onClick = { onDeclinePrompt(incomingPrompt.token) }
+                        onClick = { onDeclinePrompt(incomingPrompt.token) },
+                        shape = RoundedCornerShape(12.dp)
                     ) {
-                        Text("Decline", color = OmarchyRed)
+                        Text("Decline", color = MaterialTheme.colorScheme.error)
                     }
                 }
             )
@@ -381,30 +552,41 @@ fun RadarScreen(
             var newName by remember { mutableStateOf(NetworkUtils.getDeviceName(context)) }
             AlertDialog(
                 onDismissRequest = { showSettingsDialog = false },
-                containerColor = OmarchyCardBg,
-                title = { Text("Device Settings", color = OmarchyTextPrimary) },
+                shape = RoundedCornerShape(28.dp),
+                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                title = {
+                    Text(
+                        text = "Device Settings",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                },
                 text = {
                     Column {
-                        Text("Device Name (visible to peers):", color = OmarchyTextSecondary, fontSize = 12.sp)
+                        Text(
+                            text = "Device Name (visible to nearby peers):",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                         Spacer(modifier = Modifier.height(8.dp))
                         OutlinedTextField(
                             value = newName,
                             onValueChange = { newName = it },
                             singleLine = true,
-                            colors = androidx.compose.material3.TextFieldDefaults.colors(
-                                focusedTextColor = OmarchyTextPrimary,
-                                unfocusedTextColor = OmarchyTextPrimary,
-                                focusedContainerColor = OmarchyDarkBg,
-                                unfocusedContainerColor = OmarchyDarkBg
-                            )
+                            shape = RoundedCornerShape(14.dp),
+                            modifier = Modifier.fillMaxWidth()
                         )
                     }
                 },
                 confirmButton = {
-                    Button(onClick = {
-                        NetworkUtils.setDeviceName(context, newName)
-                        showSettingsDialog = false
-                    }) {
+                    Button(
+                        onClick = {
+                            NetworkUtils.setDeviceName(context, newName)
+                            showSettingsDialog = false
+                        },
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
                         Text("Save")
                     }
                 },
@@ -414,6 +596,106 @@ fun RadarScreen(
                     }
                 }
             )
+        }
+
+        if (showQrDialog) {
+            QrCodeDialog(
+                onDismiss = { showQrDialog = false },
+                onConnectEndpoint = { endpoint ->
+                    val parsed = TransferBridge.parseConnectionEndpoint(endpoint)
+                    if (parsed != null) {
+                        app.discoveryManager.addManualPeer(parsed.first, parsed.second)
+                        Toast.makeText(context, "Cihaz eklendi: ${parsed.first}", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(context, "Girdi geçersiz IPv4 veya endpoint", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            )
+        }
+
+        if (showDirectIpDialog) {
+            DirectIpDialog(
+                onDismiss = { showDirectIpDialog = false },
+                onConnect = { ip, port ->
+                    app.discoveryManager.addManualPeer(ip, port)
+                    Toast.makeText(context, "Doğrudan bağlantı eklendi: $ip:$port", Toast.LENGTH_SHORT).show()
+                }
+            )
+        }
+    }
+}
+
+
+@Composable
+fun LocalDeviceHeroCard(context: Context) {
+    ElevatedCard(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(22.dp),
+        colors = CardDefaults.elevatedCardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainer
+        )
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Surface(
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.primaryContainer,
+                modifier = Modifier.size(46.dp)
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        Icons.Default.PhoneAndroid,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                        modifier = Modifier.size(24.dp)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.width(14.dp))
+
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = NetworkUtils.getDeviceName(context),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Text(
+                    text = "${NetworkUtils.getLocalIpAddress()}:53317",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontFamily = FontFamily.Monospace
+                )
+            }
+
+            Surface(
+                shape = RoundedCornerShape(10.dp),
+                color = MaterialTheme.colorScheme.secondaryContainer
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        Icons.Default.Wifi,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                        modifier = Modifier.size(12.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = "Active",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer
+                    )
+                }
+            }
         }
     }
 }
@@ -426,15 +708,17 @@ fun PeerCard(
     onSendFile: () -> Unit,
     onSendClipboard: () -> Unit
 ) {
-    Card(
+    ElevatedCard(
         modifier = Modifier
             .fillMaxWidth()
             .clickable { onClick() },
-        shape = RoundedCornerShape(12.dp),
-        colors = CardDefaults.cardColors(containerColor = OmarchyCardBg),
-        border = androidx.compose.foundation.BorderStroke(
-            1.dp,
-            if (isSelected) OmarchyCyan else OmarchyBorder
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.elevatedCardColors(
+            containerColor = if (isSelected) {
+                MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f)
+            } else {
+                MaterialTheme.colorScheme.surfaceContainer
+            }
         )
     ) {
         Row(
@@ -443,44 +727,152 @@ fun PeerCard(
                 .padding(14.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Box(
-                modifier = Modifier
-                    .size(44.dp)
-                    .clip(CircleShape)
-                    .background(OmarchyDarkBg)
-                    .border(1.dp, OmarchyCyan, CircleShape),
-                contentAlignment = Alignment.Center
+            Surface(
+                shape = RoundedCornerShape(14.dp),
+                color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondaryContainer,
+                modifier = Modifier.size(44.dp)
             ) {
-                Icon(
-                    Icons.Default.Computer,
-                    contentDescription = null,
-                    tint = OmarchyCyan,
-                    modifier = Modifier.size(22.dp)
-                )
+                Box(contentAlignment = Alignment.Center) {
+                    val icon = if (peer.name.lowercase().contains("phone") || peer.name.lowercase().contains("android")) {
+                        Icons.Default.PhoneAndroid
+                    } else if (peer.name.lowercase().contains("laptop") || peer.name.lowercase().contains("thinkpad")) {
+                        Icons.Default.Laptop
+                    } else {
+                        Icons.Default.Computer
+                    }
+                    Icon(
+                        icon,
+                        contentDescription = null,
+                        tint = if (isSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSecondaryContainer,
+                        modifier = Modifier.size(22.dp)
+                    )
+                }
             }
 
-            Spacer(modifier = Modifier.width(12.dp))
+            Spacer(modifier = Modifier.width(14.dp))
 
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = peer.name,
-                    color = OmarchyTextPrimary,
+                    style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold,
-                    fontSize = 15.sp
+                    color = MaterialTheme.colorScheme.onSurface
                 )
                 Text(
                     text = "${peer.ip}:${peer.port} • ${peer.transport}",
-                    color = OmarchyTextSecondary,
-                    fontSize = 12.sp,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                     fontFamily = FontFamily.Monospace
                 )
             }
 
-            IconButton(onClick = onSendClipboard) {
-                Icon(Icons.Default.ContentCopy, contentDescription = "Sync Clipboard", tint = OmarchyBlue)
+            FilledTonalIconButton(onClick = onSendClipboard) {
+                Icon(
+                    Icons.Default.ContentCopy,
+                    contentDescription = "Sync Clipboard",
+                    modifier = Modifier.size(18.dp)
+                )
             }
-            IconButton(onClick = onSendFile) {
-                Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send File", tint = OmarchyCyan)
+            Spacer(modifier = Modifier.width(6.dp))
+            FilledTonalIconButton(onClick = onSendFile) {
+                Icon(
+                    Icons.AutoMirrored.Filled.Send,
+                    contentDescription = "Send File",
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun ModernRadarEmptyState(modifier: Modifier = Modifier) {
+    val infiniteTransition = rememberInfiniteTransition(label = "radarWaves")
+    val wave1 by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(2400, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "wave1"
+    )
+    val wave2 by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(2400, delayMillis = 1200, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "wave2"
+    )
+
+    val primaryColor = MaterialTheme.colorScheme.primary
+
+    ElevatedCard(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(24.dp)),
+        colors = CardDefaults.elevatedCardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainer
+        )
+    ) {
+        Box(
+            modifier = Modifier.fillMaxSize(),
+            contentAlignment = Alignment.Center
+        ) {
+            Canvas(modifier = Modifier.size(240.dp)) {
+                val maxRadius = size.minDimension / 2f
+                // Inner ring
+                drawCircle(
+                    color = primaryColor.copy(alpha = 0.12f),
+                    radius = maxRadius * 0.35f
+                )
+                // Wave 1
+                drawCircle(
+                    color = primaryColor.copy(alpha = (1f - wave1) * 0.3f),
+                    radius = maxRadius * wave1,
+                    style = Stroke(width = 2.dp.toPx())
+                )
+                // Wave 2
+                drawCircle(
+                    color = primaryColor.copy(alpha = (1f - wave2) * 0.3f),
+                    radius = maxRadius * wave2,
+                    style = Stroke(width = 2.dp.toPx())
+                )
+            }
+
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier.padding(24.dp)
+            ) {
+                Surface(
+                    shape = CircleShape,
+                    color = MaterialTheme.colorScheme.primaryContainer,
+                    modifier = Modifier.size(54.dp)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            Icons.Default.WifiTethering,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                            modifier = Modifier.size(28.dp)
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(16.dp))
+                Text(
+                    text = "Scanning Wi-Fi on port 53317",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = "Open OmaSend on your PC or other Android devices",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
     }
@@ -491,51 +883,69 @@ fun TransferStatusCard(
     state: TransferProgressState,
     onDismiss: () -> Unit
 ) {
-    Card(
+    ElevatedCard(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(12.dp),
-        colors = CardDefaults.cardColors(containerColor = OmarchyCardBg),
-        border = androidx.compose.foundation.BorderStroke(1.dp, OmarchyBorder)
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.elevatedCardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
+        )
     ) {
-        Column(modifier = Modifier.padding(14.dp)) {
+        Column(modifier = Modifier.padding(16.dp)) {
             when (state) {
                 is TransferProgressState.Requesting -> {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        CircularProgressIndicator(modifier = Modifier.size(18.dp), color = OmarchyCyan, strokeWidth = 2.dp)
-                        Spacer(modifier = Modifier.width(10.dp))
-                        Text("Requesting transfer to '${state.peerName}'...", color = OmarchyTextPrimary, fontSize = 13.sp)
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            color = MaterialTheme.colorScheme.primary,
+                            strokeWidth = 2.5.dp
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Text(
+                            text = "Requesting transfer to '${state.peerName}'...",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
                     }
                 }
                 is TransferProgressState.WaitingConsent -> {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        CircularProgressIndicator(modifier = Modifier.size(18.dp), color = OmarchyCyan, strokeWidth = 2.dp)
-                        Spacer(modifier = Modifier.width(10.dp))
-                        Text("Waiting for '${state.peerName}' to accept...", color = OmarchyCyan, fontSize = 13.sp)
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            color = MaterialTheme.colorScheme.primary,
+                            strokeWidth = 2.5.dp
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Text(
+                            text = "Waiting for '${state.peerName}' to accept...",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Medium,
+                            color = MaterialTheme.colorScheme.primary
+                        )
                     }
                 }
                 is TransferProgressState.Transferring -> {
                     Text(
                         text = if (state.isUploading) "Uploading to '${state.peerName}'" else "Receiving from '${state.peerName}'",
-                        color = OmarchyTextPrimary,
+                        style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.Bold,
-                        fontSize = 13.sp
+                        color = MaterialTheme.colorScheme.onSurface
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
                         text = "${state.fileName} (${NetworkUtils.formatBytes(state.bytesTransferred)} / ${NetworkUtils.formatBytes(state.totalBytes)})",
-                        color = OmarchyTextSecondary,
-                        fontSize = 12.sp,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         fontFamily = FontFamily.Monospace
                     )
-                    Spacer(modifier = Modifier.height(8.dp))
+                    Spacer(modifier = Modifier.height(10.dp))
                     LinearProgressIndicator(
                         progress = { state.percent / 100f },
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(6.dp)
-                            .clip(RoundedCornerShape(3.dp)),
-                        color = OmarchyCyan,
-                        trackColor = OmarchyDarkBg
+                            .height(8.dp)
+                            .clip(RoundedCornerShape(4.dp)),
+                        color = MaterialTheme.colorScheme.primary,
+                        trackColor = MaterialTheme.colorScheme.surfaceVariant
                     )
                 }
                 is TransferProgressState.Success -> {
@@ -545,12 +955,22 @@ fun TransferStatusCard(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Default.CheckCircle, contentDescription = null, tint = OmarchyGreen, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(state.message, color = OmarchyGreen, fontSize = 13.sp)
+                            Icon(
+                                Icons.Default.CheckCircle,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text(
+                                text = state.message,
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Medium,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
                         }
                         TextButton(onClick = onDismiss) {
-                            Text("OK", color = OmarchyCyan)
+                            Text("OK", color = MaterialTheme.colorScheme.primary)
                         }
                     }
                 }
@@ -561,12 +981,21 @@ fun TransferStatusCard(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Default.Error, contentDescription = null, tint = OmarchyRed, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(state.message, color = OmarchyRed, fontSize = 13.sp)
+                            Icon(
+                                Icons.Default.Error,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text(
+                                text = state.message,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.error
+                            )
                         }
                         TextButton(onClick = onDismiss) {
-                            Text("Dismiss", color = OmarchyTextSecondary)
+                            Text("Dismiss", color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }
                 }
@@ -581,7 +1010,7 @@ fun PulseBeaconIndicator() {
     val infiniteTransition = rememberInfiniteTransition(label = "pulse")
     val scale by infiniteTransition.animateFloat(
         initialValue = 0.8f,
-        targetValue = 1.2f,
+        targetValue = 1.3f,
         animationSpec = infiniteRepeatable(
             animation = tween(1000, easing = FastOutSlowInEasing),
             repeatMode = RepeatMode.Reverse
@@ -589,12 +1018,14 @@ fun PulseBeaconIndicator() {
         label = "pulseScale"
     )
 
+    val color = MaterialTheme.colorScheme.primary
+
     Box(
         modifier = Modifier
             .size(10.dp)
             .scale(scale)
             .clip(CircleShape)
-            .background(OmarchyGreen)
+            .background(color)
     )
 }
 
@@ -715,3 +1146,259 @@ suspend fun sendClipboardToPeer(
 private fun scopeLaunchMain(block: () -> Unit) {
     android.os.Handler(android.os.Looper.getMainLooper()).post(block)
 }
+
+@Composable
+fun QrCodeDialog(
+    onDismiss: () -> Unit,
+    onConnectEndpoint: (String) -> Unit
+) {
+    val context = LocalContext.current
+    val myIp = NetworkUtils.getLocalIpAddress()
+    val endpointUrl = "http://$myIp:${NetworkUtils.PORT}"
+    val qrBitmap = remember(endpointUrl) {
+        TransferBridge.generateQrCode(endpointUrl, 512)
+    }
+    var manualInput by remember { mutableStateOf("") }
+    var inputError by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        shape = RoundedCornerShape(28.dp),
+        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Default.QrCode,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(24.dp)
+                )
+                Spacer(modifier = Modifier.width(10.dp))
+                Text(
+                    text = "QR / Barkod ile Bağlan",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+            }
+        },
+        text = {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = "Aynı ağdaki başka bir telefon veya PC tarayıcısından bu kodu okutarak bağlanabilir:",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(14.dp))
+
+                // White surface container for high-contrast QR scannability in all themes
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = Color.White,
+                    modifier = Modifier.size(200.dp)
+                ) {
+                    Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(12.dp)) {
+                        if (qrBitmap != null) {
+                            Image(
+                                bitmap = qrBitmap.asImageBitmap(),
+                                contentDescription = "OmaSend Connection QR Code",
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        } else {
+                            CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainer,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = endpointUrl,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        IconButton(
+                            onClick = {
+                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                                clipboard?.setPrimaryClip(ClipData.newPlainText("OmaSend Endpoint", endpointUrl))
+                                Toast.makeText(context, "URL panoya kopyalandı", Toast.LENGTH_SHORT).show()
+                            },
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.ContentCopy,
+                                contentDescription = "Copy",
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                Spacer(modifier = Modifier.height(12.dp))
+
+                Text(
+                    text = "Veya taranan QR metnini / IP adresini girin:",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.align(Alignment.Start)
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                OutlinedTextField(
+                    value = manualInput,
+                    onValueChange = {
+                        manualInput = it
+                        inputError = null
+                    },
+                    placeholder = { Text("Örn: 192.168.1.50:53317", fontSize = 13.sp) },
+                    singleLine = true,
+                    isError = inputError != null,
+                    supportingText = inputError?.let { { Text(it, color = MaterialTheme.colorScheme.error) } },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp)
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    if (manualInput.isNotBlank()) {
+                        val endpoint = TransferBridge.parseConnectionEndpoint(manualInput)
+                        if (endpoint != null) {
+                            onConnectEndpoint(manualInput)
+                            onDismiss()
+                        } else {
+                            inputError = "Geçersiz IP adresi veya format (IPv4 zorunlu)"
+                        }
+                    } else {
+                        onDismiss()
+                    }
+                },
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Text(if (manualInput.isNotBlank()) "Bağlan" else "Tamam")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Kapat")
+            }
+        }
+    )
+}
+
+@Composable
+fun DirectIpDialog(
+    onDismiss: () -> Unit,
+    onConnect: (String, Int) -> Unit
+) {
+    var ipText by remember { mutableStateOf("") }
+    var portText by remember { mutableStateOf("53317") }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        shape = RoundedCornerShape(28.dp),
+        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Default.AddLink,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(24.dp)
+                )
+                Spacer(modifier = Modifier.width(10.dp))
+                Text(
+                    text = "Doğrudan IP ile Bağlan",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+            }
+        },
+        text = {
+            Column {
+                Text(
+                    text = "UDP yayın paketlerini engelleyen kısıtlı veya misafir ağlarında cihazın IP adresini girerek doğrudan bağlanabilirsiniz.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(14.dp))
+                OutlinedTextField(
+                    value = ipText,
+                    onValueChange = {
+                        ipText = it
+                        errorMessage = null
+                    },
+                    label = { Text("Hedef IP Adresi") },
+                    placeholder = { Text("192.168.1.50") },
+                    singleLine = true,
+                    isError = errorMessage != null,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp)
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                OutlinedTextField(
+                    value = portText,
+                    onValueChange = { portText = it },
+                    label = { Text("Port") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp)
+                )
+                if (errorMessage != null) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = errorMessage!!,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    val trimmedIp = ipText.trim()
+                    val port = portText.trim().toIntOrNull() ?: 53317
+                    if (!TransferBridge.isValidIpv4(trimmedIp)) {
+                        errorMessage = "Lütfen geçerli bir IPv4 adresi girin (örn: 192.168.1.50)"
+                        return@Button
+                    }
+                    if (port !in 1024..65535) {
+                        errorMessage = "Port numarası 1024 ile 65535 arasında olmalıdır"
+                        return@Button
+                    }
+                    onConnect(trimmedIp, port)
+                    onDismiss()
+                },
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Text("Cihazı Ekle")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("İptal")
+            }
+        }
+    )
+}
+

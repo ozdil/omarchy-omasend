@@ -94,6 +94,7 @@ dependencies {
   // Network & Serialization
   implementation(libs.okhttp)
   implementation(libs.kotlinx.serialization.json)
+  implementation(libs.zxing.core)
 
   // Tooling
   debugImplementation(libs.androidx.compose.ui.tooling)
