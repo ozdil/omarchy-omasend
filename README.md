@@ -83,16 +83,22 @@ omarchy-restart-shell
 ```
 
 ### 3. OmaSend for Android (Companion Application)
-The `android/` directory contains the native Android companion app built with Kotlin, Jetpack Compose, and Material 3.
 
-To compile the Android debug package:
+OmaSend features an official native Android companion app built with modern Kotlin, Jetpack Compose, and Material 3. It provides seamless, bidirectional file streaming and clipboard synchronization directly from your mobile device.
+
+- **Source Repository:** [ozdil/omasend-android](https://github.com/ozdil/omasend-android)
+
+#### 🛡️ Official Google Play Closed Beta:
+OmaSend for Android is distributed officially via Google Play:
+1. **Join Tester Community:** [OmaSend Testers Google Group](https://groups.google.com/g/omasend-testers) *(Click "Join group")*
+2. **Opt-in to Beta:** [Google Play Testing Opt-in](https://play.google.com/apps/testing/io.omarchy.omasend) *(Click "Become a tester")*
+3. **Download on Google Play:** [OmaSend on Google Play](https://play.google.com/store/apps/details?id=io.omarchy.omasend)
+
+#### Build from Source:
 ```bash
 cd ~/.config/omarchy/plugins/ozdil.omasend && ./build-android.sh
-```
-This generates `omasend-debug.apk` in the project root.
 
-To install directly to a connected Android phone via ADB:
-```bash
+# Install directly via ADB:
 adb install -r omasend-debug.apk
 ```
 
