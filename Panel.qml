@@ -171,6 +171,7 @@ Panel {
   Process { id: folderProc }
 
   Timer {
+    id: refreshTimer
     interval: root.wanConnecting ? 1000 : 3000
     running: root.opened || root.wanConnecting
     repeat: true
@@ -179,6 +180,7 @@ Panel {
 
   // Background watchdog to restart engine if terminated
   Timer {
+    id: watchdogTimer
     interval: 5000
     running: true
     repeat: true
@@ -199,6 +201,8 @@ Panel {
     if (actionProc.running) actionProc.running = false
     if (copyProc.running) copyProc.running = false
     if (folderProc.running) folderProc.running = false
+    if (refreshTimer.running) refreshTimer.running = false
+    if (watchdogTimer.running) watchdogTimer.running = false
   }
 
   BarIconButton {

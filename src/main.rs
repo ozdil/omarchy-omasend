@@ -168,6 +168,24 @@ fn get_shared_dir() -> PathBuf {
     dir
 }
 
+/// Queries available disk space in bytes on the filesystem containing the given path
+pub fn get_available_disk_space(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs is a standard POSIX libc call with a valid null-terminated path and valid buffer.
+    unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
+            let bavail = stat.f_bavail as u64;
+            let bsize = stat.f_frsize as u64;
+            Some(bavail.saturating_mul(bsize))
+        } else {
+            None
+        }
+    }
+}
+
 // ------------------- PIN & E2EE KEY MANAGEMENT (SECURE 0600) -------------------
 
 /// Reads a sensitive file (pin.txt or session_key.txt) verifying:
@@ -534,6 +552,9 @@ fn start_wan_tunnel() -> Result<String, String> {
             "--logfile",
             log_file.to_str().unwrap_or(""),
         ])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/local/bin")
+        .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -650,22 +671,9 @@ fn get_pc_clipboard() -> String {
 
 fn set_pc_clipboard(text: &str) {
     let env_store = get_desktop_gui_envs();
-    let mut cmd = Command::new("/usr/bin/wl-copy");
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-
-    for (k, v) in env_store {
-        cmd.env(k, v);
-    }
-
-    if let Ok(mut child) = cmd.spawn() {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
-            drop(stdin);
-        }
-        let _ = child.wait();
-    }
+    let envs: Vec<(&str, &str)> = env_store.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let deadline = Instant::now() + Duration::from_millis(800);
+    let _ = subproc::run_cmd_write_stdin_bounded("/usr/bin/wl-copy", &[], &envs, text.as_bytes(), deadline);
 }
 
 fn sanitize_filename(raw: &str) -> String {
@@ -704,7 +712,7 @@ fn get_unique_filepath(dir: &Path, filename: &str) -> PathBuf {
             return candidate_path;
         }
     }
-    dir.join(format!("{}_{}", stem, SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()))
+    dir.join(format!("{}_{}", stem, SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()))
 }
 
 fn get_directory_files(dir: &Path) -> Vec<FileInfo> {
@@ -917,8 +925,18 @@ fn save_discovered_peers(peers: &[DiscoveredPeer]) {
 }
 
 fn is_local_subnet_or_private_ip(ip: &str) -> bool {
-    if ip.starts_with("192.168.") || ip.starts_with("10.") || ip == "127.0.0.1" {
+    if ip.starts_with("192.168.") || ip.starts_with("10.") || ip == "127.0.0.1" || ip == "::1" || ip.starts_with("169.254.") {
         return true;
+    }
+    // Carrier-Grade NAT & Tailscale: 100.64.0.0/10 (100.64.0.0 - 100.127.255.255)
+    if ip.starts_with("100.") {
+        if let Some(second) = ip.split('.').nth(1) {
+            if let Ok(num) = second.parse::<u8>() {
+                if (64..=127).contains(&num) {
+                    return true;
+                }
+            }
+        }
     }
     if ip.starts_with("172.") {
         if let Some(second) = ip.split('.').nth(1) {
@@ -1057,8 +1075,8 @@ fn connect_peer_with_timeout(addr_str: &str, timeout: Duration) -> Result<TcpStr
         }
     }
     Err(format!(
-        "Connection timed out to '{}'. Ensure port 8844 TCP is open in firewall (UFW).",
-        addr_str
+        "Connection timed out to '{}'. Ensure port {} TCP is open in firewall (UFW).",
+        addr_str, PORT
     ))
 }
 
@@ -1276,6 +1294,9 @@ fn read_full_http_request(stream: &mut TcpStream) -> Option<(HttpRequest, Vec<u8
             Ok(bytes) if bytes > 0 => bytes,
             _ => break,
         };
+        if buffer.len().saturating_add(n) > MAX_BODY_SIZE.saturating_add(MAX_HEADER_SIZE) {
+            return None; // Buffer overrun protection
+        }
         buffer.extend_from_slice(&temp[..n]);
 
         if header_end.is_none() {
@@ -2031,6 +2052,19 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             }
         }
 
+        let ddir = get_download_dir();
+        if let Some(avail) = get_available_disk_space(&ddir) {
+            if total_size_bytes.saturating_add(25 * 1024 * 1024) > avail {
+                let err = serde_json::json!({
+                    "error": "Insufficient disk space on recipient device",
+                    "available_bytes": avail,
+                    "required_bytes": total_size_bytes
+                });
+                respond(&stream, "413 Payload Too Large", "application/json", err.to_string().as_bytes(), None, None);
+                return;
+            }
+        }
+
         let mut token_bytes = [0u8; 16];
         let _ = getrandom::getrandom(&mut token_bytes);
         let token = hex::encode(token_bytes);
@@ -2119,6 +2153,12 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             if pending.token == token && pending.status == "ACCEPTED" && now <= pending.expires_at {
                 let body = &buffer[req.body_offset..];
                 let ddir = get_download_dir();
+                if let Some(avail) = get_available_disk_space(&ddir) {
+                    if (body.len() as u64).saturating_add(10 * 1024 * 1024) > avail {
+                        respond(&stream, "507 Insufficient Storage", "text/plain", b"Insufficient disk space to save file", None, None);
+                        return;
+                    }
+                }
                 let file_path = get_unique_filepath(&ddir, &clean_filename);
                 if write_secure_bytes(&file_path, body).is_ok() {
                     RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -2211,12 +2251,18 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
         match decrypt_aes256_gcm(key_hex, &iv_bytes, body) {
             Ok(decrypted) => {
                 let ddir = get_download_dir();
+                if let Some(avail) = get_available_disk_space(&ddir) {
+                    if (decrypted.len() as u64).saturating_add(10 * 1024 * 1024) > avail {
+                        respond(&stream, "507 Insufficient Storage", "text/plain", b"Insufficient disk space to save decrypted file", None, None);
+                        return;
+                    }
+                }
                 let file_path = get_unique_filepath(&ddir, &clean_filename);
                 if write_secure_bytes(&file_path, &decrypted).is_ok() {
                     RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
                     notify_desktop(
                         "OmaSend: E2EE File Received",
-                        &format!("'{}' ({} bytes) decrypted and saved to Downloads/omasend.", file_path.file_name().unwrap().to_string_lossy(), decrypted.len())
+                        &format!("'{}' ({} bytes) decrypted and saved to Downloads/omasend.", file_path.file_name().unwrap_or_default().to_string_lossy(), decrypted.len())
                     );
                     let resp = serde_json::json!({
                         "status": "OK",
@@ -2348,22 +2394,29 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
     else if req.method == "POST" && req.path == "/upload" {
         let ddir = get_download_dir();
         let body = &buffer[req.body_offset..];
-        let mut saved_name = format!("transfer_{}.bin", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
+        let mut saved_name = format!("transfer_{}.bin", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs());
         let body_str = String::from_utf8_lossy(body);
         if let Some(pos) = body_str.find("filename=\"") {
             if let Some(end) = body_str[pos + 10..].find('"') {
                 saved_name = sanitize_filename(&body_str[pos + 10..pos + 10 + end]);
             }
         }
-        let file_path = get_unique_filepath(&ddir, &saved_name);
         let data_start = body.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(0);
         let data_slice = if data_start < body.len() { &body[data_start..] } else { body };
 
+        if let Some(avail) = get_available_disk_space(&ddir) {
+            if (data_slice.len() as u64).saturating_add(10 * 1024 * 1024) > avail {
+                respond(&stream, "507 Insufficient Storage", "text/plain", b"Insufficient disk space to save file", None, None);
+                return;
+            }
+        }
+
+        let file_path = get_unique_filepath(&ddir, &saved_name);
         let _ = write_secure_bytes(&file_path, data_slice);
         RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
         notify_desktop(
             "OmaSend: File Received",
-            &format!("'{}' saved to Downloads/omasend.", file_path.file_name().unwrap().to_string_lossy()),
+            &format!("'{}' saved to Downloads/omasend.", file_path.file_name().unwrap_or_default().to_string_lossy()),
         );
         let resp = "{\"status\":\"OK\"}";
         respond(&stream, "200 OK", "application/json", resp.as_bytes(), None, None);
@@ -2650,7 +2703,9 @@ fn main() {
             p2p_discovered_peers: get_discovered_peers(),
             p2p_pending_transfer: get_pending_transfer(),
         };
-        println!("{}", serde_json::to_string_pretty(&state).unwrap());
+        if let Ok(s) = serde_json::to_string_pretty(&state) {
+            println!("{}", s);
+        }
         return;
     }
 
@@ -2930,6 +2985,13 @@ mod tests {
 
         let req_empty = HttpRequest::default();
         assert_eq!(extract_provided_pin(&req_empty), None);
+    }
+
+    #[test]
+    fn test_get_available_disk_space() {
+        let space = get_available_disk_space(Path::new("/tmp"));
+        assert!(space.is_some());
+        assert!(space.unwrap() > 0);
     }
 }
 

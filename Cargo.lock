@@ -172,6 +172,7 @@ dependencies = [
  "aes-gcm",
  "getrandom",
  "hex",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
