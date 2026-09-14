@@ -880,6 +880,67 @@ fn is_bluetooth_available() -> bool {
     false
 }
 
+fn is_accessory_device(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains("controller")
+        || lower.contains("gamepad")
+        || lower.contains("joystick")
+        || lower.contains("mouse")
+        || lower.contains("keyboard")
+        || lower.contains("headset")
+        || lower.contains("headphones")
+        || lower.contains("earbuds")
+        || lower.contains("airpods")
+        || lower.contains("watch")
+        || lower.contains("speaker")
+}
+
+pub fn parse_bluetooth_paired_devices(output: &str, now: u64) -> Vec<DiscoveredPeer> {
+    let mut peers = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        // Line format: "Device 4C:E2:0F:FD:5E:06 POCO X8 Pro Max"
+        if let Some(rest) = trimmed.strip_prefix("Device ") {
+            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+            if parts.len() == 2 {
+                let mac = parts[0].trim();
+                let name = parts[1].trim();
+                if is_accessory_device(name) {
+                    continue;
+                }
+                if mac.len() == 17 && mac.chars().filter(|c| *c == ':').count() == 5 {
+                    let clean_id = format!("bt_{}", mac.replace(':', ""));
+                    peers.push(DiscoveredPeer {
+                        id: clean_id,
+                        name: name.to_string(),
+                        ip: format!("bt:{}", mac),
+                        port: 0,
+                        transport: "BT".to_string(),
+                        fingerprint: mac.to_string(),
+                        is_trusted: true,
+                        last_seen_secs: now,
+                    });
+                }
+            }
+        }
+    }
+    peers
+}
+
+fn get_bluetooth_paired_peers() -> Vec<DiscoveredPeer> {
+    if !is_bluetooth_available() {
+        return Vec::new();
+    }
+    let deadline = Instant::now() + Duration::from_millis(600);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+    if let Some(out) = run_cmd_bounded("/usr/bin/bluetoothctl", &["devices", "Paired"], &[], deadline, 4096) {
+        let output_str = String::from_utf8_lossy(&out);
+        return parse_bluetooth_paired_devices(&output_str, now);
+    }
+    Vec::new()
+}
+
 fn get_pending_transfer() -> Option<PendingFileTransfer> {
     let path = get_state_dir().join("pending_transfer.json");
     if let Ok(content) = read_secure_file(&path) {
@@ -906,15 +967,43 @@ fn clear_pending_transfer() {
 }
 
 fn get_discovered_peers() -> Vec<DiscoveredPeer> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let mut lan_peers = Vec::new();
     let path = get_state_dir().join("discovered_peers.json");
     if let Ok(content) = read_secure_file(&path) {
         if let Ok(peers) = serde_json::from_str::<Vec<DiscoveredPeer>>(&content) {
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
             // Prune peers older than 15s
-            return peers.into_iter().filter(|p| now.saturating_sub(p.last_seen_secs) <= 15).collect();
+            lan_peers = peers.into_iter().filter(|p| now.saturating_sub(p.last_seen_secs) <= 15).collect();
         }
     }
-    Vec::new()
+
+    let bt_peers = get_bluetooth_paired_peers();
+    let mut merged = Vec::new();
+
+    for mut lan_peer in lan_peers {
+        let has_bt_match = bt_peers.iter().any(|b| {
+            b.name.eq_ignore_ascii_case(&lan_peer.name)
+                || lan_peer.name.to_lowercase().contains(&b.name.to_lowercase())
+                || b.name.to_lowercase().contains(&lan_peer.name.to_lowercase())
+        });
+        if has_bt_match {
+            lan_peer.transport = "HYBRID".to_string();
+        }
+        merged.push(lan_peer);
+    }
+
+    for bt_peer in bt_peers {
+        let already_merged = merged.iter().any(|p| {
+            p.name.eq_ignore_ascii_case(&bt_peer.name)
+                || p.id == bt_peer.id
+                || p.fingerprint == bt_peer.fingerprint
+        });
+        if !already_merged {
+            merged.push(bt_peer);
+        }
+    }
+
+    merged
 }
 
 fn save_discovered_peers(peers: &[DiscoveredPeer]) {
@@ -1207,6 +1296,90 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
     Ok(())
 }
 
+pub fn sanitize_bluetooth_mac(raw: &str) -> Option<String> {
+    let clean: String = raw.chars().filter(|c| c.is_ascii_hexdigit() || *c == ':').collect();
+    if clean.len() == 17 && clean.chars().filter(|c| *c == ':').count() == 5 {
+        Some(clean)
+    } else {
+        None
+    }
+}
+
+pub fn p2p_send_file_via_bluetooth(mac: &str, file_path: &Path) -> Result<(), String> {
+    let clean_mac = sanitize_bluetooth_mac(mac)
+        .ok_or_else(|| format!("Invalid Bluetooth MAC address format: '{}'", mac))?;
+
+    let _ = safe_read_file(file_path).map_err(|e| format!("Security check failed: {}", e))?;
+    let file_str = file_path.to_str().ok_or_else(|| "Invalid file path UTF-8".to_string())?;
+    let file_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+
+    notify_desktop(
+        "OmaSend Bluetooth",
+        &format!("Sending '{}' via Bluetooth to {}...", file_name, clean_mac),
+    );
+
+    let bin = if Path::new("/usr/bin/bt-obex").exists() {
+        "/usr/bin/bt-obex"
+    } else {
+        return Err("Bluetooth OBEX tool (/usr/bin/bt-obex) not found on system. Install bluez-tools/bluez-obex.".to_string());
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(180);
+    println!("Initiating Bluetooth OBEX push to {} for file: {}", clean_mac, file_str);
+    if let Some(out) = run_cmd_bounded(bin, &["-p", &clean_mac, file_str], &[], deadline, 8192) {
+        let resp = String::from_utf8_lossy(&out);
+        if resp.to_lowercase().contains("error") || resp.to_lowercase().contains("failed") {
+            notify_desktop(
+                "OmaSend Bluetooth",
+                &format!("Bluetooth transfer failed for '{}': {}", file_name, resp.trim()),
+            );
+            return Err(format!("Bluetooth transfer failed: {}", resp.trim()));
+        }
+        notify_desktop(
+            "OmaSend Bluetooth",
+            &format!("'{}' successfully sent via Bluetooth to {}!", file_name, clean_mac),
+        );
+        Ok(())
+    } else {
+        notify_desktop(
+            "OmaSend Bluetooth",
+            &format!("Bluetooth transfer timed out for '{}'.", file_name),
+        );
+        Err("Bluetooth transfer timed out or failed to connect.".to_string())
+    }
+}
+
+fn ensure_obex_service_running() {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let _ = run_cmd_bounded("/usr/bin/systemctl", &["--user", "start", "obex.service"], &[], deadline, 1024);
+}
+
+fn start_bluetooth_receiver(download_dir: &Path) {
+    if !is_bluetooth_available() {
+        return;
+    }
+    ensure_obex_service_running();
+    let dir_str = download_dir.to_string_lossy().to_string();
+    let _ = fs::create_dir_all(download_dir);
+
+    if Path::new("/usr/bin/bt-obex").exists() {
+        thread::spawn(move || {
+            let mut cmd = Command::new("/usr/bin/bt-obex");
+            cmd.args(["-s", &dir_str, "-y"])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("LC_ALL", "C")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0);
+            if let Ok(mut child) = cmd.spawn() {
+                let _ = child.wait();
+            }
+        });
+    }
+}
+
 fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
     let text = get_pc_clipboard();
     if text.is_empty() {
@@ -1282,8 +1455,8 @@ fn read_full_http_request(stream: &mut TcpStream) -> Option<(HttpRequest, Vec<u8
     let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
 
-    let mut buffer = Vec::with_capacity(65536);
-    let mut temp = [0u8; 16384];
+    let mut buffer = Vec::with_capacity(131072);
+    let mut temp = [0u8; 65536];
     let mut header_end = None;
     let mut content_length: usize = 0;
     const MAX_HEADER_SIZE: usize = 65536; // 64 KiB
@@ -2468,6 +2641,7 @@ fn run_server() {
     // Spawn P2P AirBridge discovery threads
     thread::spawn(run_p2p_discovery_listener);
     thread::spawn(run_p2p_beacon_broadcaster);
+    start_bluetooth_receiver(&get_download_dir());
 
     for s in listener.incoming().flatten() {
         let ip_clone = local_ip.clone();
@@ -2546,19 +2720,35 @@ fn main() {
         }
     }
 
-    if let Some(pos) = args.iter().position(|a| a == "--send-p2p") {
-        if let (Some(target_ip), Some(file_path_str)) = (args.get(pos + 1), args.get(pos + 2)) {
+    if let Some(pos) = args.iter().position(|a| a == "--send-p2p" || a == "--send") {
+        if let (Some(target), Some(file_path_str)) = (args.get(pos + 1), args.get(pos + 2)) {
             let path = Path::new(file_path_str);
-            match p2p_send_file_to_peer(target_ip, path) {
-                Ok(()) => println!("File sent successfully to {}", target_ip),
-                Err(e) => eprintln!("Error sending file: {}", e),
+            if target.starts_with("bt:") || (target.len() == 17 && target.chars().filter(|c| *c == ':').count() == 5) {
+                let mac = target.strip_prefix("bt:").unwrap_or(target);
+                match p2p_send_file_via_bluetooth(mac, path) {
+                    Ok(()) => println!("File sent successfully via Bluetooth to {}", mac),
+                    Err(e) => eprintln!("Error sending file via Bluetooth: {}", e),
+                }
+            } else {
+                match p2p_send_file_to_peer(target, path) {
+                    Ok(()) => println!("File sent successfully to {}", target),
+                    Err(e) => {
+                        eprintln!("Error sending file via LAN: {}", e);
+                        let bt_peers = get_bluetooth_paired_peers();
+                        if let Some(bt_match) = bt_peers.first() {
+                            let mac = bt_match.ip.strip_prefix("bt:").unwrap_or(&bt_match.ip);
+                            println!("Falling back to Bluetooth transfer for {} ({})", bt_match.name, mac);
+                            let _ = p2p_send_file_via_bluetooth(mac, path);
+                        }
+                    }
+                }
             }
             return;
         }
     }
 
     if let Some(pos) = args.iter().position(|a| a == "--send-dialog") {
-        if let Some(target_ip) = args.get(pos + 1) {
+        if let Some(target) = args.get(pos + 1) {
             let env_store = get_desktop_gui_envs();
             let envs: Vec<(&str, &str)> = env_store.iter().map(|(k, v)| (*k, v.as_str())).collect();
             let deadline = Instant::now() + Duration::from_secs(120);
@@ -2572,9 +2762,30 @@ fn main() {
                 let chosen = String::from_utf8_lossy(&out).trim().to_string();
                 if !chosen.is_empty() {
                     let path = Path::new(&chosen);
-                    match p2p_send_file_to_peer(target_ip, path) {
-                        Ok(()) => println!("File successfully sent to {}", target_ip),
-                        Err(e) => eprintln!("Error sending file: {}", e),
+                    if target.starts_with("bt:") || (target.len() == 17 && target.chars().filter(|c| *c == ':').count() == 5) {
+                        let mac = target.strip_prefix("bt:").unwrap_or(target);
+                        match p2p_send_file_via_bluetooth(mac, path) {
+                            Ok(()) => println!("File successfully sent via Bluetooth to {}", mac),
+                            Err(e) => eprintln!("Error sending file via Bluetooth: {}", e),
+                        }
+                    } else {
+                        match p2p_send_file_to_peer(target, path) {
+                            Ok(()) => println!("File successfully sent to {}", target),
+                            Err(e) => {
+                                eprintln!("Error sending file via LAN: {}", e);
+                                let bt_peers = get_bluetooth_paired_peers();
+                                if let Some(bt_match) = bt_peers.first() {
+                                    let mac = bt_match.ip.strip_prefix("bt:").unwrap_or(&bt_match.ip);
+                                    notify_desktop(
+                                        "OmaSend AirBridge",
+                                        &format!("LAN unreachable. Attempting Bluetooth transfer to {}...", bt_match.name),
+                                    );
+                                    if let Err(bt_err) = p2p_send_file_via_bluetooth(mac, path) {
+                                        eprintln!("Bluetooth fallback error: {}", bt_err);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -2992,6 +3203,33 @@ mod tests {
         let space = get_available_disk_space(Path::new("/tmp"));
         assert!(space.is_some());
         assert!(space.unwrap() > 0);
+    }
+
+    #[test]
+    fn test_parse_bluetooth_paired_devices() {
+        let sample = "Device 4C:E2:0F:FD:5E:06 POCO X8 Pro Max\nDevice 40:8E:2C:6A:13:DE Xbox Wireless Controller\nInvalid Line\nDevice short invalid";
+        let peers = parse_bluetooth_paired_devices(sample, 1000);
+        // Xbox Wireless Controller should be filtered out
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].name, "POCO X8 Pro Max");
+        assert_eq!(peers[0].ip, "bt:4C:E2:0F:FD:5E:06");
+        assert_eq!(peers[0].transport, "BT");
+        assert_eq!(peers[0].id, "bt_4CE20FFD5E06");
+    }
+
+    #[test]
+    fn test_sanitize_bluetooth_mac() {
+        assert_eq!(
+            sanitize_bluetooth_mac("4C:E2:0F:FD:5E:06"),
+            Some("4C:E2:0F:FD:5E:06".to_string())
+        );
+        assert_eq!(
+            sanitize_bluetooth_mac("4c:e2:0f:fd:5e:06"),
+            Some("4c:e2:0f:fd:5e:06".to_string())
+        );
+        assert_eq!(sanitize_bluetooth_mac("invalid_mac"), None);
+        assert_eq!(sanitize_bluetooth_mac("4C:E2:0F:FD:5E"), None);
+        assert_eq!(sanitize_bluetooth_mac("4C:E2:0F:FD:5E:06:99"), None);
     }
 }
 

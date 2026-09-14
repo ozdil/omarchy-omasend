@@ -571,8 +571,8 @@ Panel {
 
                   Text {
                     textFormat: Text.PlainText
-                    text: modelData.transport === "BT" ? "" : "💻"
-                    color: Color.accent
+                    text: modelData.transport === "BT" ? "" : (modelData.transport === "HYBRID" ? "⚡" : "💻")
+                    color: modelData.transport === "BT" ? "#3b82f6" : (modelData.transport === "HYBRID" ? "#a855f7" : Color.accent)
                     font.family: root.bar ? root.bar.fontFamily : Style.font.family
                     font.pixelSize: Style.font.body
                   }
@@ -580,17 +580,36 @@ Panel {
                   Column {
                     Layout.fillWidth: true
                     spacing: 0
-                    Text {
-                      textFormat: Text.PlainText
-                      text: modelData.name || "Omarchy Device"
-                      color: root.bar ? root.bar.foreground : Color.foreground
-                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                      font.pixelSize: Style.font.bodySmall
-                      font.bold: true
+                    RowLayout {
+                      spacing: Style.space(6)
+                      Text {
+                        textFormat: Text.PlainText
+                        text: modelData.name || "Omarchy Device"
+                        color: root.bar ? root.bar.foreground : Color.foreground
+                        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                        font.pixelSize: Style.font.bodySmall
+                        font.bold: true
+                      }
+                      Rectangle {
+                        implicitWidth: badgeText.implicitWidth + Style.space(8)
+                        implicitHeight: Style.space(16)
+                        radius: Style.cornerRadius
+                        color: modelData.transport === "BT" ? "#1e3a8a" : (modelData.transport === "HYBRID" ? "#581c87" : "#064e3b")
+                        Text {
+                          id: badgeText
+                          anchors.centerIn: parent
+                          textFormat: Text.PlainText
+                          text: modelData.transport
+                          color: modelData.transport === "BT" ? "#93c5fd" : (modelData.transport === "HYBRID" ? "#d8b4fe" : "#6ee7b7")
+                          font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                          font.pixelSize: 9
+                          font.bold: true
+                        }
+                      }
                     }
                     Text {
                       textFormat: Text.PlainText
-                      text: modelData.ip + " • " + modelData.transport + (modelData.is_trusted ? " • TRUSTED" : "")
+                      text: (modelData.ip.startsWith("bt:") ? "Bluetooth Paired" : modelData.ip) + (modelData.is_trusted ? " • TRUSTED" : "")
                       color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
                       font.family: root.bar ? root.bar.fontFamily : Style.font.family
                       font.pixelSize: Style.font.caption
@@ -619,6 +638,7 @@ Panel {
                   }
 
                   Rectangle {
+                    visible: !modelData.ip.startsWith("bt:")
                     Layout.preferredWidth: Style.space(86)
                     Layout.preferredHeight: Style.space(24)
                     radius: Style.cornerRadius

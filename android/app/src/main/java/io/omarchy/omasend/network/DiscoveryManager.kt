@@ -2,6 +2,12 @@ package io.omarchy.omasend.network
 
 import android.content.Context
 import android.net.wifi.WifiManager
+import android.bluetooth.BluetoothManager
+import android.os.Build
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.core.content.ContextCompat
+import io.omarchy.omasend.model.DiscoveryMode
 import io.omarchy.omasend.model.DiscoveredPeer
 import io.omarchy.omasend.model.P2pBeaconPacket
 import kotlinx.coroutines.CoroutineScope
@@ -33,19 +39,52 @@ class DiscoveryManager(private val context: Context) {
     private val peerMap = ConcurrentHashMap<String, DiscoveredPeer>()
     private val _peers = MutableStateFlow<List<DiscoveredPeer>>(emptyList())
     val peers: StateFlow<List<DiscoveredPeer>> = _peers.asStateFlow()
+    private val _isScanning = MutableStateFlow(false)
+    val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
+    private val _discoveryMode = MutableStateFlow(DiscoveryMode.EVERYONE)
+    val discoveryMode: StateFlow<DiscoveryMode> = _discoveryMode.asStateFlow()
+
+    fun setMode(mode: DiscoveryMode) {
+        _discoveryMode.value = mode
+        when (mode) {
+            DiscoveryMode.OFF -> stop()
+            DiscoveryMode.KNOWN_PEERS -> {
+                if (!_isScanning.value) start()
+            }
+            DiscoveryMode.EVERYONE -> {
+                if (!_isScanning.value) start()
+            }
+        }
+    }
 
     fun start() {
+        if (_isScanning.value) return
+        _isScanning.value = true
+        if (_discoveryMode.value == DiscoveryMode.OFF) {
+            _discoveryMode.value = DiscoveryMode.EVERYONE
+        }
         acquireMulticastLock()
+        refreshBluetoothPeers()
         startListener()
         startBroadcaster()
         startCleanup()
     }
 
     fun stop() {
+        _isScanning.value = false
+        _discoveryMode.value = DiscoveryMode.OFF
         broadcastJob?.cancel()
         listenJob?.cancel()
         cleanupJob?.cancel()
+        broadcastJob = null
+        listenJob = null
+        cleanupJob = null
         releaseMulticastLock()
+        // Retain manual peers if any, but clear discovered peers so UI reflects paused state
+        val manualPeers = peerMap.values.filter { it.id.startsWith("manual_") }
+        peerMap.clear()
+        manualPeers.forEach { peerMap[it.id] = it }
+        _peers.value = peerMap.values.toList().sortedBy { it.name }
     }
 
     fun addManualPeer(ip: String, port: Int = NetworkUtils.PORT, name: String = "Direct ($ip)") {
@@ -149,8 +188,8 @@ class DiscoveryManager(private val context: Context) {
                             name = NetworkUtils.getDeviceName(context),
                             ip = myIp,
                             port = NetworkUtils.PORT,
-                            mode = "ALL",
-                            bt = false,
+                            mode = _discoveryMode.value.wireMode,
+                            bt = isBluetoothEnabled(),
                             fp = ""
                         )
                         val payload = json.encodeToString(P2pBeaconPacket.serializer(), beacon).toByteArray(Charsets.UTF_8)
@@ -174,6 +213,7 @@ class DiscoveryManager(private val context: Context) {
 
                         // 3. Direct Unicast to discovered peers (bypasses Wi-Fi broadcast drops)
                         for (peer in peerMap.values) {
+                            if (peer.ip.startsWith("bt:")) continue
                             try {
                                 val peerAddr = InetAddress.getByName(peer.ip)
                                 socket.send(DatagramPacket(payload, payload.size, peerAddr, peer.port))
@@ -190,11 +230,90 @@ class DiscoveryManager(private val context: Context) {
         }
     }
 
+    private fun isBluetoothEnabled(): Boolean {
+        return try {
+            val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+            bluetoothManager?.adapter?.isEnabled == true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    fun refreshBluetoothPeers() {
+        try {
+            val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+            val adapter = bluetoothManager?.adapter ?: return
+            if (!adapter.isEnabled) return
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                if (ContextCompat.checkSelfPermission(
+                        context,
+                        Manifest.permission.BLUETOOTH_CONNECT
+                    ) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    return
+                }
+            }
+
+            val bonded = adapter.bondedDevices ?: return
+            val now = System.currentTimeMillis()
+            var changed = false
+
+            for (device in bonded) {
+                val name = device.name ?: "Paired Device"
+                val lowerName = name.lowercase()
+                // Filter out non-file-transfer accessories
+                if (lowerName.contains("controller") || lowerName.contains("gamepad") ||
+                    lowerName.contains("mouse") || lowerName.contains("keyboard") ||
+                    lowerName.contains("headset") || lowerName.contains("headphones") ||
+                    lowerName.contains("earbuds") || lowerName.contains("airpods") ||
+                    lowerName.contains("watch") || lowerName.contains("speaker")
+                ) {
+                    continue
+                }
+
+                val addr = device.address
+                val peerId = "bt_${addr.replace(":", "")}"
+                val existing = peerMap.values.find {
+                    it.name.equals(name, ignoreCase = true) || it.id == peerId
+                }
+
+                if (existing != null) {
+                    if (existing.transport == "LAN") {
+                        peerMap[existing.id] = existing.copy(
+                            transport = "HYBRID",
+                            lastSeen = now
+                        )
+                        changed = true
+                    }
+                } else {
+                    val peer = DiscoveredPeer(
+                        id = peerId,
+                        name = name,
+                        ip = "bt:$addr",
+                        port = 0,
+                        transport = "BT",
+                        fingerprint = addr,
+                        lastSeen = now + 60_000L
+                    )
+                    peerMap[peer.id] = peer
+                    changed = true
+                }
+            }
+
+            if (changed) {
+                _peers.value = peerMap.values.toList().sortedBy { it.name }
+            }
+        } catch (_: Exception) {
+        }
+    }
+
     private fun startCleanup() {
         cleanupJob?.cancel()
         cleanupJob = scope.launch {
             while (isActive) {
                 delay(5000)
+                refreshBluetoothPeers()
                 val now = System.currentTimeMillis()
                 var changed = false
                 val it = peerMap.entries.iterator()
