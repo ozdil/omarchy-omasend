@@ -42,81 +42,91 @@ Panel {
     return Qt.resolvedUrl("omasend-engine").toString().replace(/^file:\/\//, "")
   }
 
+  function executeAction(args) {
+    if (actionProc.running) {
+      actionProc.running = false
+    }
+    actionProc.command = [root.resolveEnginePath()].concat(args)
+    actionProc.running = true
+  }
+
   function refresh() {
     if (!serverProc.running) {
       serverProc.running = true
     }
-    if (!scanProc.running) {
-      scanProc.running = true
+    if (scanProc.running) {
+      scanProc.running = false
     }
+    scanProc.running = true
   }
 
   function setP2pVisibility(mode) {
-    actionProc.command = [root.resolveEnginePath(), "--set-visibility", mode]
-    actionProc.running = true
+    root.p2pVisibility = mode
+    if (mode === "EVERYONE") {
+      root.p2pVisibilityRemainingSecs = 600
+    } else {
+      root.p2pVisibilityRemainingSecs = 0
+    }
+    root.executeAction(["--set-visibility", mode])
   }
 
   function acceptTransfer(token) {
-    actionProc.command = [root.resolveEnginePath(), "--accept-transfer", token]
-    actionProc.running = true
+    root.executeAction(["--accept-transfer", token])
   }
 
   function rejectTransfer(token) {
-    actionProc.command = [root.resolveEnginePath(), "--reject-transfer", token]
-    actionProc.running = true
+    root.executeAction(["--reject-transfer", token])
   }
 
   function syncClipboardTo(ip) {
-    actionProc.command = [root.resolveEnginePath(), "--sync-clipboard", ip]
-    actionProc.running = true
+    root.executeAction(["--sync-clipboard", ip])
   }
 
   function sendFileTo(ip) {
-    actionProc.command = [root.resolveEnginePath(), "--send-dialog", ip]
-    actionProc.running = true
+    root.executeAction(["--send-dialog", ip])
   }
 
   function newPin() {
-    actionProc.command = [root.resolveEnginePath(), "--new-pin"]
-    actionProc.running = true
+    root.executeAction(["--new-pin"])
   }
 
   function newKey() {
-    actionProc.command = [root.resolveEnginePath(), "--new-key"]
-    actionProc.running = true
+    root.executeAction(["--new-key"])
   }
 
   function toggleWan() {
-    actionProc.command = [root.resolveEnginePath(), "--toggle-wan"]
-    actionProc.running = true
+    root.wanConnecting = true
+    root.executeAction(["--toggle-wan"])
   }
 
   function setLanMode() {
-    actionProc.command = [root.resolveEnginePath(), "--set-lan"]
-    actionProc.running = true
+    root.activeMode = "LAN"
+    root.executeAction(["--set-lan"])
   }
 
   function setWanMode() {
-    actionProc.command = [root.resolveEnginePath(), "--set-wan"]
-    actionProc.running = true
+    root.activeMode = "WAN"
+    root.executeAction(["--set-wan"])
   }
 
   function copyPortalUrl() {
+    if (copyProc.running) copyProc.running = false
     copyProc.command = ["wl-copy", root.activeUrl ? root.activeUrl : ("http://" + root.localIp + ":" + root.port)]
     copyProc.running = true
   }
 
   function openFolder() {
+    if (folderProc.running) folderProc.running = false
     folderProc.command = ["xdg-open", root.savePath]
     folderProc.running = true
   }
 
   IpcHandler {
     target: "ozdil.omasend"
-    function open() { root.open() }
-    function close() { root.close() }
-    function toggle() { root.toggle() }
-    function refresh() { root.refresh() }
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function toggle(): void { root.toggle() }
+    function refresh(): void { root.refresh() }
   }
 
   // Persistent background HTTP daemon
@@ -129,9 +139,13 @@ Panel {
   Process {
     id: scanProc
     command: [root.resolveEnginePath(), "--json"]
+    onExited: function(code) {
+      scanProc.running = false
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
+        scanProc.running = false
         try {
           var clean = String(text || "").slice(0, 65536)
           var d = JSON.parse(clean)
@@ -163,6 +177,7 @@ Panel {
   Process {
     id: actionProc
     onExited: function(code) {
+      actionProc.running = false
       root.refresh()
     }
   }
@@ -369,13 +384,6 @@ Panel {
                 Layout.preferredHeight: Style.space(28)
                 radius: Style.cornerRadius
                 color: Color.accent
-                MouseArea {
-                  anchors.fill: parent
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: {
-                    if (root.p2pPendingTransfer) root.acceptTransfer(root.p2pPendingTransfer.token)
-                  }
-                }
                 Text {
                   anchors.centerIn: parent
                   textFormat: Text.PlainText
@@ -384,6 +392,14 @@ Panel {
                   font.family: root.bar ? root.bar.fontFamily : Style.font.family
                   font.pixelSize: Style.font.caption
                   font.bold: true
+                }
+                MouseArea {
+                  anchors.fill: parent
+                  z: 10
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    if (root.p2pPendingTransfer) root.acceptTransfer(root.p2pPendingTransfer.token)
+                  }
                 }
               }
 
@@ -394,13 +410,6 @@ Panel {
                 color: "transparent"
                 border.color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
                 border.width: 1
-                MouseArea {
-                  anchors.fill: parent
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: {
-                    if (root.p2pPendingTransfer) root.rejectTransfer(root.p2pPendingTransfer.token)
-                  }
-                }
                 Text {
                   anchors.centerIn: parent
                   textFormat: Text.PlainText
@@ -409,6 +418,14 @@ Panel {
                   font.family: root.bar ? root.bar.fontFamily : Style.font.family
                   font.pixelSize: Style.font.caption
                   font.bold: true
+                }
+                MouseArea {
+                  anchors.fill: parent
+                  z: 10
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    if (root.p2pPendingTransfer) root.rejectTransfer(root.p2pPendingTransfer.token)
+                  }
                 }
               }
             }
@@ -471,11 +488,7 @@ Panel {
               color: root.p2pVisibility === "OFF" ? Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent) : "transparent"
               border.color: root.p2pVisibility === "OFF" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
               border.width: 1
-              MouseArea {
-                anchors.fill: parent
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.setP2pVisibility("OFF")
-              }
+
               Text {
                 anchors.centerIn: parent
                 textFormat: Text.PlainText
@@ -484,6 +497,13 @@ Panel {
                 font.family: root.bar ? root.bar.fontFamily : Style.font.family
                 font.pixelSize: Style.font.caption
                 font.bold: root.p2pVisibility === "OFF"
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                z: 10
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.setP2pVisibility("OFF")
               }
             }
 
@@ -495,11 +515,7 @@ Panel {
               color: root.p2pVisibility === "KNOWN" ? Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent) : "transparent"
               border.color: root.p2pVisibility === "KNOWN" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
               border.width: 1
-              MouseArea {
-                anchors.fill: parent
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.setP2pVisibility("KNOWN")
-              }
+
               Text {
                 anchors.centerIn: parent
                 textFormat: Text.PlainText
@@ -508,6 +524,13 @@ Panel {
                 font.family: root.bar ? root.bar.fontFamily : Style.font.family
                 font.pixelSize: Style.font.caption
                 font.bold: root.p2pVisibility === "KNOWN"
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                z: 10
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.setP2pVisibility("KNOWN")
               }
             }
 
@@ -519,11 +542,7 @@ Panel {
               color: root.p2pVisibility === "EVERYONE" ? Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent) : "transparent"
               border.color: root.p2pVisibility === "EVERYONE" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
               border.width: 1
-              MouseArea {
-                anchors.fill: parent
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.setP2pVisibility("EVERYONE")
-              }
+
               Text {
                 anchors.centerIn: parent
                 textFormat: Text.PlainText
@@ -532,6 +551,13 @@ Panel {
                 font.family: root.bar ? root.bar.fontFamily : Style.font.family
                 font.pixelSize: Style.font.caption
                 font.bold: root.p2pVisibility === "EVERYONE"
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                z: 10
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.setP2pVisibility("EVERYONE")
               }
             }
           }
@@ -621,11 +647,7 @@ Panel {
                     Layout.preferredHeight: Style.space(24)
                     radius: Style.cornerRadius
                     color: Color.accent
-                    MouseArea {
-                      anchors.fill: parent
-                      cursorShape: Qt.PointingHandCursor
-                      onClicked: root.sendFileTo(modelData.ip)
-                    }
+
                     Text {
                       anchors.centerIn: parent
                       textFormat: Text.PlainText
@@ -634,6 +656,13 @@ Panel {
                       font.family: root.bar ? root.bar.fontFamily : Style.font.family
                       font.pixelSize: Style.font.caption
                       font.bold: true
+                    }
+
+                    MouseArea {
+                      anchors.fill: parent
+                      z: 10
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.sendFileTo(modelData.ip)
                     }
                   }
 
@@ -645,11 +674,7 @@ Panel {
                     color: Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
                     border.color: Color.accent
                     border.width: 1
-                    MouseArea {
-                      anchors.fill: parent
-                      cursorShape: Qt.PointingHandCursor
-                      onClicked: root.syncClipboardTo(modelData.ip)
-                    }
+
                     Text {
                       anchors.centerIn: parent
                       textFormat: Text.PlainText
@@ -658,6 +683,13 @@ Panel {
                       font.family: root.bar ? root.bar.fontFamily : Style.font.family
                       font.pixelSize: Style.font.caption
                       font.bold: true
+                    }
+
+                    MouseArea {
+                      anchors.fill: parent
+                      z: 10
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.syncClipboardTo(modelData.ip)
                     }
                   }
                 }
@@ -720,12 +752,6 @@ Panel {
                 border.color: root.activeMode === "LAN" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
                 border.width: 1
 
-                MouseArea {
-                  anchors.fill: parent
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: root.setLanMode()
-                }
-
                 RowLayout {
                   anchors.fill: parent
                   anchors.leftMargin: Style.space(10)
@@ -759,6 +785,13 @@ Panel {
                     font.pixelSize: Style.font.caption
                   }
                 }
+
+                MouseArea {
+                  anchors.fill: parent
+                  z: 10
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.setLanMode()
+                }
               }
 
               // Global WAN Button
@@ -769,12 +802,6 @@ Panel {
                 color: root.activeMode === "WAN" ? Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent) : "transparent"
                 border.color: root.activeMode === "WAN" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
                 border.width: 1
-
-                MouseArea {
-                  anchors.fill: parent
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: root.setWanMode()
-                }
 
                 RowLayout {
                   anchors.fill: parent
@@ -807,6 +834,13 @@ Panel {
                     font.family: root.bar ? root.bar.fontFamily : Style.font.family
                     font.pixelSize: Style.font.caption
                   }
+                }
+
+                MouseArea {
+                  anchors.fill: parent
+                  z: 10
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.setWanMode()
                 }
               }
 
