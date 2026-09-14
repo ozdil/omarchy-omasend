@@ -2338,6 +2338,7 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
                     if pending.token == token {
                         if action == "accept" {
                             pending.status = "ACCEPTED".to_string();
+                            pending.expires_at = now.saturating_add(600); // 10 minutes to complete file transfer
                             save_pending_transfer(&pending);
                             add_trusted_peer(&pending.sender_id, &pending.sender_name, "");
                             notify_desktop("OmaSend AirBridge", "Transfer accepted. Receiving files...");
@@ -2364,7 +2365,7 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
         let clean_filename = sanitize_filename(&urlencoding_decode(&filename_raw));
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
-        if let Some(pending) = get_pending_transfer() {
+        if let Some(mut pending) = get_pending_transfer() {
             if pending.token == token && pending.status == "ACCEPTED" && now <= pending.expires_at {
                 let body = &buffer[req.body_offset..];
                 let ddir = get_download_dir();
@@ -2377,7 +2378,14 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
                 let file_path = get_unique_filepath(&ddir, &clean_filename);
                 if write_secure_bytes(&file_path, body).is_ok() {
                     RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
-                    clear_pending_transfer();
+                    if let Some(pos) = pending.file_names.iter().position(|f| f == &clean_filename) {
+                        pending.file_names.remove(pos);
+                    }
+                    if pending.file_names.is_empty() {
+                        clear_pending_transfer();
+                    } else {
+                        save_pending_transfer(&pending);
+                    }
                     let final_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
                     notify_desktop(
                         "OmaSend: AirBridge Transfer Complete",

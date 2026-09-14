@@ -102,24 +102,27 @@ class OmaSendClient(private val context: Context) {
         token: String,
         filename: String,
         totalBytes: Long,
-        inputStream: InputStream,
+        inputStreamProvider: () -> InputStream?,
         onProgress: (bytesWritten: Long, totalBytes: Long, percent: Int) -> Unit
     ): Result<Unit> {
         return try {
             val encodedName = URLEncoder.encode(filename, "UTF-8")
             val countingBody = object : RequestBody() {
                 override fun contentType() = "application/octet-stream".toMediaType()
-                override fun contentLength() = totalBytes
+                override fun contentLength() = if (totalBytes > 0) totalBytes else -1L
 
                 override fun writeTo(sink: BufferedSink) {
-                    val buffer = ByteArray(65536)
-                    var uploaded = 0L
-                    var read: Int
-                    while (inputStream.read(buffer).also { read = it } != -1) {
-                        sink.write(buffer, 0, read)
-                        uploaded += read
-                        val percent = if (totalBytes > 0) ((uploaded * 100) / totalBytes).toInt() else 0
-                        onProgress(uploaded, totalBytes, percent)
+                    val stream = inputStreamProvider() ?: throw java.io.IOException("Cannot open input stream for $filename")
+                    stream.use { input ->
+                        val buffer = ByteArray(65536)
+                        var uploaded = 0L
+                        var read: Int
+                        while (input.read(buffer).also { read = it } != -1) {
+                            sink.write(buffer, 0, read)
+                            uploaded += read
+                            val percent = if (totalBytes > 0) ((uploaded * 100) / totalBytes).toInt().coerceIn(0, 100) else 0
+                            onProgress(uploaded, totalBytes, percent)
+                        }
                     }
                 }
             }
@@ -133,15 +136,11 @@ class OmaSendClient(private val context: Context) {
             if (response.isSuccessful) {
                 Result.success(Unit)
             } else {
-                Result.failure(Exception("Upload failed with HTTP ${response.code}"))
+                val errBody = response.body?.string() ?: ""
+                Result.failure(Exception("Upload failed (HTTP ${response.code}): $errBody"))
             }
         } catch (e: Exception) {
             Result.failure(e)
-        } finally {
-            try {
-                inputStream.close()
-            } catch (_: Exception) {
-            }
         }
     }
 
