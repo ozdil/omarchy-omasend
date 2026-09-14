@@ -39,7 +39,7 @@ Plugin ID: ozdil.omasend
 - wl-clipboard (provides wl-copy and wl-paste on Wayland)
 - libnotify (desktop notifications via notify-send)
 - zenity (GTK file selection dialog)
-- cloudflared (optional, required for Global WAN Tunnel mode): available via system package manager (`pacman -S cloudflared`)
+- cloudflared (optional, required for Global WAN Tunnel mode; system package)
 
 ---
 
