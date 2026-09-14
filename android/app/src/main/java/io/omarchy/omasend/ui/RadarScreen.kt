@@ -1734,13 +1734,6 @@ suspend fun sendClipboardToPeer(
     peer: DiscoveredPeer,
     onState: (TransferProgressState) -> Unit
 ) {
-    if (peer.transport == "BT" || peer.ip.startsWith("bt:")) {
-        withContext(Dispatchers.Main) {
-            Toast.makeText(context, "Pano senkronizasyonu yalnızca Wi-Fi (LAN) bağlantısıyla desteklenir.", Toast.LENGTH_SHORT).show()
-        }
-        return
-    }
-
     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
     val clip = clipboard?.primaryClip
     val text = if (clip != null && clip.itemCount > 0) clip.getItemAt(0).text?.toString() else null
@@ -1748,6 +1741,14 @@ suspend fun sendClipboardToPeer(
     if (text.isNullOrEmpty()) {
         withContext(Dispatchers.Main) {
             Toast.makeText(context, "Telefon panosu boş! Önce bir metin kopyalayın.", Toast.LENGTH_SHORT).show()
+        }
+        return
+    }
+
+    if (peer.transport == "BT" || peer.ip.startsWith("bt:")) {
+        withContext(Dispatchers.Main) {
+            TransferBridge.sendViaBluetooth(context, emptyList(), textPayload = text)
+            Toast.makeText(context, "Pano metni Bluetooth üzerinden gönderiliyor...", Toast.LENGTH_SHORT).show()
         }
         return
     }

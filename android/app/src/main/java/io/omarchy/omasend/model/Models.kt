@@ -84,3 +84,10 @@ data class IncomingTransferPrompt(
     val files: List<TransferFileInfo>,
     val totalSizeBytes: Long
 )
+
+enum class DiscoveryMode(val wireMode: String) {
+    OFF("OFF"),
+    KNOWN_PEERS("KNOWN"),
+    EVERYONE("ALL")
+}
+
