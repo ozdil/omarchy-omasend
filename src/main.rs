@@ -836,6 +836,10 @@ fn set_visibility(mode: &str) {
     });
     let vis_file = get_state_dir().join("visibility.json");
     let _ = write_secure_file(&vis_file, &data.to_string());
+    if upper == "OFF" {
+        let peers_file = get_state_dir().join("discovered_peers.json");
+        let _ = fs::remove_file(peers_file);
+    }
 }
 
 fn load_trusted_peers() -> Vec<TrustedPeer> {
@@ -967,6 +971,11 @@ fn clear_pending_transfer() {
 }
 
 fn get_discovered_peers() -> Vec<DiscoveredPeer> {
+    let (vis, _) = get_visibility();
+    if vis == "OFF" {
+        return Vec::new();
+    }
+
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let mut lan_peers = Vec::new();
     let path = get_state_dir().join("discovered_peers.json");
@@ -1001,6 +1010,10 @@ fn get_discovered_peers() -> Vec<DiscoveredPeer> {
         if !already_merged {
             merged.push(bt_peer);
         }
+    }
+
+    if vis == "KNOWN" {
+        merged.retain(|p| p.is_trusted);
     }
 
     merged
@@ -3033,6 +3046,7 @@ mod tests {
         set_visibility("OFF");
         let (vis_off, _) = get_visibility();
         assert_eq!(vis_off, "OFF");
+        assert!(get_discovered_peers().is_empty());
 
         set_visibility("EVERYONE");
         let (vis_every, rem) = get_visibility();

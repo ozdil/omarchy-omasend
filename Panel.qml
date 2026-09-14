@@ -67,6 +67,9 @@ Panel {
     } else {
       root.p2pVisibilityRemainingSecs = 0
     }
+    if (mode === "OFF") {
+      root.p2pPeers = []
+    }
     root.executeAction(["--set-visibility", mode])
   }
 
@@ -533,7 +536,7 @@ Panel {
             spacing: Style.space(6)
 
             Text {
-              visible: root.p2pPeers.length === 0
+              visible: root.p2pVisibility === "OFF" || root.p2pPeers.length === 0
               width: parent.width
               textFormat: Text.PlainText
               text: root.p2pVisibility === "OFF" ? "AirBridge visibility is turned off." : "Scanning for nearby Omarchy devices on local network & Bluetooth..."
@@ -544,7 +547,7 @@ Panel {
             }
 
             Repeater {
-              model: root.p2pPeers
+              model: root.p2pVisibility === "OFF" ? [] : root.p2pPeers
 
               Rectangle {
                 width: parent.width
