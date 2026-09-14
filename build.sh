@@ -10,11 +10,6 @@ install -m 755 target/release/omasend-engine ./omasend-engine
 
 echo "omasend-engine successfully compiled and placed at ${DIR}/omasend-engine"
 
-if command -v ufw >/dev/null 2>&1; then
-    sudo -n ufw allow in proto tcp to any port 53317 >/dev/null 2>&1 || true
-    sudo -n ufw allow in proto udp to any port 53317 >/dev/null 2>&1 || true
-fi
-
 if command -v omarchy-restart-shell >/dev/null 2>&1; then
     echo "Reloading Omarchy shell..."
     omarchy-restart-shell >/dev/null 2>&1 || true

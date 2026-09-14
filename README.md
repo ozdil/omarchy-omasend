@@ -37,10 +37,7 @@ Plugin ID: ozdil.omasend
 - wl-clipboard (provides wl-copy and wl-paste on Wayland)
 - libnotify (desktop notifications via notify-send)
 - zenity (GTK file selection dialog)
-- cloudflared (optional, required for Global WAN Tunnel mode):
-  ```bash
-  sudo pacman -S cloudflared
-  ```
+- cloudflared (optional, required for Global WAN Tunnel mode): available via system package manager (`pacman -S cloudflared`)
 
 ---
 
@@ -62,13 +59,8 @@ cd ~/.config/omarchy/plugins/ozdil.omasend && ./build.sh
 This script compiles the engine using `cargo build --release --locked`, installs the binary (`omasend-engine`) with proper permissions, and restarts the Omarchy shell automatically.
 
 ### Step 3: Firewall Configuration (Zero Configuration on Omarchy Linux)
-Omarchy Linux pre-configures and permits port 53317 (TCP and UDP) out of the box in UFW for local network sharing, meaning OmaSend requires zero manual firewall configuration under standard Omarchy installations.
+Omarchy Linux pre-configures and permits port 53317 (TCP and UDP) out of the box for local network sharing, meaning OmaSend requires zero manual firewall configuration under standard Omarchy installations.
 
-If your machine uses custom firewall rules or a non-default setup, you can verify or allow port 53317:
-```bash
-sudo ufw allow 53317/tcp
-sudo ufw allow 53317/udp
-```
 
 ### Step 4: Add to Top Bar (Optional)
 If not automatically present in your panel, add `ozdil.omasend` to `bar.layout.right` in `~/.config/omarchy/shell.json`:

@@ -575,7 +575,7 @@ fn start_wan_tunnel() -> Result<String, String> {
         }
     }
 
-    Err("WAN Tunneling requires cloudflared. Please install the trusted system package: sudo pacman -S cloudflared (see README.md)".to_string())
+    Err("WAN Tunneling requires cloudflared. Please install the trusted system package: pacman -S cloudflared (see README.md)".to_string())
 }
 
 // ------------------- QR CODE & URLS -------------------
