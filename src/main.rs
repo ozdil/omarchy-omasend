@@ -1339,7 +1339,15 @@ pub fn p2p_send_file_via_bluetooth(mac: &str, file_path: &Path) -> Result<(), St
 
     let deadline = Instant::now() + Duration::from_secs(180);
     println!("Initiating Bluetooth OBEX push to {} for file: {}", clean_mac, file_str);
-    if let Some(out) = run_cmd_bounded(bin, &["-p", &clean_mac, file_str], &[], deadline, 8192) {
+    let mut envs = Vec::new();
+    if let Ok(val) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+        envs.push(("DBUS_SESSION_BUS_ADDRESS", val));
+    }
+    if let Ok(val) = std::env::var("XDG_RUNTIME_DIR") {
+        envs.push(("XDG_RUNTIME_DIR", val));
+    }
+    let env_refs: Vec<(&str, &str)> = envs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    if let Some(out) = run_cmd_bounded(bin, &["-p", &clean_mac, file_str], &env_refs, deadline, 8192) {
         let resp = String::from_utf8_lossy(&out);
         if resp.to_lowercase().contains("error") || resp.to_lowercase().contains("failed") {
             notify_desktop(
@@ -1363,8 +1371,38 @@ pub fn p2p_send_file_via_bluetooth(mac: &str, file_path: &Path) -> Result<(), St
 }
 
 fn ensure_obex_service_running() {
+    if let Ok(config_home) = std::env::var("XDG_CONFIG_HOME")
+        .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.config", h)))
+    {
+        let dropin_dir = PathBuf::from(config_home).join("systemd/user/obex.service.d");
+        let dropin_file = dropin_dir.join("override.conf");
+        if !dropin_file.exists() {
+            let _ = fs::create_dir_all(&dropin_dir);
+            let content = "[Service]\nExecStart=\nExecStart=/usr/lib/bluetooth/obexd -r %h/Downloads -a\n";
+            let _ = fs::write(&dropin_file, content);
+            let mut envs = Vec::new();
+            if let Ok(val) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+                envs.push(("DBUS_SESSION_BUS_ADDRESS", val));
+            }
+            if let Ok(val) = std::env::var("XDG_RUNTIME_DIR") {
+                envs.push(("XDG_RUNTIME_DIR", val));
+            }
+            let env_refs: Vec<(&str, &str)> = envs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let dl = Instant::now() + Duration::from_millis(500);
+            let _ = run_cmd_bounded("/usr/bin/systemctl", &["--user", "daemon-reload"], &env_refs, dl, 1024);
+        }
+    }
+
+    let mut envs = Vec::new();
+    if let Ok(val) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+        envs.push(("DBUS_SESSION_BUS_ADDRESS", val));
+    }
+    if let Ok(val) = std::env::var("XDG_RUNTIME_DIR") {
+        envs.push(("XDG_RUNTIME_DIR", val));
+    }
+    let env_refs: Vec<(&str, &str)> = envs.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let deadline = Instant::now() + Duration::from_millis(500);
-    let _ = run_cmd_bounded("/usr/bin/systemctl", &["--user", "start", "obex.service"], &[], deadline, 1024);
+    let _ = run_cmd_bounded("/usr/bin/systemctl", &["--user", "restart", "obex.service"], &env_refs, deadline, 1024);
 }
 
 fn start_bluetooth_receiver(download_dir: &Path) {
@@ -1381,8 +1419,14 @@ fn start_bluetooth_receiver(download_dir: &Path) {
             cmd.args(["-s", &dir_str, "-y"])
                 .env_clear()
                 .env("PATH", "/usr/bin:/bin")
-                .env("LC_ALL", "C")
-                .stdin(Stdio::null())
+                .env("LC_ALL", "C");
+            if let Ok(val) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+                cmd.env("DBUS_SESSION_BUS_ADDRESS", val);
+            }
+            if let Ok(val) = std::env::var("XDG_RUNTIME_DIR") {
+                cmd.env("XDG_RUNTIME_DIR", val);
+            }
+            cmd.stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .process_group(0);
