@@ -9,7 +9,7 @@ import qs.Ui
 Panel {
   id: root
   moduleName: "ozdil.omasend"
-  ipcTarget: "ozdil.omasend"
+  ipcTarget: ""
   manageIpc: false
 
   implicitWidth: button.implicitWidth
@@ -83,7 +83,9 @@ Panel {
   }
 
   function sendFileTo(ip) {
-    root.executeAction(["--send-dialog", ip])
+    if (sendDialogProc.running) sendDialogProc.running = false
+    sendDialogProc.command = [root.resolveEnginePath(), "--send-dialog", ip]
+    sendDialogProc.running = true
   }
 
   function newPin() {
@@ -127,6 +129,8 @@ Panel {
     function close(): void { root.close() }
     function toggle(): void { root.toggle() }
     function refresh(): void { root.refresh() }
+    function setVisibility(mode: string): void { root.setP2pVisibility(mode) }
+    function sendFile(ip: string): void { root.sendFileTo(ip) }
   }
 
   // Persistent background HTTP daemon
@@ -182,6 +186,14 @@ Panel {
     }
   }
 
+  Process {
+    id: sendDialogProc
+    onExited: function(code) {
+      sendDialogProc.running = false
+      root.refresh()
+    }
+  }
+
   Process { id: copyProc }
   Process { id: folderProc }
 
@@ -214,6 +226,7 @@ Panel {
     if (serverProc.running) serverProc.running = false
     if (scanProc.running) scanProc.running = false
     if (actionProc.running) actionProc.running = false
+    if (sendDialogProc.running) sendDialogProc.running = false
     if (copyProc.running) copyProc.running = false
     if (folderProc.running) folderProc.running = false
     if (refreshTimer.running) refreshTimer.running = false
@@ -480,85 +493,37 @@ Panel {
             width: parent.width
             spacing: Style.space(6)
 
-            // OFF Button
-            Rectangle {
+            Button {
               Layout.fillWidth: true
-              Layout.preferredHeight: Style.space(26)
-              radius: Style.cornerRadius
-              color: root.p2pVisibility === "OFF" ? Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent) : "transparent"
-              border.color: root.p2pVisibility === "OFF" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
-              border.width: 1
-
-              Text {
-                anchors.centerIn: parent
-                textFormat: Text.PlainText
-                text: "OFF"
-                color: root.p2pVisibility === "OFF" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                font.pixelSize: Style.font.caption
-                font.bold: root.p2pVisibility === "OFF"
-              }
-
-              MouseArea {
-                anchors.fill: parent
-                z: 10
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.setP2pVisibility("OFF")
-              }
+              text: "OFF"
+              selected: root.p2pVisibility === "OFF"
+              bordered: true
+              accent: Color.accent
+              fontSize: Style.font.caption
+              fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+              onClicked: root.setP2pVisibility("OFF")
             }
 
-            // KNOWN PEERS Button
-            Rectangle {
+            Button {
               Layout.fillWidth: true
-              Layout.preferredHeight: Style.space(26)
-              radius: Style.cornerRadius
-              color: root.p2pVisibility === "KNOWN" ? Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent) : "transparent"
-              border.color: root.p2pVisibility === "KNOWN" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
-              border.width: 1
-
-              Text {
-                anchors.centerIn: parent
-                textFormat: Text.PlainText
-                text: "KNOWN PEERS"
-                color: root.p2pVisibility === "KNOWN" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                font.pixelSize: Style.font.caption
-                font.bold: root.p2pVisibility === "KNOWN"
-              }
-
-              MouseArea {
-                anchors.fill: parent
-                z: 10
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.setP2pVisibility("KNOWN")
-              }
+              text: "KNOWN PEERS"
+              selected: root.p2pVisibility === "KNOWN"
+              bordered: true
+              accent: Color.accent
+              fontSize: Style.font.caption
+              fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+              onClicked: root.setP2pVisibility("KNOWN")
             }
 
-            // EVERYONE 10M Button
-            Rectangle {
+            Button {
               Layout.fillWidth: true
-              Layout.preferredHeight: Style.space(26)
-              radius: Style.cornerRadius
-              color: root.p2pVisibility === "EVERYONE" ? Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent) : "transparent"
-              border.color: root.p2pVisibility === "EVERYONE" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
-              border.width: 1
-
-              Text {
-                anchors.centerIn: parent
-                textFormat: Text.PlainText
-                text: root.p2pVisibility === "EVERYONE" && root.p2pVisibilityRemainingSecs > 0 ? ("EVERYONE (" + Math.floor(root.p2pVisibilityRemainingSecs / 60) + ":" + (root.p2pVisibilityRemainingSecs % 60 < 10 ? "0" : "") + (root.p2pVisibilityRemainingSecs % 60) + ")") : "EVERYONE (10M)"
-                color: root.p2pVisibility === "EVERYONE" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                font.pixelSize: Style.font.caption
-                font.bold: root.p2pVisibility === "EVERYONE"
-              }
-
-              MouseArea {
-                anchors.fill: parent
-                z: 10
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.setP2pVisibility("EVERYONE")
-              }
+              text: root.p2pVisibility === "EVERYONE" && root.p2pVisibilityRemainingSecs > 0 ? ("EVERYONE (" + Math.floor(root.p2pVisibilityRemainingSecs / 60) + ":" + (root.p2pVisibilityRemainingSecs % 60 < 10 ? "0" : "") + (root.p2pVisibilityRemainingSecs % 60) + ")") : "EVERYONE (10M)"
+              selected: root.p2pVisibility === "EVERYONE"
+              bordered: true
+              accent: Color.accent
+              fontSize: Style.font.caption
+              fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+              onClicked: root.setP2pVisibility("EVERYONE")
             }
           }
 
@@ -583,7 +548,8 @@ Panel {
 
               Rectangle {
                 width: parent.width
-                implicitHeight: Style.space(38)
+                implicitHeight: Style.space(46)
+                height: implicitHeight
                 radius: Style.cornerRadius
                 color: "transparent"
                 border.color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
@@ -642,55 +608,23 @@ Panel {
                     }
                   }
 
-                  Rectangle {
-                    Layout.preferredWidth: Style.space(64)
-                    Layout.preferredHeight: Style.space(24)
-                    radius: Style.cornerRadius
-                    color: Color.accent
-
-                    Text {
-                      anchors.centerIn: parent
-                      textFormat: Text.PlainText
-                      text: "📁 SEND"
-                      color: "#000000"
-                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                      font.pixelSize: Style.font.caption
-                      font.bold: true
-                    }
-
-                    MouseArea {
-                      anchors.fill: parent
-                      z: 10
-                      cursorShape: Qt.PointingHandCursor
-                      onClicked: root.sendFileTo(modelData.ip)
-                    }
+                  Button {
+                    text: "📁 SEND"
+                    bordered: true
+                    accent: Color.accent
+                    fontSize: Style.font.caption
+                    fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+                    onClicked: root.sendFileTo(modelData.ip)
                   }
 
-                  Rectangle {
+                  Button {
                     visible: !modelData.ip.startsWith("bt:")
-                    Layout.preferredWidth: Style.space(86)
-                    Layout.preferredHeight: Style.space(24)
-                    radius: Style.cornerRadius
-                    color: Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
-                    border.color: Color.accent
-                    border.width: 1
-
-                    Text {
-                      anchors.centerIn: parent
-                      textFormat: Text.PlainText
-                      text: "📋 CLIPBOARD"
-                      color: Color.accent
-                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                      font.pixelSize: Style.font.caption
-                      font.bold: true
-                    }
-
-                    MouseArea {
-                      anchors.fill: parent
-                      z: 10
-                      cursorShape: Qt.PointingHandCursor
-                      onClicked: root.syncClipboardTo(modelData.ip)
-                    }
+                    text: "📋 CLIPBOARD"
+                    bordered: true
+                    accent: Color.accent
+                    fontSize: Style.font.caption
+                    fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+                    onClicked: root.syncClipboardTo(modelData.ip)
                   }
                 }
               }
