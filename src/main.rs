@@ -1399,6 +1399,24 @@ fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
         notify_desktop("OmaSend AirBridge", "Clipboard is empty. Copy some text first.");
         return Err("Clipboard is empty".to_string());
     }
+
+    if target_ip.starts_with("bt:") || (target_ip.len() == 17 && target_ip.chars().filter(|c| *c == ':').count() == 5) {
+        let mac = target_ip.strip_prefix("bt:").unwrap_or(target_ip);
+        let temp_clip = get_state_dir().join("clipboard_share.txt");
+        let _ = write_secure_file(&temp_clip, &text);
+        match p2p_send_file_via_bluetooth(mac, &temp_clip) {
+            Ok(()) => {
+                println!("Clipboard text sent via Bluetooth to {}", mac);
+                notify_desktop("OmaSend AirBridge", "Clipboard text sent via Bluetooth.");
+                return Ok(());
+            }
+            Err(e) => {
+                notify_desktop("OmaSend AirBridge", &format!("Bluetooth clipboard send failed: {}", e));
+                return Err(e);
+            }
+        }
+    }
+
     let (my_id, _) = get_or_create_device_id();
     let my_name = get_system_hostname();
     let payload = serde_json::json!({
@@ -1410,6 +1428,17 @@ fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
     let mut stream = match connect_peer_with_timeout(&addr, Duration::from_secs(4)) {
         Ok(s) => s,
         Err(e) => {
+            let bt_peers = get_bluetooth_paired_peers();
+            if let Some(bt_match) = bt_peers.first() {
+                let mac = bt_match.ip.strip_prefix("bt:").unwrap_or(&bt_match.ip);
+                notify_desktop("OmaSend AirBridge", &format!("LAN unreachable. Attempting Bluetooth clipboard sync to {}...", bt_match.name));
+                let temp_clip = get_state_dir().join("clipboard_share.txt");
+                let _ = write_secure_file(&temp_clip, &text);
+                if let Ok(()) = p2p_send_file_via_bluetooth(mac, &temp_clip) {
+                    notify_desktop("OmaSend AirBridge", "Clipboard text sent via Bluetooth fallback.");
+                    return Ok(());
+                }
+            }
             notify_desktop(
                 "OmaSend AirBridge",
                 &format!("Connection failed to {}. Ensure peer is online.", target_ip),

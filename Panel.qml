@@ -621,7 +621,6 @@ Panel {
                   }
 
                   Button {
-                    visible: !modelData.ip.startsWith("bt:")
                     text: "📋 CLIPBOARD"
                     bordered: true
                     accent: Color.accent
