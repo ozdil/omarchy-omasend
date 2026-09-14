@@ -1,5 +1,7 @@
 # OmaSend - Zero-Knowledge AirBridge and E2EE Transfer for Omarchy Linux
 
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy_Me_A_Coffee-Support_Development-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/ozdil)
+
 Cross-device file transfer, encrypted clipboard bridge, Omarchy AirDrop P2P, and global WAN portal with Zero-Knowledge AES-256-GCM encryption for Omarchy Linux.
 
 Author: Ozan Ozdil (ozdil)  
@@ -136,6 +138,14 @@ OmaSend complies strictly with the Omarchy Linux Security Architecture (AGENTS.m
 - Strict File Permissions: Sensitive state files (`trusted_peers.json`, `device_id.key`) are written atomically with mode 0600. Symlinks are rejected.
 - Network Limits: Absolute timeouts (15s) and header size caps (64 KiB) protect against Slowloris and resource exhaustion attacks.
 - Plain Text UI: All dynamic strings in QML use `textFormat: Text.PlainText` to prevent script and markup injection.
+
+---
+
+## Support & Sponsorship
+
+If you find OmaSend useful and want to support independent, open-source Linux development:
+
+<a href="https://buymeacoffee.com/ozdil" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 50px !important;width: 180px !important;" ></a>
 
 ---
 
