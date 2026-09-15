@@ -14,7 +14,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use sha2::{Digest, Sha256};
 use std::thread;
@@ -1563,8 +1563,88 @@ fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
 // ------------------- HTTP ENGINE -------------------
 
 pub const MAX_HEADER_SIZE: usize = 65536; // 64 KiB header limit
-pub const MAX_BODY_SIZE: usize = 100 * 1024 * 1024; // 100 MiB strict ceiling (reduced from 250 MiB)
-pub const IN_MEMORY_BODY_LIMIT: usize = 1024 * 1024; // 1 MiB in-memory cap for non-file requests
+pub const MAX_BODY_SIZE: usize = 100 * 1024 * 1024; // 100 MiB strict plain upload ceiling
+pub const MAX_ENCRYPTED_UPLOAD_SIZE: usize = 25 * 1024 * 1024; // 25 MiB encrypted upload ceiling
+pub const MAX_CLIPBOARD_BODY: usize = 1024 * 1024; // 1 MiB clipboard limit
+pub const MAX_CONTROL_BODY: usize = 65536; // 64 KiB JSON metadata limit
+pub const IN_MEMORY_BODY_LIMIT: usize = 1024 * 1024; // 1 MiB in-memory cap
+pub const MAX_AGGREGATE_STAGING_BYTES: u64 = 200 * 1024 * 1024; // 200 MiB aggregate disk staging cap
+pub const MAX_CONCURRENT_ENCRYPTED_UPLOADS: u32 = 2; // Max 2 concurrent encrypted uploads
+pub const HEADER_READ_TIMEOUT_SECS: u64 = 15; // 15s max header timeout
+pub const DEFAULT_BODY_TIMEOUT_SECS: u64 = 30; // 30s body timeout for small requests
+pub const MAX_UPLOAD_DURATION_SECS: u64 = 120; // 120s max duration for 100 MiB uploads
+
+// Atomic aggregate staging capacity accounting to eliminate disk space check races
+static CURRENT_STAGED_BYTES: AtomicU64 = AtomicU64::new(0);
+static STAGING_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(Debug)]
+pub struct StagingReservationGuard {
+    pub reserved_bytes: u64,
+}
+
+impl StagingReservationGuard {
+    pub fn try_reserve(needed_bytes: u64, ddir: &Path) -> Result<Self, &'static str> {
+        let _lock = STAGING_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let current = CURRENT_STAGED_BYTES.load(Ordering::SeqCst);
+        if current.saturating_add(needed_bytes) > MAX_AGGREGATE_STAGING_BYTES {
+            return Err("Aggregate staging capacity exceeded (200 MiB limit)");
+        }
+        if let Some(avail) = get_available_disk_space(ddir) {
+            let required_space = current.saturating_add(needed_bytes).saturating_add(25 * 1024 * 1024);
+            if required_space > avail {
+                return Err("Insufficient disk space for staging reservation");
+            }
+        }
+        CURRENT_STAGED_BYTES.fetch_add(needed_bytes, Ordering::SeqCst);
+        Ok(Self { reserved_bytes: needed_bytes })
+    }
+
+    pub fn release(&mut self) {
+        if self.reserved_bytes > 0 {
+            CURRENT_STAGED_BYTES.fetch_sub(self.reserved_bytes, Ordering::SeqCst);
+            self.reserved_bytes = 0;
+        }
+    }
+}
+
+impl Drop for StagingReservationGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+// Concurrency tracker for encrypted uploads to strictly bound peak decryption memory
+static ACTIVE_ENCRYPTED_UPLOADS: AtomicU32 = AtomicU32::new(0);
+
+#[derive(Debug)]
+pub struct EncryptedUploadGuard;
+
+impl EncryptedUploadGuard {
+    pub fn try_acquire() -> Option<Self> {
+        let mut curr = ACTIVE_ENCRYPTED_UPLOADS.load(Ordering::SeqCst);
+        loop {
+            if curr >= MAX_CONCURRENT_ENCRYPTED_UPLOADS {
+                return None;
+            }
+            match ACTIVE_ENCRYPTED_UPLOADS.compare_exchange_weak(
+                curr,
+                curr.saturating_add(1),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return Some(EncryptedUploadGuard),
+                Err(actual) => curr = actual,
+            }
+        }
+    }
+}
+
+impl Drop for EncryptedUploadGuard {
+    fn drop(&mut self) {
+        ACTIVE_ENCRYPTED_UPLOADS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 #[derive(Default, Debug, Clone)]
 pub struct HttpRequest {
@@ -1602,14 +1682,16 @@ pub struct StagedFile {
     pub path: PathBuf,
     pub size: u64,
     pub persisted: bool,
+    pub reservation: Option<StagingReservationGuard>,
 }
 
 impl StagedFile {
-    pub fn new(path: PathBuf, size: u64) -> Self {
+    pub fn new(path: PathBuf, size: u64, reservation: Option<StagingReservationGuard>) -> Self {
         Self {
             path,
             size,
             persisted: false,
+            reservation,
         }
     }
 
@@ -1620,10 +1702,16 @@ impl StagedFile {
         fs::rename(&self.path, target).map_err(|e| format!("Failed to rename staged file: {}", e))?;
         let _ = fs::set_permissions(target, fs::Permissions::from_mode(0o600));
         self.persisted = true;
+        if let Some(ref mut res) = self.reservation {
+            res.release();
+        }
         Ok(())
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
+        if self.size > MAX_ENCRYPTED_UPLOAD_SIZE as u64 {
+            return Err("Payload exceeds maximum in-memory materialization limit".to_string());
+        }
         safe_read_file(&self.path)
     }
 }
@@ -1632,6 +1720,9 @@ impl Drop for StagedFile {
     fn drop(&mut self) {
         if !self.persisted && self.path.exists() {
             let _ = fs::remove_file(&self.path);
+        }
+        if let Some(ref mut res) = self.reservation {
+            res.release();
         }
     }
 }
@@ -1668,13 +1759,67 @@ impl HttpBody {
     }
 }
 
-pub fn read_http_request_stream<R: Read>(stream: &mut R) -> Option<(HttpRequest, HttpBody)> {
+pub trait TimeoutStream: Read {
+    fn set_stream_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()> {
+        let _ = timeout;
+        Ok(())
+    }
+}
+
+impl TimeoutStream for TcpStream {
+    fn set_stream_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.set_read_timeout(timeout)
+    }
+}
+
+impl<T: AsRef<[u8]>> TimeoutStream for std::io::Cursor<T> {}
+
+/// Reads a stream chunk while strictly enforcing a monotonic deadline and updating socket timeout
+pub fn read_stream_chunk_with_deadline<S: TimeoutStream>(
+    stream: &mut S,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<usize> {
+    let now = Instant::now();
+    if now >= deadline {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "Monotonic request deadline exceeded",
+        ));
+    }
+
+    let remaining = deadline.saturating_duration_since(now);
+    let sock_to = remaining.min(Duration::from_secs(15));
+    let _ = stream.set_stream_timeout(Some(sock_to));
+
+    let n = stream.read(buf)?;
+    if Instant::now() >= deadline {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "Monotonic request deadline exceeded",
+        ));
+    }
+
+    Ok(n)
+}
+
+#[derive(Debug)]
+pub struct HttpHeaderResult {
+    pub req: HttpRequest,
+    pub content_length: usize,
+    pub initial_body: Vec<u8>,
+}
+
+/// Phase 1: Read HTTP headers bounded strictly by MAX_HEADER_SIZE (64 KiB) under monotonic deadline
+pub fn read_http_headers<S: TimeoutStream>(
+    stream: &mut S,
+    deadline: Instant,
+) -> Option<HttpHeaderResult> {
     let mut header_buf = Vec::with_capacity(4096);
-    let mut temp = [0u8; 8192];
+    let mut temp = [0u8; 4096];
     let mut header_end = None;
     let mut content_length: usize = 0;
 
-    // Phase 1: Read HTTP headers bounded by MAX_HEADER_SIZE (64 KiB)
     loop {
         if let Some(pos) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
             header_end = Some(pos + 4);
@@ -1686,7 +1831,7 @@ pub fn read_http_request_stream<R: Read>(stream: &mut R) -> Option<(HttpRequest,
                     if k == "content-length" {
                         content_length = v.parse::<usize>().unwrap_or(0);
                         if content_length > MAX_BODY_SIZE {
-                            return None; // Reject oversized payload ceiling
+                            return None; // Immediate ceiling rejection
                         }
                     }
                 }
@@ -1698,16 +1843,33 @@ pub fn read_http_request_stream<R: Read>(stream: &mut R) -> Option<(HttpRequest,
             return None; // Header overrun protection
         }
 
-        match stream.read(&mut temp) {
+        match read_stream_chunk_with_deadline(stream, &mut temp, deadline) {
             Ok(0) => break,
             Ok(n) => {
-                if header_buf.len().saturating_add(n) > MAX_HEADER_SIZE.saturating_add(IN_MEMORY_BODY_LIMIT) {
-                    let needed = MAX_HEADER_SIZE.saturating_sub(header_buf.len());
-                    let take = n.min(needed);
-                    header_buf.extend_from_slice(&temp[..take]);
-                    header_buf.windows(4).position(|w| w == b"\r\n\r\n")?;
-                } else {
-                    header_buf.extend_from_slice(&temp[..n]);
+                let remaining_space = MAX_HEADER_SIZE.saturating_sub(header_buf.len());
+                let take = n.min(remaining_space);
+                header_buf.extend_from_slice(&temp[..take]);
+                if n > take && !header_buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    return None;
+                }
+                if n > take {
+                    if let Some(pos) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        header_end = Some(pos + 4);
+                        let header_str = String::from_utf8_lossy(&header_buf[..pos]);
+                        for line in header_str.lines() {
+                            if let Some(col) = line.find(':') {
+                                let k = line[..col].trim().to_lowercase();
+                                let v = line[col + 1..].trim();
+                                if k == "content-length" {
+                                    content_length = v.parse::<usize>().unwrap_or(0);
+                                    if content_length > MAX_BODY_SIZE {
+                                        return None;
+                                    }
+                                }
+                            }
+                        }
+                        break;
+                    }
                 }
             }
             Err(_) => return None,
@@ -1747,22 +1909,44 @@ pub fn read_http_request_stream<R: Read>(stream: &mut R) -> Option<(HttpRequest,
         body_offset: 0,
     };
 
-    let initial_body = &header_buf[hend..];
-    let initial_len = initial_body.len();
+    let initial_body = header_buf[hend..].to_vec();
 
-    // Phase 2: Handle Body
-    if content_length == 0 {
-        return Some((req, HttpBody::Memory(Vec::new())));
+    Some(HttpHeaderResult {
+        req,
+        content_length,
+        initial_body,
+    })
+}
+
+/// Phase 2: Read HTTP body with endpoint-specific caps, atomic staging reservation, and monotonic deadlines
+pub fn read_http_body<S: TimeoutStream>(
+    stream: &mut S,
+    content_length: usize,
+    initial_body: &[u8],
+    deadline: Instant,
+    staging_allowed: bool,
+    max_allowed_bytes: usize,
+) -> Option<HttpBody> {
+    if content_length > max_allowed_bytes {
+        return None;
     }
+
+    if content_length == 0 {
+        return Some(HttpBody::Memory(Vec::new()));
+    }
+
+    let initial_len = initial_body.len();
 
     if content_length <= IN_MEMORY_BODY_LIMIT {
         let mut body_vec = Vec::with_capacity(content_length);
         let copy_len = initial_len.min(content_length);
         body_vec.extend_from_slice(&initial_body[..copy_len]);
         let mut remaining = content_length.saturating_sub(copy_len);
+        let mut temp = [0u8; 8192];
+
         while remaining > 0 {
             let to_read = remaining.min(temp.len());
-            match stream.read(&mut temp[..to_read]) {
+            match read_stream_chunk_with_deadline(stream, &mut temp[..to_read], deadline) {
                 Ok(0) => break,
                 Ok(n) => {
                     body_vec.extend_from_slice(&temp[..n]);
@@ -1771,21 +1955,22 @@ pub fn read_http_request_stream<R: Read>(stream: &mut R) -> Option<(HttpRequest,
                 Err(_) => return None,
             }
         }
+
         if body_vec.len() < content_length {
             return None; // Premature EOF
         }
-        Some((req, HttpBody::Memory(body_vec)))
+
+        Some(HttpBody::Memory(body_vec))
     } else {
-        // Stream directly to a bounded mode 0600 disk staging file
+        if !staging_allowed {
+            return None; // Staging not permitted for this endpoint
+        }
+
         let ddir = get_download_dir();
         let _ = fs::create_dir_all(&ddir);
         let _ = fs::set_permissions(&ddir, fs::Permissions::from_mode(0o700));
 
-        if let Some(avail) = get_available_disk_space(&ddir) {
-            if (content_length as u64).saturating_add(25 * 1024 * 1024) > avail {
-                return None; // Insufficient storage
-            }
-        }
+        let reservation = StagingReservationGuard::try_reserve(content_length as u64, &ddir).ok()?;
 
         let now_nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
         let mut rand_bytes = [0u8; 8];
@@ -1797,7 +1982,6 @@ pub fn read_http_request_stream<R: Read>(stream: &mut R) -> Option<(HttpRequest,
         opts.write(true).create_new(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
 
@@ -1818,7 +2002,7 @@ pub fn read_http_request_stream<R: Read>(stream: &mut R) -> Option<(HttpRequest,
 
         while remaining > 0 {
             let to_read = remaining.min(stream_chunk.len());
-            match stream.read(&mut stream_chunk[..to_read]) {
+            match read_stream_chunk_with_deadline(stream, &mut stream_chunk[..to_read], deadline) {
                 Ok(0) => {
                     let _ = fs::remove_file(&stage_path);
                     return None;
@@ -1843,15 +2027,37 @@ pub fn read_http_request_stream<R: Read>(stream: &mut R) -> Option<(HttpRequest,
             return None;
         }
 
-        let staged = StagedFile::new(stage_path, total_written);
-        Some((req, HttpBody::Staged(staged)))
+        let staged = StagedFile::new(stage_path, total_written, Some(reservation));
+        Some(HttpBody::Staged(staged))
     }
 }
 
+pub fn read_http_request_stream<S: TimeoutStream>(stream: &mut S) -> Option<(HttpRequest, HttpBody)> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let h_res = read_http_headers(stream, deadline)?;
+    let body = read_http_body(
+        stream,
+        h_res.content_length,
+        &h_res.initial_body,
+        deadline,
+        true,
+        MAX_BODY_SIZE,
+    )?;
+    Some((h_res.req, body))
+}
+
 pub fn read_full_http_request(stream: &mut TcpStream) -> Option<(HttpRequest, HttpBody)> {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
-    read_http_request_stream(stream)
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let h_res = read_http_headers(stream, deadline)?;
+    let body = read_http_body(
+        stream,
+        h_res.content_length,
+        &h_res.initial_body,
+        deadline,
+        true,
+        MAX_BODY_SIZE,
+    )?;
+    Some((h_res.req, body))
 }
 
 struct PinAttemptState {
@@ -2381,10 +2587,17 @@ window.addEventListener('load', async function() {{
 // ------------------- CONNECTION HANDLER -------------------
 
 fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) {
-    let (req, body) = match read_full_http_request(&mut stream) {
-        Some(res) => res,
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
+    let header_deadline = Instant::now() + Duration::from_secs(HEADER_READ_TIMEOUT_SECS);
+
+    let h_res = match read_http_headers(&mut stream, header_deadline) {
+        Some(h) => h,
         None => return,
     };
+
+    let req = h_res.req;
+    let content_length = h_res.content_length;
+    let initial_body = h_res.initial_body;
 
     let client_ip = stream
         .peer_addr()
@@ -2509,6 +2722,18 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             return;
         }
 
+        if content_length > MAX_CONTROL_BODY {
+            let err = serde_json::json!({ "error": "Request payload exceeds control limit" });
+            respond(&stream, "413 Payload Too Large", "application/json", err.to_string().as_bytes(), None, None);
+            return;
+        }
+
+        let body_deadline = Instant::now() + Duration::from_secs(DEFAULT_BODY_TIMEOUT_SECS);
+        let body = match read_http_body(&mut stream, content_length, &initial_body, body_deadline, false, MAX_CONTROL_BODY) {
+            Some(b) => b,
+            None => return,
+        };
+
         let body_slice = match body.as_slice() {
             Some(s) => s,
             None => {
@@ -2611,6 +2836,17 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             respond(&stream, "404 Not Found", "application/json", b"{\"status\":\"NOT_FOUND\"}", None, None);
             return;
         } else if req.method == "POST" {
+            if content_length > MAX_CONTROL_BODY {
+                respond(&stream, "413 Payload Too Large", "application/json", b"{\"error\":\"Request payload exceeds limit\"}", None, None);
+                return;
+            }
+
+            let body_deadline = Instant::now() + Duration::from_secs(DEFAULT_BODY_TIMEOUT_SECS);
+            let body = match read_http_body(&mut stream, content_length, &initial_body, body_deadline, false, MAX_CONTROL_BODY) {
+                Some(b) => b,
+                None => return,
+            };
+
             let body_slice = match body.as_slice() {
                 Some(s) => s,
                 None => {
@@ -2652,55 +2888,73 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
         let clean_filename = sanitize_filename(&urlencoding_decode(&filename_raw));
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
-        if let Some(mut pending) = get_pending_transfer() {
-            if pending.token == token && pending.status == "ACCEPTED" && now <= pending.expires_at {
-                let ddir = get_download_dir();
-                let file_path = get_unique_filepath(&ddir, &clean_filename);
-                let payload_len = body.len();
-                let write_res = match body {
-                    HttpBody::Staged(staged) => {
-                        staged.persist(&file_path)
-                    }
-                    HttpBody::Memory(ref bytes) => {
-                        if let Some(avail) = get_available_disk_space(&ddir) {
-                            if (bytes.len() as u64).saturating_add(10 * 1024 * 1024) > avail {
-                                respond(&stream, "507 Insufficient Storage", "text/plain", b"Insufficient disk space to save file", None, None);
-                                return;
-                            }
-                        }
-                        write_secure_bytes(&file_path, bytes)
-                    }
-                };
-                if write_res.is_ok() {
-                    RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
-                    if let Some(pos) = pending.file_names.iter().position(|f| f == &clean_filename) {
-                        pending.file_names.remove(pos);
-                    }
-                    if pending.file_names.is_empty() {
-                        clear_pending_transfer();
-                    } else {
-                        save_pending_transfer(&pending);
-                    }
-                    let final_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                    notify_desktop(
-                        "OmaSend: AirBridge Transfer Complete",
-                        &format!("'{}' ({} bytes) received and saved to Downloads/omasend.", final_name, payload_len)
-                    );
-                    let resp = serde_json::json!({
-                        "status": "OK",
-                        "filename": final_name,
-                        "size": payload_len
-                    });
-                    respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
-                    return;
-                } else {
-                    respond(&stream, "500 Internal Server Error", "text/plain", b"Failed to write file to disk", None, None);
-                    return;
-                }
-            }
+        let pending_opt = get_pending_transfer();
+        let has_valid_token = match pending_opt.as_ref() {
+            Some(p) => p.token == token && p.status == "ACCEPTED" && now <= p.expires_at,
+            None => false,
+        };
+
+        if !has_valid_token {
+            respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Unauthorized or expired transfer token\"}", None, None);
+            return;
         }
-        respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Unauthorized or expired transfer token\"}", None, None);
-        return;
+
+        if content_length > MAX_BODY_SIZE {
+            respond(&stream, "413 Payload Too Large", "application/json", b"{\"error\":\"Payload exceeds 100 MiB limit\"}", None, None);
+            return;
+        }
+
+        let upload_secs = (content_length as u64 / (512 * 1024)).clamp(30, MAX_UPLOAD_DURATION_SECS);
+        let body_deadline = Instant::now() + Duration::from_secs(upload_secs);
+        let body = match read_http_body(&mut stream, content_length, &initial_body, body_deadline, true, MAX_BODY_SIZE) {
+            Some(b) => b,
+            None => return,
+        };
+
+        let mut pending = pending_opt.unwrap();
+        let ddir = get_download_dir();
+        let file_path = get_unique_filepath(&ddir, &clean_filename);
+        let payload_len = body.len();
+        let write_res = match body {
+            HttpBody::Staged(staged) => {
+                staged.persist(&file_path)
+            }
+            HttpBody::Memory(ref bytes) => {
+                if let Some(avail) = get_available_disk_space(&ddir) {
+                    if (bytes.len() as u64).saturating_add(10 * 1024 * 1024) > avail {
+                        respond(&stream, "507 Insufficient Storage", "text/plain", b"Insufficient disk space to save file", None, None);
+                        return;
+                    }
+                }
+                write_secure_bytes(&file_path, bytes)
+            }
+        };
+        if write_res.is_ok() {
+            RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
+            if let Some(pos) = pending.file_names.iter().position(|f| f == &clean_filename) {
+                pending.file_names.remove(pos);
+            }
+            if pending.file_names.is_empty() {
+                clear_pending_transfer();
+            } else {
+                save_pending_transfer(&pending);
+            }
+            let final_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            notify_desktop(
+                "OmaSend: AirBridge Transfer Complete",
+                &format!("'{}' ({} bytes) received and saved to Downloads/omasend.", final_name, payload_len)
+            );
+            let resp = serde_json::json!({
+                "status": "OK",
+                "filename": final_name,
+                "size": payload_len
+            });
+            respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+            return;
+        } else {
+            respond(&stream, "500 Internal Server Error", "text/plain", b"Failed to write file to disk", None, None);
+            return;
+        }
     }
 
     if req.method == "POST" && req.path == "/api/p2p/clipboard" {
@@ -2709,6 +2963,18 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Visibility is Off\"}", None, None);
             return;
         }
+
+        if content_length > MAX_CLIPBOARD_BODY {
+            respond(&stream, "413 Payload Too Large", "application/json", b"{\"error\":\"Clipboard payload exceeds 1 MiB limit\"}", None, None);
+            return;
+        }
+
+        let body_deadline = Instant::now() + Duration::from_secs(DEFAULT_BODY_TIMEOUT_SECS);
+        let body = match read_http_body(&mut stream, content_length, &initial_body, body_deadline, false, MAX_CLIPBOARD_BODY) {
+            Some(b) => b,
+            None => return,
+        };
+
         let body_slice = match body.as_slice() {
             Some(s) => s,
             None => {
@@ -2725,7 +2991,7 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
                 return;
             }
             if let Some(text) = val["text"].as_str() {
-                if text.len() <= 1_048_576 {
+                if text.len() <= MAX_CLIPBOARD_BODY {
                     set_pc_clipboard(text);
                     notify_desktop("OmaSend: Universal Clipboard", &format!("Received clipboard text from {}.", sender_name));
                     respond(&stream, "200 OK", "application/json", b"{\"status\":\"OK\"}", None, None);
@@ -2738,8 +3004,12 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
     }
 
     if !authorized {
-        let html = render_login_page();
-        respond(&stream, "200 OK", "text/html; charset=utf-8", html.as_bytes(), None, None);
+        if req.method == "GET" && req.path == "/" {
+            let html = render_login_page();
+            respond(&stream, "200 OK", "text/html; charset=utf-8", html.as_bytes(), None, None);
+        } else {
+            respond(&stream, "401 Unauthorized", "text/plain", b"Unauthorized. Please provide valid PIN.", None, None);
+        }
         return;
     }
 
@@ -2751,6 +3021,26 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
         respond(&stream, "200 OK", "text/html; charset=utf-8", html.as_bytes(), set_cookie.as_deref(), None);
     }
     else if req.method == "POST" && req.path == "/api/upload-encrypted" {
+        if content_length > MAX_ENCRYPTED_UPLOAD_SIZE {
+            respond(&stream, "413 Payload Too Large", "text/plain", b"Encrypted upload exceeds 25 MiB ceiling", None, None);
+            return;
+        }
+
+        let _enc_guard = match EncryptedUploadGuard::try_acquire() {
+            Some(g) => g,
+            None => {
+                respond(&stream, "429 Too Many Requests", "text/plain", b"Too many concurrent encrypted uploads. Please try again in a moment.", None, None);
+                return;
+            }
+        };
+
+        let upload_secs = (content_length as u64 / (512 * 1024)).clamp(30, MAX_UPLOAD_DURATION_SECS);
+        let body_deadline = Instant::now() + Duration::from_secs(upload_secs);
+        let body = match read_http_body(&mut stream, content_length, &initial_body, body_deadline, true, MAX_ENCRYPTED_UPLOAD_SIZE) {
+            Some(b) => b,
+            None => return,
+        };
+
         let filename_raw = req.get_header("x-omasend-filename").unwrap_or("received_file.bin");
         let filename_decoded = urlencoding_decode(filename_raw);
         let clean_filename = sanitize_filename(&filename_decoded);
@@ -2844,6 +3134,17 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
         respond(&stream, "404 Not Found", "text/plain", b"File not found or access denied", None, None);
     }
     else if req.method == "POST" && req.path == "/api/clipboard-encrypted" {
+        if content_length > MAX_CLIPBOARD_BODY {
+            respond(&stream, "413 Payload Too Large", "text/plain", b"Clipboard payload exceeds 1 MiB ceiling", None, None);
+            return;
+        }
+
+        let body_deadline = Instant::now() + Duration::from_secs(DEFAULT_BODY_TIMEOUT_SECS);
+        let body = match read_http_body(&mut stream, content_length, &initial_body, body_deadline, false, MAX_CLIPBOARD_BODY) {
+            Some(b) => b,
+            None => return,
+        };
+
         let iv_hex = match req.get_header("x-omasend-iv") {
             Some(iv) if iv.len() == 24 => iv,
             _ => {
@@ -2904,6 +3205,17 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             let resp = serde_json::json!({ "clipboard": clip });
             respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
         } else if req.method == "POST" {
+            if content_length > MAX_CLIPBOARD_BODY {
+                respond(&stream, "413 Payload Too Large", "text/plain", b"Clipboard payload exceeds 1 MiB ceiling", None, None);
+                return;
+            }
+
+            let body_deadline = Instant::now() + Duration::from_secs(DEFAULT_BODY_TIMEOUT_SECS);
+            let body = match read_http_body(&mut stream, content_length, &initial_body, body_deadline, false, MAX_CLIPBOARD_BODY) {
+                Some(b) => b,
+                None => return,
+            };
+
             let body_bytes = body.to_bytes().unwrap_or_default();
             let body_str = String::from_utf8_lossy(&body_bytes);
             let text = if let Some(val) = body_str.strip_prefix("text=") {
@@ -2930,6 +3242,18 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
         respond(&stream, "404 Not Found", "text/plain", b"File not found or access denied", None, None);
     }
     else if req.method == "POST" && req.path == "/upload" {
+        if content_length > MAX_BODY_SIZE {
+            respond(&stream, "413 Payload Too Large", "text/plain", b"Upload payload exceeds 100 MiB ceiling", None, None);
+            return;
+        }
+
+        let upload_secs = (content_length as u64 / (512 * 1024)).clamp(30, MAX_UPLOAD_DURATION_SECS);
+        let body_deadline = Instant::now() + Duration::from_secs(upload_secs);
+        let body = match read_http_body(&mut stream, content_length, &initial_body, body_deadline, true, MAX_BODY_SIZE) {
+            Some(b) => b,
+            None => return,
+        };
+
         let ddir = get_download_dir();
         let mut saved_name = format!("transfer_{}.bin", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs());
         let mut success = false;
@@ -3357,6 +3681,8 @@ fn main() {
 mod tests {
     use super::*;
 
+    static TEST_SYNC_MUTEX: Mutex<()> = Mutex::new(());
+
     #[test]
     fn test_secure_file_atomic_write_and_mode_0600() {
         let temp_dir = env::temp_dir().join(format!("omasend_sec_test_{}", std::process::id()));
@@ -3661,6 +3987,7 @@ mod tests {
 
     #[test]
     fn test_concurrency_tracker_caps_and_early_rejection() {
+        let _test_lock = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         reset_connection_tracker();
 
         let peer_a = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
@@ -3726,6 +4053,8 @@ mod tests {
     #[test]
     fn test_streaming_body_staged_to_disk() {
         use std::io::Cursor;
+        let _test_lock = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        CURRENT_STAGED_BYTES.store(0, Ordering::SeqCst);
 
         // 2 MiB payload (exceeds 1 MiB IN_MEMORY_BODY_LIMIT, but under 100 MiB ceiling)
         let body_size = 2 * 1024 * 1024;
@@ -3765,6 +4094,8 @@ mod tests {
     #[test]
     fn test_slow_client_early_eof_cleanup() {
         use std::io::Cursor;
+        let _test_lock = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        CURRENT_STAGED_BYTES.store(0, Ordering::SeqCst);
 
         // Header claims 2 MiB, but only sends 1024 bytes and disconnects
         let mut raw = Vec::new();
@@ -3774,6 +4105,184 @@ mod tests {
         let mut cursor = Cursor::new(raw);
         let res = read_http_request_stream(&mut cursor);
         assert!(res.is_none(), "Premature EOF must reject request");
+    }
+
+    struct SlowProgressReader {
+        total: usize,
+        sent: usize,
+        chunk_delay: Duration,
+    }
+
+    impl Read for SlowProgressReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.sent >= self.total {
+                return Ok(0);
+            }
+            std::thread::sleep(self.chunk_delay);
+            let n = buf.len().min(16).min(self.total - self.sent);
+            for b in &mut buf[..n] {
+                *b = b'X';
+            }
+            self.sent += n;
+            Ok(n)
+        }
+    }
+
+    impl TimeoutStream for SlowProgressReader {}
+
+    #[test]
+    fn test_monotonic_deadline_slow_client_progress() {
+        // Slow client sends bytes in 16-byte chunks with 20ms delay per chunk.
+        // With a 50ms monotonic deadline, it can send at most 2 chunks (40ms) before the deadline expires.
+        let mut slow_reader = SlowProgressReader {
+            total: 2048,
+            sent: 0,
+            chunk_delay: Duration::from_millis(20),
+        };
+
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let res = read_http_headers(&mut slow_reader, deadline);
+        assert!(res.is_none(), "Slow client making partial progress past deadline must be terminated");
+
+        // Test body reading with expired monotonic deadline
+        let mut slow_body_reader = SlowProgressReader {
+            total: 1024,
+            sent: 0,
+            chunk_delay: Duration::from_millis(20),
+        };
+        let body_deadline = Instant::now() + Duration::from_millis(50);
+        let body_res = read_http_body(
+            &mut slow_body_reader,
+            1024,
+            b"",
+            body_deadline,
+            false,
+            MAX_BODY_SIZE,
+        );
+        assert!(body_res.is_none(), "Body reader must abort when monotonic deadline is reached");
+    }
+
+    #[test]
+    fn test_endpoint_specific_body_limits() {
+        use std::io::Cursor;
+
+        // 1. Clipboard endpoint (> 1 MiB MAX_CLIPBOARD_BODY)
+        let clip_size = MAX_CLIPBOARD_BODY + 10;
+        let mut cursor = Cursor::new(vec![0u8; 100]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let res = read_http_body(&mut cursor, clip_size, b"", deadline, false, MAX_CLIPBOARD_BODY);
+        assert!(res.is_none(), "Clipboard payload exceeding 1 MiB must be rejected immediately");
+
+        // 2. Control endpoint (> 64 KiB MAX_CONTROL_BODY)
+        let ctrl_size = MAX_CONTROL_BODY + 10;
+        let mut cursor_ctrl = Cursor::new(vec![0u8; 100]);
+        let res_ctrl = read_http_body(&mut cursor_ctrl, ctrl_size, b"", deadline, false, MAX_CONTROL_BODY);
+        assert!(res_ctrl.is_none(), "Control payload exceeding 64 KiB must be rejected immediately");
+
+        // 3. Encrypted upload endpoint (> 25 MiB MAX_ENCRYPTED_UPLOAD_SIZE)
+        let enc_size = MAX_ENCRYPTED_UPLOAD_SIZE + 10;
+        let mut cursor_enc = Cursor::new(vec![0u8; 100]);
+        let res_enc = read_http_body(&mut cursor_enc, enc_size, b"", deadline, true, MAX_ENCRYPTED_UPLOAD_SIZE);
+        assert!(res_enc.is_none(), "Encrypted upload payload exceeding 25 MiB must be rejected immediately");
+    }
+
+    #[test]
+    fn test_staged_file_to_bytes_memory_guard() {
+        let fake_staged = StagedFile {
+            path: PathBuf::from("/nonexistent/file.bin"),
+            size: (MAX_ENCRYPTED_UPLOAD_SIZE + 1) as u64,
+            persisted: true,
+            reservation: None,
+        };
+
+        let res = fake_staged.to_bytes();
+        assert!(res.is_err(), "Calling to_bytes() on staged payload exceeding 25 MiB must fail to protect RAM");
+        assert!(res.unwrap_err().contains("Payload exceeds maximum in-memory materialization limit"));
+    }
+
+    #[test]
+    fn test_aggregate_staging_capacity_and_race_prevention() {
+        let _test_lock = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let ddir = get_download_dir();
+        let _ = fs::create_dir_all(&ddir);
+
+        // Reset staged bytes to baseline
+        CURRENT_STAGED_BYTES.store(0, Ordering::SeqCst);
+
+        // Reserve 100 MiB
+        let guard1 = StagingReservationGuard::try_reserve(100 * 1024 * 1024, &ddir);
+        assert!(guard1.is_ok(), "First 100 MiB reservation should succeed");
+        assert_eq!(CURRENT_STAGED_BYTES.load(Ordering::SeqCst), 100 * 1024 * 1024);
+
+        // Reserve another 100 MiB (total 200 MiB = MAX_AGGREGATE_STAGING_BYTES)
+        let guard2 = StagingReservationGuard::try_reserve(100 * 1024 * 1024, &ddir);
+        assert!(guard2.is_ok(), "Second 100 MiB reservation reaching aggregate cap should succeed");
+        assert_eq!(CURRENT_STAGED_BYTES.load(Ordering::SeqCst), 200 * 1024 * 1024);
+
+        // Third reservation exceeding cap must fail
+        let guard3 = StagingReservationGuard::try_reserve(1024, &ddir);
+        assert!(guard3.is_err(), "Reservation exceeding 200 MiB aggregate cap must be rejected");
+
+        // Drop first guard
+        drop(guard1);
+        assert_eq!(CURRENT_STAGED_BYTES.load(Ordering::SeqCst), 100 * 1024 * 1024);
+
+        // Now a 50 MiB reservation should succeed
+        let guard4 = StagingReservationGuard::try_reserve(50 * 1024 * 1024, &ddir);
+        assert!(guard4.is_ok(), "Reservation under remaining cap should succeed");
+        assert_eq!(CURRENT_STAGED_BYTES.load(Ordering::SeqCst), 150 * 1024 * 1024);
+
+        // Cleanup
+        drop(guard2);
+        drop(guard4);
+        assert_eq!(CURRENT_STAGED_BYTES.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_encrypted_upload_concurrency_guard() {
+        let _test_lock = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        ACTIVE_ENCRYPTED_UPLOADS.store(0, Ordering::SeqCst);
+
+        let g1 = EncryptedUploadGuard::try_acquire();
+        assert!(g1.is_some(), "First encrypted upload should acquire");
+
+        let g2 = EncryptedUploadGuard::try_acquire();
+        assert!(g2.is_some(), "Second encrypted upload should acquire (up to MAX_CONCURRENT_ENCRYPTED_UPLOADS = 2)");
+
+        let g3 = EncryptedUploadGuard::try_acquire();
+        assert!(g3.is_none(), "Third concurrent encrypted upload must be rejected early");
+
+        drop(g1);
+        let g4 = EncryptedUploadGuard::try_acquire();
+        assert!(g4.is_some(), "After dropping g1, slot is freed and acquisition succeeds");
+
+        drop(g2);
+        drop(g4);
+        assert_eq!(ACTIVE_ENCRYPTED_UPLOADS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_unauthenticated_upload_early_rejected_without_staging() {
+        use std::io::Cursor;
+        let _test_lock = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+
+        CURRENT_STAGED_BYTES.store(0, Ordering::SeqCst);
+
+        // Simulate an unauthenticated upload request header
+        let raw_headers = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10485760\r\n\r\n";
+        let mut cursor = Cursor::new(raw_headers.to_vec());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let h_res = read_http_headers(&mut cursor, deadline);
+        assert!(h_res.is_some());
+
+        let h = h_res.unwrap();
+        let maybe_pin = extract_provided_pin(&h.req);
+        let authorized = maybe_pin.as_deref() == Some("correct_pin");
+        assert!(!authorized, "Request without PIN must not be authorized");
+
+        // Verify that because authorized is false, staging is NEVER performed
+        // CURRENT_STAGED_BYTES remains 0
+        assert_eq!(CURRENT_STAGED_BYTES.load(Ordering::SeqCst), 0);
     }
 }
 

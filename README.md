@@ -135,10 +135,16 @@ Click the paper plane icon in the Omarchy top bar to open the OmaSend panel.
 
 OmaSend complies strictly with the Omarchy Linux Security Architecture (AGENTS.md):
 - Subprocess Isolation: Processes run in isolated process groups (`cmd.process_group(0)`) with non-blocking I/O (`fcntl O_NONBLOCK`) and bounded polling.
-- Strict File Permissions: Sensitive state files (`trusted_peers.json`, `device_id.key`) are written atomically with mode 0600. Symlinks are rejected.
+- Strict File Permissions: Sensitive state files (`trusted_peers.json`, `device_id.key`) and in-flight staging parts are written atomically with mode 0600. Download and staging directories enforce mode 0700. Symlinks are strictly rejected.
 - Concurrency Caps & DoS Protection: Strict global cap (max 32 active connections) and per-peer IP cap (max 4 active connections) enforced at socket accept before spawning worker threads; excess requests are rejected early with HTTP 429.
-- Upload Ceiling & Direct Disk Staging: Documented strict 100 MiB upload ceiling. Request bodies exceeding 1 MiB stream directly to bounded mode 0600 disk staging files (`.tmp_stage_*.part`) instead of retaining in RAM, eliminating memory exhaustion attack vectors.
-- Network Limits & Timeouts: Absolute timeouts (15s) and header size caps (64 KiB) protect against Slowloris attacks. In-memory PIN rate limiter blocks brute-force attempts after 5 failures.
+- Monotonic Socket Deadlines: End-to-end socket reads across both headers and body enforce an immutable monotonic deadline (30s) recalculating remaining durations dynamically, neutralizing Slowloris drip-feeding attacks.
+- Early Header-First Authentication: Request headers are parsed and strictly authenticated (via PIN rate-limiter or transfer token) *before* reading or staging any request body bytes. Unauthenticated or forbidden requests are rejected immediately with HTTP 401/403 without touching disk or allocating body buffers.
+- Endpoint-Specific Body Ceilings:
+  - Clipboard endpoints (`/api/clipboard*`): strictly capped at 1 MiB.
+  - Control and signaling endpoints: strictly capped at 64 KiB.
+  - Plain file uploads (`/upload`, `/api/p2p/upload`): capped at 100 MiB and streamed directly to disk.
+  - Encrypted uploads (`/api/upload-encrypted`): strictly capped at 25 MiB with a global concurrency ceiling of 2 concurrent decryption workers, bounding server-wide peak decryption RAM to ~100 MiB.
+- Atomic Aggregate Staging Reservation: Global aggregate cap of 200 MiB across all in-flight staging files guarded by atomic state and disk space pre-check, eliminating TOCTOU races on filesystem storage.
 - Plain Text UI: All dynamic strings in QML use `textFormat: Text.PlainText` to prevent script and markup injection.
 
 ---
