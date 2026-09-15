@@ -7,8 +7,8 @@ use aes_gcm::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
@@ -28,6 +28,62 @@ extern "C" {
 const PORT: u16 = 53317;
 const P2P_BEACON_PORT: u16 = 53317;
 static RECEIVED_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+// Global and per-peer connection concurrency limits to protect against thread & memory exhaustion DOS
+pub const MAX_GLOBAL_CONNECTIONS: usize = 32;
+pub const MAX_PEER_CONNECTIONS: usize = 4;
+static GLOBAL_ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+static PEER_CONNECTION_TRACKER: Mutex<Option<HashMap<IpAddr, usize>>> = Mutex::new(None);
+
+pub struct ConnectionGuard {
+    ip: IpAddr,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        GLOBAL_ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+        if let Ok(mut lock) = PEER_CONNECTION_TRACKER.lock() {
+            if let Some(map) = lock.as_mut() {
+                if let Some(count) = map.get_mut(&self.ip) {
+                    if *count <= 1 {
+                        map.remove(&self.ip);
+                    } else {
+                        *count -= 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn try_acquire_connection(ip: IpAddr) -> Option<ConnectionGuard> {
+    let mut lock = PEER_CONNECTION_TRACKER.lock().ok()?;
+    let map = lock.get_or_insert_with(HashMap::new);
+
+    let global = GLOBAL_ACTIVE_CONNECTIONS.load(Ordering::SeqCst);
+    if global >= MAX_GLOBAL_CONNECTIONS {
+        return None;
+    }
+
+    let peer_count = map.entry(ip).or_insert(0);
+    if *peer_count >= MAX_PEER_CONNECTIONS {
+        return None;
+    }
+
+    *peer_count += 1;
+    GLOBAL_ACTIVE_CONNECTIONS.fetch_add(1, Ordering::SeqCst);
+    Some(ConnectionGuard { ip })
+}
+
+#[cfg(test)]
+fn reset_connection_tracker() {
+    GLOBAL_ACTIVE_CONNECTIONS.store(0, Ordering::SeqCst);
+    if let Ok(mut lock) = PEER_CONNECTION_TRACKER.lock() {
+        if let Some(map) = lock.as_mut() {
+            map.clear();
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileInfo {
@@ -1506,17 +1562,21 @@ fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
 
 // ------------------- HTTP ENGINE -------------------
 
-#[derive(Default)]
-struct HttpRequest {
-    method: String,
-    path: String,
-    query: String,
-    headers: Vec<(String, String)>,
-    body_offset: usize,
+pub const MAX_HEADER_SIZE: usize = 65536; // 64 KiB header limit
+pub const MAX_BODY_SIZE: usize = 100 * 1024 * 1024; // 100 MiB strict ceiling (reduced from 250 MiB)
+pub const IN_MEMORY_BODY_LIMIT: usize = 1024 * 1024; // 1 MiB in-memory cap for non-file requests
+
+#[derive(Default, Debug, Clone)]
+pub struct HttpRequest {
+    pub method: String,
+    pub path: String,
+    pub query: String,
+    pub headers: Vec<(String, String)>,
+    pub body_offset: usize,
 }
 
 impl HttpRequest {
-    fn get_header(&self, name: &str) -> Option<&str> {
+    pub fn get_header(&self, name: &str) -> Option<&str> {
         let lower = name.to_lowercase();
         for (k, v) in &self.headers {
             if k == &lower {
@@ -1526,7 +1586,7 @@ impl HttpRequest {
         None
     }
 
-    fn get_param(&self, key: &str) -> Option<String> {
+    pub fn get_param(&self, key: &str) -> Option<String> {
         let prefix = format!("{}=", key);
         for part in self.query.split('&') {
             if part.starts_with(&prefix) {
@@ -1537,57 +1597,125 @@ impl HttpRequest {
     }
 }
 
-fn read_full_http_request(stream: &mut TcpStream) -> Option<(HttpRequest, Vec<u8>)> {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
+#[derive(Debug)]
+pub struct StagedFile {
+    pub path: PathBuf,
+    pub size: u64,
+    pub persisted: bool,
+}
 
-    let mut buffer = Vec::with_capacity(131072);
-    let mut temp = [0u8; 65536];
+impl StagedFile {
+    pub fn new(path: PathBuf, size: u64) -> Self {
+        Self {
+            path,
+            size,
+            persisted: false,
+        }
+    }
+
+    pub fn persist(mut self, target: &Path) -> Result<(), String> {
+        let dir = target.parent().ok_or_else(|| "Target path has no parent directory".to_string())?;
+        let _ = fs::create_dir_all(dir);
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        fs::rename(&self.path, target).map_err(|e| format!("Failed to rename staged file: {}", e))?;
+        let _ = fs::set_permissions(target, fs::Permissions::from_mode(0o600));
+        self.persisted = true;
+        Ok(())
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
+        safe_read_file(&self.path)
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        if !self.persisted && self.path.exists() {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+pub enum HttpBody {
+    Memory(Vec<u8>),
+    Staged(StagedFile),
+}
+
+impl HttpBody {
+    pub fn len(&self) -> usize {
+        match self {
+            HttpBody::Memory(v) => v.len(),
+            HttpBody::Staged(s) => s.size as usize,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn as_slice(&self) -> Option<&[u8]> {
+        match self {
+            HttpBody::Memory(v) => Some(v.as_slice()),
+            HttpBody::Staged(_) => None,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
+        match self {
+            HttpBody::Memory(v) => Ok(v.clone()),
+            HttpBody::Staged(s) => s.to_bytes(),
+        }
+    }
+}
+
+pub fn read_http_request_stream<R: Read>(stream: &mut R) -> Option<(HttpRequest, HttpBody)> {
+    let mut header_buf = Vec::with_capacity(4096);
+    let mut temp = [0u8; 8192];
     let mut header_end = None;
     let mut content_length: usize = 0;
-    const MAX_HEADER_SIZE: usize = 65536; // 64 KiB
-    const MAX_BODY_SIZE: usize = 250 * 1024 * 1024; // 250 MiB limit for uploads
 
+    // Phase 1: Read HTTP headers bounded by MAX_HEADER_SIZE (64 KiB)
     loop {
-        let n = match stream.read(&mut temp) {
-            Ok(bytes) if bytes > 0 => bytes,
-            _ => break,
-        };
-        if buffer.len().saturating_add(n) > MAX_BODY_SIZE.saturating_add(MAX_HEADER_SIZE) {
-            return None; // Buffer overrun protection
-        }
-        buffer.extend_from_slice(&temp[..n]);
-
-        if header_end.is_none() {
-            if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
-                header_end = Some(pos + 4);
-                let header_str = String::from_utf8_lossy(&buffer[..pos]);
-                for line in header_str.lines() {
-                    if let Some(col) = line.find(':') {
-                        let k = line[..col].trim().to_lowercase();
-                        let v = line[col + 1..].trim();
-                        if k == "content-length" {
-                            content_length = v.parse::<usize>().unwrap_or(0);
-                            if content_length > MAX_BODY_SIZE {
-                                return None; // Reject oversized payload
-                            }
+        if let Some(pos) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            header_end = Some(pos + 4);
+            let header_str = String::from_utf8_lossy(&header_buf[..pos]);
+            for line in header_str.lines() {
+                if let Some(col) = line.find(':') {
+                    let k = line[..col].trim().to_lowercase();
+                    let v = line[col + 1..].trim();
+                    if k == "content-length" {
+                        content_length = v.parse::<usize>().unwrap_or(0);
+                        if content_length > MAX_BODY_SIZE {
+                            return None; // Reject oversized payload ceiling
                         }
                     }
                 }
-            } else if buffer.len() > MAX_HEADER_SIZE {
-                return None; // Header overrun protection
             }
+            break;
         }
 
-        if let Some(hend) = header_end {
-            if buffer.len() >= hend.saturating_add(content_length) {
-                break;
+        if header_buf.len() >= MAX_HEADER_SIZE {
+            return None; // Header overrun protection
+        }
+
+        match stream.read(&mut temp) {
+            Ok(0) => break,
+            Ok(n) => {
+                if header_buf.len().saturating_add(n) > MAX_HEADER_SIZE.saturating_add(IN_MEMORY_BODY_LIMIT) {
+                    let needed = MAX_HEADER_SIZE.saturating_sub(header_buf.len());
+                    let take = n.min(needed);
+                    header_buf.extend_from_slice(&temp[..take]);
+                    header_buf.windows(4).position(|w| w == b"\r\n\r\n")?;
+                } else {
+                    header_buf.extend_from_slice(&temp[..n]);
+                }
             }
+            Err(_) => return None,
         }
     }
 
     let hend = header_end?;
-    let header_str = String::from_utf8_lossy(&buffer[..hend - 4]);
+    let header_str = String::from_utf8_lossy(&header_buf[..hend - 4]);
     let mut lines = header_str.lines();
     let req_line = lines.next()?;
     let parts: Vec<&str> = req_line.split_whitespace().collect();
@@ -1611,16 +1739,119 @@ fn read_full_http_request(stream: &mut TcpStream) -> Option<(HttpRequest, Vec<u8
         }
     }
 
-    Some((
-        HttpRequest {
-            method,
-            path,
-            query,
-            headers,
-            body_offset: hend,
-        },
-        buffer,
-    ))
+    let req = HttpRequest {
+        method,
+        path,
+        query,
+        headers,
+        body_offset: 0,
+    };
+
+    let initial_body = &header_buf[hend..];
+    let initial_len = initial_body.len();
+
+    // Phase 2: Handle Body
+    if content_length == 0 {
+        return Some((req, HttpBody::Memory(Vec::new())));
+    }
+
+    if content_length <= IN_MEMORY_BODY_LIMIT {
+        let mut body_vec = Vec::with_capacity(content_length);
+        let copy_len = initial_len.min(content_length);
+        body_vec.extend_from_slice(&initial_body[..copy_len]);
+        let mut remaining = content_length.saturating_sub(copy_len);
+        while remaining > 0 {
+            let to_read = remaining.min(temp.len());
+            match stream.read(&mut temp[..to_read]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    body_vec.extend_from_slice(&temp[..n]);
+                    remaining = remaining.saturating_sub(n);
+                }
+                Err(_) => return None,
+            }
+        }
+        if body_vec.len() < content_length {
+            return None; // Premature EOF
+        }
+        Some((req, HttpBody::Memory(body_vec)))
+    } else {
+        // Stream directly to a bounded mode 0600 disk staging file
+        let ddir = get_download_dir();
+        let _ = fs::create_dir_all(&ddir);
+        let _ = fs::set_permissions(&ddir, fs::Permissions::from_mode(0o700));
+
+        if let Some(avail) = get_available_disk_space(&ddir) {
+            if (content_length as u64).saturating_add(25 * 1024 * 1024) > avail {
+                return None; // Insufficient storage
+            }
+        }
+
+        let now_nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let mut rand_bytes = [0u8; 8];
+        let _ = getrandom::getrandom(&mut rand_bytes);
+        let stage_name = format!(".tmp_stage_{}_{}_{}.part", std::process::id(), now_nanos, hex::encode(rand_bytes));
+        let stage_path = ddir.join(&stage_name);
+
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+
+        let mut stage_file = match opts.open(&stage_path) {
+            Ok(f) => f,
+            Err(_) => return None,
+        };
+
+        let copy_len = initial_len.min(content_length);
+        if stage_file.write_all(&initial_body[..copy_len]).is_err() {
+            let _ = fs::remove_file(&stage_path);
+            return None;
+        }
+
+        let mut remaining = content_length.saturating_sub(copy_len);
+        let mut total_written = copy_len as u64;
+        let mut stream_chunk = [0u8; 65536];
+
+        while remaining > 0 {
+            let to_read = remaining.min(stream_chunk.len());
+            match stream.read(&mut stream_chunk[..to_read]) {
+                Ok(0) => {
+                    let _ = fs::remove_file(&stage_path);
+                    return None;
+                }
+                Ok(n) => {
+                    if stage_file.write_all(&stream_chunk[..n]).is_err() {
+                        let _ = fs::remove_file(&stage_path);
+                        return None;
+                    }
+                    total_written = total_written.saturating_add(n as u64);
+                    remaining = remaining.saturating_sub(n);
+                }
+                Err(_) => {
+                    let _ = fs::remove_file(&stage_path);
+                    return None;
+                }
+            }
+        }
+
+        if stage_file.flush().is_err() {
+            let _ = fs::remove_file(&stage_path);
+            return None;
+        }
+
+        let staged = StagedFile::new(stage_path, total_written);
+        Some((req, HttpBody::Staged(staged)))
+    }
+}
+
+pub fn read_full_http_request(stream: &mut TcpStream) -> Option<(HttpRequest, HttpBody)> {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
+    read_http_request_stream(stream)
 }
 
 struct PinAttemptState {
@@ -2150,7 +2381,7 @@ window.addEventListener('load', async function() {{
 // ------------------- CONNECTION HANDLER -------------------
 
 fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) {
-    let (req, buffer) = match read_full_http_request(&mut stream) {
+    let (req, body) = match read_full_http_request(&mut stream) {
         Some(res) => res,
         None => return,
     };
@@ -2278,7 +2509,13 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             return;
         }
 
-        let body_slice = &buffer[req.body_offset..];
+        let body_slice = match body.as_slice() {
+            Some(s) => s,
+            None => {
+                respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid JSON request\"}", None, None);
+                return;
+            }
+        };
         let req_data: serde_json::Value = match serde_json::from_slice(body_slice) {
             Ok(v) => v,
             Err(_) => {
@@ -2374,7 +2611,13 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             respond(&stream, "404 Not Found", "application/json", b"{\"status\":\"NOT_FOUND\"}", None, None);
             return;
         } else if req.method == "POST" {
-            let body_slice = &buffer[req.body_offset..];
+            let body_slice = match body.as_slice() {
+                Some(s) => s,
+                None => {
+                    respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid payload\"}", None, None);
+                    return;
+                }
+            };
             if let Ok(val) = serde_json::from_slice::<serde_json::Value>(body_slice) {
                 let token = val["token"].as_str().unwrap_or_default();
                 let action = val["action"].as_str().unwrap_or_default();
@@ -2411,16 +2654,24 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
 
         if let Some(mut pending) = get_pending_transfer() {
             if pending.token == token && pending.status == "ACCEPTED" && now <= pending.expires_at {
-                let body = &buffer[req.body_offset..];
                 let ddir = get_download_dir();
-                if let Some(avail) = get_available_disk_space(&ddir) {
-                    if (body.len() as u64).saturating_add(10 * 1024 * 1024) > avail {
-                        respond(&stream, "507 Insufficient Storage", "text/plain", b"Insufficient disk space to save file", None, None);
-                        return;
-                    }
-                }
                 let file_path = get_unique_filepath(&ddir, &clean_filename);
-                if write_secure_bytes(&file_path, body).is_ok() {
+                let payload_len = body.len();
+                let write_res = match body {
+                    HttpBody::Staged(staged) => {
+                        staged.persist(&file_path)
+                    }
+                    HttpBody::Memory(ref bytes) => {
+                        if let Some(avail) = get_available_disk_space(&ddir) {
+                            if (bytes.len() as u64).saturating_add(10 * 1024 * 1024) > avail {
+                                respond(&stream, "507 Insufficient Storage", "text/plain", b"Insufficient disk space to save file", None, None);
+                                return;
+                            }
+                        }
+                        write_secure_bytes(&file_path, bytes)
+                    }
+                };
+                if write_res.is_ok() {
                     RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
                     if let Some(pos) = pending.file_names.iter().position(|f| f == &clean_filename) {
                         pending.file_names.remove(pos);
@@ -2433,12 +2684,12 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
                     let final_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
                     notify_desktop(
                         "OmaSend: AirBridge Transfer Complete",
-                        &format!("'{}' ({} bytes) received and saved to Downloads/omasend.", final_name, body.len())
+                        &format!("'{}' ({} bytes) received and saved to Downloads/omasend.", final_name, payload_len)
                     );
                     let resp = serde_json::json!({
                         "status": "OK",
                         "filename": final_name,
-                        "size": body.len()
+                        "size": payload_len
                     });
                     respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
                     return;
@@ -2458,7 +2709,13 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Visibility is Off\"}", None, None);
             return;
         }
-        let body_slice = &buffer[req.body_offset..];
+        let body_slice = match body.as_slice() {
+            Some(s) => s,
+            None => {
+                respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid payload\"}", None, None);
+                return;
+            }
+        };
         if let Ok(val) = serde_json::from_slice::<serde_json::Value>(body_slice) {
             let sender_id = val["sender_id"].as_str().unwrap_or_default();
             let sender_name = val["sender_name"].as_str().unwrap_or("Nearby Device");
@@ -2514,8 +2771,15 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             }
         };
 
-        let body = &buffer[req.body_offset..];
-        match decrypt_aes256_gcm(key_hex, &iv_bytes, body) {
+        let ciphertext = match body.to_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                respond(&stream, "500 Internal Server Error", "text/plain", e.as_bytes(), None, None);
+                return;
+            }
+        };
+
+        match decrypt_aes256_gcm(key_hex, &iv_bytes, &ciphertext) {
             Ok(decrypted) => {
                 let ddir = get_download_dir();
                 if let Some(avail) = get_available_disk_space(&ddir) {
@@ -2595,8 +2859,14 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             }
         };
 
-        let body = &buffer[req.body_offset..];
-        match decrypt_aes256_gcm(key_hex, &iv_bytes, body) {
+        let ciphertext = match body.to_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                respond(&stream, "400 Bad Request", "text/plain", e.as_bytes(), None, None);
+                return;
+            }
+        };
+        match decrypt_aes256_gcm(key_hex, &iv_bytes, &ciphertext) {
             Ok(decrypted) => {
                 let text = String::from_utf8_lossy(&decrypted).to_string();
                 set_pc_clipboard(&text);
@@ -2634,11 +2904,12 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             let resp = serde_json::json!({ "clipboard": clip });
             respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
         } else if req.method == "POST" {
-            let body = String::from_utf8_lossy(&buffer[req.body_offset..]);
-            let text = if let Some(val) = body.strip_prefix("text=") {
+            let body_bytes = body.to_bytes().unwrap_or_default();
+            let body_str = String::from_utf8_lossy(&body_bytes);
+            let text = if let Some(val) = body_str.strip_prefix("text=") {
                 urlencoding_decode(val)
             } else {
-                body.to_string()
+                body_str.to_string()
             };
             set_pc_clipboard(&text);
             notify_desktop("OmaSend: Clipboard Received", &format!("Clipboard updated from device ({} chars)", text.len()));
@@ -2660,33 +2931,82 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
     }
     else if req.method == "POST" && req.path == "/upload" {
         let ddir = get_download_dir();
-        let body = &buffer[req.body_offset..];
         let mut saved_name = format!("transfer_{}.bin", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs());
-        let body_str = String::from_utf8_lossy(body);
-        if let Some(pos) = body_str.find("filename=\"") {
-            if let Some(end) = body_str[pos + 10..].find('"') {
-                saved_name = sanitize_filename(&body_str[pos + 10..pos + 10 + end]);
+        let mut success = false;
+
+        match body {
+            HttpBody::Memory(bytes) => {
+                let body_str = String::from_utf8_lossy(&bytes);
+                if let Some(pos) = body_str.find("filename=\"") {
+                    if let Some(end) = body_str[pos + 10..].find('"') {
+                        saved_name = sanitize_filename(&body_str[pos + 10..pos + 10 + end]);
+                    }
+                }
+                let data_start = bytes.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(0);
+                let data_slice = if data_start < bytes.len() { &bytes[data_start..] } else { &bytes[..] };
+
+                if let Some(avail) = get_available_disk_space(&ddir) {
+                    if (data_slice.len() as u64).saturating_add(10 * 1024 * 1024) > avail {
+                        respond(&stream, "507 Insufficient Storage", "text/plain", b"Insufficient disk space to save file", None, None);
+                        return;
+                    }
+                }
+
+                let file_path = get_unique_filepath(&ddir, &saved_name);
+                if write_secure_bytes(&file_path, data_slice).is_ok() {
+                    success = true;
+                    RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
+                    notify_desktop(
+                        "OmaSend: File Received",
+                        &format!("'{}' saved to Downloads/omasend.", file_path.file_name().unwrap_or_default().to_string_lossy()),
+                    );
+                }
+            }
+            HttpBody::Staged(staged) => {
+                if let Ok(mut sf) = File::open(&staged.path) {
+                    let mut head_buf = [0u8; 4096];
+                    let n = sf.read(&mut head_buf).unwrap_or(0);
+                    let head_str = String::from_utf8_lossy(&head_buf[..n]);
+                    if let Some(pos) = head_str.find("filename=\"") {
+                        if let Some(end) = head_str[pos + 10..].find('"') {
+                            saved_name = sanitize_filename(&head_str[pos + 10..pos + 10 + end]);
+                        }
+                    }
+                    let dstart = head_buf[..n].windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(0) as u64;
+                    let dlen = staged.size.saturating_sub(dstart);
+
+                    let file_path = get_unique_filepath(&ddir, &saved_name);
+                    if let Ok(mut src) = File::open(&staged.path) {
+                        if src.seek(SeekFrom::Start(dstart)).is_ok() {
+                            let mut opts = OpenOptions::new();
+                            opts.write(true).create_new(true);
+                            #[cfg(unix)]
+                            {
+                                opts.mode(0o600);
+                            }
+                            if let Ok(mut dest) = opts.open(&file_path) {
+                                let mut take = src.take(dlen);
+                                if std::io::copy(&mut take, &mut dest).is_ok() {
+                                    success = true;
+                                    RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
+                                    notify_desktop(
+                                        "OmaSend: File Received",
+                                        &format!("'{}' saved to Downloads/omasend.", file_path.file_name().unwrap_or_default().to_string_lossy()),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
-        let data_start = body.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(0);
-        let data_slice = if data_start < body.len() { &body[data_start..] } else { body };
 
-        if let Some(avail) = get_available_disk_space(&ddir) {
-            if (data_slice.len() as u64).saturating_add(10 * 1024 * 1024) > avail {
-                respond(&stream, "507 Insufficient Storage", "text/plain", b"Insufficient disk space to save file", None, None);
-                return;
-            }
+        if success {
+            let resp = "{\"status\":\"OK\"}";
+            respond(&stream, "200 OK", "application/json", resp.as_bytes(), None, None);
+        } else {
+            respond(&stream, "500 Internal Server Error", "text/plain", b"Failed to write file", None, None);
         }
-
-        let file_path = get_unique_filepath(&ddir, &saved_name);
-        let _ = write_secure_bytes(&file_path, data_slice);
-        RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
-        notify_desktop(
-            "OmaSend: File Received",
-            &format!("'{}' saved to Downloads/omasend.", file_path.file_name().unwrap_or_default().to_string_lossy()),
-        );
-        let resp = "{\"status\":\"OK\"}";
-        respond(&stream, "200 OK", "application/json", resp.as_bytes(), None, None);
     } else {
         respond(&stream, "404 Not Found", "text/plain", b"Not Found", None, None);
     }
@@ -2737,11 +3057,23 @@ fn run_server() {
     thread::spawn(run_p2p_beacon_broadcaster);
     start_bluetooth_receiver(&get_download_dir());
 
-    for s in listener.incoming().flatten() {
+    for mut s in listener.incoming().flatten() {
+        let client_ip = s.peer_addr().map(|a| a.ip()).unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let guard = match try_acquire_connection(client_ip) {
+            Some(g) => g,
+            None => {
+                let _ = s.set_write_timeout(Some(Duration::from_millis(500)));
+                let _ = s.write_all(b"HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\nContent-Type: application/json\r\nRetry-After: 5\r\nContent-Length: 43\r\n\r\n{\"error\":\"Too many concurrent connections\"}");
+                let _ = s.flush();
+                continue;
+            }
+        };
+
         let ip_clone = local_ip.clone();
         let pin_clone = pin.clone();
         let key_clone = key.clone();
         thread::spawn(move || {
+            let _guard = guard;
             handle_connection(s, &ip_clone, &pin_clone, &key_clone);
         });
     }
@@ -3325,6 +3657,123 @@ mod tests {
         assert_eq!(sanitize_bluetooth_mac("invalid_mac"), None);
         assert_eq!(sanitize_bluetooth_mac("4C:E2:0F:FD:5E"), None);
         assert_eq!(sanitize_bluetooth_mac("4C:E2:0F:FD:5E:06:99"), None);
+    }
+
+    #[test]
+    fn test_concurrency_tracker_caps_and_early_rejection() {
+        reset_connection_tracker();
+
+        let peer_a = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
+        let peer_b = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20));
+
+        // 1. Peer A acquires up to MAX_PEER_CONNECTIONS (4)
+        let mut guards_a = Vec::new();
+        for _ in 0..MAX_PEER_CONNECTIONS {
+            let g = try_acquire_connection(peer_a);
+            assert!(g.is_some(), "Peer A should acquire up to MAX_PEER_CONNECTIONS");
+            guards_a.push(g.unwrap());
+        }
+
+        // 5th connection from Peer A must be rejected
+        let excess_a = try_acquire_connection(peer_a);
+        assert!(excess_a.is_none(), "5th connection from same IP must be rejected early");
+
+        // Peer B can still connect (different IP)
+        let g_b = try_acquire_connection(peer_b);
+        assert!(g_b.is_some(), "Peer B should connect independently");
+
+        // Dropping one guard from Peer A frees up a slot
+        guards_a.pop();
+        let freed_a = try_acquire_connection(peer_a);
+        assert!(freed_a.is_some(), "Dropping guard should immediately allow a new connection from Peer A");
+
+        // Clean up
+        drop(guards_a);
+        drop(g_b);
+        drop(freed_a);
+        reset_connection_tracker();
+
+        // 2. Test global connection cap (32)
+        let mut global_guards = Vec::new();
+        for i in 0..MAX_GLOBAL_CONNECTIONS {
+            let ip = IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8));
+            let g = try_acquire_connection(ip);
+            assert!(g.is_some(), "Global connection slot {} should succeed", i);
+            global_guards.push(g.unwrap());
+        }
+
+        // 33rd global connection must be rejected regardless of IP
+        let new_peer = IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1));
+        let excess_global = try_acquire_connection(new_peer);
+        assert!(excess_global.is_none(), "33rd global connection must be rejected by global cap");
+
+        drop(global_guards);
+        reset_connection_tracker();
+    }
+
+    #[test]
+    fn test_oversized_body_ceiling_rejected() {
+        use std::io::Cursor;
+
+        // Content-Length exceeding 100 MiB limit (MAX_BODY_SIZE = 104,857,600)
+        let raw_req = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 104857601\r\n\r\n";
+        let mut cursor = Cursor::new(raw_req.to_vec());
+
+        let res = read_http_request_stream(&mut cursor);
+        assert!(res.is_none(), "Request exceeding 100 MiB ceiling must be rejected immediately without reading/allocating");
+    }
+
+    #[test]
+    fn test_streaming_body_staged_to_disk() {
+        use std::io::Cursor;
+
+        // 2 MiB payload (exceeds 1 MiB IN_MEMORY_BODY_LIMIT, but under 100 MiB ceiling)
+        let body_size = 2 * 1024 * 1024;
+        let mut raw = Vec::new();
+        raw.extend_from_slice(format!("POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n", body_size).as_bytes());
+        raw.resize(raw.len() + body_size, 0xAA);
+
+        let mut cursor = Cursor::new(raw);
+        let res = read_http_request_stream(&mut cursor);
+        assert!(res.is_some(), "Streaming 2 MiB payload should succeed");
+
+        let (req, body) = res.unwrap();
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, "/upload");
+        assert_eq!(body.len(), body_size);
+
+        // Body must be Staged, not kept in Memory
+        match body {
+            HttpBody::Staged(staged) => {
+                assert_eq!(staged.size, body_size as u64);
+                assert!(staged.path.exists(), "Staged part file must exist on disk");
+
+                let meta = fs::symlink_metadata(&staged.path).expect("staged file metadata");
+                assert_eq!(meta.mode() & 0o777, 0o600, "Staged file must have mode 0600");
+
+                let staged_path = staged.path.clone();
+                drop(staged);
+                // RAII Drop must clean up the staging file
+                assert!(!staged_path.exists(), "Dropped staged file must be removed from disk");
+            }
+            HttpBody::Memory(_) => {
+                panic!("Body > 1 MiB must be streamed to disk staging file, not kept in RAM");
+            }
+        }
+    }
+
+    #[test]
+    fn test_slow_client_early_eof_cleanup() {
+        use std::io::Cursor;
+
+        // Header claims 2 MiB, but only sends 1024 bytes and disconnects
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2097152\r\n\r\n");
+        raw.extend_from_slice(&[0xBB; 1024]);
+
+        let mut cursor = Cursor::new(raw);
+        let res = read_http_request_stream(&mut cursor);
+        assert!(res.is_none(), "Premature EOF must reject request");
     }
 }
 
