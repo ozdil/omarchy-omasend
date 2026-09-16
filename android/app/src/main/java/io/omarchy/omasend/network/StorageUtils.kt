@@ -12,12 +12,20 @@ import java.io.OutputStream
 
 object StorageUtils {
 
+    const val MAX_FILE_SIZE = 10L * 1024 * 1024 * 1024L // 10 GiB ceiling
+
     fun sanitizeFilename(raw: String): String {
-        val cleaned = raw.filter { it.isLetterOrDigit() || it in ".-_ " }.trim()
-        return if (cleaned.isEmpty() || cleaned.startsWith(".") || cleaned.contains("..")) {
+        // Strip null bytes, slashes, backslashes, and control characters
+        val cleanChars = raw.replace("\u0000", "")
+            .replace('/', '_')
+            .replace('\\', '_')
+            .filter { it.isLetterOrDigit() || it in ".-_ " }
+            .trim()
+
+        return if (cleanChars.isEmpty() || cleanChars.startsWith(".") || cleanChars.contains("..")) {
             "file_${System.currentTimeMillis()}"
         } else {
-            cleaned.take(180)
+            cleanChars.take(180)
         }
     }
 
@@ -28,6 +36,16 @@ object StorageUtils {
         totalBytes: Long,
         onProgress: ((bytesRead: Long, total: Long) -> Unit)? = null
     ): Pair<Boolean, String> {
+        if (totalBytes <= 0 || totalBytes > MAX_FILE_SIZE) {
+            return Pair(false, "Invalid or excessive file size ($totalBytes bytes)")
+        }
+
+        // Check available device storage before allocating (require at least file size + 64 MB buffer)
+        val usableSpace = context.filesDir.usableSpace
+        if (usableSpace > 0 && usableSpace < (totalBytes + 64L * 1024 * 1024)) {
+            return Pair(false, "Insufficient storage space on device")
+        }
+
         val cleanName = sanitizeFilename(filename)
 
         return try {
@@ -55,6 +73,11 @@ object StorageUtils {
                 if (!dir.exists()) dir.mkdirs()
 
                 var target = File(dir, cleanName)
+                // Strict path traversal defense: target MUST reside within dir
+                if (!target.canonicalPath.startsWith(dir.canonicalPath)) {
+                    return Pair(false, "Directory traversal detected")
+                }
+
                 if (target.exists()) {
                     val dot = cleanName.lastIndexOf('.')
                     val name = if (dot != -1) cleanName.substring(0, dot) else cleanName
@@ -62,6 +85,9 @@ object StorageUtils {
                     var counter = 1
                     while (target.exists() && counter < 1000) {
                         target = File(dir, "$name ($counter)$ext")
+                        if (!target.canonicalPath.startsWith(dir.canonicalPath)) {
+                            return Pair(false, "Directory traversal detected")
+                        }
                         counter++
                     }
                 }

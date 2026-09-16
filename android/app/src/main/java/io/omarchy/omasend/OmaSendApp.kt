@@ -24,7 +24,9 @@ class OmaSendApp : Application() {
         createNotificationChannels()
 
         discoveryManager = DiscoveryManager(this)
-        server = OmaSendServer(this)
+        server = OmaSendServer(this).apply {
+            getDiscoveryMode = { discoveryManager.discoveryMode.value }
+        }
         client = OmaSendClient(this)
 
         server.start()

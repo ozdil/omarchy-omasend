@@ -58,6 +58,11 @@ class OmaSendForegroundService : Service() {
         return START_STICKY
     }
 
+    override fun onDestroy() {
+        super.onDestroy()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+    }
+
     companion object {
         const val ACTION_START = "io.omarchy.omasend.START_SERVICE"
         const val ACTION_STOP = "io.omarchy.omasend.STOP_SERVICE"

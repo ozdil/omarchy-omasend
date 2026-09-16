@@ -89,13 +89,28 @@ class OmaSendServer(private val context: Context) {
         serverSocket = null
     }
 
+    var getDiscoveryMode: (() -> io.omarchy.omasend.model.DiscoveryMode)? = null
+
+    companion object {
+        const val MAX_HEADER_SIZE = 65536 // 64 KiB ceiling to prevent header DoS
+        const val MAX_CONTROL_BODY = 65536 // 64 KiB ceiling for control JSON payloads
+        const val MAX_CLIPBOARD_BODY = 1048576 // 1 MiB ceiling matching Omarchy standard
+    }
+
     private fun handleClient(socket: Socket) {
         try {
+            // RFC 1918 / RFC 3927 Network Scope Guard: strictly drop foreign/WAN IP connections
+            val remoteAddr = socket.inetAddress
+            if (remoteAddr != null && !NetworkUtils.isPrivateOrLocalAddress(remoteAddr)) {
+                socket.close()
+                return
+            }
+
             socket.soTimeout = 30000
             val input = BufferedInputStream(socket.getInputStream())
             val output = socket.getOutputStream()
 
-            // Read HTTP headers
+            // Read HTTP headers with strict byte ceiling
             val headerBytes = ByteArrayOutputStream()
             var prev1 = -1
             var prev2 = -1
@@ -104,6 +119,10 @@ class OmaSendServer(private val context: Context) {
 
             while (input.read().also { curr = it } != -1) {
                 headerBytes.write(curr)
+                if (headerBytes.size() > MAX_HEADER_SIZE) {
+                    socket.close()
+                    return
+                }
                 if (prev3 == '\r'.code && prev2 == '\n'.code && prev1 == '\r'.code && curr == '\n'.code) {
                     break
                 }
@@ -142,6 +161,13 @@ class OmaSendServer(private val context: Context) {
             }
 
             val contentLength = headers["content-length"]?.toLongOrNull() ?: 0L
+
+            // Early Visibility Check: reject connections if visibility is turned OFF
+            val currentMode = getDiscoveryMode?.invoke()
+            if (currentMode == io.omarchy.omasend.model.DiscoveryMode.OFF && path != "/api/status") {
+                sendResponse(output, 403, "Forbidden", "application/json", "{\"error\":\"Visibility is Off\"}")
+                return
+            }
 
             when {
                 path == "/api/status" || path == "/api/p2p/ping" -> {
@@ -185,8 +211,8 @@ class OmaSendServer(private val context: Context) {
     }
 
     private fun handleTransferRequest(input: InputStream, output: OutputStream, contentLength: Long) {
-        if (contentLength > 1024 * 1024) {
-            sendResponse(output, 400, "Bad Request", "application/json", "{\"error\":\"Payload too large\"}")
+        if (contentLength <= 0 || contentLength > MAX_CONTROL_BODY) {
+            sendResponse(output, 400, "Bad Request", "application/json", "{\"error\":\"Invalid or excessive payload\"}")
             return
         }
         val bodyBytes = ByteArray(contentLength.toInt())
@@ -255,6 +281,11 @@ class OmaSendServer(private val context: Context) {
             filenameRaw
         }
 
+        if (contentLength <= 0 || contentLength > StorageUtils.MAX_FILE_SIZE) {
+            sendResponse(output, 400, "Bad Request", "application/json", "{\"error\":\"Invalid or excessive file size\"}")
+            return
+        }
+
         val state = pendingTransfers[token]
         if (state == null || state.status != "ACCEPTED" || System.currentTimeMillis() > state.expiresAt) {
             sendResponse(output, 403, "Forbidden", "application/json", "{\"error\":\"Unauthorized or expired transfer\"}")
@@ -276,13 +307,13 @@ class OmaSendServer(private val context: Context) {
             val resp = """{"status":"OK","filename":"$finalName","size":$contentLength}"""
             sendResponse(output, 200, "OK", "application/json", resp)
         } else {
-            sendResponse(output, 500, "Internal Server Error", "application/json", "{\"error\":\"Failed to save file\"}")
+            sendResponse(output, 500, "Internal Server Error", "application/json", "{\"error\":\"Failed to save file: $finalName\"}")
         }
     }
 
     private fun handleClipboard(input: InputStream, output: OutputStream, contentLength: Long) {
-        if (contentLength > 1024 * 1024) {
-            sendResponse(output, 400, "Bad Request", "application/json", "{\"error\":\"Payload too large\"}")
+        if (contentLength <= 0 || contentLength > MAX_CLIPBOARD_BODY) {
+            sendResponse(output, 400, "Bad Request", "application/json", "{\"error\":\"Invalid or excessive payload\"}")
             return
         }
         val bodyBytes = ByteArray(contentLength.toInt())

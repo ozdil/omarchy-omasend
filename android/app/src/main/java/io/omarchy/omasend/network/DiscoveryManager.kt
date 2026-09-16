@@ -3,6 +3,7 @@ package io.omarchy.omasend.network
 import android.content.Context
 import android.net.wifi.WifiManager
 import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothClass
 import android.os.Build
 import android.Manifest
 import android.content.pm.PackageManager
@@ -88,6 +89,7 @@ class DiscoveryManager(private val context: Context) {
     }
 
     fun addManualPeer(ip: String, port: Int = NetworkUtils.PORT, name: String = "Direct ($ip)") {
+        if (!NetworkUtils.isPrivateOrLocalIp(ip)) return
         val peer = DiscoveredPeer(
             id = "manual_${ip.replace('.', '_')}_$port",
             name = name,
@@ -136,6 +138,9 @@ class DiscoveryManager(private val context: Context) {
                 while (isActive) {
                     try {
                         socket.receive(packet)
+                        val packetAddr = packet.address
+                        if (packetAddr == null || !NetworkUtils.isPrivateOrLocalAddress(packetAddr)) continue
+
                         val length = packet.length
                         if (length > 0) {
                             val rawJson = String(packet.data, 0, length, Charsets.UTF_8)
@@ -144,7 +149,7 @@ class DiscoveryManager(private val context: Context) {
                                 val myId = NetworkUtils.getDeviceId(context)
                                 val myIp = NetworkUtils.getLocalIpAddress()
                                 if (beacon.id != myId && beacon.ip != myIp) {
-                                    val senderIp = packet.address.hostAddress ?: beacon.ip
+                                    val senderIp = packetAddr.hostAddress ?: beacon.ip
                                     val peer = DiscoveredPeer(
                                         id = beacon.id,
                                         name = beacon.name,
@@ -262,12 +267,26 @@ class DiscoveryManager(private val context: Context) {
             for (device in bonded) {
                 val name = device.name ?: "Paired Device"
                 val lowerName = name.lowercase()
-                // Filter out non-file-transfer accessories
+                // 1. Device Class Check: Filter out audio/video (headphones, car, speakers), peripherals, wearables
+                val majorClass = try { device.bluetoothClass?.majorDeviceClass } catch (_: Exception) { null }
+                if (majorClass == BluetoothClass.Device.Major.AUDIO_VIDEO ||
+                    majorClass == BluetoothClass.Device.Major.PERIPHERAL ||
+                    majorClass == BluetoothClass.Device.Major.WEARABLE ||
+                    majorClass == BluetoothClass.Device.Major.HEALTH
+                ) {
+                    continue
+                }
+
+                // 2. Keyword Filter: Exclude accessories, cars, audio devices
                 if (lowerName.contains("controller") || lowerName.contains("gamepad") ||
                     lowerName.contains("mouse") || lowerName.contains("keyboard") ||
                     lowerName.contains("headset") || lowerName.contains("headphones") ||
                     lowerName.contains("earbuds") || lowerName.contains("airpods") ||
-                    lowerName.contains("watch") || lowerName.contains("speaker")
+                    lowerName.contains("watch") || lowerName.contains("speaker") ||
+                    lowerName.contains("beats") || lowerName.contains("buds") ||
+                    lowerName.contains("sound") || lowerName.contains("audio") ||
+                    lowerName.contains("tws") || lowerName.contains("renault") ||
+                    lowerName.contains("car") || lowerName.contains("auto")
                 ) {
                     continue
                 }
@@ -285,6 +304,10 @@ class DiscoveryManager(private val context: Context) {
                             lastSeen = now
                         )
                         changed = true
+                    } else if (existing.transport == "BT" || existing.transport == "HYBRID") {
+                        peerMap[existing.id] = existing.copy(
+                            lastSeen = now + 60_000L
+                        )
                     }
                 } else {
                     val peer = DiscoveredPeer(

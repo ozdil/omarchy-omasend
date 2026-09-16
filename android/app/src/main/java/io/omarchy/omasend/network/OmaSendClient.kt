@@ -34,6 +34,9 @@ class OmaSendClient(private val context: Context) {
         targetPort: Int,
         files: List<TransferFileInfo>
     ): Result<String> {
+        if (!NetworkUtils.isPrivateOrLocalIp(targetIp)) {
+            return Result.failure(SecurityException("Target IP is outside private network scope (RFC 1918/3927)"))
+        }
         return try {
             val totalBytes = files.sumOf { it.size_bytes }
             val requestPayload = TransferRequest(
@@ -69,6 +72,9 @@ class OmaSendClient(private val context: Context) {
         token: String,
         timeoutSec: Int = 30
     ): Result<Boolean> {
+        if (!NetworkUtils.isPrivateOrLocalIp(targetIp)) {
+            return Result.failure(SecurityException("Target IP is outside private network scope (RFC 1918/3927)"))
+        }
         val deadline = System.currentTimeMillis() + (timeoutSec * 1000L)
         while (System.currentTimeMillis() < deadline) {
             try {
@@ -102,27 +108,27 @@ class OmaSendClient(private val context: Context) {
         token: String,
         filename: String,
         totalBytes: Long,
-        inputStreamProvider: () -> InputStream?,
+        inputStream: InputStream,
         onProgress: (bytesWritten: Long, totalBytes: Long, percent: Int) -> Unit
     ): Result<Unit> {
+        if (!NetworkUtils.isPrivateOrLocalIp(targetIp)) {
+            return Result.failure(SecurityException("Target IP is outside private network scope (RFC 1918/3927)"))
+        }
         return try {
             val encodedName = URLEncoder.encode(filename, "UTF-8")
             val countingBody = object : RequestBody() {
                 override fun contentType() = "application/octet-stream".toMediaType()
-                override fun contentLength() = if (totalBytes > 0) totalBytes else -1L
+                override fun contentLength() = totalBytes
 
                 override fun writeTo(sink: BufferedSink) {
-                    val stream = inputStreamProvider() ?: throw java.io.IOException("Cannot open input stream for $filename")
-                    stream.use { input ->
-                        val buffer = ByteArray(65536)
-                        var uploaded = 0L
-                        var read: Int
-                        while (input.read(buffer).also { read = it } != -1) {
-                            sink.write(buffer, 0, read)
-                            uploaded += read
-                            val percent = if (totalBytes > 0) ((uploaded * 100) / totalBytes).toInt().coerceIn(0, 100) else 0
-                            onProgress(uploaded, totalBytes, percent)
-                        }
+                    val buffer = ByteArray(65536)
+                    var uploaded = 0L
+                    var read: Int
+                    while (inputStream.read(buffer).also { read = it } != -1) {
+                        sink.write(buffer, 0, read)
+                        uploaded += read
+                        val percent = if (totalBytes > 0) ((uploaded * 100) / totalBytes).toInt() else 0
+                        onProgress(uploaded, totalBytes, percent)
                     }
                 }
             }
@@ -136,11 +142,15 @@ class OmaSendClient(private val context: Context) {
             if (response.isSuccessful) {
                 Result.success(Unit)
             } else {
-                val errBody = response.body?.string() ?: ""
-                Result.failure(Exception("Upload failed (HTTP ${response.code}): $errBody"))
+                Result.failure(Exception("Upload failed with HTTP ${response.code}"))
             }
         } catch (e: Exception) {
             Result.failure(e)
+        } finally {
+            try {
+                inputStream.close()
+            } catch (_: Exception) {
+            }
         }
     }
 
@@ -149,6 +159,9 @@ class OmaSendClient(private val context: Context) {
         targetPort: Int,
         text: String
     ): Result<Unit> {
+        if (!NetworkUtils.isPrivateOrLocalIp(targetIp)) {
+            return Result.failure(SecurityException("Target IP is outside private network scope (RFC 1918/3927)"))
+        }
         return try {
             val payload = ClipboardPayload(
                 sender_id = NetworkUtils.getDeviceId(context),

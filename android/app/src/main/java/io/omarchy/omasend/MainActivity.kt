@@ -26,6 +26,8 @@ class MainActivity : ComponentActivity() {
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { _ ->
+        val app = application as? OmaSendApp
+        app?.discoveryManager?.refreshBluetoothPeers()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -34,7 +36,7 @@ class MainActivity : ComponentActivity() {
 
         val app = application as OmaSendApp
 
-        // Request modern notifications and storage permissions
+        // Request modern notifications, storage and bluetooth permissions
         checkAndRequestPermissions()
 
         // Start background service
@@ -77,6 +79,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        val app = application as? OmaSendApp
+        app?.discoveryManager?.refreshBluetoothPeers()
+    }
+
     private fun checkAndRequestPermissions() {
         val permissions = mutableListOf<String>()
 
@@ -86,8 +94,24 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+            }
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+                permissions.add(Manifest.permission.BLUETOOTH_SCAN)
+            }
+        }
+
         if (permissions.isNotEmpty()) {
             permissionLauncher.launch(permissions.toTypedArray())
         }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        val app = application as? OmaSendApp
+        app?.discoveryManager?.stop()
+        OmaSendForegroundService.stopService(this)
     }
 }

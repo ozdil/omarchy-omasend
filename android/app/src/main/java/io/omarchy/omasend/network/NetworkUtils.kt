@@ -60,4 +60,41 @@ object NetworkUtils {
         val gb = mb / 1024.0
         return String.format("%.2f GB", gb)
     }
+
+    /**
+     * Strictly validates whether an IP address belongs to RFC 1918 private space,
+     * RFC 3927 link-local, or loopback space.
+     */
+    fun isPrivateOrLocalAddress(addr: java.net.InetAddress): Boolean {
+        if (addr.isLoopbackAddress || addr.isSiteLocalAddress || addr.isLinkLocalAddress) {
+            return true
+        }
+        val host = addr.hostAddress ?: return false
+        return isPrivateOrLocalIp(host)
+    }
+
+    /**
+     * Validates an IPv4 or loopback string against RFC 1918, RFC 3927 link-local, or loopback.
+     */
+    fun isPrivateOrLocalIp(ip: String): Boolean {
+        val cleanIp = ip.substringBefore(':').trim()
+        if (cleanIp == "127.0.0.1" || cleanIp == "localhost" || cleanIp == "::1") return true
+        val parts = cleanIp.split('.')
+        if (parts.size != 4) return false
+        val octets = parts.map { it.toIntOrNull() ?: return false }
+        if (octets.any { it !in 0..255 }) return false
+
+        // 10.0.0.0/8 (RFC 1918)
+        if (octets[0] == 10) return true
+        // 172.16.0.0/12 (RFC 1918)
+        if (octets[0] == 172 && octets[1] in 16..31) return true
+        // 192.168.0.0/16 (RFC 1918)
+        if (octets[0] == 192 && octets[1] == 168) return true
+        // 169.254.0.0/16 (RFC 3927 Link-Local)
+        if (octets[0] == 169 && octets[1] == 254) return true
+        // 127.0.0.0/8 (Loopback)
+        if (octets[0] == 127) return true
+
+        return false
+    }
 }

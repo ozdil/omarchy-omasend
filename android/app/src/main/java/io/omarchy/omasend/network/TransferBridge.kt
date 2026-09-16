@@ -53,6 +53,7 @@ object TransferBridge {
         val portCandidate = parts.getOrNull(1)?.trim()?.toIntOrNull() ?: 53317
 
         if (!isValidIpv4(ipCandidate)) return null
+        if (!NetworkUtils.isPrivateOrLocalIp(ipCandidate)) return null
         if (portCandidate !in 1024..65535) return null
 
         return Pair(ipCandidate, portCandidate)
@@ -89,8 +90,7 @@ object TransferBridge {
     }
 
     /**
-     * Shares file(s) or text payload using Bluetooth OPP or falls back to system share sheet.
-     * Grants URI read permission via ClipData to satisfy Android 7+ / 11+ / 14+ requirements.
+     * Shares file(s) or text payload using Android's native Bluetooth service.
      */
     fun sendViaBluetooth(
         context: Context,
@@ -98,66 +98,45 @@ object TransferBridge {
         textPayload: String? = null,
         targetMac: String? = null
     ): Boolean {
-        val mimeType = when {
-            uris.isNotEmpty() -> context.contentResolver.getType(uris.first()) ?: "*/*"
-            !textPayload.isNullOrBlank() -> "text/plain"
-            else -> "*/*"
-        }
+        val intent = Intent().apply {
+            action = if (uris.size > 1) Intent.ACTION_SEND_MULTIPLE else Intent.ACTION_SEND
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
 
-        val baseIntent = buildShareIntent(context, uris, textPayload, mimeType)
-
-        // If target MAC is provided and valid, try attaching BluetoothDevice extra
-        if (!targetMac.isNullOrBlank() && targetMac.contains(":")) {
-            try {
-                val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? android.bluetooth.BluetoothManager
-                val adapter = btManager?.adapter
-                if (adapter != null && adapter.isEnabled) {
-                    val device = adapter.getRemoteDevice(targetMac.trim())
-                    if (device != null) {
-                        baseIntent.putExtra(android.bluetooth.BluetoothDevice.EXTRA_DEVICE, device)
-                        baseIntent.putExtra("android.bluetooth.device.extra.DEVICE", device)
-                    }
-                }
-            } catch (_: Exception) {
+            if (uris.size > 1) {
+                putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))
+                type = "*/*"
+            } else if (uris.isNotEmpty()) {
+                putExtra(Intent.EXTRA_STREAM, uris.first())
+                type = context.contentResolver.getType(uris.first()) ?: "*/*"
+            } else if (!textPayload.isNullOrBlank()) {
+                putExtra(Intent.EXTRA_TEXT, textPayload)
+                type = "text/plain"
             }
-        }
 
-        // Try to locate dedicated Bluetooth OPP activity on the device
-        val pm = context.packageManager
-        val candidates = try {
-            pm.queryIntentActivities(baseIntent, android.content.pm.PackageManager.MATCH_DEFAULT_ONLY)
-        } catch (_: Exception) {
-            emptyList()
-        }
-
-        val btActivity = candidates.firstOrNull { info ->
-            val pkg = info.activityInfo.packageName.lowercase()
-            val name = info.activityInfo.name.lowercase()
-            (pkg.contains("bluetooth") || name.contains("bluetooth") || pkg.contains("opp") || name.contains("opp")) &&
-            !pkg.contains("wear")
-        }
-
-        if (btActivity != null) {
-            try {
-                val directBtIntent = Intent(baseIntent).apply {
-                    component = android.content.ComponentName(btActivity.activityInfo.packageName, btActivity.activityInfo.name)
-                }
-                context.startActivity(directBtIntent)
-                return true
-            } catch (_: Exception) {
+            if (!targetMac.isNullOrBlank()) {
+                val cleanMac = targetMac.removePrefix("bt:")
                 try {
-                    val pkgIntent = Intent(baseIntent).apply {
-                        setPackage(btActivity.activityInfo.packageName)
+                    val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? android.bluetooth.BluetoothManager
+                    val adapter = bluetoothManager?.adapter
+                    val device = adapter?.getRemoteDevice(cleanMac)
+                    if (device != null) {
+                        putExtra("android.bluetooth.device.extra.DEVICE", device)
                     }
-                    context.startActivity(pkgIntent)
-                    return true
-                } catch (_: Exception) {
-                }
+                } catch (_: Exception) {}
             }
         }
 
-        // Fallback: System chooser targeting Bluetooth / Nearby Share
-        return shareViaSystem(context, uris, textPayload, "Bluetooth / Paylaş")
+        return try {
+            val btIntent = Intent(intent).apply {
+                setPackage("com.android.bluetooth")
+            }
+            context.startActivity(btIntent)
+            true
+        } catch (_: Exception) {
+            // Fallback to system chooser targeting Bluetooth or general sharing
+            shareViaSystem(context, uris, textPayload, "Share via Bluetooth")
+        }
     }
 
     /**
@@ -167,58 +146,32 @@ object TransferBridge {
         context: Context,
         uris: List<Uri>,
         textPayload: String? = null,
-        chooserTitle: String = "Paylaş"
+        chooserTitle: String = "Share via"
     ): Boolean {
         return try {
-            val mimeType = when {
-                uris.isNotEmpty() -> context.contentResolver.getType(uris.first()) ?: "*/*"
-                !textPayload.isNullOrBlank() -> "text/plain"
-                else -> "*/*"
-            }
-            val intent = buildShareIntent(context, uris, textPayload, mimeType)
-            val chooser = Intent.createChooser(intent, chooserTitle).apply {
+            val intent = Intent().apply {
+                action = if (uris.size > 1) Intent.ACTION_SEND_MULTIPLE else Intent.ACTION_SEND
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                if (context !is android.app.Activity) {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+
+                if (uris.size > 1) {
+                    putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))
+                    type = "*/*"
+                } else if (uris.isNotEmpty()) {
+                    putExtra(Intent.EXTRA_STREAM, uris.first())
+                    type = context.contentResolver.getType(uris.first()) ?: "*/*"
+                } else if (!textPayload.isNullOrBlank()) {
+                    putExtra(Intent.EXTRA_TEXT, textPayload)
+                    type = "text/plain"
                 }
+            }
+            val chooser = Intent.createChooser(intent, chooserTitle).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
             context.startActivity(chooser)
             true
         } catch (_: Exception) {
             false
         }
-    }
-
-    private fun buildShareIntent(
-        context: Context,
-        uris: List<Uri>,
-        textPayload: String?,
-        mimeType: String
-    ): Intent {
-        val intent = Intent().apply {
-            action = if (uris.size > 1) Intent.ACTION_SEND_MULTIPLE else Intent.ACTION_SEND
-            type = mimeType
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            if (context !is android.app.Activity) {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-
-            if (uris.size > 1) {
-                putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))
-                val clipData = android.content.ClipData.newUri(context.contentResolver, "file_0", uris[0])
-                for (i in 1 until uris.size) {
-                    clipData.addItem(android.content.ClipData.Item(uris[i]))
-                }
-                this.clipData = clipData
-            } else if (uris.isNotEmpty()) {
-                val singleUri = uris.first()
-                putExtra(Intent.EXTRA_STREAM, singleUri)
-                clipData = android.content.ClipData.newUri(context.contentResolver, "file", singleUri)
-            } else if (!textPayload.isNullOrBlank()) {
-                putExtra(Intent.EXTRA_TEXT, textPayload)
-                clipData = android.content.ClipData.newPlainText("text", textPayload)
-            }
-        }
-        return intent
     }
 }
