@@ -37,6 +37,7 @@ Panel {
   property bool p2pBtAvailable: false
   property var p2pPeers: []
   property var p2pPendingTransfer: null
+  readonly property string fontFamily: (root.bar && root.bar.fontFamily) ? root.bar.fontFamily : ((typeof Style !== "undefined" && Style.font && Style.font.family) ? Style.font.family : "JetBrainsMono Nerd Font")
 
   function resolveEnginePath() {
     return Qt.resolvedUrl("omasend-engine").toString().replace(/^file:\/\//, "")
@@ -279,7 +280,7 @@ Panel {
             textFormat: Text.PlainText
             text: ""
             color: root.bar ? root.bar.foreground : Color.foreground
-            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.family: root.fontFamily
             font.pixelSize: Style.font.display
             anchors.left: parent.left
             anchors.verticalCenter: parent.verticalCenter
@@ -301,7 +302,7 @@ Panel {
                 text: "OmaSend"
                 textFormat: Text.PlainText
                 color: root.bar ? root.bar.foreground : Color.foreground
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.family: root.fontFamily
                 font.pixelSize: Style.font.title
                 font.bold: true
               }
@@ -323,7 +324,7 @@ Panel {
                   textFormat: Text.PlainText
                   text: " E2EE"
                   color: Color.accent
-                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                  font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   font.bold: true
                 }
@@ -334,7 +335,7 @@ Panel {
               textFormat: Text.PlainText
               text: (root.wanConnecting ? "ESTABLISHING WAN TUNNEL..." : (root.activeMode === "WAN" ? "GLOBAL AIRBRIDGE (WAN)" : "LOCAL NETWORK BRIDGE (LAN)")).toUpperCase()
               color: root.wanConnecting ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               font.bold: true
               font.letterSpacing: 1.1
@@ -366,7 +367,7 @@ Panel {
                 textFormat: Text.PlainText
                 text: "📁"
                 color: Color.accent
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.family: root.fontFamily
                 font.pixelSize: Style.font.body
               }
 
@@ -375,7 +376,7 @@ Panel {
                 textFormat: Text.PlainText
                 text: "INCOMING AIRBRIDGE TRANSFER"
                 color: Color.accent
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 font.bold: true
               }
@@ -387,7 +388,7 @@ Panel {
               textFormat: Text.PlainText
               text: root.p2pPendingTransfer ? ("From: " + root.p2pPendingTransfer.sender_name + " (" + root.p2pPendingTransfer.sender_ip + ")\nFiles: " + (root.p2pPendingTransfer.file_names || []).join(", ") + " (" + ((root.p2pPendingTransfer.total_size_bytes || 0) / 1024 / 1024).toFixed(1) + " MB)") : ""
               color: root.bar ? root.bar.foreground : Color.foreground
-              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
             }
 
@@ -405,7 +406,7 @@ Panel {
                   textFormat: Text.PlainText
                   text: " ACCEPT"
                   color: "#000000"
-                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                  font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   font.bold: true
                 }
@@ -431,7 +432,7 @@ Panel {
                   textFormat: Text.PlainText
                   text: " DECLINE"
                   color: root.bar ? root.bar.foreground : Color.foreground
-                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                  font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   font.bold: true
                 }
@@ -465,7 +466,7 @@ Panel {
               Layout.fillWidth: true
               text: "AIRDROP & PEER DISCOVERY"
               foreground: root.bar ? root.bar.foreground : Color.foreground
-              fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+              fontFamily: root.fontFamily
             }
 
             // Bluetooth Status Indicator
@@ -484,7 +485,7 @@ Panel {
                 textFormat: Text.PlainText
                 text: " BT READY"
                 color: Color.accent
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 font.bold: true
               }
@@ -503,7 +504,7 @@ Panel {
               bordered: true
               accent: Color.accent
               fontSize: Style.font.caption
-              fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+              fontFamily: root.fontFamily
               onClicked: root.setP2pVisibility("OFF")
             }
 
@@ -514,7 +515,7 @@ Panel {
               bordered: true
               accent: Color.accent
               fontSize: Style.font.caption
-              fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+              fontFamily: root.fontFamily
               onClicked: root.setP2pVisibility("KNOWN")
             }
 
@@ -525,7 +526,7 @@ Panel {
               bordered: true
               accent: Color.accent
               fontSize: Style.font.caption
-              fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+              fontFamily: root.fontFamily
               onClicked: root.setP2pVisibility("EVERYONE")
             }
           }
@@ -541,7 +542,7 @@ Panel {
               textFormat: Text.PlainText
               text: root.p2pVisibility === "OFF" ? "AirBridge visibility is turned off." : "Scanning for nearby Omarchy devices on local network & Bluetooth..."
               color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
-              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               font.italic: true
             }
@@ -568,7 +569,7 @@ Panel {
                     textFormat: Text.PlainText
                     text: modelData.transport === "BT" ? "" : (modelData.transport === "HYBRID" ? "⚡" : "💻")
                     color: modelData.transport === "BT" ? "#3b82f6" : (modelData.transport === "HYBRID" ? "#a855f7" : Color.accent)
-                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.family: root.fontFamily
                     font.pixelSize: Style.font.body
                   }
 
@@ -581,7 +582,7 @@ Panel {
                         textFormat: Text.PlainText
                         text: modelData.name || "Omarchy Device"
                         color: root.bar ? root.bar.foreground : Color.foreground
-                        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                        font.family: root.fontFamily
                         font.pixelSize: Style.font.bodySmall
                         font.bold: true
                       }
@@ -596,7 +597,7 @@ Panel {
                           textFormat: Text.PlainText
                           text: modelData.transport
                           color: modelData.transport === "BT" ? "#93c5fd" : (modelData.transport === "HYBRID" ? "#d8b4fe" : "#6ee7b7")
-                          font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                          font.family: root.fontFamily
                           font.pixelSize: 9
                           font.bold: true
                         }
@@ -606,7 +607,7 @@ Panel {
                       textFormat: Text.PlainText
                       text: (modelData.ip.startsWith("bt:") ? "Bluetooth Paired" : modelData.ip) + (modelData.is_trusted ? " • TRUSTED" : "")
                       color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                      font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
                     }
                   }
@@ -616,7 +617,7 @@ Panel {
                     bordered: true
                     accent: Color.accent
                     fontSize: Style.font.caption
-                    fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+                    fontFamily: root.fontFamily
                     onClicked: root.sendFileTo(modelData.ip)
                   }
 
@@ -625,7 +626,7 @@ Panel {
                     bordered: true
                     accent: Color.accent
                     fontSize: Style.font.caption
-                    fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+                    fontFamily: root.fontFamily
                     onClicked: root.syncClipboardTo(modelData.ip)
                   }
                 }
@@ -646,7 +647,7 @@ Panel {
           PanelSectionHeader {
             text: "NETWORK MODE & PAIRING"
             foreground: root.bar ? root.bar.foreground : Color.foreground
-            fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+            fontFamily: root.fontFamily
           }
 
           RowLayout {
@@ -698,7 +699,7 @@ Panel {
                     textFormat: Text.PlainText
                     text: ""
                     color: root.activeMode === "LAN" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
                   }
 
@@ -707,7 +708,7 @@ Panel {
                     textFormat: Text.PlainText
                     text: "Local Network (LAN)"
                     color: root.activeMode === "LAN" ? (root.bar ? root.bar.foreground : Color.foreground) : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
                     font.bold: root.activeMode === "LAN"
                   }
@@ -717,7 +718,7 @@ Panel {
                     textFormat: Text.PlainText
                     text: "●"
                     color: Color.accent
-                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                   }
                 }
@@ -749,7 +750,7 @@ Panel {
                     textFormat: Text.PlainText
                     text: ""
                     color: root.activeMode === "WAN" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
                   }
 
@@ -758,7 +759,7 @@ Panel {
                     textFormat: Text.PlainText
                     text: "Global WAN"
                     color: root.activeMode === "WAN" ? (root.bar ? root.bar.foreground : Color.foreground) : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
                     font.bold: root.activeMode === "WAN"
                   }
@@ -767,7 +768,7 @@ Panel {
                     textFormat: Text.PlainText
                     text: root.wanActive ? "●" : (root.wanConnecting ? "󰑐" : "")
                     color: Color.accent
-                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                   }
                 }
@@ -800,7 +801,7 @@ Panel {
                           (root.wanActive ? "● Tunnel Active" : (root.wanConnecting ? "󰑐 Connecting..." : "○ Tunnel Offline")) :
                           " Same Wi-Fi Network"
                     color: (root.wanActive || root.wanConnecting) ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.3)
-                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                     font.bold: true
                     elide: Text.ElideRight
@@ -834,7 +835,7 @@ Panel {
                 textFormat: Text.PlainText
                 text: root.activeUrl ? root.activeUrl.replace(/#key=.*$/, "") : ("http://" + root.localIp + ":" + root.port)
                 color: root.bar ? root.bar.foreground : Color.foreground
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
                 font.bold: true
                 elide: Text.ElideMiddle
@@ -860,7 +861,7 @@ Panel {
           PanelSectionHeader {
             text: "SECURITY PIN"
             foreground: root.bar ? root.bar.foreground : Color.foreground
-            fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+            fontFamily: root.fontFamily
           }
 
           Rectangle {
@@ -880,7 +881,7 @@ Panel {
                 textFormat: Text.PlainText
                 text: "PIN: " + root.pin
                 color: root.bar ? root.bar.foreground : Color.foreground
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
                 font.bold: true
               }
@@ -905,7 +906,7 @@ Panel {
           PanelSectionHeader {
             text: "END-TO-END ENCRYPTION (AES-256-GCM)"
             foreground: root.bar ? root.bar.foreground : Color.foreground
-            fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+            fontFamily: root.fontFamily
           }
 
           Rectangle {
@@ -925,7 +926,7 @@ Panel {
                 textFormat: Text.PlainText
                 text: "Key: " + (root.sessionKey.length > 16 ? (root.sessionKey.slice(0, 8) + "..." + root.sessionKey.slice(-8)) : "Active")
                 color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.3)
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 font.bold: true
               }
@@ -950,7 +951,7 @@ Panel {
           PanelSectionHeader {
             text: "DOWNLOAD DIRECTORY"
             foreground: root.bar ? root.bar.foreground : Color.foreground
-            fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+            fontFamily: root.fontFamily
           }
 
           Rectangle {
@@ -970,7 +971,7 @@ Panel {
                 textFormat: Text.PlainText
                 text: root.savePath
                 color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.3)
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 elide: Text.ElideMiddle
               }
@@ -997,7 +998,7 @@ Panel {
             textFormat: Text.PlainText
             text: "OmaSend AirBridge • Port " + root.port
             color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
-            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.family: root.fontFamily
             font.pixelSize: Style.font.caption
           }
 
