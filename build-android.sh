@@ -9,13 +9,19 @@ if [ ! -d "$ANDROID_DIR" ]; then
     exit 1
 fi
 
+if [ -z "${JAVA_HOME:-}" ]; then
+    if [ -d "$HOME/.local/share/mise/installs/java/21.0.2" ]; then
+        export JAVA_HOME="$HOME/.local/share/mise/installs/java/21.0.2"
+    fi
+fi
+
 echo "Building OmaSend for Android..."
 cd "$ANDROID_DIR"
 
 MODE="${1:-debug}"
 
 if [ "$MODE" = "bundle" ] || [ "$MODE" = "release" ]; then
-    ./gradlew bundleRelease
+    ./gradlew bundleRelease --dependency-verification=strict
     AAB_SRC="$ANDROID_DIR/app/build/outputs/bundle/release/app-release.aab"
     AAB_DEST="$SCRIPT_DIR/omasend-release.aab"
     if [ -f "$AAB_SRC" ]; then
@@ -26,7 +32,7 @@ if [ "$MODE" = "bundle" ] || [ "$MODE" = "release" ]; then
         exit 1
     fi
 else
-    ./gradlew assembleDebug
+    ./gradlew assembleDebug --dependency-verification=strict
     APK_SRC="$ANDROID_DIR/app/build/outputs/apk/debug/app-debug.apk"
     APK_DEST="$SCRIPT_DIR/omasend-debug.apk"
     if [ -f "$APK_SRC" ]; then

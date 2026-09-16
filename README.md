@@ -133,11 +133,12 @@ Click the paper plane icon in the Omarchy top bar to open the OmaSend panel.
 
 ## Security and Architecture Standards
 
-OmaSend complies strictly with the Omarchy Linux Security Architecture (AGENTS.md):
+OmaSend complies strictly with the Omarchy Linux Security Architecture:
 - Subprocess Isolation: Processes run in isolated process groups (`cmd.process_group(0)`) with non-blocking I/O (`fcntl O_NONBLOCK`) and bounded polling.
 - Strict File Permissions: Sensitive state files (`trusted_peers.json`, `device_id.key`) and in-flight staging parts are written atomically with mode 0600. Download and staging directories enforce mode 0700. Symlinks are strictly rejected.
 - Concurrency Caps & DoS Protection: Strict global cap (max 32 active connections) and per-peer IP cap (max 4 active connections) enforced at socket accept before spawning worker threads; excess requests are rejected early with HTTP 429.
 - Monotonic Socket Deadlines: End-to-end socket reads across both headers and body enforce an immutable monotonic deadline (30s) recalculating remaining durations dynamically, neutralizing Slowloris drip-feeding attacks.
+- Strict Supply-Chain & Android Dependency Verification: The Android companion build strictly verifies every direct, plugin, and transitive dependency against committed cryptographic SHA-256 digests in `android/gradle/verification-metadata.xml` with strict mode enforced (`org.gradle.dependency.verification=strict`). Building the companion will fail immediately if any downloaded artifact does not match its pinned cryptographic checksum.
 - Early Header-First Authentication: Request headers are parsed and strictly authenticated (via PIN rate-limiter or transfer token) *before* reading or staging any request body bytes. Unauthenticated or forbidden requests are rejected immediately with HTTP 401/403 without touching disk or allocating body buffers.
 - Endpoint-Specific Body Ceilings:
   - Clipboard endpoints (`/api/clipboard*`): strictly capped at 1 MiB.
