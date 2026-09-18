@@ -82,7 +82,7 @@ OmaSend features an official native Android companion app built with modern Kotl
 
 - **Source Repository:** [ozdil/omasend-android](https://github.com/ozdil/omasend-android)
 
-#### 🛡️ Official Google Play Closed Beta:
+#### Official Google Play Closed Beta:
 OmaSend for Android is distributed officially via Google Play:
 1. **Join Tester Community:** [OmaSend Testers Google Group](https://groups.google.com/g/omasend-testers) *(Click "Join group")*
 2. **Opt-in to Beta:** [Google Play Testing Opt-in](https://play.google.com/apps/testing/io.omarchy.omasend) *(Click "Become a tester")*

@@ -365,7 +365,7 @@ Panel {
 
               Text {
                 textFormat: Text.PlainText
-                text: "📁"
+                text: "\uf07b"
                 color: Color.accent
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
@@ -537,14 +537,46 @@ Panel {
             spacing: Style.space(6)
 
             Text {
-              visible: root.p2pVisibility === "OFF" || root.p2pPeers.length === 0
+              visible: root.p2pVisibility === "OFF"
               width: parent.width
               textFormat: Text.PlainText
-              text: root.p2pVisibility === "OFF" ? "AirBridge visibility is turned off." : "Scanning for nearby Omarchy devices on local network & Bluetooth..."
+              text: "AirBridge görünürlüğü kapalı."
               color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               font.italic: true
+            }
+
+            RowLayout {
+              visible: root.p2pVisibility !== "OFF" && root.p2pPeers.length === 0
+              width: parent.width
+              spacing: Style.space(8)
+
+              Text {
+                textFormat: Text.PlainText
+                text: "\uf1ce"
+                color: Color.accent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+
+                NumberAnimation on rotation {
+                  from: 0
+                  to: 360
+                  duration: 1200
+                  loops: Animation.Infinite
+                  running: root.p2pVisibility !== "OFF" && root.p2pPeers.length === 0
+                }
+              }
+
+              Text {
+                Layout.fillWidth: true
+                textFormat: Text.PlainText
+                text: "Yakındaki cihazlar taranıyor (Wi-Fi & Bluetooth)..."
+                color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.italic: true
+              }
             }
 
             Repeater {
@@ -567,7 +599,7 @@ Panel {
 
                   Text {
                     textFormat: Text.PlainText
-                    text: modelData.transport === "BT" ? "" : (modelData.transport === "HYBRID" ? "⚡" : "💻")
+                    text: modelData.transport === "BT" ? "" : (modelData.transport === "HYBRID" ? "\uf0e7" : "\uf108")
                     color: modelData.transport === "BT" ? "#3b82f6" : (modelData.transport === "HYBRID" ? "#a855f7" : Color.accent)
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.body
@@ -613,7 +645,7 @@ Panel {
                   }
 
                   Button {
-                    text: "📁 SEND"
+                    text: "\uf07b GÖNDER"
                     bordered: true
                     accent: Color.accent
                     fontSize: Style.font.caption
@@ -622,7 +654,7 @@ Panel {
                   }
 
                   Button {
-                    text: "📋 CLIPBOARD"
+                    text: "\uf0ea PANO"
                     bordered: true
                     accent: Color.accent
                     fontSize: Style.font.caption

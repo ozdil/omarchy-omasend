@@ -37,6 +37,7 @@ class DiscoveryManager(private val context: Context) {
         encodeDefaults = true
         ignoreUnknownKeys = true
     }
+    private val prefs = context.getSharedPreferences("omasend_trusted_peers", Context.MODE_PRIVATE)
     private val peerMap = ConcurrentHashMap<String, DiscoveredPeer>()
     private val _peers = MutableStateFlow<List<DiscoveredPeer>>(emptyList())
     val peers: StateFlow<List<DiscoveredPeer>> = _peers.asStateFlow()
@@ -45,15 +46,80 @@ class DiscoveryManager(private val context: Context) {
     private val _discoveryMode = MutableStateFlow(DiscoveryMode.EVERYONE)
     val discoveryMode: StateFlow<DiscoveryMode> = _discoveryMode.asStateFlow()
 
+    fun isPeerTrusted(peerId: String): Boolean {
+        return prefs.getBoolean("trusted_$peerId", false)
+    }
+
+    fun setPeerTrusted(peerId: String, trusted: Boolean) {
+        prefs.edit().putBoolean("trusted_$peerId", trusted).apply()
+        peerMap[peerId]?.let { peer ->
+            peerMap[peerId] = peer.copy(isTrusted = trusted)
+        }
+        updatePeersFlow()
+    }
+
+    fun toggleTrust(peerId: String) {
+        val current = isPeerTrusted(peerId)
+        setPeerTrusted(peerId, !current)
+    }
+
+    private fun updatePeersFlow() {
+        val mode = _discoveryMode.value
+        val list = when (mode) {
+            DiscoveryMode.OFF -> emptyList()
+            DiscoveryMode.KNOWN_PEERS -> {
+                peerMap.values.filter { it.isTrusted || it.id.startsWith("manual_") }
+            }
+            DiscoveryMode.EVERYONE -> {
+                peerMap.values.toList()
+            }
+        }
+        _peers.value = list.sortedBy { it.name }
+    }
+
+    fun forceRefresh() {
+        scope.launch {
+            val myIp = NetworkUtils.getLocalIpAddress()
+            if (myIp != "127.0.0.1") {
+                try {
+                    val socket = DatagramSocket().apply { broadcast = true }
+                    val beacon = P2pBeaconPacket(
+                        magic = "OMASEND_P2P",
+                        v = 1,
+                        id = NetworkUtils.getDeviceId(context),
+                        name = NetworkUtils.getDeviceName(context),
+                        ip = myIp,
+                        port = NetworkUtils.PORT,
+                        mode = _discoveryMode.value.wireMode,
+                        bt = isBluetoothEnabled(),
+                        fp = ""
+                    )
+                    val payload = json.encodeToString(P2pBeaconPacket.serializer(), beacon).toByteArray(Charsets.UTF_8)
+                    val bcastAddr = InetAddress.getByName("255.255.255.255")
+                    repeat(3) {
+                        socket.send(DatagramPacket(payload, payload.size, bcastAddr, NetworkUtils.PORT))
+                        delay(120)
+                    }
+                    socket.close()
+                } catch (_: Exception) {
+                }
+            }
+            refreshBluetoothPeers()
+            updatePeersFlow()
+        }
+    }
+
     fun setMode(mode: DiscoveryMode) {
         _discoveryMode.value = mode
         when (mode) {
             DiscoveryMode.OFF -> stop()
             DiscoveryMode.KNOWN_PEERS -> {
                 if (!_isScanning.value) start()
+                else updatePeersFlow()
             }
             DiscoveryMode.EVERYONE -> {
                 if (!_isScanning.value) start()
+                else updatePeersFlow()
             }
         }
     }
@@ -69,6 +135,7 @@ class DiscoveryManager(private val context: Context) {
         startListener()
         startBroadcaster()
         startCleanup()
+        updatePeersFlow()
     }
 
     fun stop() {
@@ -85,7 +152,7 @@ class DiscoveryManager(private val context: Context) {
         val manualPeers = peerMap.values.filter { it.id.startsWith("manual_") }
         peerMap.clear()
         manualPeers.forEach { peerMap[it.id] = it }
-        _peers.value = peerMap.values.toList().sortedBy { it.name }
+        updatePeersFlow()
     }
 
     fun addManualPeer(ip: String, port: Int = NetworkUtils.PORT, name: String = "Direct ($ip)") {
@@ -97,10 +164,11 @@ class DiscoveryManager(private val context: Context) {
             port = port,
             transport = "DIRECT",
             fingerprint = "",
+            isTrusted = true,
             lastSeen = System.currentTimeMillis() + 3600000L // 1 hour persistent
         )
         peerMap[peer.id] = peer
-        _peers.value = peerMap.values.toList().sortedBy { it.name }
+        updatePeersFlow()
     }
 
     private fun acquireMulticastLock() {
@@ -157,10 +225,11 @@ class DiscoveryManager(private val context: Context) {
                                         port = beacon.port,
                                         transport = if (beacon.bt) "BT+LAN" else "LAN",
                                         fingerprint = beacon.fp,
+                                        isTrusted = isPeerTrusted(beacon.id),
                                         lastSeen = System.currentTimeMillis()
                                     )
                                     peerMap[peer.id] = peer
-                                    _peers.value = peerMap.values.toList().sortedBy { it.name }
+                                    updatePeersFlow()
                                 }
                             }
                         }
@@ -293,6 +362,7 @@ class DiscoveryManager(private val context: Context) {
 
                 val addr = device.address
                 val peerId = "bt_${addr.replace(":", "")}"
+                val trusted = isPeerTrusted(peerId)
                 val existing = peerMap.values.find {
                     it.name.equals(name, ignoreCase = true) || it.id == peerId
                 }
@@ -301,12 +371,14 @@ class DiscoveryManager(private val context: Context) {
                     if (existing.transport == "LAN") {
                         peerMap[existing.id] = existing.copy(
                             transport = "HYBRID",
+                            isTrusted = trusted || existing.isTrusted,
                             lastSeen = now
                         )
                         changed = true
                     } else if (existing.transport == "BT" || existing.transport == "HYBRID") {
                         peerMap[existing.id] = existing.copy(
-                            lastSeen = now + 60_000L
+                            isTrusted = trusted || existing.isTrusted,
+                            lastSeen = now
                         )
                     }
                 } else {
@@ -317,7 +389,8 @@ class DiscoveryManager(private val context: Context) {
                         port = 0,
                         transport = "BT",
                         fingerprint = addr,
-                        lastSeen = now + 60_000L
+                        isTrusted = trusted,
+                        lastSeen = now
                     )
                     peerMap[peer.id] = peer
                     changed = true
@@ -325,7 +398,7 @@ class DiscoveryManager(private val context: Context) {
             }
 
             if (changed) {
-                _peers.value = peerMap.values.toList().sortedBy { it.name }
+                updatePeersFlow()
             }
         } catch (_: Exception) {
         }
@@ -335,20 +408,20 @@ class DiscoveryManager(private val context: Context) {
         cleanupJob?.cancel()
         cleanupJob = scope.launch {
             while (isActive) {
-                delay(5000)
+                delay(3000)
                 refreshBluetoothPeers()
                 val now = System.currentTimeMillis()
                 var changed = false
                 val it = peerMap.entries.iterator()
                 while (it.hasNext()) {
                     val entry = it.next()
-                    if (now - entry.value.lastSeen > 15000) {
+                    if (!entry.value.id.startsWith("manual_") && (now - entry.value.lastSeen > 8000L)) {
                         it.remove()
                         changed = true
                     }
                 }
                 if (changed) {
-                    _peers.value = peerMap.values.toList().sortedBy { it.name }
+                    updatePeersFlow()
                 }
             }
         }

@@ -34,6 +34,27 @@ pub const MAX_GLOBAL_CONNECTIONS: usize = 32;
 pub const MAX_PEER_CONNECTIONS: usize = 4;
 static GLOBAL_ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 static PEER_CONNECTION_TRACKER: Mutex<Option<HashMap<IpAddr, usize>>> = Mutex::new(None);
+static RECENTLY_NOTIFIED_FILES: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
+
+pub fn record_notified_file(file_name: &str) {
+    if let Ok(mut lock) = RECENTLY_NOTIFIED_FILES.lock() {
+        let map = lock.get_or_insert_with(HashMap::new);
+        let now = Instant::now();
+        map.retain(|_, v| now.duration_since(*v) < Duration::from_secs(60));
+        map.insert(file_name.to_string(), now);
+    }
+}
+
+pub fn is_recently_notified(file_name: &str) -> bool {
+    if let Ok(mut lock) = RECENTLY_NOTIFIED_FILES.lock() {
+        if let Some(map) = lock.as_mut() {
+            let now = Instant::now();
+            map.retain(|_, v| now.duration_since(*v) < Duration::from_secs(60));
+            return map.contains_key(file_name);
+        }
+    }
+    false
+}
 
 pub struct ConnectionGuard {
     ip: IpAddr,
@@ -708,11 +729,67 @@ fn notify_desktop(title: &str, body: &str) {
     let deadline = Instant::now() + Duration::from_millis(1500);
     let _ = run_cmd_bounded(
         "/usr/bin/notify-send",
-        &["-a", "OmaSend", "-i", "document-send", title, body],
+        &["-a", "OmaSend", "-i", "document-send", "--", title, body],
         &envs,
         deadline,
         1024,
     );
+}
+
+fn start_download_dir_watcher(download_dir: &Path) {
+    let dir = download_dir.to_path_buf();
+    thread::spawn(move || {
+        // Initial scan: record existing files so we don't send notifications for old files
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if let Ok(ft) = entry.file_type() {
+                    if ft.is_file() {
+                        let fname = entry.file_name().to_string_lossy().to_string();
+                        record_notified_file(&fname);
+                    }
+                }
+            }
+        }
+
+        let mut previous_sizes: HashMap<String, u64> = HashMap::new();
+
+        loop {
+            thread::sleep(Duration::from_millis(1500));
+            if let Ok(entries) = fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    if let Ok(ft) = entry.file_type() {
+                        if !ft.is_file() {
+                            continue;
+                        }
+                        let fname = entry.file_name().to_string_lossy().to_string();
+                        if fname.starts_with('.') || fname.ends_with(".part") || fname.ends_with(".crdownload") {
+                            continue;
+                        }
+                        if is_recently_notified(&fname) {
+                            continue;
+                        }
+
+                        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                        if let Some(&prev_size) = previous_sizes.get(&fname) {
+                            if prev_size == size && size > 0 {
+                                record_notified_file(&fname);
+                                previous_sizes.remove(&fname);
+                                RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
+                                notify_desktop(
+                                    "OmaSend: Dosya Alindi",
+                                    &format!("'{}' ({} bayt) Downloads/omasend dizinine kaydedildi.", fname, size),
+                                );
+                            } else {
+                                previous_sizes.insert(fname, size);
+                            }
+                        } else {
+                            previous_sizes.insert(fname, size);
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn get_pc_clipboard() -> String {
@@ -1464,6 +1541,12 @@ fn ensure_obex_service_running() {
 fn start_bluetooth_receiver(download_dir: &Path) {
     if !is_bluetooth_available() {
         return;
+    }
+    let deadline = Instant::now() + Duration::from_millis(500);
+    if let Some(out) = run_cmd_bounded("/usr/bin/pgrep", &["-f", "bt-obex -s"], &[], deadline, 256) {
+        if !out.is_empty() {
+            return;
+        }
     }
     ensure_obex_service_running();
     let dir_str = download_dir.to_string_lossy().to_string();
@@ -2940,6 +3023,7 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
                 save_pending_transfer(&pending);
             }
             let final_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            record_notified_file(&final_name);
             notify_desktop(
                 "OmaSend: AirBridge Transfer Complete",
                 &format!("'{}' ({} bytes) received and saved to Downloads/omasend.", final_name, payload_len)
@@ -3080,10 +3164,12 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
                 }
                 let file_path = get_unique_filepath(&ddir, &clean_filename);
                 if write_secure_bytes(&file_path, &decrypted).is_ok() {
+                    let final_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    record_notified_file(&final_name);
                     RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
                     notify_desktop(
                         "OmaSend: E2EE File Received",
-                        &format!("'{}' ({} bytes) decrypted and saved to Downloads/omasend.", file_path.file_name().unwrap_or_default().to_string_lossy(), decrypted.len())
+                        &format!("'{}' ({} bytes) decrypted and saved to Downloads/omasend.", final_name, decrypted.len())
                     );
                     let resp = serde_json::json!({
                         "status": "OK",
@@ -3278,11 +3364,13 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
 
                 let file_path = get_unique_filepath(&ddir, &saved_name);
                 if write_secure_bytes(&file_path, data_slice).is_ok() {
+                    let final_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    record_notified_file(&final_name);
                     success = true;
                     RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
                     notify_desktop(
                         "OmaSend: File Received",
-                        &format!("'{}' saved to Downloads/omasend.", file_path.file_name().unwrap_or_default().to_string_lossy()),
+                        &format!("'{}' saved to Downloads/omasend.", final_name),
                     );
                 }
             }
@@ -3311,11 +3399,13 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
                             if let Ok(mut dest) = opts.open(&file_path) {
                                 let mut take = src.take(dlen);
                                 if std::io::copy(&mut take, &mut dest).is_ok() {
+                                    let final_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                    record_notified_file(&final_name);
                                     success = true;
                                     RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
                                     notify_desktop(
                                         "OmaSend: File Received",
-                                        &format!("'{}' saved to Downloads/omasend.", file_path.file_name().unwrap_or_default().to_string_lossy()),
+                                        &format!("'{}' saved to Downloads/omasend.", final_name),
                                     );
                                 }
                             }
@@ -3380,6 +3470,7 @@ fn run_server() {
     thread::spawn(run_p2p_discovery_listener);
     thread::spawn(run_p2p_beacon_broadcaster);
     start_bluetooth_receiver(&get_download_dir());
+    start_download_dir_watcher(&get_download_dir());
 
     for mut s in listener.incoming().flatten() {
         let client_ip = s.peer_addr().map(|a| a.ip()).unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
@@ -3419,6 +3510,12 @@ fn main() {
     } else {
         get_or_create_session_key()
     };
+
+    if args.iter().any(|a| a == "--test-notification") {
+        notify_desktop("OmaSend", "Masaustu bildirim sistemi aktif ve calisiyor.");
+        println!("Test bildirimi gonderildi.");
+        return;
+    }
 
     if let Some(pos) = args.iter().position(|a| a == "--set-visibility") {
         if let Some(mode) = args.get(pos + 1) {
@@ -4283,6 +4380,14 @@ mod tests {
         // Verify that because authorized is false, staging is NEVER performed
         // CURRENT_STAGED_BYTES remains 0
         assert_eq!(CURRENT_STAGED_BYTES.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_recently_notified_file_lifecycle() {
+        let test_name = "test_received_doc.pdf";
+        assert!(!is_recently_notified(test_name));
+        record_notified_file(test_name);
+        assert!(is_recently_notified(test_name));
     }
 }
 

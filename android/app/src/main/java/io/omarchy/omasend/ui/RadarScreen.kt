@@ -37,6 +37,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
@@ -233,7 +234,7 @@ fun RadarScreen(
                                     targetValue = refreshRotation.value + 360f,
                                     animationSpec = tween(600, easing = FastOutSlowInEasing)
                                 )
-                                app.discoveryManager.refreshBluetoothPeers()
+                                app.discoveryManager.forceRefresh()
                                 refreshRecentFiles()
                                 isRefreshing = false
                                 Toast.makeText(context, "Ağ ve Bluetooth eşleri güncellendi", Toast.LENGTH_SHORT).show()
@@ -399,10 +400,13 @@ fun RadarScreen(
             if (peers.isEmpty()) {
                 item {
                     CleanEmptyStateCard(
-                        isOff = discoveryMode == DiscoveryMode.OFF,
+                        discoveryMode = discoveryMode,
                         onEnableScan = {
                             app.discoveryManager.setMode(DiscoveryMode.EVERYONE)
                             OmaSendForegroundService.startService(context)
+                        },
+                        onSwitchToEveryone = {
+                            app.discoveryManager.setMode(DiscoveryMode.EVERYONE)
                         },
                         onAddDirectIp = { showDirectIpDialog = true }
                     )
@@ -414,6 +418,9 @@ fun RadarScreen(
                         isSelected = selectedPeer?.id == peer.id,
                         onCardClick = {
                             selectedPeer = if (selectedPeer?.id == peer.id) null else peer
+                        },
+                        onToggleTrust = {
+                            app.discoveryManager.toggleTrust(peer.id)
                         },
                         onSendClick = {
                             selectedPeer = peer
@@ -524,6 +531,107 @@ private fun showTargetDeviceSheetOrFallback(
 // ------------------- UI BİLEŞENLERİ (MATERIAL 3) -------------------
 
 @Composable
+fun RadarPulseAvatar(
+    isScanning: Boolean,
+    modifier: Modifier = Modifier
+) {
+    if (isScanning) {
+        val infiniteTransition = rememberInfiniteTransition(label = "RadarPulse")
+        val wave1Scale by infiniteTransition.animateFloat(
+            initialValue = 1f,
+            targetValue = 1.6f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(2000, easing = LinearEasing),
+                repeatMode = RepeatMode.Restart
+            ),
+            label = "Wave1Scale"
+        )
+        val wave1Alpha by infiniteTransition.animateFloat(
+            initialValue = 0.45f,
+            targetValue = 0f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(2000, easing = LinearEasing),
+                repeatMode = RepeatMode.Restart
+            ),
+            label = "Wave1Alpha"
+        )
+        val wave2Scale by infiniteTransition.animateFloat(
+            initialValue = 1f,
+            targetValue = 1.6f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(2000, delayMillis = 1000, easing = LinearEasing),
+                repeatMode = RepeatMode.Restart
+            ),
+            label = "Wave2Scale"
+        )
+        val wave2Alpha by infiniteTransition.animateFloat(
+            initialValue = 0.45f,
+            targetValue = 0f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(2000, delayMillis = 1000, easing = LinearEasing),
+                repeatMode = RepeatMode.Restart
+            ),
+            label = "Wave2Alpha"
+        )
+
+        Box(
+            modifier = modifier.size(52.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(46.dp)
+                    .graphicsLayer {
+                        scaleX = wave1Scale
+                        scaleY = wave1Scale
+                        alpha = wave1Alpha
+                    }
+                    .background(MaterialTheme.colorScheme.primary, CircleShape)
+            )
+            Box(
+                modifier = Modifier
+                    .size(46.dp)
+                    .graphicsLayer {
+                        scaleX = wave2Scale
+                        scaleY = wave2Scale
+                        alpha = wave2Alpha
+                    }
+                    .background(MaterialTheme.colorScheme.primary, CircleShape)
+            )
+            Surface(
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.primaryContainer,
+                modifier = Modifier.size(46.dp)
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        Icons.Default.PhoneAndroid,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(24.dp)
+                    )
+                }
+            }
+        }
+    } else {
+        Surface(
+            shape = CircleShape,
+            color = MaterialTheme.colorScheme.surfaceVariant,
+            modifier = modifier.size(46.dp)
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Icon(
+                    Icons.Default.PhoneAndroid,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(24.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
 fun LocalDeviceHeroCard(
     context: Context,
     currentMode: DiscoveryMode,
@@ -546,20 +654,7 @@ fun LocalDeviceHeroCard(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Surface(
-                    shape = CircleShape,
-                    color = MaterialTheme.colorScheme.primaryContainer,
-                    modifier = Modifier.size(48.dp)
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            Icons.Default.PhoneAndroid,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(26.dp)
-                        )
-                    }
-                }
+                RadarPulseAvatar(isScanning = currentMode != DiscoveryMode.OFF)
 
                 Spacer(modifier = Modifier.width(14.dp))
 
@@ -749,6 +844,7 @@ fun ModernPeerCard(
     peer: DiscoveredPeer,
     isSelected: Boolean,
     onCardClick: () -> Unit,
+    onToggleTrust: () -> Unit = {},
     onSendClick: () -> Unit,
     onClipboardClick: () -> Unit
 ) {
@@ -813,8 +909,21 @@ fun ModernPeerCard(
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.onSurface,
                         maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
                     )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    IconButton(
+                        onClick = onToggleTrust,
+                        modifier = Modifier.size(24.dp)
+                    ) {
+                        Icon(
+                            if (peer.isTrusted) Icons.Default.Star else Icons.Default.StarBorder,
+                            contentDescription = if (peer.isTrusted) "Güvenilen Cihaz" else "Güvenilir Olarak İşaretle",
+                            tint = if (peer.isTrusted) Color(0xFFF59E0B) else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
                 }
                 Spacer(modifier = Modifier.height(2.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -837,6 +946,21 @@ fun ModernPeerCard(
                                 else -> MaterialTheme.colorScheme.primary
                             }
                         )
+                    }
+                    if (peer.isTrusted) {
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Surface(
+                            shape = RoundedCornerShape(6.dp),
+                            color = Color(0xFFF59E0B).copy(alpha = 0.15f)
+                        ) {
+                            Text(
+                                text = "GÜVENİLİR",
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFFD97706)
+                            )
+                        }
                     }
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
@@ -893,8 +1017,9 @@ fun ModernPeerCard(
 
 @Composable
 fun CleanEmptyStateCard(
-    isOff: Boolean,
+    discoveryMode: DiscoveryMode,
     onEnableScan: () -> Unit,
+    onSwitchToEveryone: () -> Unit,
     onAddDirectIp: () -> Unit
 ) {
     ElevatedCard(
@@ -918,9 +1043,13 @@ fun CleanEmptyStateCard(
             ) {
                 Box(contentAlignment = Alignment.Center) {
                     Icon(
-                        if (isOff) Icons.Default.WifiOff else Icons.Default.WifiTethering,
+                        when (discoveryMode) {
+                            DiscoveryMode.OFF -> Icons.Default.WifiOff
+                            DiscoveryMode.KNOWN_PEERS -> Icons.Default.Security
+                            DiscoveryMode.EVERYONE -> Icons.Default.WifiTethering
+                        },
                         contentDescription = null,
-                        tint = if (isOff) MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.primary,
+                        tint = if (discoveryMode == DiscoveryMode.OFF) MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.primary,
                         modifier = Modifier.size(36.dp)
                     )
                 }
@@ -929,7 +1058,11 @@ fun CleanEmptyStateCard(
             Spacer(modifier = Modifier.height(16.dp))
 
             Text(
-                text = if (isOff) "Ağ Taraması Duraklatıldı" else "Yakında Cihaz Aranıyor...",
+                text = when (discoveryMode) {
+                    DiscoveryMode.OFF -> "Ağ Taraması Duraklatıldı"
+                    DiscoveryMode.KNOWN_PEERS -> "Kayıtlı Güvenilir Cihaz Yok"
+                    DiscoveryMode.EVERYONE -> "Yakında Cihaz Aranıyor..."
+                },
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.onSurface
@@ -938,10 +1071,10 @@ fun CleanEmptyStateCard(
             Spacer(modifier = Modifier.height(6.dp))
 
             Text(
-                text = if (isOff) {
-                    "Cihazları görmek için görünürlüğü 'Herkes' veya 'Bilinenler' olarak açın."
-                } else {
-                    "Masaüstünde OmaSend'in açık olduğundan emin olun. Cihazlar farklı ağdaysa Bluetooth eşleştirmesini kontrol edin."
+                text = when (discoveryMode) {
+                    DiscoveryMode.OFF -> "Cihazları görmek için görünürlüğü 'Herkes' veya 'Bilinenler' olarak açın."
+                    DiscoveryMode.KNOWN_PEERS -> "Yalnızca güvenilir olarak işaretlenen veya eşleşen cihazlar listelenir. Yakındaki tüm cihazları görmek için 'Herkes' moduna geçebilirsiniz."
+                    DiscoveryMode.EVERYONE -> "Masaüstünde OmaSend'in açık olduğundan emin olun. Cihazlar farklı ağdaysa Bluetooth eşleştirmesini kontrol edin."
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -952,21 +1085,42 @@ fun CleanEmptyStateCard(
             Spacer(modifier = Modifier.height(18.dp))
 
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                if (isOff) {
-                    Button(
-                        onClick = onEnableScan,
-                        shape = RoundedCornerShape(12.dp)
-                    ) {
-                        Text("Taramayı Başlat")
+                when (discoveryMode) {
+                    DiscoveryMode.OFF -> {
+                        Button(
+                            onClick = onEnableScan,
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Text("Taramayı Başlat")
+                        }
                     }
-                } else {
-                    OutlinedButton(
-                        onClick = onAddDirectIp,
-                        shape = RoundedCornerShape(12.dp)
-                    ) {
-                        Icon(Icons.Default.AddLink, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Doğrudan IP Ekle")
+                    DiscoveryMode.KNOWN_PEERS -> {
+                        Button(
+                            onClick = onSwitchToEveryone,
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Icon(Icons.Default.Public, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Herkes Moduna Geç")
+                        }
+                        OutlinedButton(
+                            onClick = onAddDirectIp,
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Icon(Icons.Default.AddLink, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Doğrudan IP Ekle")
+                        }
+                    }
+                    DiscoveryMode.EVERYONE -> {
+                        OutlinedButton(
+                            onClick = onAddDirectIp,
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Icon(Icons.Default.AddLink, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Doğrudan IP Ekle")
+                        }
                     }
                 }
             }
