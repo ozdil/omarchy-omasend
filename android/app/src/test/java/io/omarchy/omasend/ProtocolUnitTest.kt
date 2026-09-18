@@ -81,4 +81,38 @@ class ProtocolUnitTest {
         assertEquals("1.5 MB", NetworkUtils.formatBytes(1572864))
         assertEquals("2.00 GB", NetworkUtils.formatBytes(2147483648L))
     }
+
+    @Test
+    fun testClipboardPayloadSerializationWithAuth() {
+        val payload = io.omarchy.omasend.model.ClipboardPayload(
+            sender_id = "sender-789",
+            sender_name = "Desktop",
+            text = "secret clipboard text",
+            pin = "123456",
+            token = "session-tok-abc"
+        )
+        val encoded = json.encodeToString(io.omarchy.omasend.model.ClipboardPayload.serializer(), payload)
+        assertTrue(encoded.contains("\"pin\":\"123456\""))
+        assertTrue(encoded.contains("\"token\":\"session-tok-abc\""))
+
+        val decoded = json.decodeFromString<io.omarchy.omasend.model.ClipboardPayload>(encoded)
+        assertEquals("sender-789", decoded.sender_id)
+        assertEquals("secret clipboard text", decoded.text)
+        assertEquals("123456", decoded.pin)
+        assertEquals("session-tok-abc", decoded.token)
+    }
+
+    @Test
+    fun testNetworkScopeValidation() {
+        assertTrue(NetworkUtils.isPrivateOrLocalIp("127.0.0.1"))
+        assertTrue(NetworkUtils.isPrivateOrLocalIp("192.168.1.10"))
+        assertTrue(NetworkUtils.isPrivateOrLocalIp("10.0.0.1"))
+        assertTrue(NetworkUtils.isPrivateOrLocalIp("172.16.0.5"))
+        assertTrue(NetworkUtils.isPrivateOrLocalIp("169.254.1.1"))
+
+        // Public WAN IPs must be rejected
+        assertFalse(NetworkUtils.isPrivateOrLocalIp("8.8.8.8"))
+        assertFalse(NetworkUtils.isPrivateOrLocalIp("1.1.1.1"))
+        assertFalse(NetworkUtils.isPrivateOrLocalIp("142.250.190.46"))
+    }
 }

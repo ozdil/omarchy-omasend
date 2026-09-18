@@ -23,6 +23,7 @@ import java.net.Socket
 import java.net.URLDecoder
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 class OmaSendServer(private val context: Context) {
     private val scope = CoroutineScope(Dispatchers.IO)
@@ -46,8 +47,45 @@ class OmaSendServer(private val context: Context) {
     var onClipboardReceived: ((senderName: String, text: String) -> Unit)? = null
     var onFileReceived: ((filename: String, sizeBytes: Long) -> Unit)? = null
 
+    companion object {
+        const val MAX_GLOBAL_CONNECTIONS = 8
+        const val MAX_PER_PEER_CONNECTIONS = 2
+        const val MAX_HEADER_SIZE = 65536 // 64 KiB ceiling to prevent header DoS
+        const val MAX_CONTROL_BODY = 65536 // 64 KiB ceiling for control JSON payloads
+        const val MAX_CLIPBOARD_BODY = 1048576 // 1 MiB ceiling matching Omarchy standard
+        const val HEADER_READ_TIMEOUT_MS = 15000L // 15s monotonic deadline for header read
+        const val CONTROL_DEADLINE_MS = 30000L // 30s monotonic end-to-end deadline for control requests
+        const val MAX_FAILED_AUTH_ATTEMPTS = 5
+        const val FAILED_AUTH_WINDOW_MS = 60000L // 1 minute window
+        const val AUTH_BLOCK_DURATION_MS = 60000L // 1 minute block
+    }
+
+    private data class FailedAttemptRecord(
+        var count: Int,
+        var firstAttemptTime: Long,
+        var blockedUntil: Long
+    )
+
+    private val activeGlobalConnections = AtomicInteger(0)
+    private val activePerPeerConnections = ConcurrentHashMap<String, AtomicInteger>()
+    private val failedAuthAttempts = ConcurrentHashMap<String, FailedAttemptRecord>()
+    private val trustedPeers = ConcurrentHashMap<String, Long>()
+
+    fun addTrustedPeer(senderId: String) {
+        if (senderId.isNotBlank()) {
+            trustedPeers[senderId] = System.currentTimeMillis()
+        }
+    }
+
+    fun isPeerTrusted(senderId: String): Boolean {
+        if (senderId.isBlank()) return false
+        return trustedPeers.containsKey(senderId)
+    }
+
     fun acceptTransfer(token: String) {
-        pendingTransfers[token]?.status = "ACCEPTED"
+        val state = pendingTransfers[token] ?: return
+        state.status = "ACCEPTED"
+        addTrustedPeer(state.prompt.senderId)
     }
 
     fun rejectTransfer(token: String) {
@@ -63,13 +101,46 @@ class OmaSendServer(private val context: Context) {
                 }
 
                 while (isActive) {
-                    try {
-                        val clientSocket = serverSocket?.accept() ?: break
-                        scope.launch {
-                            handleClient(clientSocket)
-                        }
+                    val clientSocket = try {
+                        serverSocket?.accept() ?: break
                     } catch (_: Exception) {
                         break
+                    }
+
+                    // Strict RFC 1918 / 3927 private network scope check BEFORE launching work
+                    val remoteAddr = clientSocket.inetAddress
+                    if (remoteAddr == null || !NetworkUtils.isPrivateOrLocalAddress(remoteAddr)) {
+                        try { clientSocket.close() } catch (_: Exception) {}
+                        continue
+                    }
+                    val peerIp = remoteAddr.hostAddress ?: ""
+
+                    // Strict Global Concurrency Limit BEFORE launching work
+                    if (activeGlobalConnections.get() >= MAX_GLOBAL_CONNECTIONS) {
+                        try { clientSocket.close() } catch (_: Exception) {}
+                        continue
+                    }
+
+                    // Strict Per-Peer Concurrency Limit BEFORE launching work
+                    val peerCounter = activePerPeerConnections.computeIfAbsent(peerIp) { AtomicInteger(0) }
+                    if (peerCounter.get() >= MAX_PER_PEER_CONNECTIONS) {
+                        try { clientSocket.close() } catch (_: Exception) {}
+                        continue
+                    }
+
+                    // Acquire concurrency slots
+                    activeGlobalConnections.incrementAndGet()
+                    peerCounter.incrementAndGet()
+
+                    scope.launch {
+                        try {
+                            handleClient(clientSocket, peerIp)
+                        } finally {
+                            activeGlobalConnections.decrementAndGet()
+                            if (peerCounter.decrementAndGet() <= 0) {
+                                activePerPeerConnections.remove(peerIp, peerCounter)
+                            }
+                        }
                     }
                 }
             } catch (_: Exception) {
@@ -91,33 +162,40 @@ class OmaSendServer(private val context: Context) {
 
     var getDiscoveryMode: (() -> io.omarchy.omasend.model.DiscoveryMode)? = null
 
-    companion object {
-        const val MAX_HEADER_SIZE = 65536 // 64 KiB ceiling to prevent header DoS
-        const val MAX_CONTROL_BODY = 65536 // 64 KiB ceiling for control JSON payloads
-        const val MAX_CLIPBOARD_BODY = 1048576 // 1 MiB ceiling matching Omarchy standard
-    }
-
-    private fun handleClient(socket: Socket) {
+    private fun handleClient(socket: Socket, peerIp: String) {
         try {
-            // RFC 1918 / RFC 3927 Network Scope Guard: strictly drop foreign/WAN IP connections
-            val remoteAddr = socket.inetAddress
-            if (remoteAddr != null && !NetworkUtils.isPrivateOrLocalAddress(remoteAddr)) {
-                socket.close()
-                return
-            }
+            val monotonicStart = System.currentTimeMillis()
+            val headerDeadline = monotonicStart + HEADER_READ_TIMEOUT_MS
 
-            socket.soTimeout = 30000
+            socket.soTimeout = 3000 // 3-second SO_TIMEOUT to periodically verify monotonic deadline
             val input = BufferedInputStream(socket.getInputStream())
             val output = socket.getOutputStream()
 
-            // Read HTTP headers with strict byte ceiling
+            // Read HTTP headers with strict byte ceiling and monotonic deadline
             val headerBytes = ByteArrayOutputStream()
             var prev1 = -1
             var prev2 = -1
             var prev3 = -1
             var curr: Int
 
-            while (input.read().also { curr = it } != -1) {
+            while (true) {
+                if (System.currentTimeMillis() > headerDeadline) {
+                    socket.close()
+                    return
+                }
+                try {
+                    curr = input.read()
+                } catch (_: java.net.SocketTimeoutException) {
+                    if (System.currentTimeMillis() > headerDeadline) {
+                        socket.close()
+                        return
+                    }
+                    continue
+                }
+                if (curr == -1) {
+                    socket.close()
+                    return
+                }
                 headerBytes.write(curr)
                 if (headerBytes.size() > MAX_HEADER_SIZE) {
                     socket.close()
@@ -169,12 +247,14 @@ class OmaSendServer(private val context: Context) {
                 return
             }
 
+            val remainingDeadline = monotonicStart + CONTROL_DEADLINE_MS
+
             when {
                 path == "/api/status" || path == "/api/p2p/ping" -> {
                     handlePing(output)
                 }
                 method == "POST" && path == "/api/p2p/request" -> {
-                    handleTransferRequest(input, output, contentLength)
+                    handleTransferRequest(input, output, contentLength, remainingDeadline)
                 }
                 method == "GET" && path == "/api/p2p/decision" -> {
                     handleDecisionQuery(output, query)
@@ -183,7 +263,7 @@ class OmaSendServer(private val context: Context) {
                     handleFileUpload(input, output, query, contentLength)
                 }
                 method == "POST" && path == "/api/p2p/clipboard" -> {
-                    handleClipboard(input, output, contentLength)
+                    handleClipboard(input, output, headers, query, contentLength, peerIp, remainingDeadline)
                 }
                 else -> {
                     sendResponse(output, 404, "Not Found", "application/json", "{\"error\":\"Not found\"}")
@@ -210,7 +290,12 @@ class OmaSendServer(private val context: Context) {
         sendResponse(output, 200, "OK", "application/json", resp)
     }
 
-    private fun handleTransferRequest(input: InputStream, output: OutputStream, contentLength: Long) {
+    private fun handleTransferRequest(
+        input: InputStream,
+        output: OutputStream,
+        contentLength: Long,
+        deadlineMs: Long
+    ) {
         if (contentLength <= 0 || contentLength > MAX_CONTROL_BODY) {
             sendResponse(output, 400, "Bad Request", "application/json", "{\"error\":\"Invalid or excessive payload\"}")
             return
@@ -218,9 +303,26 @@ class OmaSendServer(private val context: Context) {
         val bodyBytes = ByteArray(contentLength.toInt())
         var totalRead = 0
         while (totalRead < bodyBytes.size) {
-            val r = input.read(bodyBytes, totalRead, bodyBytes.size - totalRead)
+            if (System.currentTimeMillis() > deadlineMs) {
+                sendResponse(output, 408, "Request Timeout", "application/json", "{\"error\":\"Request body timed out\"}")
+                return
+            }
+            val r = try {
+                input.read(bodyBytes, totalRead, bodyBytes.size - totalRead)
+            } catch (_: java.net.SocketTimeoutException) {
+                if (System.currentTimeMillis() > deadlineMs) {
+                    sendResponse(output, 408, "Request Timeout", "application/json", "{\"error\":\"Request body timed out\"}")
+                    return
+                }
+                continue
+            }
             if (r == -1) break
             totalRead += r
+        }
+
+        if (totalRead < bodyBytes.size) {
+            sendResponse(output, 400, "Bad Request", "application/json", "{\"error\":\"Incomplete payload\"}")
+            return
         }
 
         try {
@@ -249,7 +351,7 @@ class OmaSendServer(private val context: Context) {
 
             val resp = """{"status":"PENDING","token":"$token"}"""
             sendResponse(output, 200, "OK", "application/json", resp)
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             sendResponse(output, 400, "Bad Request", "application/json", "{\"error\":\"Invalid request\"}")
         }
     }
@@ -292,11 +394,15 @@ class OmaSendServer(private val context: Context) {
             return
         }
 
+        val uploadDurationMs = ((contentLength / (512 * 1024L)).coerceIn(30L, 600L)) * 1000L
+        val uploadDeadline = System.currentTimeMillis() + uploadDurationMs
+
         val (saved, finalName) = StorageUtils.saveIncomingStream(
             context = context,
             filename = filename,
             inputStream = input,
-            totalBytes = contentLength
+            totalBytes = contentLength,
+            deadlineMs = uploadDeadline
         )
 
         if (saved) {
@@ -311,34 +417,154 @@ class OmaSendServer(private val context: Context) {
         }
     }
 
-    private fun handleClipboard(input: InputStream, output: OutputStream, contentLength: Long) {
+    private fun isAuthRateLimited(peerIp: String): Boolean {
+        val now = System.currentTimeMillis()
+        val rec = failedAuthAttempts[peerIp] ?: return false
+        if (now < rec.blockedUntil) return true
+        if (now - rec.firstAttemptTime > FAILED_AUTH_WINDOW_MS) {
+            failedAuthAttempts.remove(peerIp)
+            return false
+        }
+        return false
+    }
+
+    private fun recordAuthAttempt(peerIp: String, success: Boolean): Boolean {
+        val now = System.currentTimeMillis()
+        if (success) {
+            failedAuthAttempts.remove(peerIp)
+            return true
+        }
+        val rec = failedAuthAttempts.compute(peerIp) { _, existing ->
+            if (existing == null || (now - existing.firstAttemptTime > FAILED_AUTH_WINDOW_MS && now >= existing.blockedUntil)) {
+                FailedAttemptRecord(count = 1, firstAttemptTime = now, blockedUntil = 0L)
+            } else {
+                existing.count++
+                if (existing.count >= MAX_FAILED_AUTH_ATTEMPTS) {
+                    existing.blockedUntil = now + AUTH_BLOCK_DURATION_MS
+                }
+                existing
+            }
+        }
+        return (rec?.blockedUntil ?: 0L) <= now
+    }
+
+    private fun handleClipboard(
+        input: InputStream,
+        output: OutputStream,
+        headers: Map<String, String>,
+        query: String,
+        contentLength: Long,
+        peerIp: String,
+        deadlineMs: Long
+    ) {
+        // 1. Rate-limiting check: reject blocked IP immediately
+        if (isAuthRateLimited(peerIp)) {
+            sendResponse(
+                output,
+                429,
+                "Too Many Requests",
+                "application/json",
+                "{\"error\":\"Too many failed authentication attempts. Please wait 60 seconds.\"}"
+            )
+            return
+        }
+
+        // 2. Monotonic body reading
         if (contentLength <= 0 || contentLength > MAX_CLIPBOARD_BODY) {
             sendResponse(output, 400, "Bad Request", "application/json", "{\"error\":\"Invalid or excessive payload\"}")
             return
         }
+
         val bodyBytes = ByteArray(contentLength.toInt())
         var totalRead = 0
         while (totalRead < bodyBytes.size) {
-            val r = input.read(bodyBytes, totalRead, bodyBytes.size - totalRead)
+            if (System.currentTimeMillis() > deadlineMs) {
+                sendResponse(output, 408, "Request Timeout", "application/json", "{\"error\":\"Clipboard read timed out\"}")
+                return
+            }
+            val r = try {
+                input.read(bodyBytes, totalRead, bodyBytes.size - totalRead)
+            } catch (_: java.net.SocketTimeoutException) {
+                if (System.currentTimeMillis() > deadlineMs) {
+                    sendResponse(output, 408, "Request Timeout", "application/json", "{\"error\":\"Clipboard read timed out\"}")
+                    return
+                }
+                continue
+            }
             if (r == -1) break
             totalRead += r
         }
 
-        try {
-            val bodyJson = String(bodyBytes, Charsets.UTF_8)
-            val payload = json.decodeFromString<ClipboardPayload>(bodyJson)
-
-            Handler(Looper.getMainLooper()).post {
-                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                val clip = ClipData.newPlainText("OmaSend", payload.text)
-                clipboard?.setPrimaryClip(clip)
-                onClipboardReceived?.invoke(payload.sender_name, payload.text)
-            }
-
-            sendResponse(output, 200, "OK", "application/json", "{\"status\":\"OK\"}")
-        } catch (_: Exception) {
-            sendResponse(output, 400, "Bad Request", "application/json", "{\"error\":\"Invalid payload\"}")
+        if (totalRead < bodyBytes.size) {
+            sendResponse(output, 400, "Bad Request", "application/json", "{\"error\":\"Incomplete payload\"}")
+            return
         }
+
+        val bodyJson = String(bodyBytes, Charsets.UTF_8)
+        val payload = try {
+            json.decodeFromString<ClipboardPayload>(bodyJson)
+        } catch (_: Exception) {
+            sendResponse(output, 400, "Bad Request", "application/json", "{\"error\":\"Invalid JSON payload\"}")
+            return
+        }
+
+        // 3. Authenticate and Authorize
+        val providedPin = headers["x-omasend-pin"]
+            ?: getQueryParam(query, "pin").ifBlank { null }
+            ?: payload.pin
+
+        val providedKey = headers["x-omasend-key"]
+            ?: headers["authorization"]?.removePrefix("Bearer ")?.trim()
+            ?: getQueryParam(query, "token").ifBlank { null }
+            ?: payload.token
+
+        val expectedPin = NetworkUtils.getDevicePin(context)
+        val expectedSessionKey = NetworkUtils.getDeviceSessionKey(context)
+
+        val isPinValid = !providedPin.isNullOrBlank() && providedPin == expectedPin
+        val isKeyValid = !providedKey.isNullOrBlank() && providedKey == expectedSessionKey
+
+        val isTokenValid = !providedKey.isNullOrBlank() &&
+            pendingTransfers[providedKey]?.status == "ACCEPTED" &&
+            System.currentTimeMillis() <= (pendingTransfers[providedKey]?.expiresAt ?: 0L)
+
+        val isTrustedPeer = !payload.sender_id.isBlank() && isPeerTrusted(payload.sender_id)
+
+        val isAuthorized = isPinValid || isKeyValid || isTokenValid || isTrustedPeer
+
+        if (!isAuthorized) {
+            val notBlocked = recordAuthAttempt(peerIp, false)
+            if (!notBlocked) {
+                sendResponse(
+                    output,
+                    429,
+                    "Too Many Requests",
+                    "application/json",
+                    "{\"error\":\"Too many failed authentication attempts. Please wait 60 seconds.\"}"
+                )
+            } else {
+                sendResponse(
+                    output,
+                    401,
+                    "Unauthorized",
+                    "application/json",
+                    "{\"error\":\"Unauthorized clipboard write: valid PIN, session key, or paired token required\"}"
+                )
+            }
+            return
+        }
+
+        // Authorized: reset failed attempts
+        recordAuthAttempt(peerIp, true)
+
+        Handler(Looper.getMainLooper()).post {
+            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            val clip = ClipData.newPlainText("OmaSend", payload.text)
+            clipboard?.setPrimaryClip(clip)
+            onClipboardReceived?.invoke(payload.sender_name, payload.text)
+        }
+
+        sendResponse(output, 200, "OK", "application/json", "{\"status\":\"OK\"}")
     }
 
     private fun getQueryParam(query: String, param: String): String {

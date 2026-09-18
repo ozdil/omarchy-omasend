@@ -51,6 +51,27 @@ object NetworkUtils {
         prefs.edit().putString("device_name", name.trim()).apply()
     }
 
+    fun getDevicePin(context: Context): String {
+        val prefs = context.getSharedPreferences("omasend_prefs", Context.MODE_PRIVATE)
+        var pin = prefs.getString("device_pin", null)
+        if (pin == null) {
+            val randomNum = java.security.SecureRandom().nextInt(900000) + 100000
+            pin = randomNum.toString()
+            prefs.edit().putString("device_pin", pin).apply()
+        }
+        return pin
+    }
+
+    fun getDeviceSessionKey(context: Context): String {
+        val prefs = context.getSharedPreferences("omasend_prefs", Context.MODE_PRIVATE)
+        var key = prefs.getString("session_key", null)
+        if (key == null) {
+            key = UUID.randomUUID().toString().replace("-", "")
+            prefs.edit().putString("session_key", key).apply()
+        }
+        return key
+    }
+
     fun formatBytes(bytes: Long): String {
         if (bytes < 1024) return "$bytes B"
         val kb = bytes / 1024.0

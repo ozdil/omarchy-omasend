@@ -34,6 +34,7 @@ object StorageUtils {
         filename: String,
         inputStream: InputStream,
         totalBytes: Long,
+        deadlineMs: Long = Long.MAX_VALUE,
         onProgress: ((bytesRead: Long, total: Long) -> Unit)? = null
     ): Pair<Boolean, String> {
         if (totalBytes <= 0 || totalBytes > MAX_FILE_SIZE) {
@@ -61,7 +62,7 @@ object StorageUtils {
                     ?: return Pair(false, "Failed to create MediaStore entry")
 
                 resolver.openOutputStream(uri)?.use { out ->
-                    pipeStream(inputStream, out, totalBytes, onProgress)
+                    pipeStream(inputStream, out, totalBytes, deadlineMs, onProgress)
                 }
 
                 contentValues.clear()
@@ -93,7 +94,7 @@ object StorageUtils {
                 }
 
                 FileOutputStream(target).use { out ->
-                    pipeStream(inputStream, out, totalBytes, onProgress)
+                    pipeStream(inputStream, out, totalBytes, deadlineMs, onProgress)
                 }
                 Pair(true, target.name)
             }
@@ -106,6 +107,7 @@ object StorageUtils {
         input: InputStream,
         output: OutputStream,
         totalBytes: Long,
+        deadlineMs: Long,
         onProgress: ((bytesRead: Long, total: Long) -> Unit)?
     ) {
         val buffer = ByteArray(65536)
@@ -114,6 +116,9 @@ object StorageUtils {
         var remaining = totalBytes
 
         while (remaining > 0) {
+            if (System.currentTimeMillis() > deadlineMs) {
+                throw java.io.InterruptedIOException("File upload exceeded monotonic deadline")
+            }
             val toRead = if (remaining < buffer.size) remaining.toInt() else buffer.size
             read = input.read(buffer, 0, toRead)
             if (read == -1) break

@@ -57,7 +57,9 @@ data class TransferDecision(
 data class ClipboardPayload(
     val sender_id: String,
     val sender_name: String,
-    val text: String
+    val text: String,
+    val pin: String? = null,
+    val token: String? = null
 )
 
 sealed class TransferProgressState {

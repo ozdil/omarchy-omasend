@@ -166,11 +166,15 @@ class OmaSendClient(private val context: Context) {
             val payload = ClipboardPayload(
                 sender_id = NetworkUtils.getDeviceId(context),
                 sender_name = NetworkUtils.getDeviceName(context),
-                text = text
+                text = text,
+                pin = NetworkUtils.getDevicePin(context),
+                token = NetworkUtils.getDeviceSessionKey(context)
             )
             val jsonBody = json.encodeToString(ClipboardPayload.serializer(), payload)
             val request = Request.Builder()
                 .url("http://$targetIp:$targetPort/api/p2p/clipboard")
+                .header("X-OmaSend-PIN", NetworkUtils.getDevicePin(context))
+                .header("X-OmaSend-Key", NetworkUtils.getDeviceSessionKey(context))
                 .post(jsonBody.toRequestBody("application/json".toMediaType()))
                 .build()
 
