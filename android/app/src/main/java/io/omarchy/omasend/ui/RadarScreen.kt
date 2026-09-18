@@ -1834,8 +1834,49 @@ suspend fun sendFileUriToPeer(
             // Bluetooth direct transfer
             if (peer.transport == "BT" || peer.ip.startsWith("bt:")) {
                 withContext(Dispatchers.Main) {
+                    onState(TransferProgressState.Transferring(
+                        isUploading = true,
+                        peerName = peer.name,
+                        fileName = fileName,
+                        bytesTransferred = 0L,
+                        totalBytes = fileSize,
+                        percent = 0
+                    ))
+                }
+                val btMac = peer.fingerprint.ifEmpty { peer.ip }
+                val stream = context.contentResolver.openInputStream(uri)
+                if (stream != null) {
+                    val obexResult = stream.use { s ->
+                        TransferBridge.sendViaBluetoothDirectObex(
+                            context = context,
+                            targetMac = btMac,
+                            fileName = fileName,
+                            fileSize = fileSize,
+                            inputStream = s
+                        ) { sent, total, pct ->
+                            withContext(Dispatchers.Main) {
+                                onState(TransferProgressState.Transferring(
+                                    isUploading = true,
+                                    peerName = peer.name,
+                                    fileName = fileName,
+                                    bytesTransferred = sent,
+                                    totalBytes = total,
+                                    percent = pct
+                                ))
+                            }
+                        }
+                    }
+                    if (obexResult.isSuccess) {
+                        withContext(Dispatchers.Main) {
+                            onState(TransferProgressState.Success("'$fileName' Bluetooth ile aktarıldı!"))
+                        }
+                        return@withContext
+                    }
+                }
+                // Fallback to system Bluetooth sharing if direct RFCOMM could not connect
+                withContext(Dispatchers.Main) {
                     onState(TransferProgressState.Idle)
-                    TransferBridge.sendViaBluetooth(context, listOf(uri), targetMac = peer.fingerprint.ifEmpty { peer.ip })
+                    TransferBridge.sendViaBluetooth(context, listOf(uri), targetMac = btMac)
                 }
                 return@withContext
             }
@@ -1848,11 +1889,51 @@ suspend fun sendFileUriToPeer(
             val requestResult = app.client.sendTransferRequest(peer.ip, peer.port, listOf(fileInfo))
 
             val token = requestResult.getOrElse {
-                if (peer.transport == "HYBRID" || peer.ip.startsWith("bt:")) {
+                if (peer.transport == "HYBRID" || peer.fingerprint.isNotEmpty() || peer.ip.startsWith("bt:")) {
+                    val btMac = peer.fingerprint.ifEmpty { peer.ip }
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(context, "Wi-Fi yanıt vermedi. Bluetooth ile aktarılıyor...", Toast.LENGTH_SHORT).show()
+                        onState(TransferProgressState.Transferring(
+                            isUploading = true,
+                            peerName = peer.name,
+                            fileName = fileName,
+                            bytesTransferred = 0L,
+                            totalBytes = fileSize,
+                            percent = 0
+                        ))
+                    }
+                    val stream = context.contentResolver.openInputStream(uri)
+                    if (stream != null) {
+                        val obexResult = stream.use { s ->
+                            TransferBridge.sendViaBluetoothDirectObex(
+                                context = context,
+                                targetMac = btMac,
+                                fileName = fileName,
+                                fileSize = fileSize,
+                                inputStream = s
+                            ) { sent, total, pct ->
+                                withContext(Dispatchers.Main) {
+                                    onState(TransferProgressState.Transferring(
+                                        isUploading = true,
+                                        peerName = peer.name,
+                                        fileName = fileName,
+                                        bytesTransferred = sent,
+                                        totalBytes = total,
+                                        percent = pct
+                                    ))
+                                }
+                            }
+                        }
+                        if (obexResult.isSuccess) {
+                            withContext(Dispatchers.Main) {
+                                onState(TransferProgressState.Success("'$fileName' Bluetooth ile aktarıldı!"))
+                            }
+                            return@withContext
+                        }
+                    }
                     withContext(Dispatchers.Main) {
                         onState(TransferProgressState.Idle)
-                        Toast.makeText(context, "Wi-Fi bağlantısı kurulamadı. Bluetooth ile aktarılıyor...", Toast.LENGTH_LONG).show()
-                        TransferBridge.sendViaBluetooth(context, listOf(uri), targetMac = peer.fingerprint.ifEmpty { peer.ip })
+                        TransferBridge.sendViaBluetooth(context, listOf(uri), targetMac = btMac)
                     }
                     return@withContext
                 }
