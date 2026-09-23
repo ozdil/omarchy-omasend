@@ -55,6 +55,7 @@ fi
 
 DIR="$(cd "$(/usr/bin/dirname "$(/usr/bin/realpath "${BASH_SOURCE[0]}")")" && /usr/bin/pwd)"
 BIN="${DIR}/omasend-engine"
+STAMP="${DIR}/.engine-provenance"
 
 # Resolve trusted cargo binary
 CARGO_BIN=""
@@ -64,31 +65,51 @@ elif [[ -x "${HOME}/.cargo/bin/cargo" ]]; then
     CARGO_BIN="${HOME}/.cargo/bin/cargo"
 fi
 
-if [[ ! -x "${BIN}" ]] && [[ -f "${DIR}/Cargo.toml" ]]; then
-    if [[ -n "${CARGO_BIN}" ]]; then
-        echo "Building omasend-engine from source..." >&2
-        TMP_BUILD_DIR="$(/usr/bin/mktemp -d -t omasend-build.XXXXXX)"
-        cleanup() {
-            /usr/bin/rm -rf "${TMP_BUILD_DIR}"
-        }
-        trap cleanup EXIT
-        if (cd "${DIR}" && "${CARGO_BIN}" build --release --locked --target-dir "${TMP_BUILD_DIR}") >&2; then
-            /usr/bin/install -m 755 "${TMP_BUILD_DIR}/release/omasend-engine" "${BIN}" >&2 || true
+# Calculate expected provenance hash from current immutable source/lock state
+SOURCE_HASH=""
+if [[ -f "${DIR}/Cargo.lock" && -f "${DIR}/Cargo.toml" ]]; then
+    SOURCE_HASH="$(/usr/bin/sha256sum "${DIR}/Cargo.lock" "${DIR}/Cargo.toml" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')"
+fi
+
+NEEDS_BUILD=1
+if [[ -x "${BIN}" && -n "${SOURCE_HASH}" && -f "${STAMP}" ]]; then
+    STORED_HASH="$(/usr/bin/cat "${STAMP}" 2>/dev/null || true)"
+    if [[ "${STORED_HASH}" == "${SOURCE_HASH}" ]]; then
+        NEEDS_BUILD=0
+    fi
+fi
+
+if [[ "${NEEDS_BUILD}" -eq 1 && -n "${CARGO_BIN}" && -f "${DIR}/Cargo.toml" ]]; then
+    echo "Building omasend-engine from source..." >&2
+    TMP_BUILD_DIR="$(/usr/bin/mktemp -d -t omasend-build.XXXXXX)"
+    cleanup() {
+        /usr/bin/rm -rf "${TMP_BUILD_DIR}"
+    }
+    trap cleanup EXIT
+    if (cd "${DIR}" && "${CARGO_BIN}" build --release --locked --target-dir "${TMP_BUILD_DIR}") >&2; then
+        if /usr/bin/install -m 755 "${TMP_BUILD_DIR}/release/omasend-engine" "${BIN}" >&2; then
+            if [[ -n "${SOURCE_HASH}" ]]; then
+                echo "${SOURCE_HASH}" > "${STAMP}" 2>/dev/null || true
+            fi
         fi
     fi
 fi
 
 if [[ -x "${BIN}" ]]; then
+    # Verify provenance before executing if stamp exists and hash is computed
+    if [[ -n "${SOURCE_HASH}" && -f "${STAMP}" ]]; then
+        STORED_HASH="$(/usr/bin/cat "${STAMP}" 2>/dev/null || true)"
+        if [[ "${STORED_HASH}" != "${SOURCE_HASH}" ]]; then
+            echo "Security Error: Engine binary provenance mismatch" >&2
+            exit 1
+        fi
+    fi
     /usr/bin/clear 2>/dev/null || true
     "${BIN}" "$@"
     echo ""
     read -r -p "Press Enter to exit..." || true
-elif [[ -x "${HOME}/.local/bin/omasend-engine" ]]; then
-    /usr/bin/clear 2>/dev/null || true
-    "${HOME}/.local/bin/omasend-engine" "$@"
-    echo ""
-    read -r -p "Press Enter to exit..." || true
 else
-    echo "Engine binary not found. Please run 'cargo build --release --locked' in ${DIR}" >&2
+    echo "Engine binary not found or provenance invalid. Please run 'cargo build --release --locked' in ${DIR}" >&2
     exit 1
 fi
+

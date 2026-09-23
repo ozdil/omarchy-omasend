@@ -1,7 +1,10 @@
 target/
 omasend-engine
+.engine-provenance
+.engine-build.lock
 *.apk
 *.aab
 .gradle/
 android/local.properties
 android/**/build/
+
