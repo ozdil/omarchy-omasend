@@ -50,10 +50,25 @@ trap cleanup EXIT
 "${CARGO_BIN}" build --release --locked --target-dir "${TMP_BUILD_DIR}"
 /usr/bin/install -m 755 "${TMP_BUILD_DIR}/release/omasend-engine" "${DIR}/omasend-engine"
 
-# Bind source provenance stamp
-if [[ -f "${DIR}/Cargo.lock" && -f "${DIR}/Cargo.toml" ]]; then
-    /usr/bin/sha256sum "${DIR}/Cargo.lock" "${DIR}/Cargo.toml" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}' > "${DIR}/.engine-provenance" 2>/dev/null || true
+# Bind source tree identity and installed binary SHA-256
+SOURCE_HASH=""
+if [[ -d "${DIR}/src" && -f "${DIR}/Cargo.toml" && -f "${DIR}/Cargo.lock" ]]; then
+    SOURCE_HASH="$(/usr/bin/find "${DIR}/src" "${DIR}/Cargo.toml" "${DIR}/Cargo.lock" -type f 2>/dev/null | /usr/bin/sort | /usr/bin/xargs /usr/bin/sha256sum 2>/dev/null | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')"
 fi
+
+if [[ -z "${SOURCE_HASH}" ]]; then
+    echo "Security Error: Unable to compute source identity" >&2
+    exit 1
+fi
+
+BIN_HASH="$(/usr/bin/sha256sum "${DIR}/omasend-engine" 2>/dev/null | /usr/bin/awk '{print $1}')"
+if [[ -z "${BIN_HASH}" ]]; then
+    echo "Security Error: Unable to compute engine binary digest" >&2
+    exit 1
+fi
+
+echo "${SOURCE_HASH} ${BIN_HASH}" > "${DIR}/.engine-provenance"
+
 
 echo "omasend-engine successfully compiled and placed at ${DIR}/omasend-engine"
 
