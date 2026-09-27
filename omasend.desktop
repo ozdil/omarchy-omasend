@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=OmaSend
+Comment=Wireless AirBridge, QR file transfer, and Zero-Trust cross-device sharing for Omarchy
+Exec=omasend-dashboard
+Icon=network-wireless
+Terminal=false
+Type=Application
+Categories=Utility;Network;FileTransfer;
+Keywords=share;airdrop;airbridge;p2p;transfer;bluetooth;zerotrust;
+StartupNotify=true

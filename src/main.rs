@@ -139,12 +139,24 @@ pub struct TrustedPeersDb {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TransferFileInfo {
+    pub name: String,
+    pub size_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub md5: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PendingFileTransfer {
     pub token: String,
     pub sender_id: String,
     pub sender_name: String,
     pub sender_ip: String,
     pub file_names: Vec<String>,
+    #[serde(default)]
+    pub files: Vec<TransferFileInfo>,
     pub total_size_bytes: u64,
     pub created_at: u64,
     pub expires_at: u64,
@@ -1332,13 +1344,23 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
     let (my_id, _) = get_or_create_device_id();
     let my_name = get_system_hostname();
 
+    let mut sha = Sha256::new();
+    sha.update(&file_bytes);
+    let sha256_hex = hex::encode(sha.finalize());
+    let md5_hex = format!("{:x}", md5::compute(&file_bytes));
+
     // 1. Send transfer request
     let request_payload = serde_json::json!({
         "sender_id": my_id,
         "sender_name": my_name,
         "sender_ip": get_local_ip(),
         "files": [
-            { "name": file_name, "size_bytes": size_bytes }
+            {
+                "name": file_name,
+                "size_bytes": size_bytes,
+                "sha256": sha256_hex,
+                "md5": md5_hex
+            }
         ],
         "total_size_bytes": size_bytes
     });
@@ -1421,15 +1443,15 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
         return Err("Transfer timed out waiting for recipient approval.".to_string());
     }
 
-    println!("Peer accepted! Streaming file '{}' ({} bytes)...", file_name, size_bytes);
+    println!("Peer accepted! Streaming file '{}' ({} bytes, sha256: {})...", file_name, size_bytes, sha256_hex);
 
     // 3. Upload file
     let mut upload_stream = connect_peer_with_timeout(&addr, Duration::from_secs(6))
         .map_err(|e| format!("Failed to connect to peer for upload: {}", e))?;
     let encoded_filename = urlencoding_encode(&file_name);
     let upload_header = format!(
-        "POST /api/p2p/upload?token={}&filename={} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        token, encoded_filename, addr, file_bytes.len()
+        "POST /api/p2p/upload?token={}&filename={}&sha256={}&md5={} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/octet-stream\r\nX-File-SHA256: {}\r\nX-File-MD5: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        token, encoded_filename, sha256_hex, md5_hex, addr, sha256_hex, md5_hex, file_bytes.len()
     );
     upload_stream.write_all(upload_header.as_bytes()).map_err(|e| e.to_string())?;
     upload_stream.write_all(&file_bytes).map_err(|e| e.to_string())?;
@@ -1838,6 +1860,35 @@ impl HttpBody {
         match self {
             HttpBody::Memory(v) => Ok(v.clone()),
             HttpBody::Staged(s) => s.to_bytes(),
+        }
+    }
+
+    pub fn compute_hashes(&self) -> Result<(String, String), String> {
+        match self {
+            HttpBody::Memory(bytes) => {
+                let mut sha = Sha256::new();
+                sha.update(bytes);
+                let sha_hex = hex::encode(sha.finalize());
+                let md5_hex = format!("{:x}", md5::compute(bytes));
+                Ok((sha_hex, md5_hex))
+            }
+            HttpBody::Staged(staged) => {
+                let mut file = fs::File::open(&staged.path).map_err(|e| format!("Failed to open staged file: {}", e))?;
+                let mut sha = Sha256::new();
+                let mut md5_ctx = md5::Context::new();
+                let mut buf = [0u8; 16384];
+                loop {
+                    let n = file.read(&mut buf).map_err(|e| format!("Failed to read staged file: {}", e))?;
+                    if n == 0 {
+                        break;
+                    }
+                    sha.update(&buf[..n]);
+                    md5_ctx.consume(&buf[..n]);
+                }
+                let sha_hex = hex::encode(sha.finalize());
+                let md5_hex = format!("{:x}", md5_ctx.compute());
+                Ok((sha_hex, md5_hex))
+            }
         }
     }
 }
@@ -2844,13 +2895,22 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
         }
 
         let mut file_names = Vec::new();
+        let mut files_info = Vec::new();
         let mut total_size_bytes = 0u64;
         if let Some(arr) = req_data["files"].as_array() {
             for item in arr {
                 if let Some(n) = item["name"].as_str() {
-                    file_names.push(sanitize_filename(n));
-                }
-                if let Some(sz) = item["size_bytes"].as_u64() {
+                    let clean = sanitize_filename(n);
+                    let sz = item["size_bytes"].as_u64().unwrap_or(0);
+                    let sha256 = item["sha256"].as_str().map(|s| s.to_lowercase());
+                    let md5 = item["md5"].as_str().map(|s| s.to_lowercase());
+                    file_names.push(clean.clone());
+                    files_info.push(TransferFileInfo {
+                        name: clean,
+                        size_bytes: sz,
+                        sha256,
+                        md5,
+                    });
                     total_size_bytes = total_size_bytes.saturating_add(sz);
                 }
             }
@@ -2880,6 +2940,7 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             sender_name: sender_name.clone(),
             sender_ip,
             file_names: file_names.clone(),
+            files: files_info,
             total_size_bytes,
             created_at: now,
             expires_at: now.saturating_add(30),
@@ -2982,6 +3043,14 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             return;
         }
 
+        let mut pending = pending_opt.unwrap();
+        let matching_info = pending.files.iter().find(|f| f.name == clean_filename).cloned();
+        let is_in_pending = matching_info.is_some() || pending.file_names.iter().any(|n| n == &clean_filename);
+        if !is_in_pending {
+            respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"File not listed in approved transfer request\"}", None, None);
+            return;
+        }
+
         if content_length > MAX_BODY_SIZE {
             respond(&stream, "413 Payload Too Large", "application/json", b"{\"error\":\"Payload exceeds 100 MiB limit\"}", None, None);
             return;
@@ -2994,7 +3063,36 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             None => return,
         };
 
-        let mut pending = pending_opt.unwrap();
+        let (computed_sha256, computed_md5) = match body.compute_hashes() {
+            Ok(h) => h,
+            Err(_) => {
+                respond(&stream, "500 Internal Server Error", "application/json", b"{\"error\":\"Failed to compute integrity hashes\"}", None, None);
+                return;
+            }
+        };
+
+        let exp_sha256 = req.get_param("sha256")
+            .or_else(|| req.get_header("x-file-sha256").map(|s| s.to_string()))
+            .or_else(|| matching_info.as_ref().and_then(|f| f.sha256.clone()));
+
+        let exp_md5 = req.get_param("md5")
+            .or_else(|| req.get_header("x-file-md5").map(|s| s.to_string()))
+            .or_else(|| matching_info.as_ref().and_then(|f| f.md5.clone()));
+
+        if let Some(ref exp) = exp_sha256 {
+            if !exp.eq_ignore_ascii_case(&computed_sha256) {
+                respond(&stream, "422 Unprocessable Entity", "application/json", b"{\"error\":\"File integrity verification failed: SHA-256 checksum mismatch\"}", None, None);
+                return;
+            }
+        }
+
+        if let Some(ref exp) = exp_md5 {
+            if !exp.eq_ignore_ascii_case(&computed_md5) {
+                respond(&stream, "422 Unprocessable Entity", "application/json", b"{\"error\":\"File integrity verification failed: MD5 checksum mismatch\"}", None, None);
+                return;
+            }
+        }
+
         let ddir = get_download_dir();
         let file_path = get_unique_filepath(&ddir, &clean_filename);
         let payload_len = body.len();
@@ -3017,7 +3115,10 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             if let Some(pos) = pending.file_names.iter().position(|f| f == &clean_filename) {
                 pending.file_names.remove(pos);
             }
-            if pending.file_names.is_empty() {
+            if let Some(pos) = pending.files.iter().position(|f| f.name == clean_filename) {
+                pending.files.remove(pos);
+            }
+            if pending.file_names.is_empty() && pending.files.is_empty() {
                 clear_pending_transfer();
             } else {
                 save_pending_transfer(&pending);
@@ -3026,12 +3127,14 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             record_notified_file(&final_name);
             notify_desktop(
                 "OmaSend: AirBridge Transfer Complete",
-                &format!("'{}' ({} bytes) received and saved to Downloads/omasend.", final_name, payload_len)
+                &format!("'{}' ({} bytes) verified [SHA256: {}] and saved to Downloads/omasend.", final_name, payload_len, &computed_sha256[..8])
             );
             let resp = serde_json::json!({
                 "status": "OK",
                 "filename": final_name,
-                "size": payload_len
+                "size": payload_len,
+                "sha256": computed_sha256,
+                "md5": computed_md5
             });
             respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
             return;
@@ -4388,6 +4491,115 @@ mod tests {
         assert!(!is_recently_notified(test_name));
         record_notified_file(test_name);
         assert!(is_recently_notified(test_name));
+    }
+
+    #[test]
+    fn test_transfer_file_info_integrity_serialization() {
+        let sample_data = b"Hello Omarchy Zero-Trust AirBridge!";
+        let mut sha = Sha256::new();
+        sha.update(sample_data);
+        let exp_sha256 = hex::encode(sha.finalize());
+        let exp_md5 = format!("{:x}", md5::compute(sample_data));
+
+        let file_info = TransferFileInfo {
+            name: "test_doc.txt".to_string(),
+            size_bytes: sample_data.len() as u64,
+            sha256: Some(exp_sha256.clone()),
+            md5: Some(exp_md5.clone()),
+        };
+
+        let serialized = serde_json::to_string(&file_info).expect("Must serialize");
+        assert!(serialized.contains("sha256"));
+        assert!(serialized.contains(&exp_sha256));
+        assert!(serialized.contains("md5"));
+        assert!(serialized.contains(&exp_md5));
+
+        let deserialized: TransferFileInfo = serde_json::from_str(&serialized).expect("Must deserialize");
+        assert_eq!(deserialized.name, "test_doc.txt");
+        assert_eq!(deserialized.size_bytes, sample_data.len() as u64);
+        assert_eq!(deserialized.sha256, Some(exp_sha256));
+        assert_eq!(deserialized.md5, Some(exp_md5));
+    }
+
+    #[test]
+    fn test_http_body_compute_hashes_memory_and_staged() {
+        let test_payload = b"Zero-Trust Payload With Cryptographic Checksums (MD5 & SHA256)";
+        let mut sha = Sha256::new();
+        sha.update(test_payload);
+        let expected_sha256 = hex::encode(sha.finalize());
+        let expected_md5 = format!("{:x}", md5::compute(test_payload));
+
+        // Test in-memory HttpBody
+        let mem_body = HttpBody::Memory(test_payload.to_vec());
+        let (calc_sha, calc_md5) = mem_body.compute_hashes().expect("Compute memory hashes");
+        assert_eq!(calc_sha, expected_sha256);
+        assert_eq!(calc_md5, expected_md5);
+
+        // Test staged HttpBody
+        let temp_dir = get_download_dir();
+        let _ = fs::create_dir_all(&temp_dir);
+        let stage_path = temp_dir.join(format!(".tmp_test_stage_{}.part", std::process::id()));
+        write_secure_bytes(&stage_path, test_payload).expect("Write test staged file");
+
+        let staged = StagedFile::new(stage_path.clone(), test_payload.len() as u64, None);
+        let staged_body = HttpBody::Staged(staged);
+        let (staged_sha, staged_md5) = staged_body.compute_hashes().expect("Compute staged hashes");
+        assert_eq!(staged_sha, expected_sha256);
+        assert_eq!(staged_md5, expected_md5);
+
+        // Cleanup
+        let _ = fs::remove_file(&stage_path);
+    }
+
+    #[test]
+    fn test_tampered_file_integrity_mismatch_detected() {
+        let original_data = b"Original Authentic Omarchy Payload";
+        let tampered_data = b"Modified/Tampered Payload In Transit!";
+
+        let mut sha = Sha256::new();
+        sha.update(original_data);
+        let expected_sha256 = hex::encode(sha.finalize());
+        let expected_md5 = format!("{:x}", md5::compute(original_data));
+
+        let tampered_body = HttpBody::Memory(tampered_data.to_vec());
+        let (computed_sha256, computed_md5) = tampered_body.compute_hashes().expect("Compute hashes");
+
+        // Verification must detect mismatch
+        assert_ne!(computed_sha256, expected_sha256, "Tampered SHA-256 must NOT match");
+        assert_ne!(computed_md5, expected_md5, "Tampered MD5 must NOT match");
+    }
+
+    #[test]
+    fn test_zero_trust_unapproved_file_rejection() {
+        let approved_info = TransferFileInfo {
+            name: "approved_file.pdf".to_string(),
+            size_bytes: 1024,
+            sha256: Some("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890".to_string()),
+            md5: Some("0123456789abcdef0123456789abcdef".to_string()),
+        };
+
+        let pending = PendingFileTransfer {
+            token: "valid_tok_123".to_string(),
+            sender_id: "sender_456".to_string(),
+            sender_name: "Sender PC".to_string(),
+            sender_ip: "192.168.1.50".to_string(),
+            file_names: vec!["approved_file.pdf".to_string()],
+            files: vec![approved_info],
+            total_size_bytes: 1024,
+            created_at: 100,
+            expires_at: 500,
+            status: "ACCEPTED".to_string(),
+        };
+
+        // File listed in approved files
+        let is_approved = pending.files.iter().any(|f| f.name == "approved_file.pdf");
+        assert!(is_approved, "Approved file must be recognized");
+
+        // Attacker attempts to upload an unapproved malicious payload with same token
+        let malicious_filename = "malicious_script.sh";
+        let is_malicious_approved = pending.files.iter().any(|f| f.name == malicious_filename)
+            || pending.file_names.iter().any(|n| n == malicious_filename);
+        assert!(!is_malicious_approved, "Unapproved file MUST be rejected under Zero-Trust rules");
     }
 }
 

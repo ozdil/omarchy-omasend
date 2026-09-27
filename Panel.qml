@@ -200,6 +200,10 @@ Panel {
 
   Process { id: copyProc }
   Process { id: folderProc }
+  Process {
+    id: openWindowProc
+    command: ["omasend-dashboard"]
+  }
 
   Timer {
     id: refreshTimer
@@ -309,7 +313,7 @@ Panel {
 
               Item { Layout.fillWidth: true }
 
-              // E2EE Pill Badge
+              // Zero-Trust & Integrity Badge
               Rectangle {
                 height: Style.space(20)
                 implicitWidth: e2eeBadgeText.implicitWidth + Style.space(12)
@@ -322,11 +326,53 @@ Panel {
                   id: e2eeBadgeText
                   anchors.centerIn: parent
                   textFormat: Text.PlainText
-                  text: " E2EE"
+                  text: "\uf132 ZERO-TRUST MD5/SHA256"
                   color: Color.accent
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   font.bold: true
+                }
+              }
+
+              // Standalone Window Launcher Button
+              Rectangle {
+                height: Style.space(20)
+                implicitWidth: openAppRow.implicitWidth + Style.space(12)
+                radius: Style.cornerRadius
+                color: openAppMouse.containsMouse ? Color.alpha(Color.foreground, 0.15) : "transparent"
+                border.color: Color.alpha(Color.foreground, 0.3)
+                border.width: 1
+
+                RowLayout {
+                  id: openAppRow
+                  anchors.centerIn: parent
+                  spacing: Style.space(4)
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "\uf2d0"
+                    color: root.bar ? root.bar.foreground : Color.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "WINDOW"
+                    color: root.bar ? root.bar.foreground : Color.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                  }
+                }
+
+                MouseArea {
+                  id: openAppMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    root.close();
+                    openWindowProc.running = true;
+                  }
                 }
               }
             }
