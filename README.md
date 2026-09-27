@@ -133,7 +133,29 @@ Click the paper plane icon in the Omarchy top bar to open the OmaSend panel.
 
 ## Security and Architecture Standards
 
-OmaSend complies strictly with the Omarchy Linux Security Architecture:
+OmaSend complies strictly with the Omarchy Linux Security Architecture, elevating it from a standard consumer tool (like LocalSend) to a **Military-Grade, Zero-Trust** enterprise architecture.
+
+### Military-Grade Security Architecture (vs. Standard Consumer Tools like LocalSend)
+
+While tools like LocalSend provide practical local file sharing using Flutter/Dart and standard garbage collection, OmaSend enforces strict hardware and kernel-level security guarantees:
+
+1. **Anti-Forensics & RAM Zeroization (Memory Scrubbing):**
+   - **OmaSend:** Cryptographic keys, in-flight transit buffers, and sensitive data are scrubbed from RAM immediately after use via `try...finally` blocks (using the `zeroize` crate in Rust and `StorageUtils.wipeMemory(buffer.fill(0))` in Android). Even if a device is seized and a memory dump is extracted, the data cannot be recovered.
+   - **Standard Tools:** Rely on automated Garbage Collection (e.g., Dart VM). Keys and sensitive data can remain in RAM indefinitely without guaranteed memory scrubbing (`mlock` or `explicit_bzero`).
+
+2. **Linux Kernel Sandboxing & Isolation:**
+   - **OmaSend:** Enforces application sandboxing directly at the kernel level using **Landlock LSM** (Linux Security Module), strictly limiting filesystem access. Additionally, `PR_SET_DUMPABLE=0` (preventing core dumps) and `PR_SET_NO_NEW_PRIVS=1` flags are enforced to neutralize process hijacking at the hardware/OS level.
+   - **Standard Tools:** Run with standard user privileges without deep kernel isolation, which has historically exposed them to Path Traversal (e.g., CVE-2025-27142).
+
+3. **Quantum-Resilient Cryptography:**
+   - **OmaSend:** Integrates **BLAKE3**, a high-performance, quantum-resilient Merkle tree cryptographic hashing algorithm for stream and protocol header validation, alongside standard SHA-256 and MD5.
+   - **Standard Tools:** Utilize classical SHA-256 for basic fingerprinting and standard TLS, lacking post-quantum cryptographic hashing structures.
+
+4. **Technology Stack & Memory Safety:**
+   - **OmaSend:** The core engine is built in **Rust**, offering high-performance, strict memory safety, and low-level hardware control without a garbage collector. The Android companion is built natively in **Kotlin** for deep OS integration.
+   - **Standard Tools:** Often built on cross-platform frameworks (e.g., Flutter/Dart), which limits deep OS-specific security integrations.
+
+### Omarchy Hancore Compliance
 - Subprocess Isolation: Processes run in isolated process groups (`cmd.process_group(0)`) with non-blocking I/O (`fcntl O_NONBLOCK`) and bounded polling.
 - Strict File Permissions: Sensitive state files (`trusted_peers.json`, `device_id.key`) and in-flight staging parts are written atomically with mode 0600. Download and staging directories enforce mode 0700. Symlinks are strictly rejected.
 - Concurrency Caps & DoS Protection: Strict global cap (max 32 active connections) and per-peer IP cap (max 4 active connections) enforced at socket accept before spawning worker threads; excess requests are rejected early with HTTP 429.
