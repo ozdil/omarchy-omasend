@@ -1,4 +1,5 @@
 mod subproc;
+pub mod military;
 
 use aes_gcm::{
     aead::{Aead, KeyInit},
@@ -142,6 +143,8 @@ pub struct TrustedPeersDb {
 pub struct TransferFileInfo {
     pub name: String,
     pub size_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blake3: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1344,6 +1347,7 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
     let (my_id, _) = get_or_create_device_id();
     let my_name = get_system_hostname();
 
+    let blake3_hex = blake3::hash(&file_bytes).to_hex().to_string();
     let mut sha = Sha256::new();
     sha.update(&file_bytes);
     let sha256_hex = hex::encode(sha.finalize());
@@ -1358,6 +1362,7 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
             {
                 "name": file_name,
                 "size_bytes": size_bytes,
+                "blake3": blake3_hex,
                 "sha256": sha256_hex,
                 "md5": md5_hex
             }
@@ -1863,17 +1868,19 @@ impl HttpBody {
         }
     }
 
-    pub fn compute_hashes(&self) -> Result<(String, String), String> {
+    pub fn compute_military_hashes(&self) -> Result<(String, String, String), String> {
         match self {
             HttpBody::Memory(bytes) => {
+                let blake3_hex = blake3::hash(bytes).to_hex().to_string();
                 let mut sha = Sha256::new();
                 sha.update(bytes);
                 let sha_hex = hex::encode(sha.finalize());
                 let md5_hex = format!("{:x}", md5::compute(bytes));
-                Ok((sha_hex, md5_hex))
+                Ok((blake3_hex, sha_hex, md5_hex))
             }
             HttpBody::Staged(staged) => {
                 let mut file = fs::File::open(&staged.path).map_err(|e| format!("Failed to open staged file: {}", e))?;
+                let mut blake3_hasher = blake3::Hasher::new();
                 let mut sha = Sha256::new();
                 let mut md5_ctx = md5::Context::new();
                 let mut buf = [0u8; 16384];
@@ -1882,14 +1889,21 @@ impl HttpBody {
                     if n == 0 {
                         break;
                     }
+                    blake3_hasher.update(&buf[..n]);
                     sha.update(&buf[..n]);
                     md5_ctx.consume(&buf[..n]);
                 }
+                let blake3_hex = blake3_hasher.finalize().to_hex().to_string();
                 let sha_hex = hex::encode(sha.finalize());
                 let md5_hex = format!("{:x}", md5_ctx.compute());
-                Ok((sha_hex, md5_hex))
+                Ok((blake3_hex, sha_hex, md5_hex))
             }
         }
+    }
+
+    pub fn compute_hashes(&self) -> Result<(String, String), String> {
+        let (_, sha_hex, md5_hex) = self.compute_military_hashes()?;
+        Ok((sha_hex, md5_hex))
     }
 }
 
@@ -2902,12 +2916,14 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
                 if let Some(n) = item["name"].as_str() {
                     let clean = sanitize_filename(n);
                     let sz = item["size_bytes"].as_u64().unwrap_or(0);
+                    let blake3 = item["blake3"].as_str().map(|s| s.to_lowercase());
                     let sha256 = item["sha256"].as_str().map(|s| s.to_lowercase());
                     let md5 = item["md5"].as_str().map(|s| s.to_lowercase());
                     file_names.push(clean.clone());
                     files_info.push(TransferFileInfo {
                         name: clean,
                         size_bytes: sz,
+                        blake3,
                         sha256,
                         md5,
                     });
@@ -3063,13 +3079,17 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             None => return,
         };
 
-        let (computed_sha256, computed_md5) = match body.compute_hashes() {
+        let (computed_blake3, computed_sha256, computed_md5) = match body.compute_military_hashes() {
             Ok(h) => h,
             Err(_) => {
                 respond(&stream, "500 Internal Server Error", "application/json", b"{\"error\":\"Failed to compute integrity hashes\"}", None, None);
                 return;
             }
         };
+
+        let exp_blake3 = req.get_param("blake3")
+            .or_else(|| req.get_header("x-file-blake3").map(|s| s.to_string()))
+            .or_else(|| matching_info.as_ref().and_then(|f| f.blake3.clone()));
 
         let exp_sha256 = req.get_param("sha256")
             .or_else(|| req.get_header("x-file-sha256").map(|s| s.to_string()))
@@ -3078,6 +3098,13 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
         let exp_md5 = req.get_param("md5")
             .or_else(|| req.get_header("x-file-md5").map(|s| s.to_string()))
             .or_else(|| matching_info.as_ref().and_then(|f| f.md5.clone()));
+
+        if let Some(ref exp) = exp_blake3 {
+            if !exp.eq_ignore_ascii_case(&computed_blake3) {
+                respond(&stream, "422 Unprocessable Entity", "application/json", b"{\"error\":\"File integrity verification failed: BLAKE3 checksum mismatch\"}", None, None);
+                return;
+            }
+        }
 
         if let Some(ref exp) = exp_sha256 {
             if !exp.eq_ignore_ascii_case(&computed_sha256) {
@@ -3554,6 +3581,12 @@ fn urlencoding_decode(input: &str) -> String {
 // ------------------- SERVER DAEMON -------------------
 
 fn run_server() {
+    // Enforce military-grade defense: anti-forensics and Landlock LSM sandbox
+    military::enable_anti_forensics();
+    let download_dir = get_download_dir();
+    let state_dir = get_state_dir();
+    let _ = military::enable_landlock_sandbox(&[&download_dir, &state_dir], &[&download_dir, &state_dir]);
+
     let local_ip = get_local_ip();
     let pin = get_or_create_pin();
     let key = get_or_create_session_key();
@@ -3600,6 +3633,7 @@ fn run_server() {
 // ------------------- CLI ENTRYPOINT -------------------
 
 fn main() {
+    military::enable_anti_forensics();
     let args: Vec<String> = env::args().collect();
     let ip = get_local_ip();
     let pin = if args.iter().any(|a| a == "--new-pin") {
@@ -4498,17 +4532,21 @@ mod tests {
         let sample_data = b"Hello Omarchy Zero-Trust AirBridge!";
         let mut sha = Sha256::new();
         sha.update(sample_data);
+        let exp_blake3 = blake3::hash(sample_data).to_hex().to_string();
         let exp_sha256 = hex::encode(sha.finalize());
         let exp_md5 = format!("{:x}", md5::compute(sample_data));
 
         let file_info = TransferFileInfo {
             name: "test_doc.txt".to_string(),
             size_bytes: sample_data.len() as u64,
+            blake3: Some(exp_blake3.clone()),
             sha256: Some(exp_sha256.clone()),
             md5: Some(exp_md5.clone()),
         };
 
         let serialized = serde_json::to_string(&file_info).expect("Must serialize");
+        assert!(serialized.contains("blake3"));
+        assert!(serialized.contains(&exp_blake3));
         assert!(serialized.contains("sha256"));
         assert!(serialized.contains(&exp_sha256));
         assert!(serialized.contains("md5"));
@@ -4574,6 +4612,7 @@ mod tests {
         let approved_info = TransferFileInfo {
             name: "approved_file.pdf".to_string(),
             size_bytes: 1024,
+            blake3: Some("11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff".to_string()),
             sha256: Some("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890".to_string()),
             md5: Some("0123456789abcdef0123456789abcdef".to_string()),
         };
@@ -4600,6 +4639,38 @@ mod tests {
         let is_malicious_approved = pending.files.iter().any(|f| f.name == malicious_filename)
             || pending.file_names.iter().any(|n| n == malicious_filename);
         assert!(!is_malicious_approved, "Unapproved file MUST be rejected under Zero-Trust rules");
+    }
+
+    #[test]
+    fn test_military_grade_blake3_and_zeroize_defense() {
+        use crate::military::{compute_stream_checksums, ProtectedSecret};
+        use zeroize::Zeroize;
+
+        // 1. Memory zeroization
+        let mut secret_pin = ProtectedSecret::new("998877".to_string());
+        assert_eq!(secret_pin.as_str(), "998877");
+        secret_pin.zeroize();
+        assert!(secret_pin.as_str().chars().all(|c| c == '\0'));
+
+        // 2. BLAKE3 post-quantum streaming hash
+        let sample = b"Military Grade Quantum Resilient Transport Data";
+        let checksums = compute_stream_checksums(std::io::Cursor::new(sample)).unwrap();
+        let expected_b3 = blake3::hash(sample).to_hex().to_string();
+        assert_eq!(checksums.blake3_hex, expected_b3);
+        assert!(!checksums.sha256_hex.is_empty());
+        assert!(!checksums.md5_hex.is_empty());
+    }
+
+    #[test]
+    fn test_military_landlock_and_anti_forensics_lifecycle() {
+        use crate::military::{enable_anti_forensics, enable_landlock_sandbox};
+
+        // Anti-forensics must succeed on Linux
+        assert!(enable_anti_forensics());
+
+        // Landlock sandbox gracefully falls back or succeeds
+        let tmp = std::env::temp_dir();
+        let _ = enable_landlock_sandbox(&[&tmp], &[&tmp]);
     }
 }
 
