@@ -200,10 +200,6 @@ Panel {
 
   Process { id: copyProc }
   Process { id: folderProc }
-  Process {
-    id: openWindowProc
-    command: ["omasend-dashboard"]
-  }
 
   Timer {
     id: refreshTimer
@@ -313,7 +309,7 @@ Panel {
 
               Item { Layout.fillWidth: true }
 
-              // Zero-Trust & Integrity Badge
+              // E2EE Pill Badge
               Rectangle {
                 height: Style.space(20)
                 implicitWidth: e2eeBadgeText.implicitWidth + Style.space(12)
@@ -326,53 +322,11 @@ Panel {
                   id: e2eeBadgeText
                   anchors.centerIn: parent
                   textFormat: Text.PlainText
-                  text: "\uf132 ZERO-TRUST MD5/SHA256"
+                  text: " E2EE"
                   color: Color.accent
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   font.bold: true
-                }
-              }
-
-              // Standalone Window Launcher Button
-              Rectangle {
-                height: Style.space(20)
-                implicitWidth: openAppRow.implicitWidth + Style.space(12)
-                radius: Style.cornerRadius
-                color: openAppMouse.containsMouse ? Color.alpha(Color.foreground, 0.15) : "transparent"
-                border.color: Color.alpha(Color.foreground, 0.3)
-                border.width: 1
-
-                RowLayout {
-                  id: openAppRow
-                  anchors.centerIn: parent
-                  spacing: Style.space(4)
-                  Text {
-                    textFormat: Text.PlainText
-                    text: "\uf2d0"
-                    color: root.bar ? root.bar.foreground : Color.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                  }
-                  Text {
-                    textFormat: Text.PlainText
-                    text: "WINDOW"
-                    color: root.bar ? root.bar.foreground : Color.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    font.bold: true
-                  }
-                }
-
-                MouseArea {
-                  id: openAppMouse
-                  anchors.fill: parent
-                  hoverEnabled: true
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: {
-                    root.close();
-                    openWindowProc.running = true;
-                  }
                 }
               }
             }
@@ -586,7 +540,7 @@ Panel {
               visible: root.p2pVisibility === "OFF"
               width: parent.width
               textFormat: Text.PlainText
-              text: "AirBridge görünürlüğü kapalı."
+              text: "AirBridge discovery is disabled."
               color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -617,7 +571,7 @@ Panel {
               Text {
                 Layout.fillWidth: true
                 textFormat: Text.PlainText
-                text: "Yakındaki cihazlar taranıyor (Wi-Fi & Bluetooth)..."
+                text: "Scanning for nearby devices (Wi-Fi & Bluetooth)..."
                 color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -691,7 +645,7 @@ Panel {
                   }
 
                   Button {
-                    text: "\uf07b GÖNDER"
+                    text: "\uf07b SEND"
                     bordered: true
                     accent: Color.accent
                     fontSize: Style.font.caption
@@ -700,7 +654,7 @@ Panel {
                   }
 
                   Button {
-                    text: "\uf0ea PANO"
+                    text: "\uf0ea CLIPBOARD"
                     bordered: true
                     accent: Color.accent
                     fontSize: Style.font.caption
