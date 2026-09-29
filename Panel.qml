@@ -314,80 +314,24 @@ Panel {
       }
     }
 
-    // İkonun üstünde büyüyen nefes alan akrilik cam halka (Glassmorphic Bubble)
+    active: iconDropArea.containsDrag
+    useActiveColor: false
+    foreground: iconDropArea.containsDrag ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
+
+    // Omarchy Minimalist Drag Highlight Indicator
     Rectangle {
-      id: glassBubble
-      anchors.centerIn: parent
-      width: iconDropArea.containsDrag ? 72 : 0
-      height: iconDropArea.containsDrag ? 72 : 0
-      radius: width / 2
-      color: Qt.rgba(0.06, 0.08, 0.14, 0.82)
-      border.color: Qt.rgba(0.4, 0.8, 1.0, 0.85)
-      border.width: 1.5
+      id: dragIndicator
+      anchors.fill: parent
+      anchors.margins: Style.space(2)
+      radius: Style.cornerRadius
+      color: iconDropArea.containsDrag ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.18) : "transparent"
+      border.color: iconDropArea.containsDrag ? Color.accent : "transparent"
+      border.width: 1
       opacity: iconDropArea.containsDrag ? 1.0 : 0.0
-      scale: iconDropArea.containsDrag ? 1.0 : 0.4
-      z: 60
+      z: 55
 
-      Behavior on width { NumberAnimation { duration: 220; easing.type: Easing.OutBack } }
-      Behavior on height { NumberAnimation { duration: 220; easing.type: Easing.OutBack } }
-      Behavior on opacity { NumberAnimation { duration: 180 } }
-      Behavior on scale { NumberAnimation { duration: 220; easing.type: Easing.OutBack } }
-
-      // İç Işık Kırılması
-      Rectangle {
-        anchors.fill: parent
-        anchors.margins: 2
-        radius: parent.radius - 2
-        color: "transparent"
-        border.color: Qt.rgba(1.0, 1.0, 1.0, 0.25)
-        border.width: 1
-      }
-
-      // Nefes Alan Dış Dalgalanma
-      Rectangle {
-        anchors.centerIn: parent
-        width: parent.width + 12
-        height: parent.height + 12
-        radius: (parent.width + 12) / 2
-        color: "transparent"
-        border.color: Color.accent
-        border.width: 1
-        opacity: 0.4
-
-        SequentialAnimation on opacity {
-          running: iconDropArea.containsDrag
-          loops: Animation.Infinite
-          NumberAnimation { from: 0.2; to: 0.8; duration: 700; easing.type: Easing.InOutQuad }
-          NumberAnimation { from: 0.8; to: 0.2; duration: 700; easing.type: Easing.InOutQuad }
-        }
-      }
-
-      Column {
-        anchors.centerIn: parent
-        spacing: 2
-
-        Text {
-          anchors.horizontalCenter: parent.horizontalCenter
-          textFormat: Text.PlainText
-          text: ""
-          color: Color.accent
-          font.family: root.fontFamily
-          font.pixelSize: 20
-        }
-
-        Text {
-          anchors.horizontalCenter: parent.horizontalCenter
-          textFormat: Text.PlainText
-          text: (root.p2pPeers && root.p2pPeers.length > 0) ? root.p2pPeers[0].name : "BIRAKIN"
-          color: "#ffffff"
-          font.family: root.fontFamily
-          font.pixelSize: 8
-          font.bold: true
-          elide: Text.ElideRight
-          width: 58
-          horizontalAlignment: Text.AlignHCenter
-        }
-      }
+      Behavior on opacity { NumberAnimation { duration: 150 } }
+      Behavior on color { ColorAnimation { duration: 150 } }
     }
   }
 
