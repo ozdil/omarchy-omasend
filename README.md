@@ -15,10 +15,13 @@ Plugin ID: ozdil.omasend
 ## Features
 
 - Omarchy AirDrop P2P (PC-to-PC and Mobile Direct Transfer):
+  - AirDrop-Grade Zero-Click Transfer: Transfers from paired/trusted devices are auto-accepted instantly without manual prompt friction, streaming directly to disk with mode 0600 security.
+  - 440px Radiant Sonar Waves: Hardware-accelerated 5-layer radial sonar animation expanding from the bar icon center with sub-pixel alignment, orientation safety (top/bottom/left/right), and visual target lock-on.
+  - Single-Touch Trust Promotion: Unknown devices in Everyone mode prompt recipient once, and upon acceptance are seamlessly promoted to trusted peers for future instant transfers.
   - Zero-Config Discovery: Automatically discovers neighboring Omarchy Linux desktops and Android devices on the same local network using UDP beacons (port 53317).
-  - Native Android Companion: Dedicated Kotlin and Jetpack Compose mobile app providing system share sheet integration, bidirectional transfers, and universal clipboard bridge.
+  - Native Android Companion: Dedicated Kotlin and Jetpack Compose mobile app with LRA tactile haptic feedback (CLICK, THUD, QUICK_RISE), bidirectional transfers, and universal clipboard bridge.
   - 3-Tier Visibility Control: Off, Known (Trusted Peers Only - Default), and Everyone (10 Minutes Temporary Discovery).
-  - Gatekeeper Consent: No files are accepted silently. Recipient receives an interactive desktop notification and panel prompt with sender name, file list, and total transfer size. Transfer begins only after explicit approval.
+  - Gatekeeper Consent: Untrusted devices require explicit approval before transfer begins.
   - Universal Clipboard Sync: Bidirectional encrypted Wayland and Android clipboard synchronization between Omarchy desktops and mobile devices with a single click.
 - Zero-Knowledge End-to-End Encryption (E2EE):
   - Hardware-accelerated AES-256-GCM encryption via the native Web Crypto API (crypto.subtle).

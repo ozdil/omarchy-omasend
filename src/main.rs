@@ -1064,6 +1064,11 @@ fn is_accessory_device(name: &str) -> bool {
         || lower.contains("headphones")
         || lower.contains("earbuds")
         || lower.contains("airpods")
+        || lower.contains("beats")
+        || lower.contains("buds")
+        || lower.contains("sound")
+        || lower.contains("audio")
+        || lower.contains("tws")
         || lower.contains("watch")
         || lower.contains("speaker")
 }
@@ -1296,10 +1301,16 @@ fn run_p2p_beacon_broadcaster() {
 
             if let Ok(bytes) = serde_json::to_vec(&packet) {
                 let _ = socket.send_to(&bytes, format!("255.255.255.255:{}", P2P_BEACON_PORT));
-                // Also broadcast to local subnet
+                // Standard /24 subnet broadcast
                 if let Some(dot) = ip.rfind('.') {
-                    let subnet_bcast = format!("{}.255:{}", &ip[..dot], P2P_BEACON_PORT);
-                    let _ = socket.send_to(&bytes, subnet_bcast);
+                    let subnet_bcast24 = format!("{}.255:{}", &ip[..dot], P2P_BEACON_PORT);
+                    let _ = socket.send_to(&bytes, subnet_bcast24);
+                }
+                // Also broadcast to /16 boundary for corporate / enterprise local networks
+                let ip_parts: Vec<&str> = ip.split('.').collect();
+                if ip_parts.len() == 4 {
+                    let subnet_bcast16 = format!("{}.{}.255.255:{}", ip_parts[0], ip_parts[1], P2P_BEACON_PORT);
+                    let _ = socket.send_to(&bytes, subnet_bcast16);
                 }
                 // Unicast directly to discovered peers to bypass Wi-Fi broadcast filtering
                 for peer in get_discovered_peers() {
@@ -2971,6 +2982,9 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
         let token = hex::encode(token_bytes);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
+        let initial_status = if is_trusted { "ACCEPTED" } else { "PENDING" };
+        let initial_expiry = if is_trusted { now.saturating_add(600) } else { now.saturating_add(30) };
+
         let transfer = PendingFileTransfer {
             token: token.clone(),
             sender_id,
@@ -2980,19 +2994,26 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             files: files_info,
             total_size_bytes,
             created_at: now,
-            expires_at: now.saturating_add(30),
-            status: "PENDING".to_string(),
+            expires_at: initial_expiry,
+            status: initial_status.to_string(),
         };
         save_pending_transfer(&transfer);
 
         let size_mb = (total_size_bytes as f64) / 1024.0 / 1024.0;
-        notify_desktop(
-            "OmaSend AirBridge: Transfer Request",
-            &format!("'{}' wants to send {} file(s) ({:.1} MB).\nOpen OmaSend panel to Accept or Decline.", sender_name, file_names.len(), size_mb),
-        );
+        if is_trusted {
+            notify_desktop(
+                "OmaSend AirBridge",
+                &format!("Auto-receiving {} file(s) ({:.1} MB) from trusted device '{}'.", file_names.len(), size_mb, sender_name),
+            );
+        } else {
+            notify_desktop(
+                "OmaSend AirBridge: Transfer Request",
+                &format!("'{}' wants to send {} file(s) ({:.1} MB).\nOpen OmaSend panel to Accept or Decline.", sender_name, file_names.len(), size_mb),
+            );
+        }
 
         let resp = serde_json::json!({
-            "status": "PENDING",
+            "status": initial_status,
             "token": token
         });
         respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);

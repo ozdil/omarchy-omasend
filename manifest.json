@@ -3,7 +3,7 @@
   "id": "ozdil.omasend",
   "name": "omasend",
   "description": "Wireless AirBridge, QR file transfer, and cross-device sharing plugin for Omarchy Linux",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "author": "Ozan \u00d6zdil",
   "license": "MIT",
   "kinds": [
