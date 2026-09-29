@@ -1041,7 +1041,7 @@ Panel {
         Text {
           width: parent.width
           wrapMode: Text.WordWrap
-          text: "Version: 1.3.1\nDeveloper: Ozan Ozdil (@ozdil)\nLicense: MIT\nAirBridge P2P, E2EE Secure Local & Network File Transfer System"
+          text: "Version: 1.5.0\nDeveloper: Ozan Ozdil (@ozdil)\nLicense: MIT\nAirBridge P2P, E2EE Secure Local & Network File Transfer System"
           color: root.bar ? root.bar.foreground : Color.foreground
           opacity: 0.7
           font.family: root.fontFamily
