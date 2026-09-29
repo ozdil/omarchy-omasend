@@ -742,13 +742,34 @@ fn notify_desktop(title: &str, body: &str) {
     let env_store = get_desktop_gui_envs();
     let envs: Vec<(&str, &str)> = env_store.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let deadline = Instant::now() + Duration::from_millis(1500);
-    let _ = run_cmd_bounded(
-        "/usr/bin/notify-send",
-        &["-a", "OmaSend", "-i", "document-send", "--", title, body],
+
+    let glyph = "󰒍";
+    let status = run_cmd_bounded(
+        "omarchy-notification-send",
+        &[
+            "--app-name",
+            "OmaSend",
+            "-g",
+            glyph,
+            "-u",
+            "normal",
+            title,
+            body,
+        ],
         &envs,
         deadline,
         1024,
     );
+
+    if status.is_none() {
+        let _ = run_cmd_bounded(
+            "/usr/bin/notify-send",
+            &["-a", "OmaSend", "-i", "document-send", "--", title, body],
+            &envs,
+            deadline,
+            1024,
+        );
+    }
 }
 
 fn start_download_dir_watcher(download_dir: &Path) {
@@ -3705,30 +3726,57 @@ fn main() {
     }
 
     if let Some(pos) = args.iter().position(|a| a == "--send-p2p" || a == "--send") {
-        if let (Some(target), Some(file_path_str)) = (args.get(pos + 1), args.get(pos + 2)) {
-            let path = Path::new(file_path_str);
-            if target.starts_with("bt:") || (target.len() == 17 && target.chars().filter(|c| *c == ':').count() == 5) {
-                let mac = target.strip_prefix("bt:").unwrap_or(target);
-                match p2p_send_file_via_bluetooth(mac, path) {
-                    Ok(()) => println!("File sent successfully via Bluetooth to {}", mac),
-                    Err(e) => eprintln!("Error sending file via Bluetooth: {}", e),
+        let target_arg = args.get(pos + 1);
+        let second_arg = args.get(pos + 2);
+
+        let (target, file_path_str) = match (target_arg, second_arg) {
+            (Some(t), Some(f)) if t != "auto" => (t.clone(), f.clone()),
+            (Some(f_or_auto), None) => {
+                let peers = get_discovered_peers();
+                if let Some(first_peer) = peers.first() {
+                    (first_peer.ip.clone(), f_or_auto.clone())
+                } else {
+                    eprintln!("Error: No active peers discovered for automatic send");
+                    return;
                 }
-            } else {
-                match p2p_send_file_to_peer(target, path) {
-                    Ok(()) => println!("File sent successfully to {}", target),
-                    Err(e) => {
-                        eprintln!("Error sending file via LAN: {}", e);
-                        let bt_peers = get_bluetooth_paired_peers();
-                        if let Some(bt_match) = bt_peers.first() {
-                            let mac = bt_match.ip.strip_prefix("bt:").unwrap_or(&bt_match.ip);
-                            println!("Falling back to Bluetooth transfer for {} ({})", bt_match.name, mac);
-                            let _ = p2p_send_file_via_bluetooth(mac, path);
-                        }
+            }
+            (Some(t), Some(f)) if t == "auto" => {
+                let peers = get_discovered_peers();
+                if let Some(first_peer) = peers.first() {
+                    (first_peer.ip.clone(), f.clone())
+                } else {
+                    eprintln!("Error: No active peers discovered for automatic send");
+                    return;
+                }
+            }
+            _ => {
+                eprintln!("Usage: omasend-engine --send [peer_ip|auto] <file_path>");
+                return;
+            }
+        };
+
+        let path = Path::new(&file_path_str);
+        if target.starts_with("bt:") || (target.len() == 17 && target.chars().filter(|c| *c == ':').count() == 5) {
+            let mac = target.strip_prefix("bt:").unwrap_or(&target);
+            match p2p_send_file_via_bluetooth(mac, path) {
+                Ok(()) => println!("File sent successfully via Bluetooth to {}", mac),
+                Err(e) => eprintln!("Error sending file via Bluetooth: {}", e),
+            }
+        } else {
+            match p2p_send_file_to_peer(&target, path) {
+                Ok(()) => println!("File sent successfully to {}", target),
+                Err(e) => {
+                    eprintln!("Error sending file via LAN: {}", e);
+                    let bt_peers = get_bluetooth_paired_peers();
+                    if let Some(bt_match) = bt_peers.first() {
+                        let mac = bt_match.ip.strip_prefix("bt:").unwrap_or(&bt_match.ip);
+                        println!("Falling back to Bluetooth transfer for {} ({})", bt_match.name, mac);
+                        let _ = p2p_send_file_via_bluetooth(mac, path);
                     }
                 }
             }
-            return;
         }
+        return;
     }
 
     if let Some(pos) = args.iter().position(|a| a == "--send-dialog") {

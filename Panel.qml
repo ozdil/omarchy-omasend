@@ -9,7 +9,7 @@ import qs.Ui
 Panel {
   id: root
   moduleName: "ozdil.omasend"
-  ipcTarget: ""
+  ipcTarget: "ozdil.omasend"
   manageIpc: false
 
   implicitWidth: button.implicitWidth
@@ -37,6 +37,15 @@ Panel {
   property bool p2pBtAvailable: false
   property var p2pPeers: []
   property var p2pPendingTransfer: null
+  property bool showAboutModal: false
+
+  // Selected peer for cursor navigation
+  property int selectedPeerIndex: 0
+  property bool cursorActive: false
+  property string focusedPeerIp: ""
+
+  readonly property color hoverFill: bar ? Style.hoverFillFor(bar.foreground, Color.accent) : "transparent"
+  readonly property color selectedFill: bar ? Style.selectedFillFor(bar.foreground, Color.accent) : "transparent"
   readonly property string fontFamily: (root.bar && root.bar.fontFamily) ? root.bar.fontFamily : ((typeof Style !== "undefined" && Style.font && Style.font.family) ? Style.font.family : "JetBrainsMono Nerd Font, JetBrains Mono, monospace")
 
   function resolveEnginePath() {
@@ -74,6 +83,51 @@ Panel {
     root.executeAction(["--set-visibility", mode])
   }
 
+  function toggleVisibility() {
+    if (root.p2pVisibility === "OFF") {
+      root.setP2pVisibility("KNOWN")
+    } else if (root.p2pVisibility === "KNOWN") {
+      root.setP2pVisibility("EVERYONE")
+    } else {
+      root.setP2pVisibility("OFF")
+    }
+  }
+
+  function moveCursor(dy) {
+    if (!cursorActive) {
+      cursorActive = true
+      selectedPeerIndex = 0
+      return
+    }
+    var len = root.p2pPeers ? root.p2pPeers.length : 0
+    if (len === 0) return
+    var next = selectedPeerIndex + dy
+    if (next < 0) next = 0
+    if (next >= len) next = len - 1
+    selectedPeerIndex = next
+  }
+
+  function activateSelected() {
+    if (root.p2pPendingTransfer) {
+      root.acceptTransfer(root.p2pPendingTransfer.token)
+      return
+    }
+    if (root.p2pPeers && root.p2pPeers.length > selectedPeerIndex) {
+      var peer = root.p2pPeers[selectedPeerIndex]
+      if (peer && peer.ip) {
+        root.sendFileTo(peer.ip)
+      }
+    }
+  }
+
+  onOpenedChanged: {
+    if (root.opened) {
+      selectedPeerIndex = 0
+      cursorActive = false
+      root.refresh()
+    }
+  }
+
   function acceptTransfer(token) {
     root.executeAction(["--accept-transfer", token])
   }
@@ -90,29 +144,6 @@ Panel {
     if (sendDialogProc.running) sendDialogProc.running = false
     sendDialogProc.command = [root.resolveEnginePath(), "--send-dialog", ip]
     sendDialogProc.running = true
-  }
-
-  function newPin() {
-    root.executeAction(["--new-pin"])
-  }
-
-  function newKey() {
-    root.executeAction(["--new-key"])
-  }
-
-  function toggleWan() {
-    root.wanConnecting = true
-    root.executeAction(["--toggle-wan"])
-  }
-
-  function setLanMode() {
-    root.activeMode = "LAN"
-    root.executeAction(["--set-lan"])
-  }
-
-  function setWanMode() {
-    root.activeMode = "WAN"
-    root.executeAction(["--set-wan"])
   }
 
   function copyPortalUrl() {
@@ -200,16 +231,19 @@ Panel {
 
   Process { id: copyProc }
   Process { id: folderProc }
+  Process {
+    id: playSendSoundProc
+    command: ["pw-play", Qt.resolvedUrl("assets/send_whoosh.wav").toString().replace(/^file:\/\//, "")]
+  }
 
   Timer {
     id: refreshTimer
-    interval: root.wanConnecting ? 1000 : 3000
-    running: root.opened || root.wanConnecting
+    interval: 3000
+    running: root.opened
     repeat: true
     onTriggered: root.refresh()
   }
 
-  // Background watchdog to restart engine if terminated
   Timer {
     id: watchdogTimer
     interval: 5000
@@ -242,10 +276,118 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     text: ""
-    foreground: root.wanActive ? "#f59e0b" : (root.bar ? root.bar.foreground : Color.foreground)
-    tooltipText: "OmaSend AirBridge (" + (root.activeMode === "WAN" ? "WAN Active (Tunnel)" : "LAN (Local Only)") + " • E2EE)"
+    foreground: root.bar ? root.bar.foreground : Color.foreground
+    tooltipText: "OmaSend AirBridge (" + root.p2pVisibility + ")"
     onPressed: function(b) {
       root.toggle()
+    }
+
+    // Dosya ikonun üzerine sürüklendiğinde büyüyen ve camlaşan Drop Alanı
+    DropArea {
+      id: iconDropArea
+      anchors.fill: parent
+      z: 50
+
+      onEntered: function(drag) {
+        if (drag.hasUrls) {
+          drag.acceptProposedAction()
+        }
+      }
+
+      onDropped: function(drop) {
+        if (drop.hasUrls && drop.urls.length > 0) {
+          drop.acceptProposedAction()
+          var firstFile = drop.urls[0].toString().replace(/^file:\/\//, "")
+
+          // Akustik fırlatma sesini başlat
+          if (playSendSoundProc.running) playSendSoundProc.running = false
+          playSendSoundProc.running = true
+
+          var targetIp = ""
+          if (root.p2pPeers && root.p2pPeers.length > 0) {
+            targetIp = root.p2pPeers[0].ip
+          }
+          if (targetIp !== "") {
+            root.executeAction(["--send", targetIp, firstFile])
+          }
+        }
+      }
+    }
+
+    // İkonun üstünde büyüyen nefes alan akrilik cam halka (Glassmorphic Bubble)
+    Rectangle {
+      id: glassBubble
+      anchors.centerIn: parent
+      width: iconDropArea.containsDrag ? 72 : 0
+      height: iconDropArea.containsDrag ? 72 : 0
+      radius: width / 2
+      color: Qt.rgba(0.06, 0.08, 0.14, 0.82)
+      border.color: Qt.rgba(0.4, 0.8, 1.0, 0.85)
+      border.width: 1.5
+      opacity: iconDropArea.containsDrag ? 1.0 : 0.0
+      scale: iconDropArea.containsDrag ? 1.0 : 0.4
+      z: 60
+
+      Behavior on width { NumberAnimation { duration: 220; easing.type: Easing.OutBack } }
+      Behavior on height { NumberAnimation { duration: 220; easing.type: Easing.OutBack } }
+      Behavior on opacity { NumberAnimation { duration: 180 } }
+      Behavior on scale { NumberAnimation { duration: 220; easing.type: Easing.OutBack } }
+
+      // İç Işık Kırılması
+      Rectangle {
+        anchors.fill: parent
+        anchors.margins: 2
+        radius: parent.radius - 2
+        color: "transparent"
+        border.color: Qt.rgba(1.0, 1.0, 1.0, 0.25)
+        border.width: 1
+      }
+
+      // Nefes Alan Dış Dalgalanma
+      Rectangle {
+        anchors.centerIn: parent
+        width: parent.width + 12
+        height: parent.height + 12
+        radius: (parent.width + 12) / 2
+        color: "transparent"
+        border.color: Color.accent
+        border.width: 1
+        opacity: 0.4
+
+        SequentialAnimation on opacity {
+          running: iconDropArea.containsDrag
+          loops: Animation.Infinite
+          NumberAnimation { from: 0.2; to: 0.8; duration: 700; easing.type: Easing.InOutQuad }
+          NumberAnimation { from: 0.8; to: 0.2; duration: 700; easing.type: Easing.InOutQuad }
+        }
+      }
+
+      Column {
+        anchors.centerIn: parent
+        spacing: 2
+
+        Text {
+          anchors.horizontalCenter: parent.horizontalCenter
+          textFormat: Text.PlainText
+          text: ""
+          color: Color.accent
+          font.family: root.fontFamily
+          font.pixelSize: 20
+        }
+
+        Text {
+          anchors.horizontalCenter: parent.horizontalCenter
+          textFormat: Text.PlainText
+          text: (root.p2pPeers && root.p2pPeers.length > 0) ? root.p2pPeers[0].name : "BIRAKIN"
+          color: "#ffffff"
+          font.family: root.fontFamily
+          font.pixelSize: 8
+          font.bold: true
+          elide: Text.ElideRight
+          width: 58
+          horizontalAlignment: Text.AlignHCenter
+        }
+      }
     }
   }
 
@@ -255,35 +397,72 @@ Panel {
     owner: root
     bar: root.bar
     open: root.opened
-    contentWidth: panel.fittedContentWidth(Style.space(430))
-    contentHeight: panel.fittedContentHeight(panelColumn.implicitHeight, Style.space(660))
+    focusTarget: keyCatcher
+    contentWidth: panel.fittedContentWidth(Style.space(380))
+    contentHeight: panel.fittedContentHeight(root.showAboutModal ? Math.max(panelColumn.implicitHeight, aboutCol.implicitHeight + Style.space(40)) : panelColumn.implicitHeight)
 
-    ScrollView {
-      id: scrollArea
+    PanelKeyCatcher {
+      id: keyCatcher
       anchors.fill: parent
-      clip: true
-      ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
-      ScrollBar.vertical.policy: panelColumn.implicitHeight > height ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
+      onCloseRequested: {
+        if (root.showAboutModal) {
+          root.showAboutModal = false
+        } else {
+          root.close()
+        }
+      }
+      onTabRequested: function(direction) { root.switchPanel(direction) }
+      onMoveRequested: function(dx, dy) { root.moveCursor(dy) }
+      onActivateRequested: root.activateSelected()
+      onTextKey: function(t) {
+        if (t === "r" || t === "R") {
+          root.refresh()
+        } else if (t === "v" || t === "V") {
+          root.toggleVisibility()
+        } else if (t === "a" || t === "A") {
+          root.showAboutModal = !root.showAboutModal
+        } else if (t === "c" || t === "C") {
+          root.copyPortalUrl()
+        } else if (t === "o" || t === "O") {
+          root.openFolder()
+        }
+      }
 
       Column {
         id: panelColumn
-        width: scrollArea.availableWidth
-        spacing: Style.space(12)
+        anchors.fill: parent
+        spacing: Style.space(14)
 
-        // ---------- Hero: Paper Plane icon · title/status ----------
+        // ---------- Hero: OmaSend icon · title · Visibility Toggle ----------
         Item {
           width: parent.width
-          implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight)
+          implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight, powerSwitch.implicitHeight)
 
           Text {
             id: heroIcon
             textFormat: Text.PlainText
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
             text: ""
             color: root.bar ? root.bar.foreground : Color.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.display
-            anchors.left: parent.left
+            opacity: root.p2pVisibility !== "OFF" ? 1.0 : 0.5
+          }
+
+          ToggleSwitch {
+            id: powerSwitch
+            checked: root.p2pVisibility !== "OFF"
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
+            onToggled: root.toggleVisibility()
+
+            PanelToolTip {
+              visible: powerSwitch.containsMouse
+              text: root.p2pVisibility !== "OFF" ? "Disable OmaSend discovery" : "Enable OmaSend discovery"
+              fontFamily: root.fontFamily
+            }
           }
 
           Column {
@@ -291,54 +470,30 @@ Panel {
             anchors.left: heroIcon.right
             anchors.leftMargin: Style.space(14)
             anchors.right: parent.right
+            anchors.rightMargin: powerSwitch.width + Style.space(12)
             anchors.verticalCenter: parent.verticalCenter
             spacing: Style.space(2)
 
-            RowLayout {
+            Text {
+              text: "OmaSend"
+              color: root.bar ? root.bar.foreground : Color.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.title
+              font.bold: true
+              elide: Text.ElideRight
               width: parent.width
-              spacing: Style.space(8)
-
-              Text {
-                text: "OmaSend"
-                textFormat: Text.PlainText
-                color: root.bar ? root.bar.foreground : Color.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.title
-                font.bold: true
-              }
-
-              Item { Layout.fillWidth: true }
-
-              // E2EE Pill Badge
-              Rectangle {
-                height: Style.space(20)
-                implicitWidth: e2eeBadgeText.implicitWidth + Style.space(12)
-                radius: Style.cornerRadius
-                color: "transparent"
-                border.color: Color.accent
-                border.width: 1
-
-                Text {
-                  id: e2eeBadgeText
-                  anchors.centerIn: parent
-                  textFormat: Text.PlainText
-                  text: " E2EE"
-                  color: Color.accent
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  font.bold: true
-                }
-              }
             }
 
             Text {
               textFormat: Text.PlainText
-              text: (root.wanConnecting ? "ESTABLISHING WAN TUNNEL..." : (root.activeMode === "WAN" ? "GLOBAL AIRBRIDGE (WAN)" : "LOCAL NETWORK BRIDGE (LAN)")).toUpperCase()
-              color: root.wanConnecting ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
+              text: (root.p2pVisibility === "OFF" ? "DISCOVERY OFF" : (root.p2pVisibility === "EVERYONE" ? ("EVERYONE (" + Math.max(1, Math.floor(root.p2pVisibilityRemainingSecs / 60)) + "M)") : "KNOWN PEERS")).toUpperCase()
+              color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               font.bold: true
-              font.letterSpacing: 1.1
+              font.letterSpacing: 1.2
+              elide: Text.ElideRight
+              width: parent.width
             }
           }
         }
@@ -365,7 +520,7 @@ Panel {
 
               Text {
                 textFormat: Text.PlainText
-                text: "\uf07b"
+                text: ""
                 color: Color.accent
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
@@ -386,7 +541,7 @@ Panel {
               width: parent.width
               wrapMode: Text.Wrap
               textFormat: Text.PlainText
-              text: root.p2pPendingTransfer ? ("From: " + root.p2pPendingTransfer.sender_name + " (" + root.p2pPendingTransfer.sender_ip + ")\nFiles: " + (root.p2pPendingTransfer.file_names || []).join(", ") + " (" + ((root.p2pPendingTransfer.total_size_bytes || 0) / 1024 / 1024).toFixed(1) + " MB)") : ""
+              text: root.p2pPendingTransfer ? ("From: " + root.p2pPendingTransfer.sender_name + "\nFiles: " + (root.p2pPendingTransfer.file_names || []).join(", ") + " (" + ((root.p2pPendingTransfer.total_size_bytes || 0) / 1024 / 1024).toFixed(1) + " MB)") : ""
               color: root.bar ? root.bar.foreground : Color.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -404,7 +559,7 @@ Panel {
                 Text {
                   anchors.centerIn: parent
                   textFormat: Text.PlainText
-                  text: " ACCEPT"
+                  text: "ACCEPT"
                   color: "#000000"
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -430,7 +585,7 @@ Panel {
                 Text {
                   anchors.centerIn: parent
                   textFormat: Text.PlainText
-                  text: " DECLINE"
+                  text: "DECLINE"
                   color: root.bar ? root.bar.foreground : Color.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -449,215 +604,119 @@ Panel {
           }
         }
 
-        // ---------- AirBridge P2P & Bluetooth (AirDrop) ----------
+        // ---------- Section: PAIRED / AVAILABLE DEVICES ----------
         PanelSeparator {
           foreground: root.bar ? root.bar.foreground : Color.foreground
         }
 
         Column {
+          id: peersSection
           width: parent.width
-          spacing: Style.space(8)
+          spacing: Style.space(10)
 
-          RowLayout {
-            width: parent.width
-            spacing: Style.space(6)
+          PanelSectionHeader {
+            text: "DEVICES"
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            fontFamily: root.fontFamily
+          }
 
-            PanelSectionHeader {
-              Layout.fillWidth: true
-              text: "AIRDROP & PEER DISCOVERY"
+          Repeater {
+            model: root.p2pVisibility === "OFF" ? [] : root.p2pPeers
+
+            CursorSurface {
+              id: peerRow
+              required property var modelData
+              required property int index
+              width: peersSection.width
+              implicitHeight: peerRowContent.implicitHeight + Style.spacing.rowPaddingX
               foreground: root.bar ? root.bar.foreground : Color.foreground
-              fontFamily: root.fontFamily
-            }
+              fill: root.hoverFill
+              currentFill: root.selectedFill
+              current: false
+              hasCursor: root.cursorActive && root.selectedPeerIndex === index
 
-            // Bluetooth Status Indicator
-            Rectangle {
-              visible: root.p2pBtAvailable
-              height: Style.space(18)
-              implicitWidth: btPillText.implicitWidth + Style.space(10)
-              radius: Style.cornerRadius
-              color: "transparent"
-              border.color: Color.accent
-              border.width: 1
-
-              Text {
-                id: btPillText
-                anchors.centerIn: parent
-                textFormat: Text.PlainText
-                text: " BT READY"
-                color: Color.accent
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-              }
-            }
-          }
-
-          // 3-Tier Visibility Selector
-          RowLayout {
-            width: parent.width
-            spacing: Style.space(6)
-
-            Button {
-              Layout.fillWidth: true
-              text: "OFF"
-              selected: root.p2pVisibility === "OFF"
-              bordered: true
-              accent: Color.accent
-              fontSize: Style.font.caption
-              fontFamily: root.fontFamily
-              onClicked: root.setP2pVisibility("OFF")
-            }
-
-            Button {
-              Layout.fillWidth: true
-              text: "KNOWN PEERS"
-              selected: root.p2pVisibility === "KNOWN"
-              bordered: true
-              accent: Color.accent
-              fontSize: Style.font.caption
-              fontFamily: root.fontFamily
-              onClicked: root.setP2pVisibility("KNOWN")
-            }
-
-            Button {
-              Layout.fillWidth: true
-              text: root.p2pVisibility === "EVERYONE" && root.p2pVisibilityRemainingSecs > 0 ? ("EVERYONE (" + Math.floor(root.p2pVisibilityRemainingSecs / 60) + ":" + (root.p2pVisibilityRemainingSecs % 60 < 10 ? "0" : "") + (root.p2pVisibilityRemainingSecs % 60) + ")") : "EVERYONE (10M)"
-              selected: root.p2pVisibility === "EVERYONE"
-              bordered: true
-              accent: Color.accent
-              fontSize: Style.font.caption
-              fontFamily: root.fontFamily
-              onClicked: root.setP2pVisibility("EVERYONE")
-            }
-          }
-
-          // Discovered Peers List
-          Column {
-            width: parent.width
-            spacing: Style.space(6)
-
-            Text {
-              visible: root.p2pVisibility === "OFF"
-              width: parent.width
-              textFormat: Text.PlainText
-              text: "AirBridge discovery is disabled."
-              color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              font.italic: true
-            }
-
-            RowLayout {
-              visible: root.p2pVisibility !== "OFF" && root.p2pPeers.length === 0
-              width: parent.width
-              spacing: Style.space(8)
-
-              Text {
-                textFormat: Text.PlainText
-                text: "\uf1ce"
-                color: Color.accent
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-
-                NumberAnimation on rotation {
-                  from: 0
-                  to: 360
-                  duration: 1200
-                  loops: Animation.Infinite
-                  running: root.p2pVisibility !== "OFF" && root.p2pPeers.length === 0
+              MouseArea {
+                id: rowMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onEntered: {
+                  root.cursorActive = true
+                  root.selectedPeerIndex = index
+                }
+                onClicked: {
+                  root.sendFileTo(modelData.ip)
                 }
               }
 
-              Text {
-                Layout.fillWidth: true
-                textFormat: Text.PlainText
-                text: "Scanning for nearby devices (Wi-Fi & Bluetooth)..."
-                color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                font.italic: true
-              }
-            }
+              Item {
+                id: peerRowContent
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.leftMargin: Style.space(10)
+                anchors.rightMargin: Style.space(10)
+                implicitHeight: Math.max(devIcon.implicitHeight, devInfo.implicitHeight, actionBtns.implicitHeight)
 
-            Repeater {
-              model: root.p2pVisibility === "OFF" ? [] : root.p2pPeers
+                Text {
+                  id: devIcon
+                  textFormat: Text.PlainText
+                  text: modelData.transport === "BT" ? "" : (modelData.transport === "HYBRID" ? "󱘖" : "")
+                  color: root.bar ? root.bar.foreground : Color.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.heading
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                }
 
-              Rectangle {
-                width: parent.width
-                implicitHeight: Style.space(46)
-                height: implicitHeight
-                radius: Style.cornerRadius
-                color: "transparent"
-                border.color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
-                border.width: 1
-
-                RowLayout {
-                  anchors.fill: parent
-                  anchors.leftMargin: Style.space(8)
+                Column {
+                  id: devInfo
+                  spacing: Style.space(1)
+                  anchors.left: devIcon.right
+                  anchors.leftMargin: Style.space(10)
+                  anchors.right: actionBtns.left
                   anchors.rightMargin: Style.space(8)
-                  spacing: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
 
                   Text {
                     textFormat: Text.PlainText
-                    text: modelData.transport === "BT" ? "" : (modelData.transport === "HYBRID" ? "\uf0e7" : "\uf108")
-                    color: modelData.transport === "BT" ? "#3b82f6" : (modelData.transport === "HYBRID" ? "#a855f7" : Color.accent)
+                    text: modelData.name || "Omarchy Device"
+                    color: root.bar ? root.bar.foreground : Color.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.body
+                    elide: Text.ElideRight
+                    width: parent.width
                   }
 
-                  Column {
-                    Layout.fillWidth: true
-                    spacing: 0
-                    RowLayout {
-                      spacing: Style.space(6)
-                      Text {
-                        textFormat: Text.PlainText
-                        text: modelData.name || "Omarchy Device"
-                        color: root.bar ? root.bar.foreground : Color.foreground
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.bodySmall
-                        font.bold: true
-                      }
-                      Rectangle {
-                        implicitWidth: badgeText.implicitWidth + Style.space(8)
-                        implicitHeight: Style.space(16)
-                        radius: Style.cornerRadius
-                        color: modelData.transport === "BT" ? "#1e3a8a" : (modelData.transport === "HYBRID" ? "#581c87" : "#064e3b")
-                        Text {
-                          id: badgeText
-                          anchors.centerIn: parent
-                          textFormat: Text.PlainText
-                          text: modelData.transport
-                          color: modelData.transport === "BT" ? "#93c5fd" : (modelData.transport === "HYBRID" ? "#d8b4fe" : "#6ee7b7")
-                          font.family: root.fontFamily
-                          font.pixelSize: 9
-                          font.bold: true
-                        }
-                      }
-                    }
-                    Text {
-                      textFormat: Text.PlainText
-                      text: (modelData.ip.startsWith("bt:") ? "Bluetooth Paired" : modelData.ip) + (modelData.is_trusted ? " • TRUSTED" : "")
-                      color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
-                    }
+                  Text {
+                    textFormat: Text.PlainText
+                    text: modelData.transport === "BT" ? "Bluetooth Paired" : "Ready to Send"
+                    color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                    width: parent.width
                   }
+                }
 
-                  Button {
-                    text: "\uf07b SEND"
-                    bordered: true
-                    accent: Color.accent
-                    fontSize: Style.font.caption
+                RowLayout {
+                  id: actionBtns
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: Style.space(6)
+
+                  PanelActionButton {
+                    iconText: ""
+                    tooltipText: "Send File"
+                    foreground: root.bar ? root.bar.foreground : Color.foreground
                     fontFamily: root.fontFamily
                     onClicked: root.sendFileTo(modelData.ip)
                   }
 
-                  Button {
-                    text: "\uf0ea CLIPBOARD"
-                    bordered: true
-                    accent: Color.accent
-                    fontSize: Style.font.caption
+                  PanelActionButton {
+                    iconText: ""
+                    tooltipText: "Send Clipboard"
+                    foreground: root.bar ? root.bar.foreground : Color.foreground
                     fontFamily: root.fontFamily
                     onClicked: root.syncClipboardTo(modelData.ip)
                   }
@@ -665,354 +724,16 @@ Panel {
               }
             }
           }
-        }
 
-        // ---------- Network Mode & QR Pairing (Side-by-Side) ----------
-        PanelSeparator {
-          foreground: root.bar ? root.bar.foreground : Color.foreground
-        }
-
-        Column {
-          width: parent.width
-          spacing: Style.space(8)
-
-          PanelSectionHeader {
-            text: "NETWORK MODE & PAIRING"
-            foreground: root.bar ? root.bar.foreground : Color.foreground
-            fontFamily: root.fontFamily
-          }
-
-          RowLayout {
+          Text {
+            textFormat: Text.PlainText
+            visible: root.p2pVisibility === "OFF" || root.p2pPeers.length === 0
+            text: root.p2pVisibility === "OFF" ? "Turn discovery on to scan for devices." : "Scanning for nearby devices..."
+            color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
             width: parent.width
-            spacing: Style.space(10)
-
-            // Crisp QR Card (Left, 132x132)
-            Rectangle {
-              Layout.preferredWidth: Style.space(132)
-              Layout.preferredHeight: Style.space(132)
-              radius: Style.cornerRadius
-              color: "#ffffff"
-              border.color: root.bar ? root.bar.foreground : Color.foreground
-              border.width: 1
-
-              Image {
-                anchors.fill: parent
-                anchors.margins: Style.space(6)
-                source: root.qrPath ? ("file://" + root.qrPath + "?v=" + root.refreshNonce) : ""
-                sourceSize.width: Style.space(120)
-                sourceSize.height: Style.space(120)
-                fillMode: Image.PreserveAspectFit
-                cache: false
-              }
-            }
-
-            // Network Mode Switcher & WAN Controls (Right)
-            ColumnLayout {
-              Layout.fillWidth: true
-              Layout.preferredHeight: Style.space(132)
-              spacing: Style.space(6)
-
-              // Local Network (LAN) Button
-              Rectangle {
-                Layout.fillWidth: true
-                Layout.preferredHeight: Style.space(32)
-                radius: Style.cornerRadius
-                color: root.activeMode === "LAN" ? Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent) : "transparent"
-                border.color: root.activeMode === "LAN" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
-                border.width: 1
-
-                RowLayout {
-                  anchors.fill: parent
-                  anchors.leftMargin: Style.space(10)
-                  anchors.rightMargin: Style.space(10)
-                  spacing: Style.space(6)
-
-                  Text {
-                    textFormat: Text.PlainText
-                    text: ""
-                    color: root.activeMode === "LAN" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.bodySmall
-                  }
-
-                  Text {
-                    Layout.fillWidth: true
-                    textFormat: Text.PlainText
-                    text: "Local Network (LAN)"
-                    color: root.activeMode === "LAN" ? (root.bar ? root.bar.foreground : Color.foreground) : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.bodySmall
-                    font.bold: root.activeMode === "LAN"
-                  }
-
-                  Text {
-                    visible: root.activeMode === "LAN"
-                    textFormat: Text.PlainText
-                    text: "●"
-                    color: Color.accent
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                  }
-                }
-
-                MouseArea {
-                  anchors.fill: parent
-                  z: 10
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: root.setLanMode()
-                }
-              }
-
-              // Global WAN Button
-              Rectangle {
-                Layout.fillWidth: true
-                Layout.preferredHeight: Style.space(32)
-                radius: Style.cornerRadius
-                color: root.activeMode === "WAN" ? Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent) : "transparent"
-                border.color: root.activeMode === "WAN" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
-                border.width: 1
-
-                RowLayout {
-                  anchors.fill: parent
-                  anchors.leftMargin: Style.space(10)
-                  anchors.rightMargin: Style.space(10)
-                  spacing: Style.space(6)
-
-                  Text {
-                    textFormat: Text.PlainText
-                    text: ""
-                    color: root.activeMode === "WAN" ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.bodySmall
-                  }
-
-                  Text {
-                    Layout.fillWidth: true
-                    textFormat: Text.PlainText
-                    text: "Global WAN"
-                    color: root.activeMode === "WAN" ? (root.bar ? root.bar.foreground : Color.foreground) : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.bodySmall
-                    font.bold: root.activeMode === "WAN"
-                  }
-
-                  Text {
-                    textFormat: Text.PlainText
-                    text: root.wanActive ? "●" : (root.wanConnecting ? "󰑐" : "")
-                    color: Color.accent
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                  }
-                }
-
-                MouseArea {
-                  anchors.fill: parent
-                  z: 10
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: root.setWanMode()
-                }
-              }
-
-              // Network Status / Action Card
-              Rectangle {
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-                radius: Style.cornerRadius
-                color: Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
-
-                RowLayout {
-                  anchors.fill: parent
-                  anchors.leftMargin: Style.space(8)
-                  anchors.rightMargin: Style.space(8)
-                  spacing: Style.space(6)
-
-                  Text {
-                    Layout.fillWidth: true
-                    textFormat: Text.PlainText
-                    text: root.activeMode === "WAN" ?
-                          (root.wanActive ? "● Tunnel Active" : (root.wanConnecting ? "󰑐 Connecting..." : "○ Tunnel Offline")) :
-                          " Same Wi-Fi Network"
-                    color: (root.wanActive || root.wanConnecting) ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.3)
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    font.bold: true
-                    elide: Text.ElideRight
-                  }
-
-                  Button {
-                    visible: root.activeMode === "WAN"
-                    text: root.wanActive ? "Stop" : (root.wanConnecting ? "Cancel" : "Start")
-                    onClicked: root.toggleWan()
-                  }
-                }
-              }
-            }
-          }
-
-          // Active URL row with Copy button
-          Rectangle {
-            width: parent.width
-            height: Style.space(36)
-            radius: Style.cornerRadius
-            color: Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
-
-            RowLayout {
-              anchors.fill: parent
-              anchors.leftMargin: Style.space(10)
-              anchors.rightMargin: Style.space(6)
-              spacing: Style.space(8)
-
-              Text {
-                Layout.fillWidth: true
-                textFormat: Text.PlainText
-                text: root.activeUrl ? root.activeUrl.replace(/#key=.*$/, "") : ("http://" + root.localIp + ":" + root.port)
-                color: root.bar ? root.bar.foreground : Color.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                font.bold: true
-                elide: Text.ElideMiddle
-              }
-
-              Button {
-                text: "Copy Link"
-                onClicked: root.copyPortalUrl()
-              }
-            }
-          }
-        }
-
-        // ---------- Security PIN Section ----------
-        PanelSeparator {
-          foreground: root.bar ? root.bar.foreground : Color.foreground
-        }
-
-        Column {
-          width: parent.width
-          spacing: Style.space(6)
-
-          PanelSectionHeader {
-            text: "SECURITY PIN"
-            foreground: root.bar ? root.bar.foreground : Color.foreground
-            fontFamily: root.fontFamily
-          }
-
-          Rectangle {
-            width: parent.width
-            height: Style.space(36)
-            radius: Style.cornerRadius
-            color: Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
-
-            RowLayout {
-              anchors.fill: parent
-              anchors.leftMargin: Style.space(10)
-              anchors.rightMargin: Style.space(6)
-              spacing: Style.space(8)
-
-              Text {
-                Layout.fillWidth: true
-                textFormat: Text.PlainText
-                text: "PIN: " + root.pin
-                color: root.bar ? root.bar.foreground : Color.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                font.bold: true
-              }
-
-              Button {
-                text: "New PIN"
-                onClicked: root.newPin()
-              }
-            }
-          }
-        }
-
-        // ---------- E2EE Cryptography Section ----------
-        PanelSeparator {
-          foreground: root.bar ? root.bar.foreground : Color.foreground
-        }
-
-        Column {
-          width: parent.width
-          spacing: Style.space(6)
-
-          PanelSectionHeader {
-            text: "END-TO-END ENCRYPTION (AES-256-GCM)"
-            foreground: root.bar ? root.bar.foreground : Color.foreground
-            fontFamily: root.fontFamily
-          }
-
-          Rectangle {
-            width: parent.width
-            height: Style.space(36)
-            radius: Style.cornerRadius
-            color: Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
-
-            RowLayout {
-              anchors.fill: parent
-              anchors.leftMargin: Style.space(10)
-              anchors.rightMargin: Style.space(6)
-              spacing: Style.space(8)
-
-              Text {
-                Layout.fillWidth: true
-                textFormat: Text.PlainText
-                text: "Key: " + (root.sessionKey.length > 16 ? (root.sessionKey.slice(0, 8) + "..." + root.sessionKey.slice(-8)) : "Active")
-                color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.3)
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-              }
-
-              Button {
-                text: "New Key"
-                onClicked: root.newKey()
-              }
-            }
-          }
-        }
-
-        // ---------- Download Directory Section ----------
-        PanelSeparator {
-          foreground: root.bar ? root.bar.foreground : Color.foreground
-        }
-
-        Column {
-          width: parent.width
-          spacing: Style.space(6)
-
-          PanelSectionHeader {
-            text: "DOWNLOAD DIRECTORY"
-            foreground: root.bar ? root.bar.foreground : Color.foreground
-            fontFamily: root.fontFamily
-          }
-
-          Rectangle {
-            width: parent.width
-            height: Style.space(36)
-            radius: Style.cornerRadius
-            color: Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
-
-            RowLayout {
-              anchors.fill: parent
-              anchors.leftMargin: Style.space(10)
-              anchors.rightMargin: Style.space(6)
-              spacing: Style.space(8)
-
-              Text {
-                Layout.fillWidth: true
-                textFormat: Text.PlainText
-                text: root.savePath
-                color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.3)
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                elide: Text.ElideMiddle
-              }
-
-              Button {
-                text: "Open Folder"
-                onClicked: root.openFolder()
-              }
-            }
           }
         }
 
@@ -1025,19 +746,125 @@ Panel {
           width: parent.width
           spacing: Style.space(8)
 
-          Text {
-            Layout.fillWidth: true
-            textFormat: Text.PlainText
-            text: "OmaSend AirBridge • Port " + root.port
-            color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
+          PanelActionButton {
+            iconText: "󰋽"
+            tooltipText: "About OmaSend"
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            fontFamily: root.fontFamily
+            onClicked: root.showAboutModal = !root.showAboutModal
+          }
+
+          PanelActionButton {
+            iconText: ""
+            tooltipText: "Open Received Files Folder"
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            fontFamily: root.fontFamily
+            onClicked: root.openFolder()
+          }
+
+          Item { Layout.fillWidth: true }
+
+          Button {
+            text: root.p2pVisibility === "EVERYONE" ? "EVERYONE" : "KNOWN"
+            bordered: true
+            fontSize: Style.font.caption
+            fontFamily: root.fontFamily
+            onClicked: root.toggleVisibility()
           }
 
           Button {
             text: "Refresh"
+            bordered: true
+            fontSize: Style.font.caption
+            fontFamily: root.fontFamily
             onClicked: root.refresh()
           }
+        }
+      }
+    }
+
+    // About & Imprint Modal Overlay
+    Rectangle {
+      id: aboutOverlay
+      anchors.fill: parent
+      visible: root.showAboutModal
+      color: Qt.rgba(0.05, 0.05, 0.07, 0.96)
+      z: 99
+
+      MouseArea {
+        anchors.fill: parent
+      }
+
+      Column {
+        id: aboutCol
+        anchors.centerIn: parent
+        width: parent.width - Style.space(40)
+        spacing: Style.space(12)
+
+        Row {
+          width: parent.width
+          Item {
+            width: parent.width - closeAboutBtn.implicitWidth
+            implicitHeight: aboutTitleText.implicitHeight
+            Text {
+              id: aboutTitleText
+              text: "OmaSend"
+              color: root.bar ? root.bar.foreground : Color.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.title
+              font.bold: true
+            }
+          }
+
+          Button {
+            id: closeAboutBtn
+            text: "✕"
+            bordered: true
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            onClicked: root.showAboutModal = false
+          }
+        }
+
+        Text {
+          width: parent.width
+          wrapMode: Text.WordWrap
+          text: "Version: 1.3.1\nDeveloper: Ozan Ozdil (@ozdil)\nLicense: MIT\nAirBridge P2P, E2EE Secure Local & Network File Transfer System"
+          color: root.bar ? root.bar.foreground : Color.foreground
+          opacity: 0.7
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          lineHeight: 1.3
+        }
+
+        PanelSeparator {
+          width: parent.width
+          foreground: root.bar ? root.bar.foreground : Color.foreground
+        }
+
+        Button {
+          width: parent.width
+          text: "GitHub / Contact"
+          iconText: "󰊤"
+          bordered: true
+          foreground: root.bar ? root.bar.foreground : Color.foreground
+          accent: Color.accent
+          fontFamily: root.fontFamily
+          fontSize: Style.font.caption
+          onClicked: Qt.openUrlExternally("https://github.com/ozdil")
+        }
+
+        Button {
+          width: parent.width
+          text: "Buy Me a Coffee"
+          iconText: "󰅖"
+          bordered: true
+          foreground: "#000000"
+          color: "#FFDD00"
+          fontFamily: root.fontFamily
+          fontSize: Style.font.caption
+          onClicked: Qt.openUrlExternally("https://buymeacoffee.com/ozdil")
         }
       }
     }
