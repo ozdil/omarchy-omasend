@@ -277,9 +277,9 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     text: ""
-    active: dropPortal.active || dropPortal.isBlasting
+    active: (dropPortal.active && dropPortal.proximity > 0.01) || dropPortal.isBlasting
     useActiveColor: false
-    foreground: (dropPortal.active || dropPortal.isBlasting) ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
+    foreground: ((dropPortal.active && dropPortal.proximity > 0.01) || dropPortal.isBlasting) ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
     tooltipText: "OmaSend AirBridge (" + root.p2pVisibility + ")"
     onPressed: function(b) {
       root.toggle()
@@ -288,24 +288,26 @@ Panel {
     DropArea {
       id: iconDropArea
       anchors.centerIn: parent
-      width: 440
+      width: 1200
       height: parent.height
       keys: ["text/uri-list", "text/plain", "application/x-kde-urilist"]
 
       onEntered: function(drag) {
-        dragRetentionTimer.stop()
-        dropPortal.active = true
-        if (drag.hasUrls || drag.hasText) drag.acceptProposedAction()
+        if (drag.hasUrls || drag.hasText) {
+          dragRetentionTimer.stop()
+          dropPortal.active = true
+          drag.acceptProposedAction()
+        }
       }
 
       onPositionChanged: function(drag) {
-        dragRetentionTimer.stop()
-        dropPortal.active = true
         if (drag.hasUrls || drag.hasText) {
+          dragRetentionTimer.stop()
+          dropPortal.active = true
           drag.acceptProposedAction()
           var dx = drag.x - (iconDropArea.width / 2)
           var dist = Math.abs(dx)
-          var raw = Math.max(0.0, Math.min(1.0, 1.0 - (dist / 220.0)))
+          var raw = Math.max(0.0, Math.min(1.0, 1.0 - (dist / 600.0)))
           dropPortal.proximity = Math.max(dropPortal.proximity, 0.5 * (1.0 - Math.cos(raw * Math.PI)))
         }
       }
@@ -324,16 +326,16 @@ Panel {
     }
   }
 
-  // Anchored Drop Portal & Apple NameDrop Fluid Aura
+  // Anchored Drop Portal & Apple NameDrop Fluid Aura (600px Dynamic Range)
   PopupWindow {
     id: dropPortal
     anchor.item: button
     anchor.edges: (root.bar && root.bar.edge === "bottom") ? Edges.Top : Edges.Bottom
     anchor.gravity: (root.bar && root.bar.edge === "bottom") ? Edges.Top : Edges.Bottom
     anchor.adjustment: PopupAdjustment.None
-    implicitWidth: 440
-    implicitHeight: 320
-    visible: active || isBlasting || dragRetentionTimer.running || (auraContainer && auraContainer.opacity > 0.01)
+    implicitWidth: 1200
+    implicitHeight: 600
+    visible: (active && proximity > 0.005) || isBlasting || dragRetentionTimer.running || (auraContainer && auraContainer.opacity > 0.01)
     color: "transparent"
 
     property bool active: false
@@ -344,13 +346,13 @@ Panel {
     readonly property real originX: dropPortal.width / 2
     readonly property real originY: (root.bar && root.bar.edge === "bottom") ? dropPortal.height : 0
 
-    // 400ms Drag Dropout Buffer Timer
+    // 400ms Drag Dropout Buffer Timer (Ensures strictly drag-only activation)
     Timer {
       id: dragRetentionTimer
       interval: 400
       repeat: false
       onTriggered: {
-        if (!portalDropArea.containsDrag && !iconDropArea.containsDrag && !dropPortal.isBlasting && !button.tooltipHovered) {
+        if (!portalDropArea.containsDrag && !iconDropArea.containsDrag && !dropPortal.isBlasting) {
           dropPortal.active = false
           dropPortal.proximity = 0.0
         }
@@ -452,20 +454,22 @@ Panel {
       keys: ["text/uri-list", "text/plain", "application/x-kde-urilist"]
 
       onEntered: function(drag) {
-        dragRetentionTimer.stop()
-        dropPortal.active = true
-        if (drag.hasUrls || drag.hasText) drag.acceptProposedAction()
+        if (drag.hasUrls || drag.hasText) {
+          dragRetentionTimer.stop()
+          dropPortal.active = true
+          drag.acceptProposedAction()
+        }
       }
 
       onPositionChanged: function(drag) {
-        dragRetentionTimer.stop()
-        dropPortal.active = true
         if (drag.hasUrls || drag.hasText) {
+          dragRetentionTimer.stop()
+          dropPortal.active = true
           drag.acceptProposedAction()
           var dx = drag.x - dropPortal.originX
           var dy = drag.y - dropPortal.originY
           var dist = Math.sqrt(dx * dx + dy * dy)
-          var maxDist = 260.0
+          var maxDist = 600.0
           var raw = Math.max(0.0, Math.min(1.0, 1.0 - (dist / maxDist)))
           dropPortal.proximity = 0.5 * (1.0 - Math.cos(raw * Math.PI))
         }
@@ -488,18 +492,18 @@ Panel {
       id: auraContainer
       x: Math.round(dropPortal.originX - width / 2)
       y: Math.round(dropPortal.originY - height / 2)
-      width: 440
-      height: 440
-      opacity: (dropPortal.proximity > 0.005 || dropPortal.isBlasting || button.tooltipHovered || dragRetentionTimer.running) ? 1.0 : 0.0
+      width: 1200
+      height: 1200
+      opacity: (dropPortal.proximity > 0.005 || dropPortal.isBlasting || dragRetentionTimer.running) ? 1.0 : 0.0
       Behavior on opacity {
         NumberAnimation { duration: 140; easing.type: Easing.OutQuad }
       }
 
-      // Layer 4: Ambient Aura Glow (60px -> 380px)
+      // Layer 4: Ambient Aura Glow (80px -> 520px)
       Rectangle {
         id: ambientGlow
         anchors.centerIn: parent
-        width: 60 + (dropPortal.proximity * 320) + (dropPortal.isBlasting ? dropPortal.blastProgress * 60 : 0)
+        width: 80 + (dropPortal.proximity * 440) + (dropPortal.isBlasting ? dropPortal.blastProgress * 120 : 0)
         height: width
         radius: width / 2
         color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, dropPortal.isBlasting ? 0.32 : (0.04 + dropPortal.proximity * 0.22))
@@ -511,23 +515,23 @@ Panel {
         Behavior on color { ColorAnimation { duration: 80 } }
       }
 
-      // Layer 3: Outer Sonar Aura Wave (140px -> 300px)
+      // Layer 3: Outer Sonar Aura Wave with EMBEDDED PEER NAME (200px -> 560px)
       Rectangle {
         id: portalWave3
         anchors.centerIn: parent
-        width: 140 + dropPortal.proximity * 160
+        width: 200 + dropPortal.proximity * 360
         height: width
         radius: width / 2
-        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.02)
+        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.025)
         border.color: Color.accent
-        border.width: 1.0
+        border.width: 1.2
 
         SequentialAnimation on opacity {
           running: auraContainer.opacity > 0.01
           loops: Animation.Infinite
           PauseAnimation { duration: 600 }
-          NumberAnimation { from: 0.0; to: 0.35 + dropPortal.proximity * 0.25; duration: 600; easing.type: Easing.OutQuad }
-          NumberAnimation { from: 0.35 + dropPortal.proximity * 0.25; to: 0.0; duration: 1000; easing.type: Easing.InQuad }
+          NumberAnimation { from: 0.0; to: 0.40 + dropPortal.proximity * 0.30; duration: 600; easing.type: Easing.OutQuad }
+          NumberAnimation { from: 0.40 + dropPortal.proximity * 0.30; to: 0.0; duration: 1000; easing.type: Easing.InQuad }
         }
 
         SequentialAnimation on scale {
@@ -536,13 +540,62 @@ Panel {
           PauseAnimation { duration: 600 }
           NumberAnimation { from: 0.5; to: 1.35 + dropPortal.proximity * 0.25; duration: 1600; easing.type: Easing.OutCubic }
         }
+
+        // Embedded Glowing Peer Name Capsule in the Outer Wave Ring
+        Rectangle {
+          id: outerWaveBadge
+          anchors.horizontalCenter: parent.horizontalCenter
+          anchors.bottom: parent.bottom
+          anchors.bottomMargin: 10
+          height: 22
+          width: Math.min(280, peerBadgeRow.implicitWidth + 20)
+          radius: 11
+          color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.16 + dropPortal.proximity * 0.28)
+          border.color: Color.accent
+          border.width: 1.0
+          opacity: dropPortal.proximity > 0.05 ? 1.0 : 0.0
+
+          Behavior on opacity { NumberAnimation { duration: 100 } }
+
+          Row {
+            id: peerBadgeRow
+            anchors.centerIn: parent
+            spacing: 6
+
+            Text {
+              textFormat: Text.PlainText
+              text: "󰄡"
+              color: Color.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              anchors.verticalCenter: parent.verticalCenter
+            }
+
+            Text {
+              id: embeddedPeerName
+              textFormat: Text.PlainText
+              text: (root.p2pPeers && root.p2pPeers.length > 0)
+                    ? ((root.selectedPeerIndex >= 0 && root.selectedPeerIndex < root.p2pPeers.length)
+                       ? root.p2pPeers[root.selectedPeerIndex].name.toUpperCase()
+                       : root.p2pPeers[0].name.toUpperCase())
+                    : "DISCOVERING PEERS"
+              color: Color.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              font.letterSpacing: 1.2
+              elide: Text.ElideRight
+              anchors.verticalCenter: parent.verticalCenter
+            }
+          }
+        }
       }
 
-      // Layer 2: Mid Sonar Aura Wave (90px -> 210px)
+      // Layer 2: Mid Sonar Aura Wave (120px -> 340px)
       Rectangle {
         id: portalWave2
         anchors.centerIn: parent
-        width: 90 + dropPortal.proximity * 120
+        width: 120 + dropPortal.proximity * 220
         height: width
         radius: width / 2
         color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.03)
@@ -565,11 +618,11 @@ Panel {
         }
       }
 
-      // Layer 1: Inner Sonar Aura Wave (50px -> 130px)
+      // Layer 1: Inner Sonar Aura Wave (60px -> 180px)
       Rectangle {
         id: portalWave1
         anchors.centerIn: parent
-        width: 50 + dropPortal.proximity * 80
+        width: 60 + dropPortal.proximity * 120
         height: width
         radius: width / 2
         color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.04)
@@ -590,13 +643,13 @@ Panel {
         }
       }
 
-      // Anamorphic Optical Flare Halo Streak (Apple NameDrop Lens Corona: 40px -> 360px)
+      // Anamorphic Optical Flare Halo Streak (Apple NameDrop Lens Corona: 40px -> 480px)
       Rectangle {
         id: flareBeam
         anchors.centerIn: parent
         z: 15
-        width: 40 + (dropPortal.isBlasting ? dropPortal.blastProgress * 320 : dropPortal.proximity * 320)
-        height: 2 + (dropPortal.isBlasting ? 3 : dropPortal.proximity * 2.0)
+        width: 40 + (dropPortal.isBlasting ? dropPortal.blastProgress * 480 : dropPortal.proximity * 440)
+        height: 2 + (dropPortal.isBlasting ? 4 : dropPortal.proximity * 2.0)
         radius: 1
         color: Qt.rgba(1.0, 1.0, 1.0, 0.95)
         opacity: dropPortal.isBlasting ? (1.0 - dropPortal.blastProgress) : (dropPortal.proximity * 0.9)
@@ -604,12 +657,12 @@ Panel {
         Behavior on opacity { NumberAnimation { duration: 80 } }
       }
 
-      // Elastic Blast Shockwave (onDropped impact)
+      // Elastic Blast Shockwave (onDropped impact: expands to 580px)
       Rectangle {
         id: blastShockwave
         anchors.centerIn: parent
         visible: dropPortal.isBlasting
-        width: 44 + (dropPortal.blastProgress * 420)
+        width: 44 + (dropPortal.blastProgress * 540)
         height: width
         radius: width / 2
         color: "transparent"
@@ -649,7 +702,7 @@ Panel {
           Text {
             anchors.horizontalCenter: parent.horizontalCenter
             textFormat: Text.PlainText
-            text: dropPortal.isBlasting ? "SENT!" : ((dropPortal.proximity > 0.1) ? "DROP" : ((root.p2pPeers && root.p2pPeers.length > 0) ? ((root.selectedPeerIndex >= 0 && root.selectedPeerIndex < root.p2pPeers.length) ? root.p2pPeers[root.selectedPeerIndex].name.toUpperCase() : root.p2pPeers[0].name.toUpperCase()) : "TARGET"))
+            text: dropPortal.isBlasting ? "SENT!" : ((dropPortal.proximity > 0.1) ? "DROP" : "AIRBRIDGE")
             color: dropPortal.isBlasting ? Qt.rgba(1.0, 1.0, 1.0, 0.95) : Color.accent
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
