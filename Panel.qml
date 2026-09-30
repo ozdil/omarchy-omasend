@@ -272,6 +272,13 @@ Panel {
     if (watchdogTimer.running) watchdogTimer.running = false
   }
 
+  // Transform Watcher for strictly reactive coordinate tracking across bar re-layouts
+  TransformWatcher {
+    id: buttonWatcher
+    a: button && button.QsWindow.window ? button.QsWindow.window.contentItem : null
+    b: button
+  }
+
   BarIconButton {
     id: button
     anchors.fill: parent
@@ -296,6 +303,7 @@ Panel {
         if (drag.hasUrls || drag.hasText) {
           dragRetentionTimer.stop()
           dropPortal.active = true
+          dropPortal.proximity = Math.max(dropPortal.proximity, 0.02)
           drag.acceptProposedAction()
         }
       }
@@ -359,7 +367,7 @@ Panel {
     }
     implicitWidth: 560
     implicitHeight: 560
-    visible: true
+    visible: (active && proximity > 0.001) || isBlasting
     color: "transparent"
 
     property bool active: false
@@ -367,8 +375,9 @@ Panel {
     property bool isBlasting: false
     property real blastProgress: 0.0
 
-    // Exact button center relative to dropPortal
+    // Exact button center relative to dropPortal (Fully Reactive with TransformWatcher)
     readonly property real originX: {
+      buttonWatcher.transform
       if (!button || !button.QsWindow.window) return dropPortal.width / 2
       var win = button.QsWindow.window
       var btnCenterInWin = win.contentItem.mapFromItem(button, button.width / 2, 0)
