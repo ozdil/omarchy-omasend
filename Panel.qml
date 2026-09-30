@@ -365,9 +365,9 @@ Panel {
         dropPortalAnchor.rect.y = Math.round(point.y)
       }
     }
-    implicitWidth: 560
-    implicitHeight: 560
-    visible: (active && proximity > 0.001) || isBlasting
+    implicitWidth: 600
+    implicitHeight: 600
+    visible: true
     color: "transparent"
 
     property bool active: false
@@ -509,7 +509,7 @@ Panel {
           var dx = drag.x - dropPortal.originX
           var dy = drag.y - dropPortal.originY
           var dist = Math.sqrt(dx * dx + dy * dy)
-          var maxDist = 560.0
+          var maxDist = 600.0
           var raw = Math.max(0.0, Math.min(1.0, 1.0 - (dist / maxDist)))
           dropPortal.proximity = 0.5 * (1.0 - Math.cos(raw * Math.PI))
         }
@@ -532,22 +532,60 @@ Panel {
       id: auraContainer
       x: Math.round(dropPortal.originX - width / 2)
       y: Math.round(dropPortal.originY - height / 2)
-      width: 560
-      height: 560
+      width: 600
+      height: 600
       opacity: ((dropPortal.active && dropPortal.proximity > 0.01) || dropPortal.isBlasting) ? 1.0 : 0.0
       Behavior on opacity {
         NumberAnimation { duration: 120; easing.type: Easing.OutQuad }
       }
 
-      // Layer 4: Ambient Aura Glow (80px -> 420px)
+      // Layer 5: Radial Gradient Alpha Decay (Center 80% -> Outer 0%)
+      Canvas {
+        id: radialGradientCanvas
+        anchors.centerIn: parent
+        width: 580
+        height: 580
+        antialiasing: true
+        renderTarget: Canvas.FramebufferObject
+
+        onPaint: {
+          var ctx = getContext("2d")
+          ctx.reset()
+          if (dropPortal.proximity <= 0.005 && !dropPortal.isBlasting) return
+
+          var cx = width / 2
+          var cy = height / 2
+          var r = (80 + dropPortal.proximity * 420) / 2
+
+          var grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, r)
+          grad.addColorStop(0.0, Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.80 * (0.3 + dropPortal.proximity * 0.7)))
+          grad.addColorStop(0.35, Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.45 * dropPortal.proximity))
+          grad.addColorStop(0.70, Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.15 * dropPortal.proximity))
+          grad.addColorStop(1.0, Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.00))
+
+          ctx.fillStyle = grad
+          ctx.beginPath()
+          ctx.arc(cx, cy, r, 0, 2 * Math.PI, false)
+          ctx.fill()
+        }
+
+        Connections {
+          target: dropPortal
+          function onProximityChanged() { radialGradientCanvas.requestPaint() }
+          function onIsBlastingChanged() { radialGradientCanvas.requestPaint() }
+          function onBlastProgressChanged() { radialGradientCanvas.requestPaint() }
+        }
+      }
+
+      // Layer 4: Ambient Aura Glow (80px -> 460px)
       Rectangle {
         id: ambientGlow
         anchors.centerIn: parent
-        width: 80 + (dropPortal.proximity * 340) + (dropPortal.isBlasting ? dropPortal.blastProgress * 100 : 0)
+        width: 80 + (dropPortal.proximity * 380) + (dropPortal.isBlasting ? dropPortal.blastProgress * 120 : 0)
         height: width
         radius: width / 2
-        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, dropPortal.isBlasting ? 0.32 : (0.04 + dropPortal.proximity * 0.22))
-        border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, dropPortal.isBlasting ? 0.70 : (0.08 + dropPortal.proximity * 0.45))
+        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, dropPortal.isBlasting ? 0.35 : (0.04 + dropPortal.proximity * 0.24))
+        border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, dropPortal.isBlasting ? 0.75 : (0.08 + dropPortal.proximity * 0.48))
         border.width: 1.0
 
         Behavior on width { NumberAnimation { duration: 60; easing.type: Easing.OutQuad } }
@@ -555,87 +593,100 @@ Panel {
         Behavior on color { ColorAnimation { duration: 80 } }
       }
 
-      // Layer 3: Outer Sonar Aura Wave with EMBEDDED PEER NAME (180px -> 460px)
-      Rectangle {
-        id: portalWave3
+      // Layer 3: Outer Sonar Ring with Curved Arc Typography
+      Item {
+        id: curvedSonarRing
         anchors.centerIn: parent
-        width: 180 + dropPortal.proximity * 280
+        width: 190 + dropPortal.proximity * 310
         height: width
-        radius: width / 2
-        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.025)
-        border.color: Color.accent
-        border.width: 1.2
 
-        SequentialAnimation on opacity {
-          running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
-          loops: Animation.Infinite
-          PauseAnimation { duration: 600 }
-          NumberAnimation { from: 0.0; to: 0.40 + dropPortal.proximity * 0.30; duration: 600; easing.type: Easing.OutQuad }
-          NumberAnimation { from: 0.40 + dropPortal.proximity * 0.30; to: 0.0; duration: 1000; easing.type: Easing.InQuad }
-        }
-
-        SequentialAnimation on scale {
-          running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
-          loops: Animation.Infinite
-          PauseAnimation { duration: 600 }
-          NumberAnimation { from: 0.5; to: 1.35 + dropPortal.proximity * 0.25; duration: 1600; easing.type: Easing.OutCubic }
-        }
-
-        // Embedded Glowing Peer Name Capsule in the Outer Wave Ring
         Rectangle {
-          id: outerWaveBadge
-          anchors.horizontalCenter: parent.horizontalCenter
-          anchors.bottom: parent.bottom
-          anchors.bottomMargin: 10
-          height: 22
-          width: Math.min(260, peerBadgeRow.implicitWidth + 20)
-          radius: 11
-          color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.18 + dropPortal.proximity * 0.28)
+          id: portalWave3
+          anchors.fill: parent
+          radius: width / 2
+          color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.02)
           border.color: Color.accent
-          border.width: 1.0
+          border.width: 1.2
+
+          SequentialAnimation on opacity {
+            running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
+            loops: Animation.Infinite
+            PauseAnimation { duration: 600 }
+            NumberAnimation { from: 0.0; to: 0.40 + dropPortal.proximity * 0.30; duration: 600; easing.type: Easing.OutQuad }
+            NumberAnimation { from: 0.40 + dropPortal.proximity * 0.30; to: 0.0; duration: 1000; easing.type: Easing.InQuad }
+          }
+
+          SequentialAnimation on scale {
+            running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
+            loops: Animation.Infinite
+            PauseAnimation { duration: 600 }
+            NumberAnimation { from: 0.5; to: 1.35 + dropPortal.proximity * 0.25; duration: 1600; easing.type: Easing.OutCubic }
+          }
+        }
+
+        // Curved Arc Typography along the bottom curve of portalWave3
+        Item {
+          id: curvedTextContainer
+          anchors.fill: parent
           opacity: dropPortal.proximity > 0.05 ? 1.0 : 0.0
+          Behavior on opacity { NumberAnimation { duration: 120 } }
 
-          Behavior on opacity { NumberAnimation { duration: 100 } }
+          readonly property string targetPeerText: {
+            var name = (root.p2pPeers && root.p2pPeers.length > 0)
+                       ? ((root.selectedPeerIndex >= 0 && root.selectedPeerIndex < root.p2pPeers.length)
+                          ? root.p2pPeers[root.selectedPeerIndex].name.toUpperCase()
+                          : root.p2pPeers[0].name.toUpperCase())
+                       : "DISCOVERING PEERS"
+            return "󰄡 " + name
+          }
 
-          Row {
-            id: peerBadgeRow
-            anchors.centerIn: parent
-            spacing: 6
+          readonly property real ringRadius: curvedSonarRing.width / 2 - 12
+          readonly property int charCount: targetPeerText.length
+          readonly property real arcSpanRad: Math.min(1.5, charCount * 0.09)
+          readonly property real stepRad: charCount > 1 ? (arcSpanRad / (charCount - 1)) : 0.0
+          readonly property real startRad: (Math.PI / 2) - (arcSpanRad / 2)
 
-            Text {
-              textFormat: Text.PlainText
-              text: "󰄡"
-              color: Color.accent
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              anchors.verticalCenter: parent.verticalCenter
-            }
+          Repeater {
+            model: curvedTextContainer.charCount
 
-            Text {
-              id: embeddedPeerName
-              textFormat: Text.PlainText
-              text: (root.p2pPeers && root.p2pPeers.length > 0)
-                    ? ((root.selectedPeerIndex >= 0 && root.selectedPeerIndex < root.p2pPeers.length)
-                       ? root.p2pPeers[root.selectedPeerIndex].name.toUpperCase()
-                       : root.p2pPeers[0].name.toUpperCase())
-                    : "DISCOVERING PEERS"
-              color: Color.accent
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              font.bold: true
-              font.letterSpacing: 1.2
-              elide: Text.ElideRight
-              anchors.verticalCenter: parent.verticalCenter
+            Item {
+              id: charItem
+              required property int index
+
+              readonly property real angle: curvedTextContainer.startRad + (index * curvedTextContainer.stepRad)
+              readonly property real posX: (curvedSonarRing.width / 2) + curvedTextContainer.ringRadius * Math.cos(angle)
+              readonly property real posY: (curvedSonarRing.height / 2) + curvedTextContainer.ringRadius * Math.sin(angle)
+              readonly property real tangentDeg: (angle * 180 / Math.PI) - 90
+
+              x: posX - width / 2
+              y: posY - height / 2
+              width: 14
+              height: 18
+              rotation: tangentDeg
+              transformOrigin: Item.Center
+
+              Text {
+                anchors.centerIn: parent
+                textFormat: Text.PlainText
+                text: curvedTextContainer.targetPeerText.charAt(charItem.index)
+                color: Color.accent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 0.5
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+              }
             }
           }
         }
       }
 
-      // Layer 2: Mid Sonar Aura Wave (110px -> 290px)
+      // Layer 2: Mid Sonar Aura Wave (110px -> 300px)
       Rectangle {
         id: portalWave2
         anchors.centerIn: parent
-        width: 110 + dropPortal.proximity * 180
+        width: 110 + dropPortal.proximity * 190
         height: width
         radius: width / 2
         color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.03)
@@ -658,11 +709,11 @@ Panel {
         }
       }
 
-      // Layer 1: Inner Sonar Aura Wave (55px -> 150px)
+      // Layer 1: Inner Sonar Aura Wave (55px -> 160px)
       Rectangle {
         id: portalWave1
         anchors.centerIn: parent
-        width: 55 + dropPortal.proximity * 95
+        width: 55 + dropPortal.proximity * 105
         height: width
         radius: width / 2
         color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.04)
@@ -683,12 +734,12 @@ Panel {
         }
       }
 
-      // Anamorphic Optical Flare Halo Streak (Apple NameDrop Lens Corona: 36px -> 360px)
+      // Anamorphic Optical Flare Halo Streak (Apple NameDrop Lens Corona: 36px -> 400px)
       Rectangle {
         id: flareBeam
         anchors.centerIn: parent
         z: 15
-        width: 36 + (dropPortal.isBlasting ? dropPortal.blastProgress * 380 : dropPortal.proximity * 320)
+        width: 36 + (dropPortal.isBlasting ? dropPortal.blastProgress * 400 : dropPortal.proximity * 340)
         height: 2 + (dropPortal.isBlasting ? 4 : dropPortal.proximity * 2.0)
         radius: 1
         color: Qt.rgba(1.0, 1.0, 1.0, 0.95)
@@ -702,7 +753,7 @@ Panel {
         id: blastShockwave
         anchors.centerIn: parent
         visible: dropPortal.isBlasting
-        width: 44 + (dropPortal.blastProgress * 440)
+        width: 44 + (dropPortal.blastProgress * 480)
         height: width
         radius: width / 2
         color: "transparent"
@@ -715,7 +766,7 @@ Panel {
         id: portalLandingHalo
         anchors.centerIn: parent
         z: 20
-        width: 46 + dropPortal.proximity * 16
+        width: 48 + dropPortal.proximity * 18
         height: width
         radius: width / 2
         color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, dropPortal.isBlasting ? 0.70 : (0.20 + dropPortal.proximity * 0.35))
