@@ -2,6 +2,7 @@ package io.omarchy.omasend.network
 
 import android.content.ContentValues
 import android.content.Context
+import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
@@ -14,19 +15,29 @@ object StorageUtils {
 
     const val MAX_FILE_SIZE = 10L * 1024 * 1024 * 1024L // 10 GiB ceiling
 
+    private val RESERVED_NAMES = setOf(
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+    )
+
     fun sanitizeFilename(raw: String): String {
-        // Strip null bytes, slashes, backslashes, and control characters
-        val cleanChars = raw.replace("\u0000", "")
+        val trimmed = raw.replace("\u0000", "")
             .replace('/', '_')
             .replace('\\', '_')
             .filter { it.isLetterOrDigit() || it in ".-_ " }
             .trim()
 
-        return if (cleanChars.isEmpty() || cleanChars.startsWith(".") || cleanChars.contains("..")) {
-            "file_${System.currentTimeMillis()}"
-        } else {
-            cleanChars.take(180)
+        var clean = trimmed
+        while (clean.contains("..")) {
+            clean = clean.replace("..", "_")
         }
+
+        val baseName = clean.substringBeforeLast('.', clean)
+        if (clean.isEmpty() || clean.startsWith(".") || clean.all { it == '.' || it == '_' || it == '-' || it == ' ' } || RESERVED_NAMES.contains(baseName.uppercase())) {
+            return "file_${System.currentTimeMillis()}"
+        }
+        return clean.take(180)
     }
 
     fun saveIncomingStream(
@@ -41,7 +52,6 @@ object StorageUtils {
             return Pair(false, "Invalid or excessive file size ($totalBytes bytes)")
         }
 
-        // Check available device storage before allocating (require at least file size + 64 MB buffer)
         val usableSpace = context.filesDir.usableSpace
         if (usableSpace > 0 && usableSpace < (totalBytes + 64L * 1024 * 1024)) {
             return Pair(false, "Insufficient storage space on device")
@@ -58,23 +68,28 @@ object StorageUtils {
                     put(MediaStore.MediaColumns.IS_PENDING, 1)
                 }
 
-                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues)
+                val uri: Uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues)
                     ?: return Pair(false, "Failed to create MediaStore entry")
 
-                resolver.openOutputStream(uri)?.use { out ->
-                    pipeStream(inputStream, out, totalBytes, deadlineMs, onProgress)
-                }
+                try {
+                    resolver.openOutputStream(uri)?.use { out ->
+                        pipeStream(inputStream, out, totalBytes, deadlineMs, onProgress)
+                    } ?: throw java.io.IOException("Cannot open output stream for MediaStore URI")
 
-                contentValues.clear()
-                contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
-                resolver.update(uri, contentValues, null, null)
-                Pair(true, cleanName)
+                    contentValues.clear()
+                    contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                    resolver.update(uri, contentValues, null, null)
+                    Pair(true, cleanName)
+                } catch (e: Exception) {
+                    // Rollback dangling pending entry
+                    try { resolver.delete(uri, null, null) } catch (_: Exception) {}
+                    throw e
+                }
             } else {
                 val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "OmaSend")
                 if (!dir.exists()) dir.mkdirs()
 
                 var target = File(dir, cleanName)
-                // Strict path traversal defense: target MUST reside within dir
                 if (!target.canonicalPath.startsWith(dir.canonicalPath)) {
                     return Pair(false, "Directory traversal detected")
                 }
@@ -112,7 +127,6 @@ object StorageUtils {
     ) {
         val buffer = ByteArray(65536)
         var totalRead = 0L
-        var read: Int
         var remaining = totalBytes
 
         while (remaining > 0) {
@@ -120,7 +134,7 @@ object StorageUtils {
                 throw java.io.InterruptedIOException("File upload exceeded monotonic deadline")
             }
             val toRead = if (remaining < buffer.size) remaining.toInt() else buffer.size
-            read = input.read(buffer, 0, toRead)
+            val read = input.read(buffer, 0, toRead)
             if (read == -1) break
             output.write(buffer, 0, read)
             totalRead += read

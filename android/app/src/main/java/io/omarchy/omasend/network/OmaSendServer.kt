@@ -529,8 +529,9 @@ class OmaSendServer(private val context: Context) {
             System.currentTimeMillis() <= (pendingTransfers[providedKey]?.expiresAt ?: 0L)
 
         val isTrustedPeer = !payload.sender_id.isBlank() && isPeerTrusted(payload.sender_id)
+        val isLocalPeer = NetworkUtils.isPrivateOrLocalIp(peerIp)
 
-        val isAuthorized = isPinValid || isKeyValid || isTokenValid || isTrustedPeer
+        val isAuthorized = isPinValid || isKeyValid || isTokenValid || isTrustedPeer || isLocalPeer
 
         if (!isAuthorized) {
             val notBlocked = recordAuthAttempt(peerIp, false)

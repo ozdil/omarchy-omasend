@@ -32,7 +32,6 @@ class DiscoveryManager(private val context: Context) {
     private var broadcastJob: Job? = null
     private var listenJob: Job? = null
     private var cleanupJob: Job? = null
-    private var multicastLock: WifiManager.MulticastLock? = null
 
     private val json = Json {
         encodeDefaults = true
@@ -149,13 +148,109 @@ class DiscoveryManager(private val context: Context) {
         }
     }
 
+    private var multicastLock: WifiManager.MulticastLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+
+    private fun acquireLocks() {
+        try {
+            val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            if (wifi != null) {
+                if (multicastLock == null) {
+                    multicastLock = wifi.createMulticastLock("OmaSendMulticastLock").apply {
+                        setReferenceCounted(false)
+                    }
+                }
+                if (multicastLock?.isHeld == false) {
+                    multicastLock?.acquire()
+                }
+
+                if (wifiLock == null) {
+                    val lockMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                    } else {
+                        @Suppress("DEPRECATION")
+                        WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                    }
+                    wifiLock = wifi.createWifiLock(lockMode, "OmaSendWifiLock").apply {
+                        setReferenceCounted(false)
+                    }
+                }
+                if (wifiLock?.isHeld == false) {
+                    wifiLock?.acquire()
+                }
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun releaseLocks() {
+        try {
+            if (multicastLock?.isHeld == true) {
+                multicastLock?.release()
+            }
+            if (wifiLock?.isHeld == true) {
+                wifiLock?.release()
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun broadcastOfflineBeacon() {
+        scope.launch {
+            val myIp = NetworkUtils.getLocalIpAddress()
+            if (myIp != "127.0.0.1") {
+                try {
+                    val socket = DatagramSocket().apply { broadcast = true }
+                    val beacon = P2pBeaconPacket(
+                        magic = "OMASEND_P2P",
+                        v = 1,
+                        id = NetworkUtils.getDeviceId(context),
+                        name = NetworkUtils.getDeviceName(context),
+                        ip = myIp,
+                        port = NetworkUtils.PORT,
+                        mode = "OFF",
+                        bt = isBluetoothEnabled(),
+                        fp = getBluetoothMacAddress()
+                    )
+                    val payload = json.encodeToString(P2pBeaconPacket.serializer(), beacon).toByteArray(Charsets.UTF_8)
+                    repeat(2) {
+                        sendBroadcastPacket(socket, payload, NetworkUtils.PORT)
+                        for (peer in peerMap.values) {
+                            if (!peer.ip.startsWith("bt:")) {
+                                try {
+                                    val peerAddr = InetAddress.getByName(peer.ip)
+                                    socket.send(DatagramPacket(payload, payload.size, peerAddr, peer.port))
+                                } catch (_: Exception) {}
+                            }
+                        }
+                        delay(50)
+                    }
+                    socket.close()
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
+    private fun getBluetoothMacAddress(): String {
+        return try {
+            val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+            val adapter = bluetoothManager?.adapter ?: return ""
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                    return ""
+                }
+            }
+            adapter.address ?: ""
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
     fun start() {
         if (_isScanning.value) return
         _isScanning.value = true
         if (_discoveryMode.value == DiscoveryMode.OFF) {
             _discoveryMode.value = DiscoveryMode.EVERYONE
         }
-        acquireMulticastLock()
+        acquireLocks()
         refreshBluetoothPeers()
         startListener()
         startBroadcaster()
@@ -166,13 +261,14 @@ class DiscoveryManager(private val context: Context) {
     fun stop() {
         _isScanning.value = false
         _discoveryMode.value = DiscoveryMode.OFF
+        broadcastOfflineBeacon()
         broadcastJob?.cancel()
         listenJob?.cancel()
         cleanupJob?.cancel()
         broadcastJob = null
         listenJob = null
         cleanupJob = null
-        releaseMulticastLock()
+        releaseLocks()
         // Retain manual peers if any, but clear discovered peers so UI reflects paused state
         val manualPeers = peerMap.values.filter { it.id.startsWith("manual_") }
         peerMap.clear()
@@ -194,26 +290,6 @@ class DiscoveryManager(private val context: Context) {
         )
         peerMap[peer.id] = peer
         updatePeersFlow()
-    }
-
-    private fun acquireMulticastLock() {
-        try {
-            val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-            multicastLock = wifi?.createMulticastLock("OmaSendDiscoveryLock")?.apply {
-                setReferenceCounted(true)
-                acquire()
-            }
-        } catch (_: Exception) {
-        }
-    }
-
-    private fun releaseMulticastLock() {
-        try {
-            if (multicastLock?.isHeld == true) {
-                multicastLock?.release()
-            }
-        } catch (_: Exception) {
-        }
     }
 
     private fun startListener() {
@@ -242,6 +318,15 @@ class DiscoveryManager(private val context: Context) {
                                 val myId = NetworkUtils.getDeviceId(context)
                                 val myIp = NetworkUtils.getLocalIpAddress()
                                 if (beacon.id != myId && beacon.ip != myIp) {
+                                    // Remote peer notified OFFLINE
+                                    if (beacon.mode.equals("OFF", ignoreCase = true) || beacon.mode.equals("STOP", ignoreCase = true)) {
+                                        val removed = peerMap.remove(beacon.id) != null
+                                        if (removed) {
+                                            updatePeersFlow()
+                                        }
+                                        continue
+                                    }
+
                                     val senderIp = packetAddr.hostAddress ?: beacon.ip
                                     // Deduplication: Look for existing Bluetooth peer with matching name or fingerprint
                                     val existingBtPeer = peerMap.values.find {
@@ -305,7 +390,7 @@ class DiscoveryManager(private val context: Context) {
                             port = NetworkUtils.PORT,
                             mode = _discoveryMode.value.wireMode,
                             bt = isBluetoothEnabled(),
-                            fp = ""
+                            fp = getBluetoothMacAddress()
                         )
                         val payload = json.encodeToString(P2pBeaconPacket.serializer(), beacon).toByteArray(Charsets.UTF_8)
 

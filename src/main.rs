@@ -991,6 +991,37 @@ fn get_visibility() -> (String, u64) {
     ("KNOWN".to_string(), 0)
 }
 
+fn broadcast_offline_beacon() {
+    let socket = match UdpSocket::bind("0.0.0.0:0") {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let _ = socket.set_broadcast(true);
+    let (device_id, fp) = get_or_create_device_id();
+    let hostname = get_system_hostname();
+    let ip = get_local_ip();
+
+    let packet = P2pBeaconPacket {
+        magic: "OMASEND_P2P".to_string(),
+        v: 1,
+        id: device_id,
+        name: hostname,
+        ip: ip.clone(),
+        port: PORT,
+        mode: "OFF".to_string(),
+        bt: is_bluetooth_available(),
+        fp,
+    };
+
+    if let Ok(bytes) = serde_json::to_vec(&packet) {
+        let _ = socket.send_to(&bytes, format!("255.255.255.255:{}", P2P_BEACON_PORT));
+        if let Some(dot) = ip.rfind('.') {
+            let subnet_bcast24 = format!("{}.255:{}", &ip[..dot], P2P_BEACON_PORT);
+            let _ = socket.send_to(&bytes, subnet_bcast24);
+        }
+    }
+}
+
 fn set_visibility(mode: &str) {
     let upper = mode.to_uppercase();
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -1008,6 +1039,7 @@ fn set_visibility(mode: &str) {
     if upper == "OFF" {
         let peers_file = get_state_dir().join("discovered_peers.json");
         let _ = fs::remove_file(peers_file);
+        broadcast_offline_beacon();
     }
 }
 
@@ -1232,6 +1264,18 @@ fn update_discovered_peer(packet: &P2pBeaconPacket) {
     if packet.id == my_id {
         return;
     }
+
+    // Instant offline handling when remote peer turns discovery OFF
+    if packet.mode == "OFF" || packet.mode == "STOP" {
+        let mut peers = get_discovered_peers();
+        let initial_len = peers.len();
+        peers.retain(|p| p.id != packet.id && p.ip != packet.ip);
+        if peers.len() != initial_len {
+            save_discovered_peers(&peers);
+        }
+        return;
+    }
+
     let (vis, _) = get_visibility();
     if vis == "OFF" {
         return;

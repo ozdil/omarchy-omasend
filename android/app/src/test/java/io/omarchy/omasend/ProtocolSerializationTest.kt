@@ -1,0 +1,81 @@
+package io.omarchy.omasend
+
+import io.omarchy.omasend.model.ClipboardPayload
+import io.omarchy.omasend.model.P2pBeaconPacket
+import io.omarchy.omasend.model.TransferDecision
+import io.omarchy.omasend.model.TransferFileInfo
+import io.omarchy.omasend.model.TransferRequest
+import io.omarchy.omasend.model.TransferResponse
+import kotlinx.serialization.json.Json
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class ProtocolSerializationTest {
+
+    private val json = Json {
+        encodeDefaults = true
+        ignoreUnknownKeys = true
+    }
+
+    @Test
+    fun testP2pBeaconPacketSerialization() {
+        val beacon = P2pBeaconPacket(
+            magic = "OMASEND_P2P",
+            v = 1,
+            id = "android-node-01",
+            name = "Pixel 8 Pro",
+            ip = "192.168.1.50",
+            port = 53317,
+            mode = "ALL",
+            bt = true,
+            fp = "AA:BB:CC:DD:EE:FF"
+        )
+        val raw = json.encodeToString(P2pBeaconPacket.serializer(), beacon)
+        val decoded = json.decodeFromString<P2pBeaconPacket>(raw)
+
+        assertEquals("OMASEND_P2P", decoded.magic)
+        assertEquals("android-node-01", decoded.id)
+        assertTrue(decoded.bt)
+        assertEquals("AA:BB:CC:DD:EE:FF", decoded.fp)
+    }
+
+    @Test
+    fun testTransferRequestSerialization() {
+        val files = listOf(
+            TransferFileInfo(name = "test.iso", size_bytes = 4294967296L),
+            TransferFileInfo(name = "checksum.sha256", size_bytes = 64L)
+        )
+        val req = TransferRequest(
+            sender_id = "sender-123",
+            sender_name = "ArchLinux",
+            sender_ip = "192.168.1.10",
+            files = files,
+            total_size_bytes = 4294967360L
+        )
+
+        val raw = json.encodeToString(TransferRequest.serializer(), req)
+        val decoded = json.decodeFromString<TransferRequest>(raw)
+
+        assertEquals(2, decoded.files.size)
+        assertEquals(4294967360L, decoded.total_size_bytes)
+        assertEquals("test.iso", decoded.files[0].name)
+    }
+
+    @Test
+    fun testClipboardPayloadSerialization() {
+        val payload = ClipboardPayload(
+            sender_id = "device-a",
+            sender_name = "OmaSend Client",
+            text = "Secret Token 12345",
+            pin = "482910",
+            token = "session_token_xyz"
+        )
+        val raw = json.encodeToString(ClipboardPayload.serializer(), payload)
+        val decoded = json.decodeFromString<ClipboardPayload>(raw)
+
+        assertEquals("Secret Token 12345", decoded.text)
+        assertEquals("482910", decoded.pin)
+        assertEquals("session_token_xyz", decoded.token)
+    }
+}

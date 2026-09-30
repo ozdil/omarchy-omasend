@@ -75,11 +75,11 @@ object NetworkUtils {
     fun formatBytes(bytes: Long): String {
         if (bytes < 1024) return "$bytes B"
         val kb = bytes / 1024.0
-        if (kb < 1024) return String.format("%.1f KB", kb)
+        if (kb < 1024) return String.format(java.util.Locale.US, "%.1f KB", kb)
         val mb = kb / 1024.0
-        if (mb < 1024) return String.format("%.1f MB", mb)
+        if (mb < 1024) return String.format(java.util.Locale.US, "%.1f MB", mb)
         val gb = mb / 1024.0
-        return String.format("%.2f GB", gb)
+        return String.format(java.util.Locale.US, "%.2f GB", gb)
     }
 
     /**
@@ -98,7 +98,9 @@ object NetworkUtils {
      * Validates an IPv4 or loopback string against RFC 1918, RFC 3927 link-local, or loopback.
      */
     fun isPrivateOrLocalIp(ip: String): Boolean {
-        val cleanIp = ip.substringBefore(':').trim()
+        val raw = ip.trim()
+        if (raw == "::1" || raw == "localhost" || raw == "127.0.0.1") return true
+        val cleanIp = raw.substringBefore(':').trim()
         if (cleanIp == "127.0.0.1" || cleanIp == "localhost" || cleanIp == "::1") return true
         val parts = cleanIp.split('.')
         if (parts.size != 4) return false
