@@ -277,311 +277,387 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     text: ""
-    active: iconDropArea.containsDrag
+    active: dropPortal.active || dropPortal.isBlasting
     useActiveColor: false
-    foreground: iconDropArea.containsDrag ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
+    foreground: (dropPortal.active || dropPortal.isBlasting) ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
     tooltipText: "OmaSend AirBridge (" + root.p2pVisibility + ")"
     onPressed: function(b) {
       root.toggle()
     }
 
-    // Dosya veya fare ikonun üzerine sürüklendiğinde algılayan Drop Alanı
     DropArea {
       id: iconDropArea
-      anchors.fill: parent
-      z: 50
+      anchors.centerIn: parent
+      width: 440
+      height: parent.height
+      keys: ["text/uri-list", "text/plain", "application/x-kde-urilist"]
 
       onEntered: function(drag) {
-        if (drag.hasUrls) {
+        dragRetentionTimer.stop()
+        dropPortal.active = true
+        if (drag.hasUrls || drag.hasText) drag.acceptProposedAction()
+      }
+
+      onPositionChanged: function(drag) {
+        dragRetentionTimer.stop()
+        dropPortal.active = true
+        if (drag.hasUrls || drag.hasText) {
           drag.acceptProposedAction()
+          var dx = drag.x - (iconDropArea.width / 2)
+          var dist = Math.abs(dx)
+          var raw = Math.max(0.0, Math.min(1.0, 1.0 - (dist / 220.0)))
+          dropPortal.proximity = Math.max(dropPortal.proximity, 0.5 * (1.0 - Math.cos(raw * Math.PI)))
         }
       }
 
+      onExited: {
+        dragRetentionTimer.restart()
+      }
+
       onDropped: function(drop) {
-        if (drop.hasUrls && drop.urls.length > 0) {
+        dragRetentionTimer.stop()
+        if (drop.hasUrls || drop.hasText) {
           drop.acceptProposedAction()
-          var firstFile = drop.urls[0].toString().replace(/^file:\/\//, "")
+          dropPortal.triggerDropBlast(drop)
+        }
+      }
+    }
+  }
 
-          // Akustik fırlatma sesini başlat
-          if (playSendSoundProc.running) playSendSoundProc.running = false
-          playSendSoundProc.running = true
+  // Anchored Drop Portal & Apple NameDrop Fluid Aura
+  PopupWindow {
+    id: dropPortal
+    anchor.item: button
+    anchor.edges: (root.bar && root.bar.edge === "bottom") ? Edges.Top : Edges.Bottom
+    anchor.gravity: (root.bar && root.bar.edge === "bottom") ? Edges.Top : Edges.Bottom
+    anchor.adjustment: PopupAdjustment.None
+    implicitWidth: 440
+    implicitHeight: 320
+    visible: active || isBlasting || dragRetentionTimer.running || (auraContainer && auraContainer.opacity > 0.01)
+    color: "transparent"
 
-          var targetIp = ""
-          if (root.p2pPeers && root.p2pPeers.length > 0) {
-            targetIp = root.p2pPeers[0].ip
-          }
-          if (targetIp !== "") {
-            root.executeAction(["--send", targetIp, firstFile])
-          }
+    property bool active: false
+    property real proximity: 0.0
+    property bool isBlasting: false
+    property real blastProgress: 0.0
+
+    readonly property real originX: dropPortal.width / 2
+    readonly property real originY: (root.bar && root.bar.edge === "bottom") ? dropPortal.height : 0
+
+    // 400ms Drag Dropout Buffer Timer
+    Timer {
+      id: dragRetentionTimer
+      interval: 400
+      repeat: false
+      onTriggered: {
+        if (!portalDropArea.containsDrag && !iconDropArea.containsDrag && !dropPortal.isBlasting && !button.tooltipHovered) {
+          dropPortal.active = false
+          dropPortal.proximity = 0.0
         }
       }
     }
 
-    readonly property bool isInteractiveOrDrag: button.tooltipHovered || iconDropArea.containsDrag || (dropPortal && (dropPortal.containsDrag || dropPortal.portalHovered))
-
-    // Disa tasan 440px flu sonar dalga ve simge-merkezli hedef katmani (PopupWindow)
-    PopupWindow {
-      id: dropPortal
-      property Item anchorItem: button
-      property bool containsDrag: portalDropArea.containsDrag
-      property bool portalHovered: portalHoverHandler.hovered
-      property real proximity: 0.0
-
-      readonly property real originX: {
-        if (!root.bar) return dropPortal.implicitWidth / 2
-        if (root.bar.position === "left") return (button ? button.width / 2 : 15)
-        if (root.bar.position === "right") return dropPortal.implicitWidth - (button ? button.width / 2 : 15)
-        return dropPortal.implicitWidth / 2
+    function triggerDropBlast(drop) {
+      var rawUrl = ""
+      if (drop.hasUrls && drop.urls.length > 0) {
+        rawUrl = drop.urls[0].toString()
+      } else if (drop.hasText && drop.text) {
+        rawUrl = drop.text
       }
-      readonly property real originY: {
-        if (!root.bar) return (button ? button.height / 2 : 15)
-        if (root.bar.position === "bottom") return dropPortal.implicitHeight - (button ? button.height / 2 : 15)
-        if (root.bar.position === "left" || root.bar.position === "right") return dropPortal.implicitHeight / 2
-        return (button ? button.height / 2 : 15)
-      }
+      var firstFile = rawUrl.replace(/^file:\/\//, "")
 
-      // Buton uzerine gelindiginde veya dosya/fare yaklastiginda acik kalir
-      visible: button.tooltipHovered || iconDropArea.containsDrag || dropPortal.containsDrag || dropPortal.portalHovered
-      color: "transparent"
-      implicitWidth: 440
-      implicitHeight: 320
+      // Play send whoosh sound via PipeWire
+      if (playSendSoundProc.running) playSendSoundProc.running = false
+      playSendSoundProc.running = true
 
-      anchor {
-        id: portalAnchor
-        window: button && button.QsWindow ? button.QsWindow.window : null
-        adjustment: PopupAdjustment.None
-        edges: Edges.Top | Edges.Left
-        gravity: Edges.Bottom | Edges.Right
-        rect.width: 1
-        rect.height: 1
+      // Target peer identification
+      var targetPeer = (root.p2pPeers && root.selectedPeerIndex >= 0 && root.selectedPeerIndex < root.p2pPeers.length)
+                       ? root.p2pPeers[root.selectedPeerIndex]
+                       : (root.p2pPeers && root.p2pPeers.length > 0 ? root.p2pPeers[0] : null)
+      var targetIp = targetPeer ? targetPeer.ip : ""
 
-        onAnchoring: {
-          if (!button || !root.bar) return
-          var target = button
-          var pWidth = dropPortal.implicitWidth
-          var pHeight = dropPortal.implicitHeight
-          var win = target.QsWindow ? target.QsWindow.window : null
-          if (!win) return
-
-          if (root.bar.position === "left") {
-            var ptL = win.contentItem.mapFromItem(target, 0, target.height / 2 - pHeight / 2)
-            portalAnchor.rect.x = 0
-            portalAnchor.rect.y = Math.round(ptL.y)
-          } else if (root.bar.position === "right") {
-            var ptR = win.contentItem.mapFromItem(target, 0, target.height / 2 - pHeight / 2)
-            portalAnchor.rect.x = Math.round(win.width - pWidth)
-            portalAnchor.rect.y = Math.round(ptR.y)
-          } else {
-            var localX = target.width / 2 - pWidth / 2
-            var ptH = win.contentItem.mapFromItem(target, localX, 0)
-            portalAnchor.rect.x = Math.round(ptH.x)
-            portalAnchor.rect.y = (root.bar.position === "bottom") ? Math.round(win.height - pHeight) : 0
-          }
-        }
+      if (targetIp !== "" && firstFile !== "") {
+        root.executeAction(["--send", targetIp, firstFile])
       }
 
-      Item {
-        anchors.fill: parent
+      // Trigger NameDrop bump shockwave animation
+      dropPortal.isBlasting = true
+      blastAnim.restart()
+    }
 
-        HoverHandler {
-          id: portalHoverHandler
-          onPointChanged: {
-            if (portalHoverHandler.hovered) {
-              var dx = point.position.x - dropPortal.originX
-              var dy = point.position.y - dropPortal.originY
-              var dist = Math.sqrt(dx * dx + dy * dy)
-              var maxDist = 220.0
-              dropPortal.proximity = Math.max(0.0, Math.min(1.0, 1.0 - (dist / maxDist)))
-            } else {
-              dropPortal.proximity = 0.0
-            }
-          }
-          onHoveredChanged: {
-            if (!hovered) {
-              dropPortal.proximity = 0.0
-            }
-          }
+    // Apple NameDrop Shockwave Elastic Animation
+    SequentialAnimation {
+      id: blastAnim
+      running: false
+      ParallelAnimation {
+        NumberAnimation {
+          target: dropPortal
+          property: "blastProgress"
+          from: 0.0
+          to: 1.0
+          duration: 380
+          easing.type: Easing.OutCubic
+        }
+        NumberAnimation {
+          target: portalLandingHalo
+          property: "scale"
+          from: 1.0
+          to: 1.55
+          duration: 200
+          easing.type: Easing.OutBack
+        }
+        NumberAnimation {
+          target: flareBeam
+          property: "opacity"
+          from: 0.0
+          to: 1.0
+          duration: 120
+          easing.type: Easing.OutQuad
+        }
+      }
+      ParallelAnimation {
+        NumberAnimation {
+          target: portalLandingHalo
+          property: "scale"
+          to: 1.0
+          duration: 220
+          easing.type: Easing.OutElastic
+        }
+        NumberAnimation {
+          target: flareBeam
+          property: "opacity"
+          to: 0.0
+          duration: 220
+          easing.type: Easing.InQuad
+        }
+        NumberAnimation {
+          target: dropPortal
+          property: "proximity"
+          to: 0.0
+          duration: 220
+        }
+      }
+      ScriptAction {
+        script: {
+          dropPortal.isBlasting = false
+          dropPortal.blastProgress = 0.0
+          dropPortal.active = false
+        }
+      }
+    }
+
+    DropArea {
+      id: portalDropArea
+      anchors.fill: parent
+      keys: ["text/uri-list", "text/plain", "application/x-kde-urilist"]
+
+      onEntered: function(drag) {
+        dragRetentionTimer.stop()
+        dropPortal.active = true
+        if (drag.hasUrls || drag.hasText) drag.acceptProposedAction()
+      }
+
+      onPositionChanged: function(drag) {
+        dragRetentionTimer.stop()
+        dropPortal.active = true
+        if (drag.hasUrls || drag.hasText) {
+          drag.acceptProposedAction()
+          var dx = drag.x - dropPortal.originX
+          var dy = drag.y - dropPortal.originY
+          var dist = Math.sqrt(dx * dx + dy * dy)
+          var maxDist = 260.0
+          var raw = Math.max(0.0, Math.min(1.0, 1.0 - (dist / maxDist)))
+          dropPortal.proximity = 0.5 * (1.0 - Math.cos(raw * Math.PI))
+        }
+      }
+
+      onExited: {
+        dragRetentionTimer.restart()
+      }
+
+      onDropped: function(drop) {
+        dragRetentionTimer.stop()
+        if (drop.hasUrls || drop.hasText) {
+          drop.acceptProposedAction()
+          dropPortal.triggerDropBlast(drop)
+        }
+      }
+    }
+
+    Item {
+      id: auraContainer
+      x: Math.round(dropPortal.originX - width / 2)
+      y: Math.round(dropPortal.originY - height / 2)
+      width: 440
+      height: 440
+      opacity: (dropPortal.proximity > 0.005 || dropPortal.isBlasting || button.tooltipHovered || dragRetentionTimer.running) ? 1.0 : 0.0
+      Behavior on opacity {
+        NumberAnimation { duration: 140; easing.type: Easing.OutQuad }
+      }
+
+      // Layer 4: Ambient Aura Glow (60px -> 380px)
+      Rectangle {
+        id: ambientGlow
+        anchors.centerIn: parent
+        width: 60 + (dropPortal.proximity * 320) + (dropPortal.isBlasting ? dropPortal.blastProgress * 60 : 0)
+        height: width
+        radius: width / 2
+        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, dropPortal.isBlasting ? 0.32 : (0.04 + dropPortal.proximity * 0.22))
+        border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, dropPortal.isBlasting ? 0.70 : (0.08 + dropPortal.proximity * 0.45))
+        border.width: 1.0
+
+        Behavior on width { NumberAnimation { duration: 60; easing.type: Easing.OutQuad } }
+        Behavior on height { NumberAnimation { duration: 60; easing.type: Easing.OutQuad } }
+        Behavior on color { ColorAnimation { duration: 80 } }
+      }
+
+      // Layer 3: Outer Sonar Aura Wave (140px -> 300px)
+      Rectangle {
+        id: portalWave3
+        anchors.centerIn: parent
+        width: 140 + dropPortal.proximity * 160
+        height: width
+        radius: width / 2
+        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.02)
+        border.color: Color.accent
+        border.width: 1.0
+
+        SequentialAnimation on opacity {
+          running: auraContainer.opacity > 0.01
+          loops: Animation.Infinite
+          PauseAnimation { duration: 600 }
+          NumberAnimation { from: 0.0; to: 0.35 + dropPortal.proximity * 0.25; duration: 600; easing.type: Easing.OutQuad }
+          NumberAnimation { from: 0.35 + dropPortal.proximity * 0.25; to: 0.0; duration: 1000; easing.type: Easing.InQuad }
         }
 
-        MouseArea {
-          x: dropPortal.originX - 24
-          y: dropPortal.originY - 24
-          width: 48
-          height: 48
-          z: 30
-          cursorShape: Qt.PointingHandCursor
-          onClicked: root.toggle()
+        SequentialAnimation on scale {
+          running: auraContainer.opacity > 0.01
+          loops: Animation.Infinite
+          PauseAnimation { duration: 600 }
+          NumberAnimation { from: 0.5; to: 1.35 + dropPortal.proximity * 0.25; duration: 1600; easing.type: Easing.OutCubic }
+        }
+      }
+
+      // Layer 2: Mid Sonar Aura Wave (90px -> 210px)
+      Rectangle {
+        id: portalWave2
+        anchors.centerIn: parent
+        width: 90 + dropPortal.proximity * 120
+        height: width
+        radius: width / 2
+        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.03)
+        border.color: Color.accent
+        border.width: 1.2
+
+        SequentialAnimation on opacity {
+          running: auraContainer.opacity > 0.01
+          loops: Animation.Infinite
+          PauseAnimation { duration: 250 }
+          NumberAnimation { from: 0.0; to: 0.50 + dropPortal.proximity * 0.3; duration: 500; easing.type: Easing.OutQuad }
+          NumberAnimation { from: 0.50 + dropPortal.proximity * 0.3; to: 0.0; duration: 950; easing.type: Easing.InQuad }
         }
 
-        DropArea {
-          id: portalDropArea
-          anchors.fill: parent
-          z: 10
+        SequentialAnimation on scale {
+          running: auraContainer.opacity > 0.01
+          loops: Animation.Infinite
+          PauseAnimation { duration: 250 }
+          NumberAnimation { from: 0.45; to: 1.3 + dropPortal.proximity * 0.2; duration: 1450; easing.type: Easing.OutCubic }
+        }
+      }
 
-          onEntered: function(drag) {
-            if (drag.hasUrls) {
-              drag.acceptProposedAction()
-            }
-          }
+      // Layer 1: Inner Sonar Aura Wave (50px -> 130px)
+      Rectangle {
+        id: portalWave1
+        anchors.centerIn: parent
+        width: 50 + dropPortal.proximity * 80
+        height: width
+        radius: width / 2
+        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.04)
+        border.color: Color.accent
+        border.width: 1.5
 
-          onDropped: function(drop) {
-            if (drop.hasUrls && drop.urls.length > 0) {
-              drop.acceptProposedAction()
-              var firstFile = drop.urls[0].toString().replace(/^file:\/\//, "")
-              if (playSendSoundProc.running) playSendSoundProc.running = false
-              playSendSoundProc.running = true
-
-              var targetIp = ""
-              if (root.p2pPeers && root.p2pPeers.length > 0) {
-                targetIp = root.p2pPeers[0].ip
-              }
-              if (targetIp !== "") {
-                root.executeAction(["--send", targetIp, firstFile])
-              }
-            }
-          }
+        SequentialAnimation on opacity {
+          running: auraContainer.opacity > 0.01
+          loops: Animation.Infinite
+          NumberAnimation { from: 0.0; to: 0.70 + dropPortal.proximity * 0.25; duration: 400; easing.type: Easing.OutQuad }
+          NumberAnimation { from: 0.70 + dropPortal.proximity * 0.25; to: 0.0; duration: 800; easing.type: Easing.InQuad }
         }
 
-        // Katman 4: En dis flu / yumusak ambient isima alani (240px -> 420px capinda)
-        Rectangle {
-          id: ambientGlow
-          x: Math.round(dropPortal.originX - width / 2)
-          y: Math.round(dropPortal.originY - height / 2)
-          width: 240 + dropPortal.proximity * 180
-          height: width
-          radius: width / 2
-          color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, (portalDropArea.containsDrag || iconDropArea.containsDrag) ? 0.16 : (0.04 + dropPortal.proximity * 0.09))
-          border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, (portalDropArea.containsDrag || iconDropArea.containsDrag) ? 0.45 : (0.12 + dropPortal.proximity * 0.25))
-          border.width: 1
-
-          Behavior on width { NumberAnimation { duration: 160; easing.type: Easing.OutQuad } }
-          Behavior on height { NumberAnimation { duration: 160; easing.type: Easing.OutQuad } }
-          Behavior on color { ColorAnimation { duration: 160 } }
+        SequentialAnimation on scale {
+          running: auraContainer.opacity > 0.01
+          loops: Animation.Infinite
+          NumberAnimation { from: 0.4; to: 1.35 + dropPortal.proximity * 0.25; duration: 1200; easing.type: Easing.OutCubic }
         }
+      }
 
-        // Katman 3: Dis Sonar Dalga Halkasi (180px -> 280px)
-        Rectangle {
-          id: portalWave3
-          x: Math.round(dropPortal.originX - width / 2)
-          y: Math.round(dropPortal.originY - height / 2)
-          width: 180 + dropPortal.proximity * 100
-          height: width
-          radius: width / 2
-          color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.02)
-          border.color: Color.accent
-          border.width: 1.0
+      // Anamorphic Optical Flare Halo Streak (Apple NameDrop Lens Corona: 40px -> 360px)
+      Rectangle {
+        id: flareBeam
+        anchors.centerIn: parent
+        z: 15
+        width: 40 + (dropPortal.isBlasting ? dropPortal.blastProgress * 320 : dropPortal.proximity * 320)
+        height: 2 + (dropPortal.isBlasting ? 3 : dropPortal.proximity * 2.0)
+        radius: 1
+        color: Qt.rgba(1.0, 1.0, 1.0, 0.95)
+        opacity: dropPortal.isBlasting ? (1.0 - dropPortal.blastProgress) : (dropPortal.proximity * 0.9)
+        Behavior on width { NumberAnimation { duration: 60; easing.type: Easing.OutQuad } }
+        Behavior on opacity { NumberAnimation { duration: 80 } }
+      }
 
-          SequentialAnimation on opacity {
-            running: dropPortal.visible
-            loops: Animation.Infinite
-            PauseAnimation { duration: 600 }
-            NumberAnimation { from: 0.0; to: 0.35 + dropPortal.proximity * 0.25; duration: 600; easing.type: Easing.OutQuad }
-            NumberAnimation { from: 0.35 + dropPortal.proximity * 0.25; to: 0.0; duration: 1000; easing.type: Easing.InQuad }
+      // Elastic Blast Shockwave (onDropped impact)
+      Rectangle {
+        id: blastShockwave
+        anchors.centerIn: parent
+        visible: dropPortal.isBlasting
+        width: 44 + (dropPortal.blastProgress * 420)
+        height: width
+        radius: width / 2
+        color: "transparent"
+        border.color: Qt.rgba(1.0, 1.0, 1.0, (1.0 - dropPortal.blastProgress) * 0.95)
+        border.width: Math.max(1.0, 5.0 * (1.0 - dropPortal.blastProgress))
+      }
+
+      // Layer 0: Central Target Reticle Halo
+      Rectangle {
+        id: portalLandingHalo
+        anchors.centerIn: parent
+        z: 20
+        width: 46 + dropPortal.proximity * 16
+        height: width
+        radius: width / 2
+        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, dropPortal.isBlasting ? 0.70 : (0.20 + dropPortal.proximity * 0.35))
+        border.color: dropPortal.isBlasting ? Qt.rgba(1.0, 1.0, 1.0, 0.95) : Color.accent
+        border.width: (dropPortal.active || dropPortal.isBlasting) ? (1.5 + dropPortal.proximity * 1.5) : 1.5
+        scale: (1.0 + dropPortal.proximity * 0.35)
+
+        Behavior on width { NumberAnimation { duration: 60; easing.type: Easing.OutQuad } }
+        Behavior on height { NumberAnimation { duration: 60; easing.type: Easing.OutQuad } }
+        Behavior on scale { NumberAnimation { duration: 60; easing.type: Easing.OutBack } }
+        Behavior on color { ColorAnimation { duration: 80 } }
+
+        Column {
+          anchors.centerIn: parent
+          spacing: 1
+          Text {
+            anchors.horizontalCenter: parent.horizontalCenter
+            textFormat: Text.PlainText
+            text: dropPortal.isBlasting ? "" : (dropPortal.proximity > 0.1 ? "󱘖" : "")
+            color: dropPortal.isBlasting ? Qt.rgba(1.0, 1.0, 1.0, 0.95) : Color.accent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.title + Math.round(dropPortal.proximity * 2)
           }
-
-          SequentialAnimation on scale {
-            running: dropPortal.visible
-            loops: Animation.Infinite
-            PauseAnimation { duration: 600 }
-            NumberAnimation { from: 0.5; to: 1.35 + dropPortal.proximity * 0.25; duration: 1600; easing.type: Easing.OutCubic }
-          }
-        }
-
-        // Katman 2: Orta Sonar Dalga Halkasi (120px -> 190px)
-        Rectangle {
-          id: portalWave2
-          x: Math.round(dropPortal.originX - width / 2)
-          y: Math.round(dropPortal.originY - height / 2)
-          width: 120 + dropPortal.proximity * 70
-          height: width
-          radius: width / 2
-          color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.03)
-          border.color: Color.accent
-          border.width: 1.2
-
-          SequentialAnimation on opacity {
-            running: dropPortal.visible
-            loops: Animation.Infinite
-            PauseAnimation { duration: 250 }
-            NumberAnimation { from: 0.0; to: 0.50 + dropPortal.proximity * 0.3; duration: 500; easing.type: Easing.OutQuad }
-            NumberAnimation { from: 0.50 + dropPortal.proximity * 0.3; to: 0.0; duration: 950; easing.type: Easing.InQuad }
-          }
-
-          SequentialAnimation on scale {
-            running: dropPortal.visible
-            loops: Animation.Infinite
-            PauseAnimation { duration: 250 }
-            NumberAnimation { from: 0.45; to: 1.3 + dropPortal.proximity * 0.2; duration: 1450; easing.type: Easing.OutCubic }
-          }
-        }
-
-        // Katman 1: Ic Sonar Dalga Halkasi (70px -> 120px)
-        Rectangle {
-          id: portalWave1
-          x: Math.round(dropPortal.originX - width / 2)
-          y: Math.round(dropPortal.originY - height / 2)
-          width: 70 + dropPortal.proximity * 50
-          height: width
-          radius: width / 2
-          color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.04)
-          border.color: Color.accent
-          border.width: 1.5
-
-          SequentialAnimation on opacity {
-            running: dropPortal.visible
-            loops: Animation.Infinite
-            NumberAnimation { from: 0.0; to: 0.70 + dropPortal.proximity * 0.25; duration: 400; easing.type: Easing.OutQuad }
-            NumberAnimation { from: 0.70 + dropPortal.proximity * 0.25; to: 0.0; duration: 800; easing.type: Easing.InQuad }
-          }
-
-          SequentialAnimation on scale {
-            running: dropPortal.visible
-            loops: Animation.Infinite
-            NumberAnimation { from: 0.4; to: 1.35 + dropPortal.proximity * 0.25; duration: 1200; easing.type: Easing.OutCubic }
-          }
-        }
-
-        // Katman 0: Simge Uzerinde Dogrudan Duran Odak Reticle Halkasi
-        Rectangle {
-          id: portalLandingHalo
-          x: Math.round(dropPortal.originX - width / 2)
-          y: Math.round(dropPortal.originY - height / 2)
-          z: 20
-          width: 44 + dropPortal.proximity * 16
-          height: width
-          radius: width / 2
-          color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, (portalDropArea.containsDrag || iconDropArea.containsDrag) ? 0.50 : (0.20 + dropPortal.proximity * 0.20))
-          border.color: Color.accent
-          border.width: (portalDropArea.containsDrag || iconDropArea.containsDrag) ? 2.5 : 1.5
-          scale: (portalDropArea.containsDrag || iconDropArea.containsDrag) ? 1.25 : (1.0 + dropPortal.proximity * 0.15)
-
-          Behavior on width { NumberAnimation { duration: 140; easing.type: Easing.OutQuad } }
-          Behavior on height { NumberAnimation { duration: 140; easing.type: Easing.OutQuad } }
-          Behavior on scale { NumberAnimation { duration: 160; easing.type: Easing.OutBack } }
-          Behavior on color { ColorAnimation { duration: 160 } }
-
-          Column {
-            anchors.centerIn: parent
-            spacing: 1
-            Text {
-              anchors.horizontalCenter: parent.horizontalCenter
-              text: ""
-              color: Color.accent
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.title + Math.round(dropPortal.proximity * 2)
-            }
-            Text {
-              anchors.horizontalCenter: parent.horizontalCenter
-              text: (portalDropArea.containsDrag || iconDropArea.containsDrag) ? "SEND" : ((root.p2pPeers && root.p2pPeers.length > 0) ? root.p2pPeers[0].name.toUpperCase() : "TARGET")
-              color: Color.accent
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              font.bold: true
-              font.letterSpacing: 0.8
-              elide: Text.ElideRight
-              width: Math.min(80, portalLandingHalo.width - 6)
-              horizontalAlignment: Text.AlignHCenter
-            }
+          Text {
+            anchors.horizontalCenter: parent.horizontalCenter
+            textFormat: Text.PlainText
+            text: dropPortal.isBlasting ? "SENT!" : ((dropPortal.proximity > 0.1) ? "DROP" : ((root.p2pPeers && root.p2pPeers.length > 0) ? ((root.selectedPeerIndex >= 0 && root.selectedPeerIndex < root.p2pPeers.length) ? root.p2pPeers[root.selectedPeerIndex].name.toUpperCase() : root.p2pPeers[0].name.toUpperCase()) : "TARGET"))
+            color: dropPortal.isBlasting ? Qt.rgba(1.0, 1.0, 1.0, 0.95) : Color.accent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+            font.letterSpacing: 0.8
+            elide: Text.ElideRight
+            width: Math.min(84, portalLandingHalo.width - 4)
+            horizontalAlignment: Text.AlignHCenter
           }
         }
       }
@@ -644,7 +720,7 @@ Panel {
         anchors.fill: parent
         spacing: Style.space(14)
 
-        // ---------- Hero: OmaSend icon · title · Visibility Toggle ----------
+        // Hero: OmaSend icon, title & Visibility Toggle
         Item {
           width: parent.width
           implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight, powerSwitch.implicitHeight)
@@ -709,7 +785,7 @@ Panel {
           }
         }
 
-        // ---------- Gatekeeper Transfer Request (If Pending) ----------
+        // Gatekeeper Transfer Request (If Pending)
         Rectangle {
           visible: root.p2pPendingTransfer !== null && root.p2pPendingTransfer.status === "PENDING"
           width: parent.width
@@ -815,7 +891,7 @@ Panel {
           }
         }
 
-        // ---------- Section: PAIRED / AVAILABLE DEVICES ----------
+        // Section: PAIRED / AVAILABLE DEVICES
         PanelSeparator {
           foreground: root.bar ? root.bar.foreground : Color.foreground
         }
@@ -948,7 +1024,7 @@ Panel {
           }
         }
 
-        // ---------- Footer / Actions Section ----------
+        // Footer / Actions Section
         PanelSeparator {
           foreground: root.bar ? root.bar.foreground : Color.foreground
         }
