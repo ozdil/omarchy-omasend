@@ -334,8 +334,8 @@ Panel {
     anchor.gravity: (root.bar && root.bar.edge === "bottom") ? Edges.Top : Edges.Bottom
     anchor.adjustment: PopupAdjustment.None
     implicitWidth: 560
-    implicitHeight: 360
-    visible: (active && proximity > 0.01) || isBlasting
+    implicitHeight: 560
+    visible: true
     color: "transparent"
 
     property bool active: false
@@ -470,7 +470,7 @@ Panel {
           var dx = drag.x - dropPortal.originX
           var dy = drag.y - dropPortal.originY
           var dist = Math.sqrt(dx * dx + dy * dy)
-          var maxDist = 360.0
+          var maxDist = 560.0
           var raw = Math.max(0.0, Math.min(1.0, 1.0 - (dist / maxDist)))
           dropPortal.proximity = 0.5 * (1.0 - Math.cos(raw * Math.PI))
         }
