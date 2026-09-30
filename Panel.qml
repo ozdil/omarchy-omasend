@@ -326,13 +326,35 @@ Panel {
     }
   }
 
-  // Anchored Drop Portal & Apple NameDrop Fluid Aura (Multi-Monitor Isolated)
+  // Anchored Drop Portal & Apple NameDrop Fluid Aura (Multi-Monitor Isolated & Sub-pixel Centered)
   PopupWindow {
     id: dropPortal
-    anchor.item: button
-    anchor.edges: (root.bar && root.bar.edge === "bottom") ? Edges.Top : Edges.Bottom
-    anchor.gravity: (root.bar && root.bar.edge === "bottom") ? Edges.Top : Edges.Bottom
-    anchor.adjustment: PopupAdjustment.None
+    anchor {
+      id: dropPortalAnchor
+      window: button ? button.QsWindow.window : null
+      adjustment: PopupAdjustment.None
+      edges: Edges.Top | Edges.Left
+      gravity: Edges.Bottom | Edges.Right
+      rect.width: 1
+      rect.height: 1
+
+      onAnchoring: {
+        if (!button) return
+        var target = button
+        var popupWidth = dropPortal.implicitWidth
+        var popupHeight = dropPortal.implicitHeight
+        var localX = target.width / 2 - popupWidth / 2
+        var isBottom = (root.bar && (root.bar.position === "bottom" || root.bar.edge === "bottom"))
+        var localY = isBottom ? -popupHeight : target.height
+
+        var win = target.QsWindow.window
+        if (!win) return
+
+        var point = win.contentItem.mapFromItem(target, localX, localY)
+        dropPortalAnchor.rect.x = Math.round(point.x)
+        dropPortalAnchor.rect.y = Math.round(point.y)
+      }
+    }
     implicitWidth: 560
     implicitHeight: 560
     visible: true
@@ -344,7 +366,7 @@ Panel {
     property real blastProgress: 0.0
 
     readonly property real originX: dropPortal.width / 2
-    readonly property real originY: (root.bar && root.bar.edge === "bottom") ? dropPortal.height : 0
+    readonly property real originY: (root.bar && (root.bar.position === "bottom" || root.bar.edge === "bottom")) ? dropPortal.height : 0
 
     // 350ms Drag Dropout Buffer Timer (Ensures strictly drag-only activation)
     Timer {
