@@ -288,7 +288,7 @@ Panel {
     DropArea {
       id: iconDropArea
       anchors.centerIn: parent
-      width: 1200
+      width: Math.min(560, root.bar ? root.bar.width : 560)
       height: parent.height
       keys: ["text/uri-list", "text/plain", "application/x-kde-urilist"]
 
@@ -307,7 +307,7 @@ Panel {
           drag.acceptProposedAction()
           var dx = drag.x - (iconDropArea.width / 2)
           var dist = Math.abs(dx)
-          var raw = Math.max(0.0, Math.min(1.0, 1.0 - (dist / 600.0)))
+          var raw = Math.max(0.0, Math.min(1.0, 1.0 - (dist / (iconDropArea.width / 2))))
           dropPortal.proximity = Math.max(dropPortal.proximity, 0.5 * (1.0 - Math.cos(raw * Math.PI)))
         }
       }
@@ -326,16 +326,16 @@ Panel {
     }
   }
 
-  // Anchored Drop Portal & Apple NameDrop Fluid Aura (600px Dynamic Range)
+  // Anchored Drop Portal & Apple NameDrop Fluid Aura (Multi-Monitor Isolated)
   PopupWindow {
     id: dropPortal
     anchor.item: button
     anchor.edges: (root.bar && root.bar.edge === "bottom") ? Edges.Top : Edges.Bottom
     anchor.gravity: (root.bar && root.bar.edge === "bottom") ? Edges.Top : Edges.Bottom
     anchor.adjustment: PopupAdjustment.None
-    implicitWidth: 1200
-    implicitHeight: 600
-    visible: (active && proximity > 0.005) || isBlasting || dragRetentionTimer.running || (auraContainer && auraContainer.opacity > 0.01)
+    implicitWidth: 560
+    implicitHeight: 360
+    visible: (active && proximity > 0.01) || isBlasting
     color: "transparent"
 
     property bool active: false
@@ -346,10 +346,10 @@ Panel {
     readonly property real originX: dropPortal.width / 2
     readonly property real originY: (root.bar && root.bar.edge === "bottom") ? dropPortal.height : 0
 
-    // 400ms Drag Dropout Buffer Timer (Ensures strictly drag-only activation)
+    // 350ms Drag Dropout Buffer Timer (Ensures strictly drag-only activation)
     Timer {
       id: dragRetentionTimer
-      interval: 400
+      interval: 350
       repeat: false
       onTriggered: {
         if (!portalDropArea.containsDrag && !iconDropArea.containsDrag && !dropPortal.isBlasting) {
@@ -397,15 +397,15 @@ Panel {
           property: "blastProgress"
           from: 0.0
           to: 1.0
-          duration: 380
+          duration: 360
           easing.type: Easing.OutCubic
         }
         NumberAnimation {
           target: portalLandingHalo
           property: "scale"
           from: 1.0
-          to: 1.55
-          duration: 200
+          to: 1.50
+          duration: 180
           easing.type: Easing.OutBack
         }
         NumberAnimation {
@@ -413,7 +413,7 @@ Panel {
           property: "opacity"
           from: 0.0
           to: 1.0
-          duration: 120
+          duration: 100
           easing.type: Easing.OutQuad
         }
       }
@@ -422,27 +422,28 @@ Panel {
           target: portalLandingHalo
           property: "scale"
           to: 1.0
-          duration: 220
+          duration: 200
           easing.type: Easing.OutElastic
         }
         NumberAnimation {
           target: flareBeam
           property: "opacity"
           to: 0.0
-          duration: 220
+          duration: 200
           easing.type: Easing.InQuad
         }
         NumberAnimation {
           target: dropPortal
           property: "proximity"
           to: 0.0
-          duration: 220
+          duration: 200
         }
       }
       ScriptAction {
         script: {
           dropPortal.isBlasting = false
           dropPortal.blastProgress = 0.0
+          dropPortal.proximity = 0.0
           dropPortal.active = false
         }
       }
@@ -469,7 +470,7 @@ Panel {
           var dx = drag.x - dropPortal.originX
           var dy = drag.y - dropPortal.originY
           var dist = Math.sqrt(dx * dx + dy * dy)
-          var maxDist = 600.0
+          var maxDist = 360.0
           var raw = Math.max(0.0, Math.min(1.0, 1.0 - (dist / maxDist)))
           dropPortal.proximity = 0.5 * (1.0 - Math.cos(raw * Math.PI))
         }
@@ -492,18 +493,18 @@ Panel {
       id: auraContainer
       x: Math.round(dropPortal.originX - width / 2)
       y: Math.round(dropPortal.originY - height / 2)
-      width: 1200
-      height: 1200
-      opacity: (dropPortal.proximity > 0.005 || dropPortal.isBlasting || dragRetentionTimer.running) ? 1.0 : 0.0
+      width: 560
+      height: 560
+      opacity: ((dropPortal.active && dropPortal.proximity > 0.01) || dropPortal.isBlasting) ? 1.0 : 0.0
       Behavior on opacity {
-        NumberAnimation { duration: 140; easing.type: Easing.OutQuad }
+        NumberAnimation { duration: 120; easing.type: Easing.OutQuad }
       }
 
-      // Layer 4: Ambient Aura Glow (80px -> 520px)
+      // Layer 4: Ambient Aura Glow (80px -> 420px)
       Rectangle {
         id: ambientGlow
         anchors.centerIn: parent
-        width: 80 + (dropPortal.proximity * 440) + (dropPortal.isBlasting ? dropPortal.blastProgress * 120 : 0)
+        width: 80 + (dropPortal.proximity * 340) + (dropPortal.isBlasting ? dropPortal.blastProgress * 100 : 0)
         height: width
         radius: width / 2
         color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, dropPortal.isBlasting ? 0.32 : (0.04 + dropPortal.proximity * 0.22))
@@ -515,11 +516,11 @@ Panel {
         Behavior on color { ColorAnimation { duration: 80 } }
       }
 
-      // Layer 3: Outer Sonar Aura Wave with EMBEDDED PEER NAME (200px -> 560px)
+      // Layer 3: Outer Sonar Aura Wave with EMBEDDED PEER NAME (180px -> 460px)
       Rectangle {
         id: portalWave3
         anchors.centerIn: parent
-        width: 200 + dropPortal.proximity * 360
+        width: 180 + dropPortal.proximity * 280
         height: width
         radius: width / 2
         color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.025)
@@ -527,7 +528,7 @@ Panel {
         border.width: 1.2
 
         SequentialAnimation on opacity {
-          running: auraContainer.opacity > 0.01
+          running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
           loops: Animation.Infinite
           PauseAnimation { duration: 600 }
           NumberAnimation { from: 0.0; to: 0.40 + dropPortal.proximity * 0.30; duration: 600; easing.type: Easing.OutQuad }
@@ -535,7 +536,7 @@ Panel {
         }
 
         SequentialAnimation on scale {
-          running: auraContainer.opacity > 0.01
+          running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
           loops: Animation.Infinite
           PauseAnimation { duration: 600 }
           NumberAnimation { from: 0.5; to: 1.35 + dropPortal.proximity * 0.25; duration: 1600; easing.type: Easing.OutCubic }
@@ -548,9 +549,9 @@ Panel {
           anchors.bottom: parent.bottom
           anchors.bottomMargin: 10
           height: 22
-          width: Math.min(280, peerBadgeRow.implicitWidth + 20)
+          width: Math.min(260, peerBadgeRow.implicitWidth + 20)
           radius: 11
-          color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.16 + dropPortal.proximity * 0.28)
+          color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.18 + dropPortal.proximity * 0.28)
           border.color: Color.accent
           border.width: 1.0
           opacity: dropPortal.proximity > 0.05 ? 1.0 : 0.0
@@ -591,11 +592,11 @@ Panel {
         }
       }
 
-      // Layer 2: Mid Sonar Aura Wave (120px -> 340px)
+      // Layer 2: Mid Sonar Aura Wave (110px -> 290px)
       Rectangle {
         id: portalWave2
         anchors.centerIn: parent
-        width: 120 + dropPortal.proximity * 220
+        width: 110 + dropPortal.proximity * 180
         height: width
         radius: width / 2
         color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.03)
@@ -603,7 +604,7 @@ Panel {
         border.width: 1.2
 
         SequentialAnimation on opacity {
-          running: auraContainer.opacity > 0.01
+          running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
           loops: Animation.Infinite
           PauseAnimation { duration: 250 }
           NumberAnimation { from: 0.0; to: 0.50 + dropPortal.proximity * 0.3; duration: 500; easing.type: Easing.OutQuad }
@@ -611,18 +612,18 @@ Panel {
         }
 
         SequentialAnimation on scale {
-          running: auraContainer.opacity > 0.01
+          running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
           loops: Animation.Infinite
           PauseAnimation { duration: 250 }
           NumberAnimation { from: 0.45; to: 1.3 + dropPortal.proximity * 0.2; duration: 1450; easing.type: Easing.OutCubic }
         }
       }
 
-      // Layer 1: Inner Sonar Aura Wave (60px -> 180px)
+      // Layer 1: Inner Sonar Aura Wave (55px -> 150px)
       Rectangle {
         id: portalWave1
         anchors.centerIn: parent
-        width: 60 + dropPortal.proximity * 120
+        width: 55 + dropPortal.proximity * 95
         height: width
         radius: width / 2
         color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.04)
@@ -630,25 +631,25 @@ Panel {
         border.width: 1.5
 
         SequentialAnimation on opacity {
-          running: auraContainer.opacity > 0.01
+          running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
           loops: Animation.Infinite
           NumberAnimation { from: 0.0; to: 0.70 + dropPortal.proximity * 0.25; duration: 400; easing.type: Easing.OutQuad }
           NumberAnimation { from: 0.70 + dropPortal.proximity * 0.25; to: 0.0; duration: 800; easing.type: Easing.InQuad }
         }
 
         SequentialAnimation on scale {
-          running: auraContainer.opacity > 0.01
+          running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
           loops: Animation.Infinite
           NumberAnimation { from: 0.4; to: 1.35 + dropPortal.proximity * 0.25; duration: 1200; easing.type: Easing.OutCubic }
         }
       }
 
-      // Anamorphic Optical Flare Halo Streak (Apple NameDrop Lens Corona: 40px -> 480px)
+      // Anamorphic Optical Flare Halo Streak (Apple NameDrop Lens Corona: 36px -> 360px)
       Rectangle {
         id: flareBeam
         anchors.centerIn: parent
         z: 15
-        width: 40 + (dropPortal.isBlasting ? dropPortal.blastProgress * 480 : dropPortal.proximity * 440)
+        width: 36 + (dropPortal.isBlasting ? dropPortal.blastProgress * 380 : dropPortal.proximity * 320)
         height: 2 + (dropPortal.isBlasting ? 4 : dropPortal.proximity * 2.0)
         radius: 1
         color: Qt.rgba(1.0, 1.0, 1.0, 0.95)
@@ -657,12 +658,12 @@ Panel {
         Behavior on opacity { NumberAnimation { duration: 80 } }
       }
 
-      // Elastic Blast Shockwave (onDropped impact: expands to 580px)
+      // Elastic Blast Shockwave (onDropped impact: expands to 480px)
       Rectangle {
         id: blastShockwave
         anchors.centerIn: parent
         visible: dropPortal.isBlasting
-        width: 44 + (dropPortal.blastProgress * 540)
+        width: 44 + (dropPortal.blastProgress * 440)
         height: width
         radius: width / 2
         color: "transparent"
