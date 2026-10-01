@@ -1069,6 +1069,12 @@ fn play_clipboard_sound() {
 }
 
 fn p2p_push_clipboard_silent(target_ip: &str, text: &str) {
+    if target_ip.is_empty()
+        || target_ip.starts_with("bt:")
+        || (target_ip.len() == 17 && target_ip.chars().filter(|c| *c == ':').count() == 5)
+    {
+        return;
+    }
     let (my_id, _) = get_or_create_device_id();
     let my_name = get_system_hostname();
     let payload = serde_json::json!({
@@ -1076,18 +1082,6 @@ fn p2p_push_clipboard_silent(target_ip: &str, text: &str) {
         "sender_name": my_name,
         "text": text
     });
-    if target_ip.starts_with("bt:") || (target_ip.len() == 17 && target_ip.chars().filter(|c| *c == ':').count() == 5) {
-        let mac = target_ip.strip_prefix("bt:").unwrap_or(target_ip).to_string();
-        let text_owned = text.to_string();
-        thread::spawn(move || {
-            let temp_clip = get_state_dir().join(format!("clipboard_push_bt_{}.txt", std::process::id()));
-            if write_secure_file(&temp_clip, &text_owned).is_ok() {
-                let _ = p2p_send_file_via_bluetooth(&mac, &temp_clip);
-                let _ = fs::remove_file(&temp_clip);
-            }
-        });
-        return;
-    }
     let addr = resolve_peer_addr(target_ip);
     let req_bytes = payload.to_string().into_bytes();
     thread::spawn(move || {
@@ -1131,7 +1125,7 @@ pub fn start_clipboard_sentinel() {
 
             let peers = get_discovered_peers();
             for peer in peers {
-                if !peer.ip.is_empty() {
+                if !peer.ip.is_empty() && !peer.ip.starts_with("bt:") && peer.transport != "BT" && peer.port > 0 {
                     p2p_push_clipboard_silent(&peer.ip, &text);
                 }
             }
