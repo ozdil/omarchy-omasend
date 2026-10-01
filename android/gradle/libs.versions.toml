@@ -16,9 +16,15 @@ lifecycleViewmodelNav3 = "2.10.0"
 kotlinxSerialization = "1.8.0"
 okhttp = "4.12.0"
 zxing = "3.5.3"
+androidxCamera = "1.4.1"
 
 [libraries]
 zxing-core = { module = "com.google.zxing:core", version.ref = "zxing" }
+
+androidx-camera-core = { module = "androidx.camera:camera-core", version.ref = "androidxCamera" }
+androidx-camera-camera2 = { module = "androidx.camera:camera-camera2", version.ref = "androidxCamera" }
+androidx-camera-lifecycle = { module = "androidx.camera:camera-lifecycle", version.ref = "androidxCamera" }
+androidx-camera-view = { module = "androidx.camera:camera-view", version.ref = "androidxCamera" }
 
 androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "androidxCore" }
 androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "androidxActivity" }

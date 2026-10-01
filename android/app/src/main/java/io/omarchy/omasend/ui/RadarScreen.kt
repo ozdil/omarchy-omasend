@@ -58,6 +58,7 @@ import com.google.zxing.qrcode.QRCodeWriter
 import io.omarchy.omasend.OmaSendApp
 import io.omarchy.omasend.crypto.OmaIdentity
 import io.omarchy.omasend.model.*
+import io.omarchy.omasend.ui.scanner.OmaQrScannerDialog
 import io.omarchy.omasend.network.NetworkTransportMode
 import io.omarchy.omasend.network.NetworkUtils
 import io.omarchy.omasend.network.TransferBridge
@@ -96,6 +97,7 @@ fun RadarScreen(
     var showClipboardVaultDialog by remember { mutableStateOf(false) }
     var previewImageEntry by remember { mutableStateOf<ClipboardEntry?>(null) }
     var showOmaIdQrDialog by remember { mutableStateOf(false) }
+    var showQrScannerDialog by remember { mutableStateOf(false) }
     var showEditOmaIdDialog by remember { mutableStateOf(false) }
     var showResetOmaIdConfirmDialog by remember { mutableStateOf(false) }
     var showNetworkStatusDialog by remember { mutableStateOf(false) }
@@ -269,6 +271,17 @@ fun RadarScreen(
                         )
                     }
                     IconButton(
+                        onClick = { showQrScannerDialog = true },
+                        modifier = Modifier.size(38.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.QrCodeScanner,
+                            contentDescription = "OmaID QR / Barkod Tara",
+                            modifier = Modifier.size(20.dp),
+                            tint = Color(0xFF38BDF8)
+                        )
+                    }
+                    IconButton(
                         onClick = { showQrDialog = true },
                         modifier = Modifier.size(38.dp)
                     ) {
@@ -340,6 +353,7 @@ fun RadarScreen(
                         Toast.makeText(context, "OmaID panoya kopyalandı", Toast.LENGTH_SHORT).show()
                     },
                     onShowQr = { showOmaIdQrDialog = true },
+                    onScanQr = { showQrScannerDialog = true },
                     onEditId = { showEditOmaIdDialog = true },
                     onResetId = { showResetOmaIdConfirmDialog = true },
                     onNetworkStatusClick = { showNetworkStatusDialog = true }
@@ -544,6 +558,20 @@ fun RadarScreen(
         OmaIdQrDialog(
             identity = omaIdentity,
             onDismiss = { showOmaIdQrDialog = false }
+        )
+    }
+
+    if (showQrScannerDialog) {
+        OmaQrScannerDialog(
+            onDismissRequest = { showQrScannerDialog = false },
+            onOmaIdConnected = { scannedId ->
+                showQrScannerDialog = false
+                scope.launch {
+                    val formatted = OmaIdentity.format(scannedId)
+                    Toast.makeText(context, "OmaID okundu: $formatted. Cihaz eşleştiriliyor...", Toast.LENGTH_LONG).show()
+                    app.discoveryManager.forceRefresh()
+                }
+            }
         )
     }
 
@@ -3049,6 +3077,7 @@ fun OmaIdCapsuleCard(
     wanStatus: WanStatus,
     onCopyId: () -> Unit,
     onShowQr: () -> Unit,
+    onScanQr: () -> Unit,
     onEditId: () -> Unit,
     onResetId: () -> Unit,
     onNetworkStatusClick: () -> Unit
@@ -3148,20 +3177,20 @@ fun OmaIdCapsuleCard(
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 OutlinedButton(
                     onClick = onCopyId,
                     modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(10.dp),
-                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 6.dp)
+                    contentPadding = PaddingValues(horizontal = 2.dp, vertical = 6.dp)
                 ) {
                     Icon(
                         Icons.Default.ContentCopy,
                         contentDescription = null,
                         modifier = Modifier.size(14.dp)
                     )
-                    Spacer(modifier = Modifier.width(4.dp))
+                    Spacer(modifier = Modifier.width(3.dp))
                     Text(
                         text = "Kopyala",
                         style = MaterialTheme.typography.labelSmall,
@@ -3171,16 +3200,16 @@ fun OmaIdCapsuleCard(
 
                 OutlinedButton(
                     onClick = onShowQr,
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier.weight(0.9f),
                     shape = RoundedCornerShape(10.dp),
-                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 6.dp)
+                    contentPadding = PaddingValues(horizontal = 2.dp, vertical = 6.dp)
                 ) {
                     Icon(
                         Icons.Default.QrCode,
                         contentDescription = null,
                         modifier = Modifier.size(14.dp)
                     )
-                    Spacer(modifier = Modifier.width(4.dp))
+                    Spacer(modifier = Modifier.width(3.dp))
                     Text(
                         text = "QR",
                         style = MaterialTheme.typography.labelSmall,
@@ -3189,17 +3218,41 @@ fun OmaIdCapsuleCard(
                 }
 
                 OutlinedButton(
-                    onClick = onEditId,
+                    onClick = onScanQr,
                     modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(10.dp),
-                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 6.dp)
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = Color(0xFF38BDF8)
+                    ),
+                    contentPadding = PaddingValues(horizontal = 2.dp, vertical = 6.dp)
+                ) {
+                    Icon(
+                        Icons.Default.QrCodeScanner,
+                        contentDescription = null,
+                        modifier = Modifier.size(14.dp),
+                        tint = Color(0xFF38BDF8)
+                    )
+                    Spacer(modifier = Modifier.width(3.dp))
+                    Text(
+                        text = "Tara",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1
+                    )
+                }
+
+                OutlinedButton(
+                    onClick = onEditId,
+                    modifier = Modifier.weight(0.9f),
+                    shape = RoundedCornerShape(10.dp),
+                    contentPadding = PaddingValues(horizontal = 2.dp, vertical = 6.dp)
                 ) {
                     Icon(
                         Icons.Default.Edit,
                         contentDescription = null,
                         modifier = Modifier.size(14.dp)
                     )
-                    Spacer(modifier = Modifier.width(4.dp))
+                    Spacer(modifier = Modifier.width(3.dp))
                     Text(
                         text = "Bağla",
                         style = MaterialTheme.typography.labelSmall,
@@ -3209,18 +3262,18 @@ fun OmaIdCapsuleCard(
 
                 OutlinedButton(
                     onClick = onResetId,
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier.weight(0.9f),
                     shape = RoundedCornerShape(10.dp),
-                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 6.dp)
+                    contentPadding = PaddingValues(horizontal = 2.dp, vertical = 6.dp)
                 ) {
                     Icon(
                         Icons.Default.Refresh,
                         contentDescription = null,
                         modifier = Modifier.size(14.dp)
                     )
-                    Spacer(modifier = Modifier.width(4.dp))
+                    Spacer(modifier = Modifier.width(3.dp))
                     Text(
-                        text = "Yenile",
+                        text = "Sıfırla",
                         style = MaterialTheme.typography.labelSmall,
                         maxLines = 1
                     )

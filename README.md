@@ -21,7 +21,10 @@ Plugin ID: ozdil.omasend
   - 440px Radiant Sonar Waves: Hardware-accelerated 5-layer radial sonar animation expanding from the bar icon center with sub-pixel alignment, orientation safety (top/bottom/left/right), and visual target lock-on.
   - Single-Touch Trust Promotion: Unknown devices in Everyone mode prompt recipient once, and upon acceptance are seamlessly promoted to trusted peers for future instant transfers.
   - Zero-Config Discovery: Automatically discovers neighboring Omarchy Linux desktops and Android devices on the same local network using UDP beacons (port 53317).
-  - Native Android Companion: Dedicated Kotlin and Jetpack Compose mobile app with LRA tactile haptic feedback (CLICK, THUD, QUICK_RISE), bidirectional transfers, and universal clipboard bridge.
+  - Native Android Companion: Dedicated Kotlin and Jetpack Compose mobile app with CameraX zero-GMS QR/Barcode scanner, LRA tactile haptic feedback (CLICK, THUD, QUICK_RISE), bidirectional transfers, and universal clipboard bridge.
+  - Zero-GMS OmaID Barcode & QR Scanner:
+    - High-performance on-device QR/Barcode scanner built with CameraX and ZXing without Google Play Services or Firebase telemetry dependencies.
+    - Features acrylic viewfinder overlay with pulsing laser animation, torch toggle, gallery image QR decoding, and clipboard OmaID auto-detection.
   - 3-Tier Visibility Control: Off, Known (Trusted Peers Only - Default), and Everyone (10 Minutes Temporary Discovery).
   - Gatekeeper Consent: Untrusted devices require explicit approval before transfer begins.
   - Universal Multi-Format Clipboard Vault & WebP Micro-Thumbnails:

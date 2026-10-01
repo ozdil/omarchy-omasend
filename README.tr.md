@@ -17,7 +17,10 @@ Eklenti Kimliği: ozdil.omasend
 
 - Omarchy AirBridge P2P (Masaüstü ve Mobil Doğrudan Aktarım):
   - Sıfır Yapılandırmalı Keşif: Aynı yerel ağdaki Omarchy masaüstü ve Android cihazları UDP işaretçileri (53317 portu) ile anında bulur.
-  - Yerel Android İstemcisi: Sistem paylaşım menüsü, çift yönlü aktarımlar ve evrensel pano köprüsü.
+  - Yerel Android İstemcisi: Sistem paylaşım menüsü, CameraX tabanlı sıfır GMS bağımlılıklı OmaID QR/Barkod tarayıcısı, çift yönlü aktarımlar ve evrensel pano köprüsü.
+  - Bağımsız OmaID Barkod & QR Kod Tarayıcısı:
+    - Google Play Services veya kapalı kod bağımlılığı olmaksızın, tamamen yerel CameraX ve ZXing çekirdeği ile 60 FPS önizleme ve sıfır gecikmeli QR okuma.
+    - Lazer tarama animasyonlu akrilik vizör, fener denetimi, galeriden QR seçimi ve panodaki OmaID'yi otomatik tanıma desteği.
   - 3 Kademeli Görünürlük Kontrolü: Kapalı (Off), Yalnızca Tanınanlar (Known - Varsayılan) ve Herkes (Everyone - 10 dakikalık geçici keşif).
   - Gatekeeper İzin Kapısı: Hiçbir dosya sessizce kabul edilmez. Alıcıya gönderici adı, dosya listesi ve boyutuyla onay bildirimi çıkarılır; transfer yalnızca açık onay ile başlar.
   - Çoklu Ortam Pano Kasası ve WebP Mikro-Önizleme Motoru:
