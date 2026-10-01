@@ -2024,50 +2024,90 @@ Panel {
                   }
                 }
 
-                // Image Item View
-                Column {
+                // Image Item Compact View
+                RowLayout {
                   visible: vaultCardRect.isImage
                   width: parent.width
-                  spacing: Style.space(6)
+                  spacing: Style.space(8)
 
+                  // Compact Thumbnail Box
                   Rectangle {
-                    width: parent.width
-                    implicitHeight: Math.min(130, Math.max(70, parent.width * 0.42))
+                    implicitWidth: 42
+                    implicitHeight: 42
                     radius: Style.cornerRadius
-                    color: Qt.rgba(0.0, 0.0, 0.0, 0.35)
+                    color: Qt.rgba(0.0, 0.0, 0.0, 0.45)
                     clip: true
-                    border.color: Qt.rgba(1.0, 1.0, 1.0, 0.08)
+                    border.color: Qt.rgba(1.0, 1.0, 1.0, 0.12)
                     border.width: 1
 
                     Image {
+                      id: thumbImg
                       anchors.fill: parent
-                      anchors.margins: 2
+                      anchors.margins: 1
                       source: vaultCardRect.imageSrc
-                      fillMode: Image.PreserveAspectFit
+                      fillMode: Image.PreserveAspectCrop
                       asynchronous: true
                       smooth: true
                     }
+
+                    Text {
+                      anchors.centerIn: parent
+                      visible: thumbImg.status !== Image.Ready
+                      textFormat: Text.PlainText
+                      text: "󰄲"
+                      color: Qt.rgba(1.0, 1.0, 1.0, 0.4)
+                      font.family: root.fontFamily
+                      font.pixelSize: 16
+                    }
                   }
 
-                  RowLayout {
-                    width: parent.width
-                    spacing: Style.space(6)
+                  ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Style.space(2)
 
                     Text {
                       textFormat: Text.PlainText
-                      text: "Click: Copy | Double-click: Preview"
-                      color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.8)
+                      text: (modelData.image_width && modelData.image_height) ? (modelData.image_width + "x" + modelData.image_height + " Image") : "Image Clip"
+                      color: root.bar ? root.bar.foreground : Color.foreground
                       font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption - 1
-                      Layout.fillWidth: true
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
                       elide: Text.ElideRight
                     }
 
-                    Button {
-                      text: "󰮝 Export"
-                      bordered: true
-                      fontSize: Style.font.caption - 1
-                      fontFamily: root.fontFamily
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "Click: Copy | 2x: Preview"
+                      color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.8)
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption - 1
+                      elide: Text.ElideRight
+                    }
+                  }
+
+                  // Compact Export Button
+                  Rectangle {
+                    implicitWidth: 26
+                    implicitHeight: 26
+                    radius: Style.cornerRadius
+                    color: exportMouse.containsMouse ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.25) : Qt.rgba(1.0, 1.0, 1.0, 0.05)
+                    border.color: exportMouse.containsMouse ? Color.accent : Qt.rgba(1.0, 1.0, 1.0, 0.12)
+                    border.width: 1
+
+                    Text {
+                      anchors.centerIn: parent
+                      textFormat: Text.PlainText
+                      text: "󰮝"
+                      color: exportMouse.containsMouse ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
+                      font.family: root.fontFamily
+                      font.pixelSize: 13
+                    }
+
+                    MouseArea {
+                      id: exportMouse
+                      anchors.fill: parent
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
                       onClicked: {
                         root.exportImageToExportsDir(vaultCardRect.imagePath, vaultCardRect.imageSrc)
                       }
