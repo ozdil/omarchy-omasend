@@ -1213,13 +1213,137 @@ pub fn stage_clipboard_image(data: &[u8], content_type: &str) -> Result<(String,
     Ok((hash, file_path))
 }
 
+pub fn generate_webp_thumbnail_for_staging(image_path: &Path, hash_hex: &str) -> Option<String> {
+    if hash_hex.len() != 64 || !hash_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    let meta = match fs::symlink_metadata(image_path) {
+        Ok(m) => m,
+        Err(_) => return None,
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return None;
+    }
+    let input_len = meta.len();
+    if input_len == 0 || input_len > 50 * 1024 * 1024 {
+        return None;
+    }
+
+    let staging_dir = get_clip_staging_dir();
+    let final_thumb_path = staging_dir.join(format!("{}_thumb.webp", hash_hex));
+
+    if let Ok(thumb_meta) = fs::symlink_metadata(&final_thumb_path) {
+        if thumb_meta.file_type().is_file()
+            && !thumb_meta.file_type().is_symlink()
+            && thumb_meta.len() > 0
+            && thumb_meta.len() <= 1024 * 1024
+        {
+            if let Ok(bytes) = safe_read_file(&final_thumb_path) {
+                if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+                    return Some(format!("data:image/webp;base64,{}", base64_encode(&bytes)));
+                }
+            }
+        }
+    }
+
+    let input_str = match image_path.to_str() {
+        Some(s) => s,
+        None => return None,
+    };
+    let tmp_thumb_path = staging_dir.join(format!(".tmp_{}_thumb.webp", hash_hex));
+    let tmp_out_str = match tmp_thumb_path.to_str() {
+        Some(s) => s,
+        None => return None,
+    };
+
+    let _ = fs::remove_file(&tmp_thumb_path);
+
+    let deadline = Instant::now() + Duration::from_millis(1500);
+
+    let candidates: [(&[&str], Vec<&str>); 4] = [
+        (
+            &["/usr/bin/cwebp", "/usr/local/bin/cwebp", "/bin/cwebp"],
+            vec!["-resize", "96", "96", "-q", "80", input_str, "-o", tmp_out_str],
+        ),
+        (
+            &["/usr/bin/magick", "/usr/local/bin/magick", "/bin/magick"],
+            vec![input_str, "-thumbnail", "96x96", "-quality", "80", tmp_out_str],
+        ),
+        (
+            &["/usr/bin/convert", "/usr/local/bin/convert", "/bin/convert"],
+            vec![input_str, "-thumbnail", "96x96", "-quality", "80", tmp_out_str],
+        ),
+        (
+            &["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/bin/ffmpeg"],
+            vec!["-y", "-v", "error", "-i", input_str, "-vf", "scale=96:96:force_original_aspect_ratio=decrease", "-c:v", "libwebp", tmp_out_str],
+        ),
+    ];
+
+    let mut generated = false;
+
+    for (bin_paths, args) in &candidates {
+        if Instant::now() >= deadline {
+            break;
+        }
+        for bin in *bin_paths {
+            if Path::new(bin).exists() {
+                let ok = subproc::run_cmd_status_bounded(bin, args, &[], deadline);
+                if ok && tmp_thumb_path.exists() {
+                    generated = true;
+                    break;
+                }
+            }
+        }
+        if generated {
+            break;
+        }
+    }
+
+    if !generated || !tmp_thumb_path.exists() {
+        let _ = fs::remove_file(&tmp_thumb_path);
+        return None;
+    }
+
+    if let Ok(meta) = fs::symlink_metadata(&tmp_thumb_path) {
+        if meta.file_type().is_symlink() || !meta.file_type().is_file() || meta.len() == 0 || meta.len() > 1024 * 1024 {
+            let _ = fs::remove_file(&tmp_thumb_path);
+            return None;
+        }
+    } else {
+        let _ = fs::remove_file(&tmp_thumb_path);
+        return None;
+    }
+
+    let _ = fs::set_permissions(&tmp_thumb_path, fs::Permissions::from_mode(0o600));
+
+    if fs::rename(&tmp_thumb_path, &final_thumb_path).is_err() {
+        let _ = fs::remove_file(&tmp_thumb_path);
+        return None;
+    }
+
+    let _ = fs::set_permissions(&final_thumb_path, fs::Permissions::from_mode(0o600));
+
+    let bytes = match safe_read_file(&final_thumb_path) {
+        Ok(b) => b,
+        Err(_) => return None,
+    };
+
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some(format!("data:image/webp;base64,{}", base64_encode(&bytes)))
+    } else {
+        None
+    }
+}
+
 pub fn cleanup_clip_staging() -> Result<(), String> {
     let staging_dir = get_clip_staging_dir();
     let entries = match fs::read_dir(&staging_dir) {
         Ok(e) => e,
         Err(e) => return Err(e.to_string()),
     };
-    let mut files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+    let mut files: Vec<(PathBuf, u64, SystemTime, bool, String)> = Vec::new();
+    let now = SystemTime::now();
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -1229,9 +1353,24 @@ pub fn cleanup_clip_staging() -> Result<(), String> {
                 continue;
             }
             if meta.file_type().is_file() {
+                let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+                if fname.starts_with(".tmp_") {
+                    if let Ok(modified) = meta.modified() {
+                        if now.duration_since(modified).map(|d| d.as_secs() > 10).unwrap_or(false) {
+                            let _ = fs::remove_file(&path);
+                            continue;
+                        }
+                    }
+                }
+                let is_thumb = fname.ends_with("_thumb.webp");
+                let hash = if is_thumb {
+                    fname.trim_end_matches("_thumb.webp").to_string()
+                } else {
+                    path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string()
+                };
                 let size = meta.len();
                 let modified = meta.modified().unwrap_or(UNIX_EPOCH);
-                files.push((path, size, modified));
+                files.push((path, size, modified, is_thumb, hash));
             }
         }
     }
@@ -1240,13 +1379,26 @@ pub fn cleanup_clip_staging() -> Result<(), String> {
 
     let mut total_size: u64 = 0;
     let mut kept_count = 0;
+    let mut kept_hashes = std::collections::HashSet::new();
 
-    for (path, size, _) in files {
-        if kept_count < MAX_CLIP_STAGING_FILES && (total_size + size) <= MAX_CLIP_STAGING_BYTES {
-            total_size += size;
-            kept_count += 1;
+    for (path, size, _, is_thumb, hash) in files {
+        if !is_thumb {
+            if kept_count < MAX_CLIP_STAGING_FILES && (total_size + size) <= MAX_CLIP_STAGING_BYTES {
+                total_size += size;
+                kept_count += 1;
+                kept_hashes.insert(hash);
+            } else {
+                let _ = fs::remove_file(&path);
+                let thumb_path = staging_dir.join(format!("{}_thumb.webp", hash));
+                let _ = fs::remove_file(thumb_path);
+            }
         } else {
-            let _ = fs::remove_file(path);
+            if kept_hashes.contains(&hash) && kept_count < MAX_CLIP_STAGING_FILES && (total_size + size) <= MAX_CLIP_STAGING_BYTES {
+                total_size += size;
+                kept_count += 1;
+            } else {
+                let _ = fs::remove_file(&path);
+            }
         }
     }
 
@@ -1357,6 +1509,33 @@ pub fn add_image_clipboard_to_vault(
     let short_hash = if image_hash.len() >= 8 { &image_hash[..8] } else { image_hash };
     let desc = format!("[Image: {} ({}x{})]", short_hash, image_width, image_height);
 
+    let final_thumb = thumbnail_base64.or_else(|| {
+        let staging_dir = get_clip_staging_dir();
+        let thumb_path = staging_dir.join(format!("{}_thumb.webp", image_hash));
+        if thumb_path.exists() {
+            if let Ok(meta) = fs::symlink_metadata(&thumb_path) {
+                if meta.file_type().is_file() && !meta.file_type().is_symlink() && meta.len() > 0 && meta.len() <= 1024 * 1024 {
+                    if let Ok(bytes) = safe_read_file(&thumb_path) {
+                        if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+                            return Some(format!("data:image/webp;base64,{}", base64_encode(&bytes)));
+                        }
+                    }
+                }
+            }
+        }
+        let candidates = [
+            staging_dir.join(format!("{}.png", image_hash)),
+            staging_dir.join(format!("{}.jpg", image_hash)),
+            staging_dir.join(format!("{}.webp", image_hash)),
+        ];
+        for cand in &candidates {
+            if cand.exists() {
+                return generate_webp_thumbnail_for_staging(cand, image_hash);
+            }
+        }
+        None
+    });
+
     let item = ClipboardItem {
         timestamp: now,
         sender: sender.to_string(),
@@ -1368,13 +1547,22 @@ pub fn add_image_clipboard_to_vault(
         image_size: Some(image_size),
         image_width: Some(image_width),
         image_height: Some(image_height),
-        thumbnail_base64,
+        thumbnail_base64: final_thumb,
     };
 
     let mut vault = load_clipboard_vault();
-    if let Some(first) = vault.items.first() {
+    if let Some(first) = vault.items.first_mut() {
         if first.image_hash.as_deref() == Some(image_hash) {
-            return Ok(item);
+            let mut updated = false;
+            if first.thumbnail_base64.is_none() && item.thumbnail_base64.is_some() {
+                first.thumbnail_base64 = item.thumbnail_base64.clone();
+                updated = true;
+            }
+            let cloned = first.clone();
+            if updated {
+                let _ = save_clipboard_vault(&vault);
+            }
+            return Ok(cloned);
         }
     }
 
@@ -1389,6 +1577,7 @@ pub fn add_image_clipboard_to_vault(
 pub fn get_clipboard_vault_items() -> Vec<ClipboardItem> {
     load_clipboard_vault().items
 }
+
 
 fn play_clipboard_sound() {
     thread::spawn(|| {
@@ -1469,6 +1658,19 @@ pub fn p2p_push_image_clipboard_silent(
         None
     };
 
+    let staging_dir = get_clip_staging_dir();
+    let ext = match content_type {
+        "image_jpeg" => "jpg",
+        "image_webp" => "webp",
+        _ => "png",
+    };
+    let img_path = staging_dir.join(format!("{}.{}", hash, ext));
+    let thumb_b64 = if img_path.exists() {
+        generate_webp_thumbnail_for_staging(&img_path, hash)
+    } else {
+        None
+    };
+
     let payload = serde_json::json!({
         "sender_id": my_id,
         "sender_name": my_name,
@@ -1478,7 +1680,7 @@ pub fn p2p_push_image_clipboard_silent(
         "image_width": width,
         "image_height": height,
         "image_base64": image_base64,
-        "thumbnail_base64": None::<String>
+        "thumbnail_base64": thumb_b64
     });
 
     let addr = resolve_peer_addr(target_ip);
@@ -1520,7 +1722,21 @@ pub fn p2p_fetch_image_clipboard_and_apply(sender_ip: &str, hash: &str, _content
                             if let Ok((verified_ct, _w, _h)) = validate_image_header(body_bytes) {
                                 let computed_hash = compute_image_clipboard_hash(body_bytes);
                                 if computed_hash == h {
-                                    let _ = stage_clipboard_image(body_bytes, &verified_ct);
+                                    let staged_res = stage_clipboard_image(body_bytes, &verified_ct);
+                                    let thumb_b64 = if let Ok((_, ref staged_path)) = staged_res {
+                                        generate_webp_thumbnail_for_staging(staged_path, &computed_hash)
+                                    } else {
+                                        None
+                                    };
+                                    let _ = add_image_clipboard_to_vault(
+                                        &ip,
+                                        &verified_ct,
+                                        &computed_hash,
+                                        body_bytes.len() as u64,
+                                        _w,
+                                        _h,
+                                        thumb_b64,
+                                    );
                                     let _ = set_pc_image_clipboard(body_bytes, &verified_ct);
                                 }
                             }
@@ -1554,8 +1770,13 @@ pub fn start_clipboard_sentinel() {
                 if last_hash.as_deref() != Some(&img_hash) {
                     set_last_synced_clipboard_hash(&img_hash);
                     let size = img_bytes.len() as u64;
-                    let _ = stage_clipboard_image(&img_bytes, &ct);
-                    let _ = add_image_clipboard_to_vault("Local", &ct, &img_hash, size, w, h, None);
+                    let staged_res = stage_clipboard_image(&img_bytes, &ct);
+                    let thumb_b64 = if let Ok((_, ref staged_path)) = staged_res {
+                        generate_webp_thumbnail_for_staging(staged_path, &img_hash)
+                    } else {
+                        None
+                    };
+                    let _ = add_image_clipboard_to_vault("Local", &ct, &img_hash, size, w, h, thumb_b64);
 
                     let peers = get_discovered_peers();
                     for peer in peers {
@@ -1574,6 +1795,7 @@ pub fn start_clipboard_sentinel() {
                     continue;
                 }
             }
+
 
             // Check text clipboard
             let text = get_pc_clipboard();
@@ -6791,5 +7013,114 @@ mod tests {
 
         server_thread.join().expect("Join server thread");
     }
+
+    #[test]
+    fn test_webp_thumbnail_generation_and_caching() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+
+        // Create valid 128x128 test PNG
+        let mut png_bytes = Vec::new();
+        png_bytes.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        png_bytes.extend_from_slice(&13u32.to_be_bytes());
+        png_bytes.extend_from_slice(b"IHDR");
+        png_bytes.extend_from_slice(&128u32.to_be_bytes());
+        png_bytes.extend_from_slice(&128u32.to_be_bytes());
+        png_bytes.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit RGB
+        png_bytes.extend_from_slice(&[0, 0, 0, 0]);
+
+        let (hash, staged_path) = stage_clipboard_image(&png_bytes, "image_png").expect("Stage PNG");
+
+        // 1. Generate WebP thumbnail
+        let thumb_dataurl = generate_webp_thumbnail_for_staging(&staged_path, &hash);
+        if let Some(dataurl) = thumb_dataurl {
+            assert!(dataurl.starts_with("data:image/webp;base64,"), "DataURL must start with WebP prefix");
+            let b64_part = dataurl.trim_start_matches("data:image/webp;base64,");
+            let decoded = base64_decode(b64_part).expect("Decode thumbnail base64");
+            assert!(decoded.len() >= 12, "Thumbnail bytes must be valid WebP");
+            assert_eq!(&decoded[0..4], b"RIFF");
+            assert_eq!(&decoded[8..12], b"WEBP");
+
+            let staging_dir = get_clip_staging_dir();
+            let thumb_path = staging_dir.join(format!("{}_thumb.webp", hash));
+            assert!(thumb_path.exists(), "Thumbnail file must exist in staging");
+
+            let meta = fs::symlink_metadata(&thumb_path).expect("Thumbnail metadata");
+            assert_eq!(meta.mode() & 0o777, 0o600, "Thumbnail file must enforce 0600 permissions");
+
+            // 2. Fast cache path
+            let cached_dataurl = generate_webp_thumbnail_for_staging(&staged_path, &hash);
+            assert_eq!(cached_dataurl, Some(dataurl), "Cached thumbnail generation must match");
+        }
+    }
+
+    #[test]
+    fn test_webp_thumbnail_security_and_bounds() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let staging_dir = get_clip_staging_dir();
+
+        // 1. Path traversal hash rejection
+        let dummy_path = staging_dir.join("test.png");
+        assert!(generate_webp_thumbnail_for_staging(&dummy_path, "../../../etc/passwd").is_none());
+        assert!(generate_webp_thumbnail_for_staging(&dummy_path, "short_hash").is_none());
+        assert!(generate_webp_thumbnail_for_staging(&dummy_path, "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_none());
+
+        // 2. Symlink rejection
+        let temp_dir = std::env::temp_dir().join(format!("omasend_thumb_symlink_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let real_file = temp_dir.join("real.png");
+        write_secure_bytes(&real_file, b"\x89PNG\r\n\x1a\n").unwrap();
+
+        let symlink_file = temp_dir.join("symlink.png");
+        std::os::unix::fs::symlink(&real_file, &symlink_file).unwrap();
+
+        let valid_hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert!(generate_webp_thumbnail_for_staging(&symlink_file, valid_hash).is_none(), "Symlink input must be rejected");
+
+        // 3. Non-existent file rejection
+        let non_existent = temp_dir.join("missing.png");
+        assert!(generate_webp_thumbnail_for_staging(&non_existent, valid_hash).is_none(), "Missing file must be rejected");
+
+        // 4. Empty file rejection
+        let empty_file = temp_dir.join("empty.png");
+        write_secure_bytes(&empty_file, b"").unwrap();
+        assert!(generate_webp_thumbnail_for_staging(&empty_file, valid_hash).is_none(), "Empty file must be rejected");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_cleanup_clip_staging_with_thumbnails() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let staging_dir = get_clip_staging_dir();
+
+        let mut png_template = Vec::new();
+        png_template.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        png_template.extend_from_slice(&13u32.to_be_bytes());
+        png_template.extend_from_slice(b"IHDR");
+        png_template.extend_from_slice(&32u32.to_be_bytes());
+        png_template.extend_from_slice(&32u32.to_be_bytes());
+        png_template.extend_from_slice(&[8, 6, 0, 0, 0]);
+        png_template.extend_from_slice(&[0, 0, 0, 0]);
+
+        for i in 0u32..25u32 {
+            let mut data = png_template.clone();
+            data.extend_from_slice(&i.to_be_bytes());
+            if let Ok((hash, staged_path)) = stage_clipboard_image(&data, "image_png") {
+                let _ = generate_webp_thumbnail_for_staging(&staged_path, &hash);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        cleanup_clip_staging().expect("LRU cleanup with thumbnails");
+
+        let entries: Vec<_> = fs::read_dir(&staging_dir).unwrap().flatten().collect();
+        assert!(entries.len() <= MAX_CLIP_STAGING_FILES, "Total entries in staging must not exceed MAX_CLIP_STAGING_FILES");
+
+        let total_bytes: u64 = entries.iter().map(|e| e.metadata().map(|m| m.len()).unwrap_or(0)).sum();
+        assert!(total_bytes <= MAX_CLIP_STAGING_BYTES, "Total staging bytes must not exceed MAX_CLIP_STAGING_BYTES");
+    }
 }
+
 

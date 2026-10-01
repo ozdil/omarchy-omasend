@@ -68,6 +68,14 @@ class ClipboardVault private constructor(private val context: Context) {
         return File(imageCacheDir, "$hash.png")
     }
 
+    fun getThumbnailFile(hash: String): File {
+        return io.omarchy.omasend.engine.ThumbnailEngine.getThumbnailFile(context, hash)
+    }
+
+    fun hasThumbnail(hash: String): Boolean {
+        return io.omarchy.omasend.engine.ThumbnailEngine.hasThumbnail(context, hash)
+    }
+
     fun hasImage(hash: String): Boolean {
         if (hash.isBlank()) return false
         val file = getImageFile(hash)
@@ -77,7 +85,7 @@ class ClipboardVault private constructor(private val context: Context) {
     fun evictLruCacheIfNeeded() {
         try {
             if (!imageCacheDir.exists()) return
-            val files = imageCacheDir.listFiles()?.filter { it.isFile && !it.name.endsWith(".tmp") } ?: return
+            val files = imageCacheDir.listFiles()?.filter { it.isFile && !it.name.endsWith(".tmp") && !it.name.endsWith("_thumb.webp") } ?: return
             val maxImages = 20
             val maxTotalBytes = 50L * 1024L * 1024L // 50 MB
             val sorted = files.sortedBy { it.lastModified() }
@@ -89,9 +97,14 @@ class ClipboardVault private constructor(private val context: Context) {
                     break
                 }
                 val size = file.length()
+                val baseName = file.nameWithoutExtension
                 if (file.delete()) {
                     currentCount--
                     currentTotalBytes -= size
+                    val thumbFile = File(imageCacheDir, "${baseName}_thumb.webp")
+                    if (thumbFile.exists()) {
+                        thumbFile.delete()
+                    }
                 }
             }
         } catch (_: Exception) {}
@@ -104,6 +117,11 @@ class ClipboardVault private constructor(private val context: Context) {
         tmpFile.writeBytes(bytes)
         tmpFile.renameTo(file)
         file.setLastModified(System.currentTimeMillis())
+
+        try {
+            io.omarchy.omasend.engine.ThumbnailEngine.generateAndCacheThumbnail(context, bytes, hash)
+        } catch (_: Exception) {}
+
         evictLruCacheIfNeeded()
         return file
     }
@@ -214,13 +232,33 @@ class ClipboardVault private constructor(private val context: Context) {
             // 1. Direct write if payload contains image data (< 512 KiB)
             if (!payload.image_data_base64.isNullOrBlank()) {
                 try {
-                    val bytes = android.util.Base64.decode(payload.image_data_base64, android.util.Base64.DEFAULT)
-                    saveImageBytes(hash, bytes)
+                    val bytes = io.omarchy.omasend.engine.ThumbnailEngine.decodeBase64(payload.image_data_base64)
+                    if (bytes != null && bytes.isNotEmpty()) {
+                        saveImageBytes(hash, bytes)
+                    }
                 } catch (_: Exception) {}
             } else if (payload.image_size != null && payload.image_size <= 512 * 1024L && !payload.thumbnail_base64.isNullOrBlank()) {
                 try {
-                    val bytes = android.util.Base64.decode(payload.thumbnail_base64, android.util.Base64.DEFAULT)
-                    saveImageBytes(hash, bytes)
+                    val bytes = io.omarchy.omasend.engine.ThumbnailEngine.decodeBase64(payload.thumbnail_base64)
+                    if (bytes != null && bytes.isNotEmpty()) {
+                        saveImageBytes(hash, bytes)
+                    }
+                } catch (_: Exception) {}
+            }
+
+            // Cache incoming thumbnail payload directly to disk if available
+            if (!payload.thumbnail_base64.isNullOrBlank()) {
+                try {
+                    val thumbFile = getThumbnailFile(hash)
+                    if (!thumbFile.exists() || thumbFile.length() == 0L) {
+                        val thumbBytes = io.omarchy.omasend.engine.ThumbnailEngine.decodeBase64(payload.thumbnail_base64)
+                        if (thumbBytes != null && thumbBytes.isNotEmpty()) {
+                            val tmpThumb = File(imageCacheDir, "${hash}_thumb.webp.tmp")
+                            tmpThumb.writeBytes(thumbBytes)
+                            tmpThumb.renameTo(thumbFile)
+                            thumbFile.setLastModified(System.currentTimeMillis())
+                        }
+                    }
                 } catch (_: Exception) {}
             }
 

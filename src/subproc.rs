@@ -324,6 +324,66 @@ pub fn run_cmd_write_stdin_bounded(
     }
 }
 
+/// Executes an isolated subprocess with process_group(0) and returns whether it completed successfully before deadline
+pub fn run_cmd_status_bounded(
+    cmd_path: &str,
+    args: &[&str],
+    extra_envs: &[(&str, &str)],
+    deadline: Instant,
+) -> bool {
+    if Instant::now() >= deadline {
+        return false;
+    }
+
+    let mut cmd = Command::new(cmd_path);
+    cmd.args(args)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/local/bin")
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+
+    for (k, v) in extra_envs {
+        cmd.env(k, v);
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let pid = child.id() as i32;
+
+    let mut guard = ProcessGroupGuard {
+        child: &mut child,
+        pid,
+        active: true,
+    };
+
+    loop {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        match guard.child.try_wait() {
+            Ok(Some(status)) => {
+                guard.active = false;
+                reap_process_group(guard.child, guard.pid);
+                return status.success();
+            }
+            Ok(None) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(5).min(remaining));
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

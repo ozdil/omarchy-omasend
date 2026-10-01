@@ -2369,26 +2369,56 @@ fun ClipboardImageVaultItem(
     val context = LocalContext.current
     val hash = item.imageHash ?: ""
     val file = remember(hash) { app.clipboardVault.getImageFile(hash) }
+    val thumbFile = remember(hash) { app.clipboardVault.getThumbnailFile(hash) }
     var bitmap by remember(hash) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
     val timeFormat = remember { java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()) }
 
     LaunchedEffect(hash, item.thumbnailBase64) {
         withContext(Dispatchers.IO) {
-            if (file.exists() && file.length() > 0) {
+            // 1. Önce <hash>_thumb.webp dosyası
+            if (thumbFile.exists() && thumbFile.length() > 0) {
                 try {
-                    val bmp = android.graphics.BitmapFactory.decodeFile(file.absolutePath)
+                    val bmp = android.graphics.BitmapFactory.decodeFile(thumbFile.absolutePath)
                     if (bmp != null) {
                         bitmap = bmp.asImageBitmap()
                         return@withContext
                     }
                 } catch (_: Exception) {}
             }
+
+            // 2. Yoksa entry.thumbnailBase64 çözümlenir
             if (!item.thumbnailBase64.isNullOrBlank()) {
                 try {
-                    val bytes = android.util.Base64.decode(item.thumbnailBase64, android.util.Base64.DEFAULT)
-                    val bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    val bytes = io.omarchy.omasend.engine.ThumbnailEngine.decodeBase64(item.thumbnailBase64)
+                    if (bytes != null && bytes.isNotEmpty()) {
+                        val bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                        if (bmp != null) {
+                            bitmap = bmp.asImageBitmap()
+                            return@withContext
+                        }
+                    }
+                } catch (_: Exception) {}
+            }
+
+            // 3. Dosya sistemindeki ana görselden thumbnail türetme veya yükleme
+            if (file.exists() && file.length() > 0) {
+                try {
+                    val res = io.omarchy.omasend.engine.ThumbnailEngine.generateAndCacheThumbnail(
+                        context,
+                        file.readBytes(),
+                        hash
+                    )
+                    if (res.file != null && res.file.exists() && res.file.length() > 0) {
+                        val bmp = android.graphics.BitmapFactory.decodeFile(res.file.absolutePath)
+                        if (bmp != null) {
+                            bitmap = bmp.asImageBitmap()
+                            return@withContext
+                        }
+                    }
+                    val bmp = android.graphics.BitmapFactory.decodeFile(file.absolutePath)
                     if (bmp != null) {
                         bitmap = bmp.asImageBitmap()
+                        return@withContext
                     }
                 } catch (_: Exception) {}
             }
@@ -2421,7 +2451,7 @@ fun ClipboardImageVaultItem(
         ) {
             Box(
                 modifier = Modifier
-                    .size(56.dp)
+                    .size(44.dp)
                     .clip(RoundedCornerShape(8.dp))
                     .background(MaterialTheme.colorScheme.surfaceContainerHighest)
                     .clickable { onPreview() },
@@ -2439,7 +2469,7 @@ fun ClipboardImageVaultItem(
                         Icons.Default.Image,
                         contentDescription = null,
                         tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(24.dp)
+                        modifier = Modifier.size(22.dp)
                     )
                 }
             }
@@ -2534,6 +2564,7 @@ fun ClipboardImagePreviewDialog(
     val context = LocalContext.current
     val hash = entry.imageHash ?: ""
     val file = remember(hash) { app.clipboardVault.getImageFile(hash) }
+    val thumbFile = remember(hash) { app.clipboardVault.getThumbnailFile(hash) }
     var bitmap by remember(hash) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
     var isLoading by remember { mutableStateOf(false) }
 
@@ -2548,12 +2579,21 @@ fun ClipboardImagePreviewDialog(
                     }
                 } catch (_: Exception) {}
             }
-            if (!entry.thumbnailBase64.isNullOrBlank()) {
+            if (thumbFile.exists() && thumbFile.length() > 0) {
                 try {
-                    val bytes = android.util.Base64.decode(entry.thumbnailBase64, android.util.Base64.DEFAULT)
-                    val bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    val bmp = android.graphics.BitmapFactory.decodeFile(thumbFile.absolutePath)
                     if (bmp != null) {
                         bitmap = bmp.asImageBitmap()
+                    }
+                } catch (_: Exception) {}
+            } else if (!entry.thumbnailBase64.isNullOrBlank()) {
+                try {
+                    val bytes = io.omarchy.omasend.engine.ThumbnailEngine.decodeBase64(entry.thumbnailBase64)
+                    if (bytes != null && bytes.isNotEmpty()) {
+                        val bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                        if (bmp != null) {
+                            bitmap = bmp.asImageBitmap()
+                        }
                     }
                 } catch (_: Exception) {}
             }

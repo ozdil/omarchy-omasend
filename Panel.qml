@@ -72,6 +72,7 @@ Panel {
   readonly property string vaultPath: (Quickshell.env("HOME") || "/home/ozdil") + "/.local/state/omarchy/omasend/clipboard_vault.json"
   readonly property string peersPath: (Quickshell.env("HOME") || "/home/ozdil") + "/.local/state/omarchy/omasend/discovered_peers.json"
   readonly property string omaidQrFilePath: (Quickshell.env("HOME") || "/home/ozdil") + "/.local/state/omarchy/omasend/omaid_qr.svg"
+  readonly property string clipStagingPath: (Quickshell.env("HOME") || "/home/ozdil") + "/.local/state/omarchy/omasend/clip_staging"
 
   function formatOmaId(id, revealed) {
     if (!id || String(id).trim() === "") return "---- ---- ---- ----"
@@ -267,26 +268,37 @@ Panel {
   function isImageVaultItem(item) {
     if (!item) return false
     if (String(item.content_type || "").startsWith("image") || item.kind === "image" || item.type === "image" || item.item_type === "image" || item.is_image === true) return true
-    if (item.image_path || item.thumbnail_path || item.image_data || item.thumbnail || item.thumbnail_base64) return true
+    if (item.image_hash || item.thumbnail_base64 || item.thumbnail_path || item.image_path || item.image_data || item.thumbnail) return true
     if (typeof item.text === "string" && (item.text.startsWith("data:image/") || (item.text.startsWith("file://") && /\.(png|jpe?g|webp|gif|svg)$/i.test(item.text)))) return true
     return false
   }
 
   function resolveVaultImageSource(item) {
     if (!item) return ""
-    if (item.thumbnail_base64) {
-      return item.thumbnail_base64.startsWith("data:image/") ? item.thumbnail_base64 : ("data:image/png;base64," + item.thumbnail_base64)
+    if (item.thumbnail_base64 && typeof item.thumbnail_base64 === "string" && item.thumbnail_base64.length > 0) {
+      if (item.thumbnail_base64.startsWith("data:image/")) return item.thumbnail_base64
+      var mime = String(item.content_type || "").toLowerCase().includes("webp") ? "image/webp" : "image/png"
+      return "data:" + mime + ";base64," + item.thumbnail_base64
     }
-    if (item.image_path) {
-      return item.image_path.startsWith("file://") ? item.image_path : ("file://" + item.image_path)
+    if (item.image_hash && typeof item.image_hash === "string" && item.image_hash.length > 0) {
+      var hash = item.image_hash.trim()
+      var staging = root.clipStagingPath
+      var format = String(item.content_type || "").toLowerCase()
+      if (format.includes("webp") || format === "image_webp") {
+        return "file://" + staging + "/" + hash + "_thumb.webp"
+      }
+      return "file://" + staging + "/" + hash + ".png"
     }
-    if (item.thumbnail_path) {
+    if (item.thumbnail_path && typeof item.thumbnail_path === "string" && item.thumbnail_path.length > 0) {
       return item.thumbnail_path.startsWith("file://") ? item.thumbnail_path : ("file://" + item.thumbnail_path)
     }
-    if (item.image_data) {
+    if (item.image_path && typeof item.image_path === "string" && item.image_path.length > 0) {
+      return item.image_path.startsWith("file://") ? item.image_path : ("file://" + item.image_path)
+    }
+    if (item.image_data && typeof item.image_data === "string" && item.image_data.length > 0) {
       return item.image_data.startsWith("data:image/") ? item.image_data : ("data:image/png;base64," + item.image_data)
     }
-    if (item.thumbnail) {
+    if (item.thumbnail && typeof item.thumbnail === "string" && item.thumbnail.length > 0) {
       return item.thumbnail.startsWith("data:image/") ? item.thumbnail : ("data:image/png;base64," + item.thumbnail)
     }
     if (typeof item.text === "string") {
@@ -299,9 +311,25 @@ Panel {
 
   function resolveVaultImageFilePath(item) {
     if (!item) return ""
-    if (item.image_path) return item.image_path.replace(/^file:\/\//, "")
-    if (typeof item.text === "string" && item.text.startsWith("/")) return item.text.replace(/^file:\/\//, "")
-    if (typeof item.text === "string" && item.text.startsWith("file://")) return item.text.replace(/^file:\/\//, "")
+    if (item.image_path && typeof item.image_path === "string" && item.image_path.length > 0) {
+      return item.image_path.replace(/^file:\/\//, "")
+    }
+    if (item.thumbnail_path && typeof item.thumbnail_path === "string" && item.thumbnail_path.length > 0) {
+      return item.thumbnail_path.replace(/^file:\/\//, "")
+    }
+    if (item.image_hash && typeof item.image_hash === "string" && item.image_hash.length > 0) {
+      var hash = item.image_hash.trim()
+      var staging = root.clipStagingPath
+      var format = String(item.content_type || "").toLowerCase()
+      if (format.includes("webp") || format === "image_webp") {
+        return staging + "/" + hash + "_thumb.webp"
+      }
+      return staging + "/" + hash + ".png"
+    }
+    if (typeof item.text === "string") {
+      if (item.text.startsWith("/")) return item.text.replace(/^file:\/\//, "")
+      if (item.text.startsWith("file://")) return item.text.replace(/^file:\/\//, "")
+    }
     return ""
   }
 
@@ -2047,7 +2075,9 @@ Panel {
                       source: vaultCardRect.imageSrc
                       fillMode: Image.PreserveAspectCrop
                       asynchronous: true
+                      cache: true
                       smooth: true
+                      mipmap: true
                     }
 
                     Text {
