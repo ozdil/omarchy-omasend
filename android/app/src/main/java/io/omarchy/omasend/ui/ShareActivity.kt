@@ -174,8 +174,7 @@ class ShareActivity : ComponentActivity() {
                                                     transferState = state
                                                 }
                                             }
-                                        },
-                                        onSendClipboard = {}
+                                        }
                                     )
                                 }
                             }

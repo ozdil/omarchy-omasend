@@ -5,9 +5,16 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
 import android.os.Build
+import io.omarchy.omasend.audio.OmaSoundEngine
+import io.omarchy.omasend.crypto.OmaIdentity
 import io.omarchy.omasend.network.DiscoveryManager
+import io.omarchy.omasend.network.NetworkConnectivityWatcher
+import io.omarchy.omasend.network.NetworkTransportMode
 import io.omarchy.omasend.network.OmaSendClient
 import io.omarchy.omasend.network.OmaSendServer
+import io.omarchy.omasend.network.WanDiscoveryEngine
+import io.omarchy.omasend.repository.ClipboardVault
+import io.omarchy.omasend.ui.haptics.OmaHapticController
 
 class OmaSendApp : Application() {
     lateinit var discoveryManager: DiscoveryManager
@@ -16,6 +23,18 @@ class OmaSendApp : Application() {
         private set
     lateinit var client: OmaSendClient
         private set
+    lateinit var soundEngine: OmaSoundEngine
+        private set
+    lateinit var hapticController: OmaHapticController
+        private set
+    lateinit var clipboardVault: ClipboardVault
+        private set
+    lateinit var omaIdentity: OmaIdentity
+        private set
+    lateinit var wanDiscoveryEngine: WanDiscoveryEngine
+        private set
+    lateinit var networkWatcher: NetworkConnectivityWatcher
+        private set
 
     override fun onCreate() {
         super.onCreate()
@@ -23,14 +42,53 @@ class OmaSendApp : Application() {
 
         createNotificationChannels()
 
+        soundEngine = OmaSoundEngine(this)
+        hapticController = OmaHapticController(this)
+        clipboardVault = ClipboardVault.getInstance(this)
+        omaIdentity = OmaIdentity.getOrGenerate(this)
+        wanDiscoveryEngine = WanDiscoveryEngine(this, identityProvider = { omaIdentity })
+
         discoveryManager = DiscoveryManager(this)
         server = OmaSendServer(this).apply {
             getDiscoveryMode = { discoveryManager.discoveryMode.value }
         }
         client = OmaSendClient(this)
 
+        networkWatcher = NetworkConnectivityWatcher(this).apply {
+            onLanAvailable = {
+                discoveryManager.forceRefresh()
+                wanDiscoveryEngine.setNetworkMode(NetworkTransportMode.LAN)
+            }
+            onCellularAvailable = {
+                wanDiscoveryEngine.setNetworkMode(NetworkTransportMode.WAN)
+                discoveryManager.refreshBluetoothPeers()
+            }
+            onNetworkChanged = { state ->
+                if (state.isLanAvailable) {
+                    discoveryManager.forceRefresh()
+                }
+            }
+            start()
+        }
+
         server.start()
         discoveryManager.start()
+        wanDiscoveryEngine.start()
+    }
+
+    fun refreshOmaIdentity(): OmaIdentity {
+        omaIdentity = OmaIdentity.getOrGenerate(this)
+        return omaIdentity
+    }
+
+    fun setCustomOmaIdentity(newOmaId: String): OmaIdentity {
+        omaIdentity = OmaIdentity.save(this, newOmaId)
+        return omaIdentity
+    }
+
+    fun resetOmaIdentity(): OmaIdentity {
+        omaIdentity = OmaIdentity.reset(this)
+        return omaIdentity
     }
 
     private fun createNotificationChannels() {
@@ -56,6 +114,14 @@ class OmaSendApp : Application() {
             manager.createNotificationChannel(serviceChannel)
             manager.createNotificationChannel(transferChannel)
         }
+    }
+
+    override fun onTerminate() {
+        super.onTerminate()
+        try {
+            networkWatcher.stop()
+            soundEngine.release()
+        } catch (_: Exception) {}
     }
 
     companion object {

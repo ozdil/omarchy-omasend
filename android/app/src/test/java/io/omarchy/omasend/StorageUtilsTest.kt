@@ -43,4 +43,11 @@ class StorageUtilsTest {
         assertTrue(StorageUtils.sanitizeFilename("...").startsWith("file_"))
         assertTrue(StorageUtils.sanitizeFilename(" . ").startsWith("file_"))
     }
+
+    @Test
+    fun testStorageUtilsStreamingConstants() {
+        assertEquals(10L * 1024 * 1024 * 1024L, StorageUtils.MAX_FILE_SIZE)
+        assertEquals(128 * 1024, StorageUtils.STREAM_CHUNK_SIZE)
+        assertEquals(null, StorageUtils.incomingTransferMetrics.value)
+    }
 }

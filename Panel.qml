@@ -38,7 +38,13 @@ Panel {
   property bool p2pBtAvailable: false
   property var p2pPeers: []
   property var p2pPendingTransfer: null
+  property var clipboardVault: []
   property bool showAboutModal: false
+
+  // 16-Digit OmaID & Profile State
+  property string omaId: ""
+  property bool omaIdRevealed: false
+  property bool omaIdCopiedFeedback: false
 
   // Selected peer for cursor navigation
   property int selectedPeerIndex: 0
@@ -48,6 +54,34 @@ Panel {
   readonly property color hoverFill: bar ? Style.hoverFillFor(bar.foreground, Color.accent) : "transparent"
   readonly property color selectedFill: bar ? Style.selectedFillFor(bar.foreground, Color.accent) : "transparent"
   readonly property string fontFamily: (root.bar && root.bar.fontFamily) ? root.bar.fontFamily : ((typeof Style !== "undefined" && Style.font && Style.font.family) ? Style.font.family : "JetBrainsMono Nerd Font, JetBrains Mono, monospace")
+  readonly property string vaultPath: (Quickshell.env("HOME") || "/home/ozdil") + "/.local/state/omarchy/omasend/clipboard_vault.json"
+
+  function formatOmaId(id, revealed) {
+    if (!id || String(id).trim() === "") return "---- ---- ---- ----"
+    var clean = String(id).toUpperCase().replace(/[^A-F0-9]/g, "")
+    if (!revealed) {
+      if (clean.length >= 16) {
+        return "••••-••••-••••-" + clean.slice(12, 16)
+      }
+      return "••••-••••-••••-••••"
+    }
+    if (clean.length === 16) {
+      return clean.slice(0, 4) + "-" + clean.slice(4, 8) + "-" + clean.slice(8, 12) + "-" + clean.slice(12, 16)
+    }
+    return clean
+  }
+
+  function loadVault(content) {
+    try {
+      if (!content || String(content).trim() === "") return
+      var parsed = JSON.parse(content)
+      if (parsed && Array.isArray(parsed.items)) {
+        root.clipboardVault = parsed.items
+      } else if (Array.isArray(parsed)) {
+        root.clipboardVault = parsed
+      }
+    } catch(e) {}
+  }
 
   function resolveEnginePath() {
     return Qt.resolvedUrl("omasend-engine").toString().replace(/^file:\/\//, "")
@@ -153,6 +187,12 @@ Panel {
     copyProc.running = true
   }
 
+  function copyText(text) {
+    if (copyProc.running) copyProc.running = false
+    copyProc.command = ["wl-copy", text]
+    copyProc.running = true
+  }
+
   function openFolder() {
     if (folderProc.running) folderProc.running = false
     folderProc.command = ["xdg-open", root.savePath]
@@ -208,9 +248,20 @@ Panel {
           root.p2pBtAvailable = Boolean(d.p2p_bluetooth_available)
           root.p2pPeers = d.p2p_discovered_peers || []
           root.p2pPendingTransfer = d.p2p_pending_transfer || null
+          root.clipboardVault = d.clipboard_vault || []
+          root.omaId = String(d.p2p_device_id || "")
           root.refreshNonce++
         } catch(e) {}
       }
+    }
+  }
+
+  Timer {
+    id: omaIdCopyTimer
+    interval: 1800
+    repeat: false
+    onTriggered: {
+      root.omaIdCopiedFeedback = false
     }
   }
 
@@ -237,9 +288,20 @@ Panel {
     command: ["pw-play", Qt.resolvedUrl("assets/send_whoosh.wav").toString().replace(/^file:\/\//, "")]
   }
 
+  FileView {
+    id: vaultWatcher
+    path: root.vaultPath
+    watchChanges: true
+    atomicWrites: true
+    printErrors: false
+    onLoaded: root.loadVault(text())
+    onLoadFailed: root.clipboardVault = []
+    onFileChanged: reload()
+  }
+
   Timer {
     id: refreshTimer
-    interval: 3000
+    interval: 800
     running: root.opened
     repeat: true
     onTriggered: root.refresh()
@@ -334,7 +396,7 @@ Panel {
     }
   }
 
-  // Anchored Drop Portal & Apple NameDrop Fluid Aura (Multi-Monitor Isolated & Sub-pixel Centered)
+  // Anchored Drop Portal & Fluid Water Droplet Ripple Engine
   PopupWindow {
     id: dropPortal
     anchor {
@@ -367,7 +429,7 @@ Panel {
     }
     implicitWidth: 600
     implicitHeight: 600
-    visible: true
+    visible: (dropPortal.active && dropPortal.proximity > 0.01) || dropPortal.isBlasting
     color: "transparent"
 
     property bool active: false
@@ -421,12 +483,12 @@ Panel {
         root.executeAction(["--send", targetIp, firstFile])
       }
 
-      // Trigger NameDrop bump shockwave animation
+      // Trigger Water Droplet Splash & Rebound Shockwave
       dropPortal.isBlasting = true
       blastAnim.restart()
     }
 
-    // Apple NameDrop Shockwave Elastic Animation
+    // Water Droplet Impact & Crown Splash Animation Sequence
     SequentialAnimation {
       id: blastAnim
       running: false
@@ -436,15 +498,15 @@ Panel {
           property: "blastProgress"
           from: 0.0
           to: 1.0
-          duration: 360
+          duration: 460
           easing.type: Easing.OutCubic
         }
         NumberAnimation {
-          target: portalLandingHalo
+          target: impactCrown
           property: "scale"
-          from: 1.0
-          to: 1.50
-          duration: 180
+          from: 0.0
+          to: 1.65
+          duration: 220
           easing.type: Easing.OutBack
         }
         NumberAnimation {
@@ -452,30 +514,30 @@ Panel {
           property: "opacity"
           from: 0.0
           to: 1.0
-          duration: 100
+          duration: 120
           easing.type: Easing.OutQuad
         }
       }
       ParallelAnimation {
         NumberAnimation {
-          target: portalLandingHalo
+          target: impactCrown
           property: "scale"
           to: 1.0
-          duration: 200
+          duration: 240
           easing.type: Easing.OutElastic
         }
         NumberAnimation {
           target: flareBeam
           property: "opacity"
           to: 0.0
-          duration: 200
+          duration: 240
           easing.type: Easing.InQuad
         }
         NumberAnimation {
           target: dropPortal
           property: "proximity"
           to: 0.0
-          duration: 200
+          duration: 240
         }
       }
       ScriptAction {
@@ -534,18 +596,20 @@ Panel {
       y: Math.round(dropPortal.originY - height / 2)
       width: 600
       height: 600
+      layer.enabled: true
       opacity: ((dropPortal.active && dropPortal.proximity > 0.01) || dropPortal.isBlasting) ? 1.0 : 0.0
       Behavior on opacity {
         NumberAnimation { duration: 120; easing.type: Easing.OutQuad }
       }
 
-      // Layer 5: Radial Gradient Alpha Decay (Center 80% -> Outer 0%)
+      // Layer 5: Liquid Water Surface Radial Refraction Gradient (Center 80% -> Outer 0%)
       Canvas {
         id: radialGradientCanvas
         anchors.centerIn: parent
         width: 580
         height: 580
         antialiasing: true
+        layer.enabled: true
         renderTarget: Canvas.FramebufferObject
 
         onPaint: {
@@ -555,12 +619,12 @@ Panel {
 
           var cx = width / 2
           var cy = height / 2
-          var r = (80 + dropPortal.proximity * 420) / 2
+          var r = (80 + dropPortal.proximity * 440) / 2
 
           var grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, r)
-          grad.addColorStop(0.0, Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.80 * (0.3 + dropPortal.proximity * 0.7)))
-          grad.addColorStop(0.35, Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.45 * dropPortal.proximity))
-          grad.addColorStop(0.70, Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.15 * dropPortal.proximity))
+          grad.addColorStop(0.0, Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.80 * (0.35 + dropPortal.proximity * 0.65)))
+          grad.addColorStop(0.28, Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.48 * dropPortal.proximity))
+          grad.addColorStop(0.65, Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.16 * dropPortal.proximity))
           grad.addColorStop(1.0, Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.00))
 
           ctx.fillStyle = grad
@@ -577,13 +641,14 @@ Panel {
         }
       }
 
-      // Layer 4: Ambient Aura Glow (80px -> 460px)
+      // Layer 4: Ambient Liquid Pool Glow (80px -> 480px)
       Rectangle {
         id: ambientGlow
         anchors.centerIn: parent
-        width: 80 + (dropPortal.proximity * 380) + (dropPortal.isBlasting ? dropPortal.blastProgress * 120 : 0)
+        width: 80 + (dropPortal.proximity * 400) + (dropPortal.isBlasting ? dropPortal.blastProgress * 120 : 0)
         height: width
         radius: width / 2
+        layer.enabled: true
         color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, dropPortal.isBlasting ? 0.35 : (0.04 + dropPortal.proximity * 0.24))
         border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, dropPortal.isBlasting ? 0.75 : (0.08 + dropPortal.proximity * 0.48))
         border.width: 1.0
@@ -593,148 +658,220 @@ Panel {
         Behavior on color { ColorAnimation { duration: 80 } }
       }
 
-      // Layer 3: Outer Sonar Ring with Curved Arc Typography
-      Item {
-        id: curvedSonarRing
+      // Wave 4: Outermost Propagating Ripple (Phase Offset: 1200ms)
+      Rectangle {
+        id: portalWave4
         anchors.centerIn: parent
-        width: 190 + dropPortal.proximity * 310
+        width: 260 + dropPortal.proximity * 300
         height: width
+        radius: width / 2
+        layer.enabled: true
+        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.01)
+        border.color: Color.accent
+        border.width: Math.max(0.8, 1.4 * (1.0 - scale * 0.5))
 
+        SequentialAnimation on opacity {
+          running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
+          loops: Animation.Infinite
+          PauseAnimation { duration: 1200 }
+          NumberAnimation { from: 0.0; to: 0.35 + dropPortal.proximity * 0.30; duration: 550; easing.type: Easing.OutQuad }
+          NumberAnimation { from: 0.35 + dropPortal.proximity * 0.30; to: 0.0; duration: 1150; easing.type: Easing.InQuad }
+        }
+
+        SequentialAnimation on scale {
+          running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
+          loops: Animation.Infinite
+          PauseAnimation { duration: 1200 }
+          NumberAnimation { from: 0.0; to: 1.0; duration: 1700; easing.type: Easing.OutCubic }
+        }
+      }
+
+      // Wave 3: Outer Propagating Ripple (Phase Offset: 800ms)
+      Rectangle {
+        id: portalWave3
+        anchors.centerIn: parent
+        width: 200 + dropPortal.proximity * 280
+        height: width
+        radius: width / 2
+        layer.enabled: true
+        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.02)
+        border.color: Color.accent
+        border.width: Math.max(1.0, 1.8 * (1.0 - scale * 0.4))
+
+        SequentialAnimation on opacity {
+          running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
+          loops: Animation.Infinite
+          PauseAnimation { duration: 800 }
+          NumberAnimation { from: 0.0; to: 0.48 + dropPortal.proximity * 0.32; duration: 500; easing.type: Easing.OutQuad }
+          NumberAnimation { from: 0.48 + dropPortal.proximity * 0.32; to: 0.0; duration: 1100; easing.type: Easing.InQuad }
+        }
+
+        SequentialAnimation on scale {
+          running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
+          loops: Animation.Infinite
+          PauseAnimation { duration: 800 }
+          NumberAnimation { from: 0.0; to: 1.0; duration: 1600; easing.type: Easing.OutCubic }
+        }
+      }
+
+      // Layer 6: Floating Frosted Glass Capsule (Dynamic Island Peer Badge)
+      Item {
+        id: floatingDeviceCapsule
+        z: 30
+        anchors.horizontalCenter: parent.horizontalCenter
+        y: (root.bar && (root.bar.position === "bottom" || root.bar.edge === "bottom"))
+           ? (parent.height / 2 - 110 - (dropPortal.proximity * 25))
+           : (parent.height / 2 + 80 + (dropPortal.proximity * 25))
+
+        width: Math.min(360, capsuleRow.implicitWidth + 28)
+        height: 32
+        opacity: (dropPortal.active && dropPortal.proximity > 0.03) || dropPortal.isBlasting ? 1.0 : 0.0
+        scale: opacity > 0 ? (0.92 + dropPortal.proximity * 0.08) : 0.85
+
+        Behavior on opacity { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
+        Behavior on scale   { NumberAnimation { duration: 180; easing.type: Easing.OutBack } }
+        Behavior on y       { NumberAnimation { duration: 100; easing.type: Easing.OutQuad } }
+
+        // Frosted Dark Glass Surface
         Rectangle {
-          id: portalWave3
           anchors.fill: parent
-          radius: width / 2
-          color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.02)
-          border.color: Color.accent
-          border.width: 1.2
+          radius: height / 2
+          color: Qt.rgba(0.06, 0.07, 0.10, 0.88)
+          border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.50)
+          border.width: 1.0
 
-          SequentialAnimation on opacity {
-            running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
-            loops: Animation.Infinite
-            PauseAnimation { duration: 600 }
-            NumberAnimation { from: 0.0; to: 0.40 + dropPortal.proximity * 0.30; duration: 600; easing.type: Easing.OutQuad }
-            NumberAnimation { from: 0.40 + dropPortal.proximity * 0.30; to: 0.0; duration: 1000; easing.type: Easing.InQuad }
-          }
-
-          SequentialAnimation on scale {
-            running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
-            loops: Animation.Infinite
-            PauseAnimation { duration: 600 }
-            NumberAnimation { from: 0.5; to: 1.35 + dropPortal.proximity * 0.25; duration: 1600; easing.type: Easing.OutCubic }
+          // Subtle Inner Specular Rim
+          Rectangle {
+            anchors.fill: parent
+            anchors.margins: 1
+            radius: parent.radius - 1
+            color: "transparent"
+            border.color: Qt.rgba(1.0, 1.0, 1.0, 0.10)
+            border.width: 1.0
           }
         }
 
-        // Curved Arc Typography along the bottom curve of portalWave3
-        Item {
-          id: curvedTextContainer
-          anchors.fill: parent
-          opacity: dropPortal.proximity > 0.05 ? 1.0 : 0.0
-          Behavior on opacity { NumberAnimation { duration: 120 } }
+        RowLayout {
+          id: capsuleRow
+          anchors.centerIn: parent
+          spacing: 8
 
-          readonly property string targetPeerText: {
-            var name = (root.p2pPeers && root.p2pPeers.length > 0)
-                       ? ((root.selectedPeerIndex >= 0 && root.selectedPeerIndex < root.p2pPeers.length)
-                          ? root.p2pPeers[root.selectedPeerIndex].name.toUpperCase()
-                          : root.p2pPeers[0].name.toUpperCase())
-                       : "DISCOVERING PEERS"
-            return "󰄡 " + name
+          // Device Icon (JetBrainsMono Nerd Font)
+          Text {
+            textFormat: Text.PlainText
+            text: {
+              var peer = (root.p2pPeers && root.p2pPeers.length > root.selectedPeerIndex) ? root.p2pPeers[root.selectedPeerIndex] : null
+              var isMobile = peer && peer.is_mobile
+              return isMobile ? "󰏲" : "󰌢"
+            }
+            color: Color.accent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.base
+            Layout.alignment: Qt.AlignVCenter
           }
 
-          readonly property real ringRadius: curvedSonarRing.width / 2 - 12
-          readonly property int charCount: targetPeerText.length
-          readonly property real arcSpanRad: Math.min(1.5, charCount * 0.09)
-          readonly property real stepRad: charCount > 1 ? (arcSpanRad / (charCount - 1)) : 0.0
-          readonly property real startRad: (Math.PI / 2) - (arcSpanRad / 2)
-
-          Repeater {
-            model: curvedTextContainer.charCount
-
-            Item {
-              id: charItem
-              required property int index
-
-              readonly property real angle: curvedTextContainer.startRad + (index * curvedTextContainer.stepRad)
-              readonly property real posX: (curvedSonarRing.width / 2) + curvedTextContainer.ringRadius * Math.cos(angle)
-              readonly property real posY: (curvedSonarRing.height / 2) + curvedTextContainer.ringRadius * Math.sin(angle)
-              readonly property real tangentDeg: (angle * 180 / Math.PI) - 90
-
-              x: posX - width / 2
-              y: posY - height / 2
-              width: 14
-              height: 18
-              rotation: tangentDeg
-              transformOrigin: Item.Center
-
-              Text {
-                anchors.centerIn: parent
-                textFormat: Text.PlainText
-                text: curvedTextContainer.targetPeerText.charAt(charItem.index)
-                color: Color.accent
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-                font.letterSpacing: 0.5
-                horizontalAlignment: Text.AlignHCenter
-                verticalAlignment: Text.AlignVCenter
+          // Target Peer Name
+          Text {
+            textFormat: Text.PlainText
+            text: {
+              if (root.p2pPeers && root.p2pPeers.length > 0) {
+                var p = (root.selectedPeerIndex >= 0 && root.selectedPeerIndex < root.p2pPeers.length)
+                        ? root.p2pPeers[root.selectedPeerIndex]
+                        : root.p2pPeers[0]
+                return p.name ? p.name.toUpperCase() : "DISCOVERING..."
               }
+              return "DISCOVERING PEERS..."
+            }
+            color: root.bar ? root.bar.foreground : Color.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+            font.letterSpacing: 0.6
+            elide: Text.ElideRight
+            Layout.maximumWidth: 200
+            Layout.alignment: Qt.AlignVCenter
+          }
+
+          // Connection Mode Badge
+          Rectangle {
+            implicitWidth: modeBadgeText.implicitWidth + 10
+            implicitHeight: 18
+            radius: 4
+            color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.18)
+            border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.40)
+            border.width: 0.8
+            Layout.alignment: Qt.AlignVCenter
+
+            Text {
+              id: modeBadgeText
+              anchors.centerIn: parent
+              textFormat: Text.PlainText
+              text: root.activeMode === "LAN" ? "P2P" : root.activeMode
+              color: Color.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.micro
+              font.bold: true
+              font.letterSpacing: 0.5
             }
           }
         }
       }
 
-      // Layer 2: Mid Sonar Aura Wave (110px -> 300px)
+      // Wave 2: Mid Propagating Ripple (Phase Offset: 400ms)
       Rectangle {
         id: portalWave2
         anchors.centerIn: parent
-        width: 110 + dropPortal.proximity * 190
+        width: 130 + dropPortal.proximity * 220
         height: width
         radius: width / 2
+        layer.enabled: true
         color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.03)
         border.color: Color.accent
-        border.width: 1.2
+        border.width: Math.max(1.0, 2.0 * (1.0 - scale * 0.4))
 
         SequentialAnimation on opacity {
           running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
           loops: Animation.Infinite
-          PauseAnimation { duration: 250 }
-          NumberAnimation { from: 0.0; to: 0.50 + dropPortal.proximity * 0.3; duration: 500; easing.type: Easing.OutQuad }
-          NumberAnimation { from: 0.50 + dropPortal.proximity * 0.3; to: 0.0; duration: 950; easing.type: Easing.InQuad }
+          PauseAnimation { duration: 400 }
+          NumberAnimation { from: 0.0; to: 0.58 + dropPortal.proximity * 0.32; duration: 450; easing.type: Easing.OutQuad }
+          NumberAnimation { from: 0.58 + dropPortal.proximity * 0.32; to: 0.0; duration: 1050; easing.type: Easing.InQuad }
         }
 
         SequentialAnimation on scale {
           running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
           loops: Animation.Infinite
-          PauseAnimation { duration: 250 }
-          NumberAnimation { from: 0.45; to: 1.3 + dropPortal.proximity * 0.2; duration: 1450; easing.type: Easing.OutCubic }
+          PauseAnimation { duration: 400 }
+          NumberAnimation { from: 0.0; to: 1.0; duration: 1500; easing.type: Easing.OutCubic }
         }
       }
 
-      // Layer 1: Inner Sonar Aura Wave (55px -> 160px)
+      // Wave 1: Inner Wavefront Birth (Phase Offset: 0ms)
       Rectangle {
         id: portalWave1
         anchors.centerIn: parent
-        width: 55 + dropPortal.proximity * 105
+        width: 70 + dropPortal.proximity * 140
         height: width
         radius: width / 2
+        layer.enabled: true
         color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.04)
         border.color: Color.accent
-        border.width: 1.5
+        border.width: Math.max(1.2, 2.4 * (1.0 - scale * 0.35))
 
         SequentialAnimation on opacity {
           running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
           loops: Animation.Infinite
-          NumberAnimation { from: 0.0; to: 0.70 + dropPortal.proximity * 0.25; duration: 400; easing.type: Easing.OutQuad }
-          NumberAnimation { from: 0.70 + dropPortal.proximity * 0.25; to: 0.0; duration: 800; easing.type: Easing.InQuad }
+          NumberAnimation { from: 0.0; to: 0.75 + dropPortal.proximity * 0.25; duration: 350; easing.type: Easing.OutQuad }
+          NumberAnimation { from: 0.75 + dropPortal.proximity * 0.25; to: 0.0; duration: 900; easing.type: Easing.InQuad }
         }
 
         SequentialAnimation on scale {
           running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
           loops: Animation.Infinite
-          NumberAnimation { from: 0.4; to: 1.35 + dropPortal.proximity * 0.25; duration: 1200; easing.type: Easing.OutCubic }
+          NumberAnimation { from: 0.0; to: 1.0; duration: 1250; easing.type: Easing.OutCubic }
         }
       }
 
-      // Anamorphic Optical Flare Halo Streak (Apple NameDrop Lens Corona: 36px -> 400px)
+      // Anamorphic Optical Flare Halo Streak
       Rectangle {
         id: flareBeam
         anchors.centerIn: parent
@@ -748,12 +885,12 @@ Panel {
         Behavior on opacity { NumberAnimation { duration: 80 } }
       }
 
-      // Elastic Blast Shockwave (onDropped impact: expands to 480px)
+      // High-Energy Splash Shockwave (onDropped: 0 -> 600px with Easing.OutCubic)
       Rectangle {
-        id: blastShockwave
+        id: shockRipple
         anchors.centerIn: parent
         visible: dropPortal.isBlasting
-        width: 44 + (dropPortal.blastProgress * 480)
+        width: 30 + (dropPortal.blastProgress * 570)
         height: width
         radius: width / 2
         color: "transparent"
@@ -761,9 +898,9 @@ Panel {
         border.width: Math.max(1.0, 5.0 * (1.0 - dropPortal.blastProgress))
       }
 
-      // Layer 0: Central Target Reticle Halo
+      // Layer 0: Droplet Impact Crown & Target Reticle
       Rectangle {
-        id: portalLandingHalo
+        id: impactCrown
         anchors.centerIn: parent
         z: 20
         width: 48 + dropPortal.proximity * 18
@@ -800,7 +937,7 @@ Panel {
             font.bold: true
             font.letterSpacing: 0.8
             elide: Text.ElideRight
-            width: Math.min(84, portalLandingHalo.width - 4)
+            width: Math.min(84, impactCrown.width - 4)
             horizontalAlignment: Text.AlignHCenter
           }
         }
@@ -925,6 +1062,208 @@ Panel {
               font.letterSpacing: 1.2
               elide: Text.ElideRight
               width: parent.width
+            }
+          }
+        }
+
+        // OmaID Profile & Connection Mode Indicator
+        Rectangle {
+          width: parent.width
+          implicitHeight: omaidRow.implicitHeight + Style.space(12)
+          radius: Style.cornerRadius
+          color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.07)
+          border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.28)
+          border.width: 1
+
+          // 1px specular highlight inner rim
+          Rectangle {
+            anchors.fill: parent
+            anchors.margins: 1
+            radius: Math.max(0, parent.radius - 1)
+            color: "transparent"
+            border.color: Qt.rgba(1.0, 1.0, 1.0, 0.08)
+            border.width: 1
+          }
+
+          RowLayout {
+            id: omaidRow
+            anchors.fill: parent
+            anchors.leftMargin: Style.space(10)
+            anchors.rightMargin: Style.space(10)
+            spacing: Style.space(8)
+
+            // OmaID Icon (Nerd Font Glyph)
+            Text {
+              textFormat: Text.PlainText
+              text: "󰌆"
+              color: Color.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              Layout.alignment: Qt.AlignVCenter
+            }
+
+            // OmaID Label & Value
+            Column {
+              Layout.fillWidth: true
+              Layout.alignment: Qt.AlignVCenter
+              spacing: 1
+
+              RowLayout {
+                spacing: Style.space(4)
+                Text {
+                  text: "OMAID"
+                  color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.micro
+                  font.bold: true
+                  font.letterSpacing: 0.8
+                }
+                Text {
+                  visible: root.omaIdCopiedFeedback
+                  text: "COPIED"
+                  color: Color.accent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.micro
+                  font.bold: true
+                }
+              }
+
+              Text {
+                text: root.formatOmaId(root.omaId, root.omaIdRevealed)
+                color: root.bar ? root.bar.foreground : Color.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 1.0
+              }
+            }
+
+            // Reveal/Mask Button
+            Rectangle {
+              implicitWidth: 26
+              implicitHeight: 26
+              radius: 4
+              color: revealMouse.containsMouse ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.20) : "transparent"
+              Layout.alignment: Qt.AlignVCenter
+
+              Text {
+                anchors.centerIn: parent
+                textFormat: Text.PlainText
+                text: root.omaIdRevealed ? "󰈉" : "󰈈"
+                color: root.omaIdRevealed ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.3)
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              MouseArea {
+                id: revealMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                  root.omaIdRevealed = !root.omaIdRevealed
+                }
+              }
+
+              PanelToolTip {
+                visible: revealMouse.containsMouse
+                text: root.omaIdRevealed ? "Mask OmaID" : "Reveal OmaID"
+                fontFamily: root.fontFamily
+              }
+            }
+
+            // Copy OmaID Button
+            Rectangle {
+              implicitWidth: 26
+              implicitHeight: 26
+              radius: 4
+              color: copyOmaIdMouse.containsMouse ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.20) : "transparent"
+              Layout.alignment: Qt.AlignVCenter
+
+              Text {
+                anchors.centerIn: parent
+                textFormat: Text.PlainText
+                text: "󰅟"
+                color: root.omaIdCopiedFeedback ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              MouseArea {
+                id: copyOmaIdMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                  if (root.omaId) {
+                    root.copyText(root.omaId)
+                    root.omaIdCopiedFeedback = true
+                    omaIdCopyTimer.restart()
+                  }
+                }
+              }
+
+              PanelToolTip {
+                visible: copyOmaIdMouse.containsMouse
+                text: "Copy 16-digit OmaID"
+                fontFamily: root.fontFamily
+              }
+            }
+
+            // Connection Mode Indicator Badge (LAN / WAN / P2P)
+            Rectangle {
+              implicitWidth: modeRow.implicitWidth + Style.space(10)
+              implicitHeight: 22
+              radius: 4
+              color: {
+                if (root.wanActive) return Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.20)
+                if (root.activeMode === "P2P" || root.p2pVisibility !== "OFF") return Qt.rgba(0.73, 0.60, 0.97, 0.20)
+                return Qt.rgba(0.62, 0.81, 0.42, 0.20)
+              }
+              border.color: {
+                if (root.wanActive) return Color.accent
+                if (root.activeMode === "P2P" || root.p2pVisibility !== "OFF") return "#bb9af7"
+                return "#9ece6a"
+              }
+              border.width: 1
+              Layout.alignment: Qt.AlignVCenter
+
+              RowLayout {
+                id: modeRow
+                anchors.centerIn: parent
+                spacing: 4
+
+                // Dot Indicator
+                Rectangle {
+                  width: 6
+                  height: 6
+                  radius: 3
+                  color: {
+                    if (root.wanActive) return Color.accent
+                    if (root.activeMode === "P2P" || root.p2pVisibility !== "OFF") return "#bb9af7"
+                    return "#9ece6a"
+                  }
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: {
+                    if (root.wanActive) return "WAN"
+                    if (root.activeMode === "P2P" || root.p2pVisibility !== "OFF") return "P2P"
+                    return "LAN"
+                  }
+                  color: root.bar ? root.bar.foreground : Color.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.micro
+                  font.bold: true
+                  font.letterSpacing: 0.5
+                }
+              }
+
+              PanelToolTip {
+                text: root.wanActive ? "Cloudflare WAN Tunnel Active" : (root.p2pVisibility !== "OFF" ? "AirBridge P2P WebRTC Active" : "LAN Local Network Only")
+                fontFamily: root.fontFamily
+              }
             }
           }
         }
@@ -1137,19 +1476,11 @@ Panel {
                   spacing: Style.space(6)
 
                   PanelActionButton {
-                    iconText: ""
+                    iconText: "󰛄"
                     tooltipText: "Send File"
                     foreground: root.bar ? root.bar.foreground : Color.foreground
                     fontFamily: root.fontFamily
                     onClicked: root.sendFileTo(modelData.ip)
-                  }
-
-                  PanelActionButton {
-                    iconText: ""
-                    tooltipText: "Send Clipboard"
-                    foreground: root.bar ? root.bar.foreground : Color.foreground
-                    fontFamily: root.fontFamily
-                    onClicked: root.syncClipboardTo(modelData.ip)
                   }
                 }
               }
@@ -1168,6 +1499,121 @@ Panel {
           }
         }
 
+        // Section: UNIVERSAL CLIPBOARD VAULT
+        PanelSeparator {
+          visible: root.clipboardVault && root.clipboardVault.length > 0
+          foreground: root.bar ? root.bar.foreground : Color.foreground
+        }
+
+        Column {
+          id: clipboardVaultSection
+          visible: root.clipboardVault && root.clipboardVault.length > 0
+          width: parent.width
+          spacing: Style.space(8)
+
+          RowLayout {
+            width: parent.width
+
+            PanelSectionHeader {
+              text: "CLIPBOARD VAULT"
+              foreground: root.bar ? root.bar.foreground : Color.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Item { Layout.fillWidth: true }
+
+            Text {
+              textFormat: Text.PlainText
+              text: "󰅏 SYNC ACTIVE"
+              color: Color.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+          }
+
+          Repeater {
+            model: root.clipboardVault ? root.clipboardVault.slice(0, 10) : []
+
+            Rectangle {
+              required property var modelData
+              required property int index
+              width: clipboardVaultSection.width
+              implicitHeight: clipCol.implicitHeight + Style.space(12)
+              radius: Style.cornerRadius
+              color: Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
+              border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.28)
+              border.width: 1
+
+              // 1px specular highlight inner rim
+              Rectangle {
+                anchors.fill: parent
+                anchors.margins: 1
+                radius: Math.max(0, parent.radius - 1)
+                color: "transparent"
+                border.color: Qt.rgba(1.0, 1.0, 1.0, 0.08)
+                border.width: 1
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                  if (modelData && modelData.text) {
+                    root.copyText(modelData.text)
+                  }
+                }
+              }
+
+              Column {
+                id: clipCol
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: parent.top
+                anchors.margins: Style.space(8)
+                spacing: Style.space(4)
+
+                RowLayout {
+                  width: parent.width
+                  spacing: Style.space(6)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: modelData.sender === "Local" ? "󰌢 Local PC" : ("󰏲 " + (modelData.sender || "Device"))
+                    color: Color.accent
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                  }
+
+                  Item { Layout.fillWidth: true }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: (modelData.char_count || (modelData.text ? modelData.text.length : 0)) + " chars"
+                    color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: modelData.text || ""
+                  color: root.bar ? root.bar.foreground : Color.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
+                  maximumLineCount: 2
+                  wrapMode: Text.Wrap
+                }
+              }
+            }
+          }
+        }
+
         // Footer / Actions Section
         PanelSeparator {
           foreground: root.bar ? root.bar.foreground : Color.foreground
@@ -1183,14 +1629,6 @@ Panel {
             foreground: root.bar ? root.bar.foreground : Color.foreground
             fontFamily: root.fontFamily
             onClicked: root.showAboutModal = !root.showAboutModal
-          }
-
-          PanelActionButton {
-            iconText: ""
-            tooltipText: "Open Received Files Folder"
-            foreground: root.bar ? root.bar.foreground : Color.foreground
-            fontFamily: root.fontFamily
-            onClicked: root.openFolder()
           }
 
           Item { Layout.fillWidth: true }

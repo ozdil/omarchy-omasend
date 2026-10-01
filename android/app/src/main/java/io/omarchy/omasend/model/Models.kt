@@ -62,6 +62,15 @@ data class ClipboardPayload(
     val token: String? = null
 )
 
+@Serializable
+data class ClipboardEntry(
+    val id: String = java.util.UUID.randomUUID().toString(),
+    val text: String,
+    val senderName: String,
+    val timestamp: Long = System.currentTimeMillis(),
+    val isMine: Boolean = false
+)
+
 sealed class TransferProgressState {
     object Idle : TransferProgressState()
     data class Requesting(val peerName: String, val fileName: String) : TransferProgressState()
@@ -72,11 +81,23 @@ sealed class TransferProgressState {
         val fileName: String,
         val bytesTransferred: Long,
         val totalBytes: Long,
-        val percent: Int
+        val percent: Int,
+        val speedMBps: Double = 0.0,
+        val etaSeconds: Long = 0L
     ) : TransferProgressState()
     data class Success(val message: String) : TransferProgressState()
     data class Error(val message: String) : TransferProgressState()
 }
+
+@Serializable
+data class TransferMetrics(
+    val bytesTransferred: Long = 0L,
+    val totalBytes: Long = 0L,
+    val percent: Int = 0,
+    val speedMBps: Double = 0.0,
+    val etaSeconds: Long = 0L,
+    val isCompleted: Boolean = false
+)
 
 data class IncomingTransferPrompt(
     val token: String,

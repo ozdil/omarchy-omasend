@@ -76,3 +76,4 @@ fun OmaSendTheme(
     )
 }
 
+val JetBrainsMonoFontFamily = androidx.compose.ui.text.font.FontFamily.Monospace

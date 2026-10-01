@@ -49,4 +49,34 @@ class OmaHapticController(context: Context) {
             }
         } catch (_: Exception) {}
     }
+
+    fun onDropBounce() {
+        onTransferDispatched()
+    }
+
+    fun onFileReceivedImpact() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val timings = longArrayOf(0, 15, 30, 25)
+                val amplitudes = intArrayOf(0, 255, 0, 120)
+                vibrator?.vibrate(VibrationEffect.createWaveform(timings, amplitudes, -1))
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                vibrator?.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_DOUBLE_CLICK))
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator?.vibrate(60)
+            }
+        } catch (_: Exception) {}
+    }
+
+    fun onClipboardReceived() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                vibrator?.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK))
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator?.vibrate(30)
+            }
+        } catch (_: Exception) {}
+    }
 }

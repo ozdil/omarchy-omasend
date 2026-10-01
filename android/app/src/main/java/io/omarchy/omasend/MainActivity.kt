@@ -1,6 +1,8 @@
 package io.omarchy.omasend
 
 import android.Manifest
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -22,6 +24,7 @@ import io.omarchy.omasend.ui.theme.OmaSendTheme
 class MainActivity : ComponentActivity() {
 
     private var incomingPrompt by mutableStateOf<IncomingTransferPrompt?>(null)
+    private var clipboardListener: ClipboardManager.OnPrimaryClipChangedListener? = null
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -42,12 +45,21 @@ class MainActivity : ComponentActivity() {
         // Start background service
         OmaSendForegroundService.startService(this)
 
+        // Setup local clipboard tracking
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        clipboardListener = ClipboardManager.OnPrimaryClipChangedListener {
+            app.clipboardVault.processLocalClipboard(this, app)
+        }
+        clipboard?.addPrimaryClipChangedListener(clipboardListener)
+
         // Wire server callbacks
         app.server.onIncomingTransferPrompt = { prompt ->
             incomingPrompt = prompt
         }
 
         app.server.onFileReceived = { filename, size ->
+            app.soundEngine.playReceiveSound()
+            app.hapticController.onFileReceivedImpact()
             Toast.makeText(
                 this,
                 "Received '$filename' (${NetworkUtils.formatBytes(size)}) saved to Downloads/OmaSend",
@@ -83,6 +95,7 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         val app = application as? OmaSendApp
         app?.discoveryManager?.refreshBluetoothPeers()
+        app?.networkWatcher?.forceRefresh()
     }
 
     private fun checkAndRequestPermissions() {
@@ -110,6 +123,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        clipboardListener?.let {
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            clipboard?.removePrimaryClipChangedListener(it)
+        }
         val app = application as? OmaSendApp
         app?.discoveryManager?.stop()
         OmaSendForegroundService.stopService(this)

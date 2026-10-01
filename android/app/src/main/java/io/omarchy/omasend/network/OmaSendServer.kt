@@ -558,10 +558,22 @@ class OmaSendServer(private val context: Context) {
         // Authorized: reset failed attempts
         recordAuthAttempt(peerIp, true)
 
+        val vault = io.omarchy.omasend.repository.ClipboardVault.getInstance(context)
+        vault.processIncomingClipboard(payload.text, payload.sender_name)
+
         Handler(Looper.getMainLooper()).post {
-            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-            val clip = ClipData.newPlainText("OmaSend", payload.text)
-            clipboard?.setPrimaryClip(clip)
+            try {
+                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                val clip = ClipData.newPlainText("OmaSend", payload.text)
+                clipboard?.setPrimaryClip(clip)
+            } catch (_: Exception) {}
+
+            try {
+                val app = context.applicationContext as? io.omarchy.omasend.OmaSendApp
+                app?.soundEngine?.playReceiveSound()
+                app?.hapticController?.onClipboardReceived()
+            } catch (_: Exception) {}
+
             onClipboardReceived?.invoke(payload.sender_name, payload.text)
         }
 

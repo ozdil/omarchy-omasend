@@ -1,5 +1,16 @@
 mod subproc;
 pub mod military;
+pub mod rendezvous;
+
+pub use rendezvous::{
+    build_github_anchor_payload, compute_rendezvous_topic, create_stun_binding_request,
+    decrypt_rendezvous_record, derive_rendezvous_key, encrypt_rendezvous_record,
+    format_github_anchor_ref, format_oma_id, generate_raw_oma_id, hkdf_sha256, hmac_sha256,
+    luhn_checksum, luhn_verify, normalize_oma_id, parse_github_anchor_payload, parse_stun_response,
+    publish_local_rendezvous_anchor, query_local_rendezvous_anchor, query_stun_external_addr,
+    query_stun_server, validate_oma_id, EncryptedRendezvousEnvelope, NatTraversedSocket,
+    RendezvousRecord,
+};
 
 use aes_gcm::{
     aead::{Aead, KeyInit},
@@ -36,6 +47,23 @@ pub const MAX_PEER_CONNECTIONS: usize = 4;
 static GLOBAL_ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 static PEER_CONNECTION_TRACKER: Mutex<Option<HashMap<IpAddr, usize>>> = Mutex::new(None);
 static RECENTLY_NOTIFIED_FILES: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
+static LAST_SYNCED_CLIPBOARD_HASH: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn get_last_synced_clipboard_hash() -> Option<String> {
+    LAST_SYNCED_CLIPBOARD_HASH.lock().ok().and_then(|guard| guard.clone())
+}
+
+pub fn set_last_synced_clipboard_hash(hash: &str) {
+    if let Ok(mut guard) = LAST_SYNCED_CLIPBOARD_HASH.lock() {
+        *guard = Some(hash.to_string());
+    }
+}
+
+pub fn compute_clipboard_hash(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    hex::encode(hasher.finalize())
+}
 
 pub fn record_notified_file(file_name: &str) {
     if let Ok(mut lock) = RECENTLY_NOTIFIED_FILES.lock() {
@@ -139,6 +167,20 @@ pub struct TrustedPeersDb {
     pub peers: Vec<TrustedPeer>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardItem {
+    pub timestamp: u64,
+    pub sender: String,
+    pub text: String,
+    pub char_count: usize,
+    pub is_url: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClipboardVault {
+    pub items: Vec<ClipboardItem>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TransferFileInfo {
     pub name: String,
@@ -207,6 +249,12 @@ pub struct ServerState {
     pub p2p_bluetooth_available: bool,
     pub p2p_discovered_peers: Vec<DiscoveredPeer>,
     pub p2p_pending_transfer: Option<PendingFileTransfer>,
+    pub clipboard_vault: Vec<ClipboardItem>,
+    // OmaID, Blinded Rendezvous & WAN Discovery
+    pub oma_id: String,
+    pub wan_mode: String,
+    pub cluster_id: String,
+    pub stun_addr: Option<String>,
 }
 
 fn get_local_ip() -> String {
@@ -451,6 +499,14 @@ fn generate_new_session_key() -> String {
         eprintln!("Error writing secure session key file: {}", e);
     }
     key_hex
+}
+
+pub fn get_or_create_oma_id() -> String {
+    rendezvous::get_or_create_oma_id(&get_state_dir())
+}
+
+pub fn generate_new_oma_id() -> String {
+    rendezvous::generate_new_oma_id(&get_state_dir())
 }
 
 fn get_active_mode() -> String {
@@ -726,13 +782,36 @@ fn get_desktop_gui_envs() -> Vec<(&'static str, String)> {
         "XDG_SESSION_TYPE",
         "DBUS_SESSION_BUS_ADDRESS",
         "XDG_DATA_DIRS",
+        "PATH",
     ];
     let mut envs = Vec::new();
+    let mut has_wayland = false;
+    let mut has_runtime = false;
+    let mut has_path = false;
+
     for k in keys {
         if let Ok(v) = env::var(k) {
             if !v.is_empty() {
+                if k == "WAYLAND_DISPLAY" { has_wayland = true; }
+                if k == "XDG_RUNTIME_DIR" { has_runtime = true; }
+                if k == "PATH" { has_path = true; }
                 envs.push((k, v));
             }
+        }
+    }
+    if !has_path {
+        envs.push(("PATH", "/usr/bin:/bin:/usr/local/bin".to_string()));
+    }
+    if !has_runtime {
+        let uid = unsafe { libc::getuid() };
+        envs.push(("XDG_RUNTIME_DIR", format!("/run/user/{}", uid)));
+    }
+    if !has_wayland {
+        let uid = unsafe { libc::getuid() };
+        if Path::new(&format!("/run/user/{}/wayland-1", uid)).exists() {
+            envs.push(("WAYLAND_DISPLAY", "wayland-1".to_string()));
+        } else if Path::new(&format!("/run/user/{}/wayland-0", uid)).exists() {
+            envs.push(("WAYLAND_DISPLAY", "wayland-0".to_string()));
         }
     }
     envs
@@ -828,12 +907,223 @@ fn start_download_dir_watcher(download_dir: &Path) {
     });
 }
 
+pub const MAX_CLIPBOARD_VAULT_ITEMS: usize = 20;
+
+pub fn is_probable_url(text: &str) -> bool {
+    let t = text.trim();
+    if t.starts_with("http://") || t.starts_with("https://") || t.starts_with("ftp://") || t.starts_with("gemini://") {
+        return true;
+    }
+    if (t.starts_with("www.") || t.ends_with(".com") || t.ends_with(".org") || t.ends_with(".net") || t.ends_with(".io") || t.ends_with(".tr") || t.ends_with(".me")) && !t.contains(' ') && t.contains('.') {
+        return true;
+    }
+    false
+}
+
+pub fn load_clipboard_vault() -> ClipboardVault {
+    let path = get_state_dir().join("clipboard_vault.json");
+    if let Ok(content) = read_secure_file(&path) {
+        if let Ok(mut vault) = serde_json::from_str::<ClipboardVault>(&content) {
+            vault.items.retain(|item| {
+                let s = &item.text;
+                !s.starts_with("\u{FFFD}") &&
+                !s.starts_with("PNG") &&
+                s.chars().filter(|c| *c == '\u{FFFD}').count() < 2 &&
+                s.chars().take(100).filter(|c| c.is_control() && *c != '\n' && *c != '\r' && *c != '\t').count() < 2
+            });
+            return vault;
+        }
+    }
+    let hist_path = get_state_dir().join("clipboard_history.json");
+    if let Ok(content) = read_secure_file(&hist_path) {
+        if let Ok(mut vault) = serde_json::from_str::<ClipboardVault>(&content) {
+            vault.items.retain(|item| {
+                let s = &item.text;
+                !s.starts_with("\u{FFFD}") &&
+                !s.starts_with("PNG") &&
+                s.chars().filter(|c| *c == '\u{FFFD}').count() < 2 &&
+                s.chars().take(100).filter(|c| c.is_control() && *c != '\n' && *c != '\r' && *c != '\t').count() < 2
+            });
+            return vault;
+        }
+    }
+    ClipboardVault::default()
+}
+
+pub fn save_clipboard_vault(vault: &ClipboardVault) -> Result<(), String> {
+    let path = get_state_dir().join("clipboard_vault.json");
+    let content = serde_json::to_string_pretty(vault).map_err(|e| e.to_string())?;
+    write_secure_file(&path, &content)?;
+    let hist_path = get_state_dir().join("clipboard_history.json");
+    let _ = write_secure_file(&hist_path, &content);
+    Ok(())
+}
+
+pub fn add_clipboard_to_vault(sender: &str, text: &str) -> Result<ClipboardItem, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("Clipboard text is empty".to_string());
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let item = ClipboardItem {
+        timestamp: now,
+        sender: sender.to_string(),
+        text: text.to_string(),
+        char_count: text.chars().count(),
+        is_url: is_probable_url(text),
+    };
+
+    let mut vault = load_clipboard_vault();
+    if let Some(first) = vault.items.first() {
+        if first.text == item.text {
+            return Ok(item);
+        }
+    }
+
+    vault.items.insert(0, item.clone());
+    if vault.items.len() > MAX_CLIPBOARD_VAULT_ITEMS {
+        vault.items.truncate(MAX_CLIPBOARD_VAULT_ITEMS);
+    }
+    save_clipboard_vault(&vault)?;
+    Ok(item)
+}
+
+pub fn get_clipboard_vault_items() -> Vec<ClipboardItem> {
+    load_clipboard_vault().items
+}
+
+fn play_clipboard_sound() {
+    thread::spawn(|| {
+        let env_store = get_desktop_gui_envs();
+        let envs: Vec<(&str, &str)> = env_store.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let deadline = Instant::now() + Duration::from_millis(800);
+        let sound_candidates: [(&str, &[&str]); 3] = [
+            ("/usr/bin/canberra-gtk-play", &["-i", "message"]),
+            ("/usr/bin/paplay", &["/usr/share/sounds/freedesktop/stereo/message.oga"]),
+            ("/usr/bin/pw-play", &["/usr/share/sounds/freedesktop/stereo/message.oga"]),
+        ];
+        for (bin, args) in sound_candidates {
+            if Path::new(bin).exists() {
+                if run_cmd_bounded(bin, args, &envs, deadline, 1024).is_some() {
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn p2p_push_clipboard_silent(target_ip: &str, text: &str) {
+    let (my_id, _) = get_or_create_device_id();
+    let my_name = get_system_hostname();
+    let payload = serde_json::json!({
+        "sender_id": my_id,
+        "sender_name": my_name,
+        "text": text
+    });
+    if target_ip.starts_with("bt:") || (target_ip.len() == 17 && target_ip.chars().filter(|c| *c == ':').count() == 5) {
+        let mac = target_ip.strip_prefix("bt:").unwrap_or(target_ip).to_string();
+        let text_owned = text.to_string();
+        thread::spawn(move || {
+            let temp_clip = get_state_dir().join(format!("clipboard_push_bt_{}.txt", std::process::id()));
+            if write_secure_file(&temp_clip, &text_owned).is_ok() {
+                let _ = p2p_send_file_via_bluetooth(&mac, &temp_clip);
+                let _ = fs::remove_file(&temp_clip);
+            }
+        });
+        return;
+    }
+    let addr = resolve_peer_addr(target_ip);
+    let req_bytes = payload.to_string().into_bytes();
+    thread::spawn(move || {
+        if let Ok(mut stream) = connect_peer_with_timeout(&addr, Duration::from_millis(1500)) {
+            let http_req = format!(
+                "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                addr, req_bytes.len()
+            );
+            let _ = stream.write_all(http_req.as_bytes());
+            let _ = stream.write_all(&req_bytes);
+            let mut resp = Vec::new();
+            let _ = stream.read_to_end(&mut resp);
+        }
+    });
+}
+
+pub fn start_clipboard_sentinel() {
+    thread::spawn(move || {
+        let initial_text = get_pc_clipboard();
+        if !initial_text.trim().is_empty() {
+            let initial_hash = compute_clipboard_hash(&initial_text);
+            set_last_synced_clipboard_hash(&initial_hash);
+        }
+
+        loop {
+            thread::sleep(Duration::from_millis(200));
+            let text = get_pc_clipboard();
+            if text.trim().is_empty() {
+                continue;
+            }
+
+            let hash = compute_clipboard_hash(&text);
+            let last_hash = get_last_synced_clipboard_hash();
+
+            if last_hash.as_deref() == Some(&hash) {
+                continue;
+            }
+
+            set_last_synced_clipboard_hash(&hash);
+            let _ = add_clipboard_to_vault("Local", &text);
+
+            let peers = get_discovered_peers();
+            for peer in peers {
+                if !peer.ip.is_empty() {
+                    p2p_push_clipboard_silent(&peer.ip, &text);
+                }
+            }
+        }
+    });
+}
+
+pub fn is_valid_text_clipboard(data: &[u8]) -> Option<String> {
+    if data.is_empty() {
+        return None;
+    }
+    // Reject binary signatures (PNG, JPEG, GIF, ELF, etc.)
+    if data.starts_with(b"\x89PNG") || data.starts_with(b"\xFF\xD8\xFF") || data.starts_with(b"GIF8") || data.starts_with(b"\x7fELF") {
+        return None;
+    }
+    // Reject if contains null bytes in initial chunk
+    if data.iter().take(2048).any(|&b| b == 0) {
+        return None;
+    }
+    if let Ok(s) = std::str::from_utf8(data) {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        // Count non-printable control characters
+        let ctrl_count = trimmed.chars().take(200).filter(|c| c.is_control() && *c != '\n' && *c != '\r' && *c != '\t').count();
+        if ctrl_count > 2 {
+            return None;
+        }
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
 fn get_pc_clipboard() -> String {
     let env_store = get_desktop_gui_envs();
     let envs: Vec<(&str, &str)> = env_store.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let deadline = Instant::now() + Duration::from_millis(600);
-    if let Some(out) = run_cmd_bounded("/usr/bin/wl-paste", &["--no-newline"], &envs, deadline, 1024 * 1024) {
-        return String::from_utf8_lossy(&out).to_string();
+    if let Some(out) = run_cmd_bounded("/usr/bin/wl-paste", &["--type", "text", "--no-newline"], &envs, deadline, 1024 * 1024) {
+        if let Some(res) = is_valid_text_clipboard(&out) {
+            return res;
+        }
+    }
+    if let Some(out) = run_cmd_bounded("/usr/bin/xclip", &["-selection", "clipboard", "-o", "-t", "UTF8_STRING"], &envs, deadline, 1024 * 1024) {
+        if let Some(res) = is_valid_text_clipboard(&out) {
+            return res;
+        }
     }
     String::new()
 }
@@ -842,7 +1132,10 @@ fn set_pc_clipboard(text: &str) {
     let env_store = get_desktop_gui_envs();
     let envs: Vec<(&str, &str)> = env_store.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let deadline = Instant::now() + Duration::from_millis(800);
-    let _ = subproc::run_cmd_write_stdin_bounded("/usr/bin/wl-copy", &[], &envs, text.as_bytes(), deadline);
+    let success = subproc::run_cmd_write_stdin_bounded("/usr/bin/wl-copy", &[], &envs, text.as_bytes(), deadline);
+    if !success {
+        let _ = subproc::run_cmd_write_stdin_bounded("/usr/bin/xclip", &["-selection", "clipboard"], &envs, text.as_bytes(), deadline);
+    }
 }
 
 fn sanitize_filename(raw: &str) -> String {
@@ -1869,15 +2162,22 @@ pub struct StagedFile {
     pub size: u64,
     pub persisted: bool,
     pub reservation: Option<StagingReservationGuard>,
+    pub blake3_hash: Option<String>,
 }
 
 impl StagedFile {
-    pub fn new(path: PathBuf, size: u64, reservation: Option<StagingReservationGuard>) -> Self {
+    pub fn new(
+        path: PathBuf,
+        size: u64,
+        reservation: Option<StagingReservationGuard>,
+        blake3_hash: Option<String>,
+    ) -> Self {
         Self {
             path,
             size,
             persisted: false,
             reservation,
+            blake3_hash,
         }
     }
 
@@ -1957,19 +2257,25 @@ impl HttpBody {
             HttpBody::Staged(staged) => {
                 let mut file = fs::File::open(&staged.path).map_err(|e| format!("Failed to open staged file: {}", e))?;
                 let mut blake3_hasher = blake3::Hasher::new();
+                let need_blake3 = staged.blake3_hash.is_none();
                 let mut sha = Sha256::new();
                 let mut md5_ctx = md5::Context::new();
-                let mut buf = [0u8; 16384];
+                let mut buf = [0u8; 131072]; // 128 KiB streaming chunk
                 loop {
                     let n = file.read(&mut buf).map_err(|e| format!("Failed to read staged file: {}", e))?;
                     if n == 0 {
                         break;
                     }
-                    blake3_hasher.update(&buf[..n]);
+                    if need_blake3 {
+                        blake3_hasher.update(&buf[..n]);
+                    }
                     sha.update(&buf[..n]);
                     md5_ctx.consume(&buf[..n]);
                 }
-                let blake3_hex = blake3_hasher.finalize().to_hex().to_string();
+                let blake3_hex = match &staged.blake3_hash {
+                    Some(h) => h.clone(),
+                    None => blake3_hasher.finalize().to_hex().to_string(),
+                };
                 let sha_hex = hex::encode(sha.finalize());
                 let md5_hex = format!("{:x}", md5_ctx.compute());
                 Ok((blake3_hex, sha_hex, md5_hex))
@@ -2214,15 +2520,17 @@ pub fn read_http_body<S: TimeoutStream>(
             Err(_) => return None,
         };
 
+        let mut blake3_hasher = blake3::Hasher::new();
         let copy_len = initial_len.min(content_length);
         if stage_file.write_all(&initial_body[..copy_len]).is_err() {
             let _ = fs::remove_file(&stage_path);
             return None;
         }
+        blake3_hasher.update(&initial_body[..copy_len]);
 
         let mut remaining = content_length.saturating_sub(copy_len);
         let mut total_written = copy_len as u64;
-        let mut stream_chunk = [0u8; 65536];
+        let mut stream_chunk = [0u8; 131072]; // 128 KiB streaming chunk
 
         while remaining > 0 {
             let to_read = remaining.min(stream_chunk.len());
@@ -2236,6 +2544,7 @@ pub fn read_http_body<S: TimeoutStream>(
                         let _ = fs::remove_file(&stage_path);
                         return None;
                     }
+                    blake3_hasher.update(&stream_chunk[..n]);
                     total_written = total_written.saturating_add(n as u64);
                     remaining = remaining.saturating_sub(n);
                 }
@@ -2251,7 +2560,8 @@ pub fn read_http_body<S: TimeoutStream>(
             return None;
         }
 
-        let staged = StagedFile::new(stage_path, total_written, Some(reservation));
+        let blake3_hex = blake3_hasher.finalize().to_hex().to_string();
+        let staged = StagedFile::new(stage_path, total_written, Some(reservation), Some(blake3_hex));
         Some(HttpBody::Staged(staged))
     }
 }
@@ -2426,6 +2736,104 @@ fn send_response(
     );
     let _ = stream.write_all(resp.as_bytes());
     let _ = stream.write_all(body);
+}
+
+/// Zero-copy file streaming using Linux sendfile(2) directly to socket descriptor.
+/// Validates regular file ownership & UID, constructs HTTP response headers, and streams without Vec<u8> memory allocations.
+pub fn stream_file_zero_copy(
+    stream: &mut TcpStream,
+    path: &Path,
+    content_type: &str,
+    extra_headers: Option<&[(&str, &str)]>,
+    cors_origin: Option<&str>,
+) -> Result<u64, String> {
+    let meta = fs::symlink_metadata(path).map_err(|e| format!("Failed to stat {:?}: {}", path, e))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!("Security violation: {:?} is a symlink", path));
+    }
+    if !meta.file_type().is_file() {
+        return Err(format!("Security violation: {:?} is not a regular file", path));
+    }
+    let current_uid = get_current_uid();
+    if meta.uid() != current_uid {
+        return Err(format!(
+            "Security violation: {:?} is owned by UID {}, expected current user UID {}",
+            path,
+            meta.uid(),
+            current_uid
+        ));
+    }
+
+    let file_len = meta.len();
+    let file = File::open(path).map_err(|e| format!("Failed to open {:?}: {}", path, e))?;
+
+    let mut extra = String::new();
+    if let Some(hdrs) = extra_headers {
+        for (k, v) in hdrs {
+            extra.push_str(&format!("{}: {}\r\n", k, v));
+        }
+    }
+    let cors_header = if let Some(origin) = cors_origin {
+        format!("Access-Control-Allow-Origin: {}\r\nVary: Origin\r\n", origin)
+    } else {
+        String::new()
+    };
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}{}Connection: close\r\n\r\n",
+        content_type, file_len, cors_header, extra
+    );
+    stream.write_all(resp.as_bytes()).map_err(|e| format!("Failed to write HTTP headers: {}", e))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let in_fd = file.as_raw_fd();
+        let out_fd = stream.as_raw_fd();
+        let mut offset: libc::off_t = 0;
+        let mut remaining = file_len;
+        let mut total_sent: u64 = 0;
+
+        while remaining > 0 {
+            let to_send = (remaining as usize).min(1024 * 1024); // 1 MiB chunk for sendfile
+            let sent = unsafe {
+                libc::sendfile(
+                    out_fd,
+                    in_fd,
+                    &mut offset,
+                    to_send,
+                )
+            };
+            if sent < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(format!("sendfile error: {}", err));
+            }
+            if sent == 0 {
+                break;
+            }
+            remaining = remaining.saturating_sub(sent as u64);
+            total_sent = total_sent.saturating_add(sent as u64);
+        }
+        Ok(total_sent)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let mut reader = file;
+        let mut buf = [0u8; 131072];
+        let mut total_sent = 0u64;
+        loop {
+            let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            stream.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+            total_sent += n as u64;
+        }
+        Ok(total_sent)
+    }
 }
 
 // ------------------- WEB PAGES -------------------
@@ -3292,8 +3700,12 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             }
             if let Some(text) = val["text"].as_str() {
                 if text.len() <= MAX_CLIPBOARD_BODY {
+                    let hash = compute_clipboard_hash(text);
+                    set_last_synced_clipboard_hash(&hash);
                     set_pc_clipboard(text);
+                    let _ = add_clipboard_to_vault(sender_name, text);
                     notify_desktop("OmaSend: Universal Clipboard", &format!("Received clipboard text from {}.", sender_name));
+                    play_clipboard_sound();
                     respond(&stream, "200 OK", "application/json", b"{\"status\":\"OK\"}", None, None);
                     return;
                 }
@@ -3414,22 +3826,34 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             get_download_dir().join(&filename)
         };
 
-        if let Ok(content) = safe_read_file(&actual_target) {
-            match encrypt_aes256_gcm(key_hex, &content) {
-                Ok((iv, ciphertext)) => {
-                    let iv_hex = hex::encode(iv);
-                    let cd_val = format!("attachment; filename=\"{}.enc\"", filename);
-                    let extra = [
-                        ("X-OmaSend-IV", iv_hex.as_str()),
-                        ("X-OmaSend-Filename", filename.as_str()),
-                        ("Content-Disposition", cd_val.as_str()),
-                    ];
-                    respond(&stream, "200 OK", "application/octet-stream", &ciphertext, None, Some(&extra));
-                    return;
-                }
-                Err(e) => {
-                    respond(&stream, "500 Internal Server Error", "text/plain", e.as_bytes(), None, None);
-                    return;
+        if let Ok(meta) = fs::symlink_metadata(&actual_target) {
+            if !meta.file_type().is_symlink() && meta.file_type().is_file() && meta.uid() == get_current_uid() {
+                if let Ok(content) = safe_read_file(&actual_target) {
+                    match encrypt_aes256_gcm(key_hex, &content) {
+                        Ok((iv, ciphertext)) => {
+                            let iv_hex = hex::encode(&iv);
+                            let cd_val = format!("attachment; filename=\"{}.enc\"", filename);
+                            let extra = [
+                                ("X-OmaSend-IV", iv_hex.as_str()),
+                                ("X-OmaSend-Filename", filename.as_str()),
+                                ("Content-Disposition", cd_val.as_str()),
+                            ];
+                            let tmp_enc = get_state_dir().join(format!(".tmp_enc_{}_{}.part", std::process::id(), hex::encode(&iv)));
+                            if write_secure_bytes(&tmp_enc, &ciphertext).is_ok() {
+                                let res = stream_file_zero_copy(&mut stream, &tmp_enc, "application/octet-stream", Some(&extra), allowed_cors);
+                                let _ = fs::remove_file(&tmp_enc);
+                                if res.is_ok() {
+                                    return;
+                                }
+                            }
+                            respond(&stream, "200 OK", "application/octet-stream", &ciphertext, None, Some(&extra));
+                            return;
+                        }
+                        Err(e) => {
+                            respond(&stream, "500 Internal Server Error", "text/plain", e.as_bytes(), None, None);
+                            return;
+                        }
+                    }
                 }
             }
         }
@@ -3472,11 +3896,15 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
         match decrypt_aes256_gcm(key_hex, &iv_bytes, &ciphertext) {
             Ok(decrypted) => {
                 let text = String::from_utf8_lossy(&decrypted).to_string();
+                let hash = compute_clipboard_hash(&text);
+                set_last_synced_clipboard_hash(&hash);
                 set_pc_clipboard(&text);
+                let _ = add_clipboard_to_vault("Web Client (E2EE)", &text);
                 notify_desktop(
                     "OmaSend: E2EE Clipboard Received",
                     &format!("Encrypted clipboard updated ({} chars):\n{}", text.len(), text.chars().take(60).collect::<String>()),
                 );
+                play_clipboard_sound();
                 let resp = serde_json::json!({ "status": "OK", "encrypted": true });
                 respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
             }
@@ -3525,20 +3953,32 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             } else {
                 body_str.to_string()
             };
+            let hash = compute_clipboard_hash(&text);
+            set_last_synced_clipboard_hash(&hash);
             set_pc_clipboard(&text);
+            let _ = add_clipboard_to_vault("Web Client", &text);
             notify_desktop("OmaSend: Clipboard Received", &format!("Clipboard updated from device ({} chars)", text.len()));
+            play_clipboard_sound();
             let resp = serde_json::json!({ "status": "OK" });
             respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
         }
+    }
+    else if req.method == "GET" && (req.path == "/api/clipboard-vault" || req.path == "/api/clipboard/vault" || req.path == "/api/clipboard-history") {
+        let vault = load_clipboard_vault();
+        let resp = serde_json::json!({
+            "status": "OK",
+            "count": vault.items.len(),
+            "items": vault.items
+        });
+        respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
     }
     else if req.method == "GET" && req.path.starts_with("/download/") {
         let filename = sanitize_filename(&urlencoding_decode(req.path.trim_start_matches("/download/")));
         let target = get_shared_dir().join(&filename);
         let actual_target = if target.exists() { target } else { get_download_dir().join(&filename) };
-        if let Ok(content) = safe_read_file(&actual_target) {
-            let cd_val = format!("attachment; filename=\"{}\"", filename);
-            let extra = [("Content-Disposition", cd_val.as_str())];
-            respond(&stream, "200 OK", "application/octet-stream", &content, None, Some(&extra));
+        let cd_val = format!("attachment; filename=\"{}\"", filename);
+        let extra = [("Content-Disposition", cd_val.as_str())];
+        if stream_file_zero_copy(&mut stream, &actual_target, "application/octet-stream", Some(&extra), allowed_cors).is_ok() {
             return;
         }
         respond(&stream, "404 Not Found", "text/plain", b"File not found or access denied", None, None);
@@ -3667,11 +4107,21 @@ fn urlencoding_decode(input: &str) -> String {
 // ------------------- SERVER DAEMON -------------------
 
 fn run_server() {
-    // Enforce military-grade defense: anti-forensics and Landlock LSM sandbox
+    // Enforce military-grade defense: anti-forensics memory protection
     military::enable_anti_forensics();
-    let download_dir = get_download_dir();
     let state_dir = get_state_dir();
-    let _ = military::enable_landlock_sandbox(&[&download_dir, &state_dir], &[&download_dir, &state_dir]);
+
+    let pid_file = state_dir.join("engine.pid");
+    if let Ok(old_pid_str) = read_secure_file(&pid_file) {
+        if let Ok(old_pid) = old_pid_str.trim().parse::<i32>() {
+            let my_pid = std::process::id() as i32;
+            if old_pid != my_pid {
+                kill_process_group(old_pid);
+                thread::sleep(Duration::from_millis(60));
+            }
+        }
+    }
+    let _ = write_secure_file(&pid_file, &std::process::id().to_string());
 
     let local_ip = get_local_ip();
     let pin = get_or_create_pin();
@@ -3693,6 +4143,7 @@ fn run_server() {
     thread::spawn(run_p2p_beacon_broadcaster);
     start_bluetooth_receiver(&get_download_dir());
     start_download_dir_watcher(&get_download_dir());
+    start_clipboard_sentinel();
 
     for mut s in listener.incoming().flatten() {
         let client_ip = s.peer_addr().map(|a| a.ip()).unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
@@ -3738,6 +4189,90 @@ fn main() {
         notify_desktop("OmaSend", "Masaustu bildirim sistemi aktif ve calisiyor.");
         println!("Test bildirimi gonderildi.");
         return;
+    }
+
+    if args.iter().any(|a| a == "--oma-id") {
+        let oma_id = get_or_create_oma_id();
+        println!("{}", oma_id);
+        return;
+    }
+
+    if args.iter().any(|a| a == "--new-oma-id") {
+        let oma_id = generate_new_oma_id();
+        println!("{}", oma_id);
+        return;
+    }
+
+    if let Some(pos) = args.iter().position(|a| a == "--validate-oma-id") {
+        if let Some(candidate) = args.get(pos + 1) {
+            if validate_oma_id(candidate) {
+                println!("VALID: {}", format_oma_id(candidate));
+            } else {
+                eprintln!("INVALID OmaID: {}", candidate);
+                std::process::exit(1);
+            }
+            return;
+        }
+    }
+
+    if let Some(pos) = args.iter().position(|a| a == "--rendezvous-topic" || a == "--topic") {
+        let oma_id = args.get(pos + 1).cloned().unwrap_or_else(get_or_create_oma_id);
+        let topic = compute_rendezvous_topic(&oma_id);
+        println!("{}", topic);
+        return;
+    }
+
+    if args.iter().any(|a| a == "--stun") {
+        match query_stun_external_addr() {
+            Some(addr) => println!("{}", addr),
+            None => {
+                eprintln!("STUN query failed or timed out");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if args.iter().any(|a| a == "--rendezvous" || a == "--publish-rendezvous") {
+        let oma_id = get_or_create_oma_id();
+        let stun_addr = query_stun_external_addr().map(|a| a.to_string());
+        let (_, _, wan_url) = get_wan_status();
+        let (dev_id, _) = get_or_create_device_id();
+        let hostname = get_system_hostname();
+        match publish_local_rendezvous_anchor(
+            &oma_id,
+            &ip,
+            PORT,
+            stun_addr.as_deref(),
+            wan_url.as_deref(),
+            &dev_id,
+            &hostname,
+            &get_state_dir(),
+        ) {
+            Ok(envelope) => {
+                println!("{}", serde_json::to_string_pretty(&envelope).unwrap_or_default());
+            }
+            Err(e) => {
+                eprintln!("Error publishing rendezvous anchor: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if let Some(pos) = args.iter().position(|a| a == "--rendezvous-query") {
+        if let Some(target_oma_id) = args.get(pos + 1) {
+            match query_local_rendezvous_anchor(target_oma_id, &get_state_dir()) {
+                Some(rec) => {
+                    println!("{}", serde_json::to_string_pretty(&rec).unwrap_or_default());
+                }
+                None => {
+                    eprintln!("No rendezvous anchor found or decryption failed for OmaID {}", target_oma_id);
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
     }
 
     if let Some(pos) = args.iter().position(|a| a == "--set-visibility") {
@@ -3906,6 +4441,12 @@ fn main() {
         return;
     }
 
+    if args.iter().any(|a| a == "--clipboard-vault" || a == "--clipboard-history") {
+        let vault = load_clipboard_vault();
+        println!("{}", serde_json::to_string_pretty(&vault).unwrap_or_default());
+        return;
+    }
+
     if args.iter().any(|a| a == "--start-wan") {
         match start_wan_tunnel() {
             Ok(url) => println!("WAN Tunnel Started: {}", url),
@@ -3984,6 +4525,10 @@ fn main() {
     if args.iter().any(|a| a == "--json") {
         let (vis, rem) = get_visibility();
         let (dev_id, _) = get_or_create_device_id();
+        let oma_id = get_or_create_oma_id();
+        let cluster_id = compute_rendezvous_topic(&oma_id);
+        let wan_mode = if wan_active { "WAN" } else { "LAN" }.to_string();
+        let stun_addr = query_stun_external_addr().map(|a| a.to_string());
         let state = ServerState {
             status: "ACTIVE".to_string(),
             port: PORT,
@@ -4010,6 +4555,11 @@ fn main() {
             p2p_bluetooth_available: is_bluetooth_available(),
             p2p_discovered_peers: get_discovered_peers(),
             p2p_pending_transfer: get_pending_transfer(),
+            clipboard_vault: get_clipboard_vault_items(),
+            oma_id,
+            wan_mode,
+            cluster_id,
+            stun_addr,
         };
         if let Ok(s) = serde_json::to_string_pretty(&state) {
             println!("{}", s);
@@ -4540,6 +5090,7 @@ mod tests {
             size: (MAX_ENCRYPTED_UPLOAD_SIZE + 1) as u64,
             persisted: true,
             reservation: None,
+            blake3_hash: None,
         };
 
         let res = fake_staged.to_bytes();
@@ -4692,7 +5243,7 @@ mod tests {
         let stage_path = temp_dir.join(format!(".tmp_test_stage_{}.part", std::process::id()));
         write_secure_bytes(&stage_path, test_payload).expect("Write test staged file");
 
-        let staged = StagedFile::new(stage_path.clone(), test_payload.len() as u64, None);
+        let staged = StagedFile::new(stage_path.clone(), test_payload.len() as u64, None, None);
         let staged_body = HttpBody::Staged(staged);
         let (staged_sha, staged_md5) = staged_body.compute_hashes().expect("Compute staged hashes");
         assert_eq!(staged_sha, expected_sha256);
@@ -4784,6 +5335,249 @@ mod tests {
         // Landlock sandbox gracefully falls back or succeeds
         let tmp = std::env::temp_dir();
         let _ = enable_landlock_sandbox(&[&tmp], &[&tmp]);
+    }
+
+    #[test]
+    fn test_clipboard_item_serialization_and_url_detection() {
+        assert!(is_probable_url("https://omarchy.org"));
+        assert!(is_probable_url("http://github.com/ozdil/omasend"));
+        assert!(is_probable_url("ftp://files.archlinux.org"));
+        assert!(is_probable_url("gemini://gemini.circumlunar.space"));
+        assert!(is_probable_url("www.kernel.org"));
+        assert!(is_probable_url("omarchy.tr"));
+        assert!(!is_probable_url("Hello World! This is a simple note."));
+        assert!(!is_probable_url("cat /etc/os-release"));
+        assert!(!is_probable_url("123456"));
+
+        let item = ClipboardItem {
+            timestamp: 1727700000,
+            sender: "Pixel 9 Pro".to_string(),
+            text: "https://omarchy.org/docs".to_string(),
+            char_count: 24,
+            is_url: true,
+        };
+
+        let json = serde_json::to_string(&item).expect("Serialize ClipboardItem");
+        let parsed: ClipboardItem = serde_json::from_str(&json).expect("Deserialize ClipboardItem");
+        assert_eq!(parsed, item);
+        assert_eq!(parsed.char_count, 24);
+        assert!(parsed.is_url);
+    }
+
+    #[test]
+    fn test_clipboard_vault_lifecycle_and_0600_permissions() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let test_text = format!("Unique test note {}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos());
+        
+        let item = add_clipboard_to_vault("POCO Phone", &test_text).expect("Add to clipboard vault");
+        assert_eq!(item.sender, "POCO Phone");
+        assert_eq!(item.text, test_text);
+        assert_eq!(item.char_count, test_text.chars().count());
+
+        let vault = load_clipboard_vault();
+        assert!(!vault.items.is_empty());
+        assert_eq!(vault.items[0].text, test_text);
+
+        // Verify file permissions are strictly 0600
+        let vault_file = get_state_dir().join("clipboard_vault.json");
+        let meta = fs::symlink_metadata(&vault_file).expect("clipboard_vault.json must exist");
+        assert_eq!(meta.mode() & 0o777, 0o600, "clipboard_vault.json must enforce 0600 permissions");
+
+        let hist_file = get_state_dir().join("clipboard_history.json");
+        if hist_file.exists() {
+            let hist_meta = fs::symlink_metadata(&hist_file).expect("clipboard_history.json must exist");
+            assert_eq!(hist_meta.mode() & 0o777, 0o600, "clipboard_history.json must enforce 0600 permissions");
+        }
+    }
+
+    #[test]
+    fn test_anti_echo_loop_and_sha256_hash_tracking() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let payload = "Secret Omnipresent Clipboard Sync Payload";
+        let expected_hash = compute_clipboard_hash(payload);
+        assert!(!expected_hash.is_empty());
+        assert_eq!(expected_hash.len(), 64);
+
+        set_last_synced_clipboard_hash(&expected_hash);
+        let retrieved = get_last_synced_clipboard_hash();
+        assert_eq!(retrieved.as_deref(), Some(expected_hash.as_str()));
+
+        // Anti-Echo verification: incoming hash matches, so re-echo loop is suppressed
+        let new_probe_hash = compute_clipboard_hash(payload);
+        assert_eq!(retrieved.as_deref(), Some(new_probe_hash.as_str()), "Hash match must prevent outbound loop echo");
+    }
+
+    #[test]
+    fn test_clipboard_vault_max_capacity_truncation() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let mut test_vault = ClipboardVault::default();
+        for i in 0..30 {
+            test_vault.items.insert(0, ClipboardItem {
+                timestamp: 1000 + i,
+                sender: format!("Device {}", i),
+                text: format!("Item number {}", i),
+                char_count: 14,
+                is_url: false,
+            });
+            if test_vault.items.len() > MAX_CLIPBOARD_VAULT_ITEMS {
+                test_vault.items.truncate(MAX_CLIPBOARD_VAULT_ITEMS);
+            }
+        }
+
+        assert_eq!(test_vault.items.len(), MAX_CLIPBOARD_VAULT_ITEMS);
+        assert_eq!(test_vault.items[0].text, "Item number 29");
+        assert_eq!(test_vault.items[19].text, "Item number 10");
+    }
+
+    #[test]
+    fn test_server_state_includes_oma_id_and_rendezvous_fields() {
+        let oma_id = "4829-1048-5729-1104".to_string();
+        let topic = compute_rendezvous_topic(&oma_id);
+        let state = ServerState {
+            status: "ACTIVE".to_string(),
+            port: PORT,
+            local_ip: "192.168.1.50".to_string(),
+            tailscale_ip: None,
+            pin: "1234".to_string(),
+            session_key: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_string(),
+            active_mode: "LAN".to_string(),
+            wan_active: false,
+            wan_connecting: false,
+            wan_provider: None,
+            wan_url: None,
+            download_dir: "/home/user/Downloads".to_string(),
+            shared_dir: "/home/user/Downloads/shared".to_string(),
+            qr_path: "/tmp/qr.svg".to_string(),
+            active_url: "http://192.168.1.50:53317".to_string(),
+            total_received: 0,
+            recent_files: vec![],
+            shared_files: vec![],
+            p2p_device_id: "dev_xyz".to_string(),
+            p2p_hostname: "omarchy-node".to_string(),
+            p2p_visibility: "ALL".to_string(),
+            p2p_visibility_remaining_secs: 0,
+            p2p_bluetooth_available: false,
+            p2p_discovered_peers: vec![],
+            p2p_pending_transfer: None,
+            clipboard_vault: vec![],
+            oma_id: oma_id.clone(),
+            wan_mode: "LAN".to_string(),
+            cluster_id: topic.clone(),
+            stun_addr: Some("198.51.100.1:53317".to_string()),
+        };
+
+        let json = serde_json::to_string(&state).expect("Serialize ServerState");
+        assert!(json.contains("\"oma_id\":\"4829-1048-5729-1104\""));
+        assert!(json.contains("\"wan_mode\":\"LAN\""));
+        assert!(json.contains(&format!("\"cluster_id\":\"{}\"", topic)));
+        assert!(json.contains("\"stun_addr\":\"198.51.100.1:53317\""));
+    }
+
+    #[test]
+    fn test_publish_and_query_local_rendezvous_anchor() {
+        let temp_dir = env::temp_dir().join(format!("rendezvous_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let oma_id = "1234-5678-9012-3452";
+        let dev_id = "dev_alpha";
+        let hostname = "test-host";
+
+        let published = publish_local_rendezvous_anchor(
+            oma_id,
+            "192.168.1.200",
+            53317,
+            Some("203.0.113.10:53317"),
+            Some("https://test.trycloudflare.com"),
+            dev_id,
+            hostname,
+            &temp_dir,
+        ).expect("Publish local anchor");
+
+        assert_eq!(published.topic, compute_rendezvous_topic(oma_id));
+
+        let queried = query_local_rendezvous_anchor(oma_id, &temp_dir)
+            .expect("Query local rendezvous anchor");
+
+        assert_eq!(queried.device_id, dev_id);
+        assert_eq!(queried.hostname, hostname);
+        assert_eq!(queried.local_ip, "192.168.1.200");
+        assert_eq!(queried.local_port, 53317);
+        assert_eq!(queried.stun_addr.as_deref(), Some("203.0.113.10:53317"));
+        assert_eq!(queried.wan_url.as_deref(), Some("https://test.trycloudflare.com"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_stream_file_zero_copy_and_socket_transmission() {
+        let temp_dir = env::temp_dir().join(format!("zero_copy_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let test_file = temp_dir.join("sample_file.dat");
+        let payload = vec![0x42u8; 256 * 1024]; // 256 KiB payload
+        write_secure_bytes(&test_file, &payload).expect("Write test file");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
+        let local_addr = listener.local_addr().unwrap();
+
+        let client_thread = thread::spawn(move || {
+            let mut client = TcpStream::connect(local_addr).expect("Connect to listener");
+            let mut buf = Vec::new();
+            client.read_to_end(&mut buf).expect("Read all");
+            buf
+        });
+
+        let (mut server_stream, _) = listener.accept().expect("Accept client");
+        let extra = [("Content-Disposition", "attachment; filename=\"sample_file.dat\"")];
+        let sent_bytes = stream_file_zero_copy(
+            &mut server_stream,
+            &test_file,
+            "application/octet-stream",
+            Some(&extra),
+            Some("http://127.0.0.1"),
+        ).expect("stream_file_zero_copy");
+
+        assert_eq!(sent_bytes, payload.len() as u64);
+        drop(server_stream);
+
+        let received = client_thread.join().expect("Join client thread");
+        assert!(received.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(received.windows(4).any(|w| w == b"\r\n\r\n"));
+        let header_end = received.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let received_body = &received[header_end..];
+        assert_eq!(received_body.len(), payload.len());
+        assert_eq!(received_body, payload.as_slice());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_streaming_chunked_blake3_128k() {
+        let temp_dir = env::temp_dir().join(format!("chunked_blake3_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let test_payload = vec![0x7fu8; 1536 * 1024]; // 1.5 MiB to cross 1 MiB staging and 128 KiB boundaries
+        let expected_blake3 = blake3::hash(&test_payload).to_hex().to_string();
+
+        let mut cursor = std::io::Cursor::new(test_payload.clone());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let body = read_http_body(&mut cursor, test_payload.len(), &[], deadline, true, MAX_BODY_SIZE)
+            .expect("read_http_body chunked");
+
+        match body {
+            HttpBody::Staged(ref staged) => {
+                assert_eq!(staged.size, test_payload.len() as u64);
+                assert_eq!(staged.blake3_hash.as_deref(), Some(expected_blake3.as_str()));
+                let (calc_blake3, _, _) = body.compute_military_hashes().expect("compute military hashes");
+                assert_eq!(calc_blake3, expected_blake3);
+            }
+            HttpBody::Memory(_) => panic!("Expected Staged HttpBody for > 1 MiB payload"),
+        }
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }
 

@@ -111,9 +111,31 @@ class OmaSendClient(private val context: Context) {
         inputStream: InputStream,
         onProgress: (bytesWritten: Long, totalBytes: Long, percent: Int) -> Unit
     ): Result<Unit> {
+        return uploadFileStreamWithMetrics(
+            targetIp = targetIp,
+            targetPort = targetPort,
+            token = token,
+            filename = filename,
+            totalBytes = totalBytes,
+            inputStream = inputStream
+        ) { written, total, pct, _, _ ->
+            onProgress(written, total, pct)
+        }
+    }
+
+    fun uploadFileStreamWithMetrics(
+        targetIp: String,
+        targetPort: Int,
+        token: String,
+        filename: String,
+        totalBytes: Long,
+        inputStream: InputStream,
+        onProgress: (bytesWritten: Long, totalBytes: Long, percent: Int, speedMBps: Double, etaSeconds: Long) -> Unit
+    ): Result<Unit> {
         if (!NetworkUtils.isPrivateOrLocalIp(targetIp)) {
             return Result.failure(SecurityException("Target IP is outside private network scope (RFC 1918/3927)"))
         }
+        val speedCalculator = TransferSpeedCalculator(totalBytes)
         return try {
             val encodedName = URLEncoder.encode(filename, "UTF-8")
             val countingBody = object : RequestBody() {
@@ -127,8 +149,8 @@ class OmaSendClient(private val context: Context) {
                     while (inputStream.read(buffer).also { read = it } != -1) {
                         sink.write(buffer, 0, read)
                         uploaded += read
-                        val percent = if (totalBytes > 0) ((uploaded * 100) / totalBytes).toInt() else 0
-                        onProgress(uploaded, totalBytes, percent)
+                        val metrics = speedCalculator.update(uploaded)
+                        onProgress(uploaded, totalBytes, metrics.percent, metrics.speedMBps, metrics.etaSeconds)
                     }
                 }
             }

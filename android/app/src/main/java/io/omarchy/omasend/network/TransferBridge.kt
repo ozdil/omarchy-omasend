@@ -12,13 +12,20 @@ import androidx.core.content.ContextCompat
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import io.omarchy.omasend.model.DiscoveredPeer
+import io.omarchy.omasend.model.TransferMetrics
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import java.io.IOException
 import java.io.InputStream
 import java.util.UUID
 
 object TransferBridge {
+
+    private val _transferMetrics = MutableStateFlow<TransferMetrics?>(null)
+    val transferMetrics: StateFlow<TransferMetrics?> = _transferMetrics.asStateFlow()
 
     /**
      * Generates a QR code bitmap for sharing the local OmaSend endpoint with nearby devices.
@@ -112,22 +119,47 @@ object TransferBridge {
         fileSize: Long,
         inputStream: InputStream,
         onProgress: suspend (bytesSent: Long, totalBytes: Long, percent: Int) -> Unit
+    ): Result<Unit> {
+        return sendViaBluetoothDirectObexWithMetrics(
+            context = context,
+            targetMac = targetMac,
+            fileName = fileName,
+            fileSize = fileSize,
+            inputStream = inputStream
+        ) { sent, total, pct, _, _ ->
+            onProgress(sent, total, pct)
+        }
+    }
+
+    suspend fun sendViaBluetoothDirectObexWithMetrics(
+        context: Context,
+        targetMac: String,
+        fileName: String,
+        fileSize: Long,
+        inputStream: InputStream,
+        onProgress: suspend (bytesSent: Long, totalBytes: Long, percent: Int, speedMBps: Double, etaSeconds: Long) -> Unit
     ): Result<Unit> = withContext(Dispatchers.IO) {
         val cleanMac = targetMac.removePrefix("bt:").trim()
         if (cleanMac.isEmpty()) {
+            _transferMetrics.value = null
             return@withContext Result.failure(IllegalArgumentException("Hedef Bluetooth adresi boş"))
         }
 
         val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? android.bluetooth.BluetoothManager
         val adapter = bluetoothManager?.adapter
-            ?: return@withContext Result.failure(IllegalStateException("Bluetooth donanımı bulunamadı"))
+        if (adapter == null) {
+            _transferMetrics.value = null
+            return@withContext Result.failure(IllegalStateException("Bluetooth donanımı bulunamadı"))
+        }
 
         if (!adapter.isEnabled) {
+            _transferMetrics.value = null
             return@withContext Result.failure(IllegalStateException("Bluetooth kapalı"))
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                _transferMetrics.value = null
                 return@withContext Result.failure(SecurityException("Bluetooth bağlantı izni verilmedi"))
             }
         }
@@ -135,9 +167,11 @@ object TransferBridge {
         val device = try {
             adapter.getRemoteDevice(cleanMac)
         } catch (e: Exception) {
+            _transferMetrics.value = null
             return@withContext Result.failure(IllegalArgumentException("Geçersiz Bluetooth MAC adresi: $cleanMac", e))
         }
 
+        val speedCalculator = TransferSpeedCalculator(fileSize)
         var socket: BluetoothSocket? = null
         try {
             try { adapter.cancelDiscovery() } catch (_: Exception) {}
@@ -167,6 +201,7 @@ object TransferBridge {
             val connectRead = `in`.read(connectResp)
             if (connectRead < 3 || (connectResp[0].toInt() and 0xFF) != 0xA0) {
                 val code = if (connectRead > 0) (connectResp[0].toInt() and 0xFF) else -1
+                _transferMetrics.value = null
                 return@withContext Result.failure(IOException("OBEX bağlantısı kurulamadı (kod: $code)"))
             }
 
@@ -242,22 +277,26 @@ object TransferBridge {
                 val resp = ByteArray(64)
                 val respCount = `in`.read(resp)
                 if (respCount <= 0) {
+                    _transferMetrics.value = null
                     return@withContext Result.failure(IOException("OBEX sunucu yanıt vermedi"))
                 }
                 val respCode = resp[0].toInt() and 0xFF
                 if (isEof) {
                     if (respCode != 0xA0 && respCode != 0x90) {
+                        _transferMetrics.value = null
                         return@withContext Result.failure(IOException("OBEX dosya tamamlanamadı (kod: $respCode)"))
                     }
                 } else {
                     if (respCode != 0x90 && respCode != 0xA0) {
+                        _transferMetrics.value = null
                         return@withContext Result.failure(IOException("OBEX paket reddedildi (kod: $respCode)"))
                     }
                 }
 
                 isFirstPacket = false
-                val percent = if (fileSize > 0) ((bytesSent * 100) / fileSize).toInt().coerceIn(0, 100) else 0
-                onProgress(bytesSent, fileSize, percent)
+                val metrics = speedCalculator.update(bytesSent)
+                _transferMetrics.value = metrics
+                onProgress(bytesSent, fileSize, metrics.percent, metrics.speedMBps, metrics.etaSeconds)
 
                 if (isEof) break
             }
@@ -268,8 +307,10 @@ object TransferBridge {
                 out.flush()
             } catch (_: Exception) {}
 
+            _transferMetrics.value = null
             Result.success(Unit)
         } catch (e: Exception) {
+            _transferMetrics.value = null
             Result.failure(e)
         } finally {
             try { socket?.close() } catch (_: Exception) {}
@@ -360,5 +401,23 @@ object TransferBridge {
         } catch (_: Exception) {
             false
         }
+    }
+
+    /**
+     * Plays the inverted whoosh sound and triggers water drop impact haptics when a file is received.
+     */
+    fun notifyFileReceived(context: Context, filename: String, sizeBytes: Long) {
+        val app = context.applicationContext as? io.omarchy.omasend.OmaSendApp
+        app?.soundEngine?.playReceiveSound()
+        app?.hapticController?.onFileReceivedImpact()
+    }
+
+    /**
+     * Plays the forward whoosh sound and triggers recoil haptics when a file is dispatched.
+     */
+    fun notifyFileDispatched(context: Context, targetDevice: String, filename: String) {
+        val app = context.applicationContext as? io.omarchy.omasend.OmaSendApp
+        app?.soundEngine?.playSendSound()
+        app?.hapticController?.onDropBounce()
     }
 }

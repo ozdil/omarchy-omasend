@@ -46,6 +46,51 @@ class DiscoveryManager(private val context: Context) {
     private val _discoveryMode = MutableStateFlow(DiscoveryMode.EVERYONE)
     val discoveryMode: StateFlow<DiscoveryMode> = _discoveryMode.asStateFlow()
 
+    private var lastActiveEventTime: Long = System.currentTimeMillis()
+    private val _currentDutyCycleMs = MutableStateFlow(ACTIVE_INTERVAL_MS)
+    val currentDutyCycleMs: StateFlow<Long> = _currentDutyCycleMs.asStateFlow()
+
+    companion object {
+        const val ACTIVE_INTERVAL_MS = 1000L      // 1s active discovery when peers present or newly started
+        const val SEARCH_INTERVAL_MS = 2000L      // 2s intermediate search when idle
+        const val IDLE_INTERVAL_MS = 6000L        // 6s deep idle duty cycle (ACM MobiCom/IEEE INFOCOM ~40% energy saving)
+        const val SEARCH_THRESHOLD_MS = 10_000L   // 10s idle threshold -> 2s interval
+        const val IDLE_THRESHOLD_MS = 30_000L     // 30s idle threshold -> 6s interval
+        const val PEER_EXPIRY_TIMEOUT_MS = 18_000L // 3 missed beacons @ 6s duty cycle
+
+        fun calculateAdaptiveInterval(
+            lastActiveEventTime: Long,
+            hasActivePeers: Boolean,
+            currentTimeMs: Long = System.currentTimeMillis()
+        ): Long {
+            if (hasActivePeers) {
+                return ACTIVE_INTERVAL_MS
+            }
+            val idleDuration = currentTimeMs - lastActiveEventTime
+            return when {
+                idleDuration < SEARCH_THRESHOLD_MS -> ACTIVE_INTERVAL_MS
+                idleDuration < IDLE_THRESHOLD_MS -> SEARCH_INTERVAL_MS
+                else -> IDLE_INTERVAL_MS
+            }
+        }
+    }
+
+    fun markActiveEvent(currentTimeMs: Long = System.currentTimeMillis()) {
+        lastActiveEventTime = currentTimeMs
+        _currentDutyCycleMs.value = ACTIVE_INTERVAL_MS
+    }
+
+    fun calculateAdaptiveInterval(currentTimeMs: Long = System.currentTimeMillis()): Long {
+        val now = currentTimeMs
+        val hasActivePeers = peerMap.values.any { !it.id.startsWith("manual_") && (now - it.lastSeen <= PEER_EXPIRY_TIMEOUT_MS) }
+        if (hasActivePeers) {
+            lastActiveEventTime = now
+        }
+        val interval = calculateAdaptiveInterval(lastActiveEventTime, hasActivePeers, now)
+        _currentDutyCycleMs.value = interval
+        return interval
+    }
+
     fun isPeerTrusted(peerId: String): Boolean {
         return prefs.getBoolean("trusted_$peerId", false)
     }
@@ -103,6 +148,7 @@ class DiscoveryManager(private val context: Context) {
     }
 
     fun forceRefresh() {
+        markActiveEvent()
         scope.launch {
             val myIp = NetworkUtils.getLocalIpAddress()
             if (myIp != "127.0.0.1") {
@@ -247,6 +293,7 @@ class DiscoveryManager(private val context: Context) {
     fun start() {
         if (_isScanning.value) return
         _isScanning.value = true
+        markActiveEvent()
         if (_discoveryMode.value == DiscoveryMode.OFF) {
             _discoveryMode.value = DiscoveryMode.EVERYONE
         }
@@ -288,6 +335,11 @@ class DiscoveryManager(private val context: Context) {
             isTrusted = true,
             lastSeen = System.currentTimeMillis() + 3600000L // 1 hour persistent
         )
+        peerMap[peer.id] = peer
+        updatePeersFlow()
+    }
+
+    fun addRendezvousPeer(peer: DiscoveredPeer) {
         peerMap[peer.id] = peer
         updatePeersFlow()
     }
@@ -355,6 +407,7 @@ class DiscoveryManager(private val context: Context) {
                                         lastSeen = System.currentTimeMillis()
                                     )
                                     peerMap[peer.id] = peer
+                                    markActiveEvent()
                                     updatePeersFlow()
                                 }
                             }
@@ -407,7 +460,8 @@ class DiscoveryManager(private val context: Context) {
                             }
                         }
                     }
-                    delay(3000)
+                    val interval = calculateAdaptiveInterval()
+                    delay(interval)
                 }
             } catch (_: Exception) {
             } finally {
@@ -523,7 +577,7 @@ class DiscoveryManager(private val context: Context) {
                 val it = peerMap.entries.iterator()
                 while (it.hasNext()) {
                     val entry = it.next()
-                    if (!entry.value.id.startsWith("manual_") && (now - entry.value.lastSeen > 8000L)) {
+                    if (!entry.value.id.startsWith("manual_") && (now - entry.value.lastSeen > PEER_EXPIRY_TIMEOUT_MS)) {
                         it.remove()
                         changed = true
                     }

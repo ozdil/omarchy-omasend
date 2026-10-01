@@ -15,6 +15,9 @@ if [ "${OMASEND_SECURE_ENV:-0}" != "1" ]; then
         USER="${USER:-$(/usr/bin/id -un 2>/dev/null || echo "user")}" \
         LANG="${LANG:-C.UTF-8}" \
         LC_ALL="${LC_ALL:-C.UTF-8}" \
+        XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(/usr/bin/id -u)}" \
+        WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-1}" \
+        HYPRLAND_INSTANCE_SIGNATURE="${HYPRLAND_INSTANCE_SIGNATURE:-}" \
         OMASEND_SECURE_ENV=1 \
         /bin/bash -p "$0" "$@"
 fi
@@ -71,6 +74,21 @@ echo "${SOURCE_HASH} ${BIN_HASH}" > "${DIR}/.engine-provenance"
 
 
 echo "omasend-engine successfully compiled and placed at ${DIR}/omasend-engine"
+
+PLUGIN_TARGET_DIR="${HOME}/.config/omarchy/plugins/ozdil.omasend"
+if [[ -d "${PLUGIN_TARGET_DIR}" && "${DIR}" != "${PLUGIN_TARGET_DIR}" ]]; then
+    echo "Syncing updated plugin files to ${PLUGIN_TARGET_DIR}..."
+    /usr/bin/cp -f "${DIR}/Panel.qml" "${PLUGIN_TARGET_DIR}/Panel.qml"
+    /usr/bin/cp -f "${DIR}/manifest.json" "${PLUGIN_TARGET_DIR}/manifest.json"
+    /usr/bin/install -m 755 "${DIR}/omasend-engine" "${PLUGIN_TARGET_DIR}/omasend-engine"
+    if [[ -d "${DIR}/assets" ]]; then
+        /usr/bin/mkdir -p "${PLUGIN_TARGET_DIR}/assets"
+        /usr/bin/cp -rf "${DIR}/assets/"* "${PLUGIN_TARGET_DIR}/assets/"
+    fi
+fi
+
+# Terminate any previous instance so new binary is invoked
+/usr/bin/pkill -u "$UID" -f "omasend-engine --serve" >/dev/null 2>&1 || true
 
 if [[ -x /usr/bin/omarchy-restart-shell ]]; then
     echo "Reloading Omarchy shell..."
