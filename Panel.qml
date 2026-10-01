@@ -40,11 +40,20 @@ Panel {
   property var p2pPendingTransfer: null
   property var clipboardVault: []
   property bool showAboutModal: false
+  property bool showOmaIdQrModal: false
+  property bool showOmaIdPairModal: false
 
   // 16-Digit OmaID & Profile State
   property string omaId: ""
+  property string omaidQrPath: ""
   property bool omaIdRevealed: false
   property bool omaIdCopiedFeedback: false
+
+  // OmaID Pairing & Scan State
+  property string pairInputOmaId: ""
+  property string pairInputName: ""
+  property string pairStatusMsg: ""
+  property bool pairStatusError: false
 
   // Selected peer for cursor navigation
   property int selectedPeerIndex: 0
@@ -55,6 +64,8 @@ Panel {
   readonly property color selectedFill: bar ? Style.selectedFillFor(bar.foreground, Color.accent) : "transparent"
   readonly property string fontFamily: (root.bar && root.bar.fontFamily) ? root.bar.fontFamily : ((typeof Style !== "undefined" && Style.font && Style.font.family) ? Style.font.family : "JetBrainsMono Nerd Font, JetBrains Mono, monospace")
   readonly property string vaultPath: (Quickshell.env("HOME") || "/home/ozdil") + "/.local/state/omarchy/omasend/clipboard_vault.json"
+  readonly property string peersPath: (Quickshell.env("HOME") || "/home/ozdil") + "/.local/state/omarchy/omasend/discovered_peers.json"
+  readonly property string omaidQrFilePath: (Quickshell.env("HOME") || "/home/ozdil") + "/.local/state/omarchy/omasend/omaid_qr.svg"
 
   function formatOmaId(id, revealed) {
     if (!id || String(id).trim() === "") return "---- ---- ---- ----"
@@ -71,6 +82,16 @@ Panel {
     return clean
   }
 
+  function formatInputOmaId(val) {
+    if (!val) return ""
+    var clean = String(val).toUpperCase().replace(/[^A-F0-9]/g, "").slice(0, 16)
+    var parts = []
+    for (var i = 0; i < clean.length; i += 4) {
+      parts.push(clean.slice(i, i + 4))
+    }
+    return parts.join("-")
+  }
+
   function loadVault(content) {
     try {
       if (!content || String(content).trim() === "") return
@@ -81,6 +102,49 @@ Panel {
         root.clipboardVault = parsed
       }
     } catch(e) {}
+  }
+
+  function loadDiscoveredPeers(content) {
+    try {
+      if (!content || String(content).trim() === "") return
+      var parsed = JSON.parse(content)
+      if (Array.isArray(parsed)) {
+        root.p2pPeers = parsed
+      }
+    } catch(e) {}
+  }
+
+  function bindOmaId(targetId, targetName) {
+    var clean = String(targetId || "").toUpperCase().replace(/[^A-F0-9]/g, "")
+    if (clean.length !== 16) {
+      root.pairStatusMsg = "Geçersiz OmaID (16 hex karakter olmalı)"
+      root.pairStatusError = true
+      return
+    }
+    root.pairStatusMsg = "Cihaz bağlanıyor..."
+    root.pairStatusError = false
+    var name = String(targetName || "").trim() || ("OmaID-" + clean.slice(0, 4))
+    root.executeAction(["--bind-oma-id", clean, name])
+    root.pairStatusMsg = "Cihaz başarıyla bağlandı ve güvenildi!"
+    root.pairStatusError = false
+    pairTimer.restart()
+  }
+
+  function scanFromScreen() {
+    root.pairStatusMsg = "Ekran taranıyor..."
+    root.pairStatusError = false
+    if (screenScanProc.running) screenScanProc.running = false
+    screenScanProc.running = true
+  }
+
+  function pasteOmaIdFromClipboard() {
+    if (pasteProc.running) pasteProc.running = false
+    pasteProc.running = true
+  }
+
+  function forceScan() {
+    if (forceScanProc.running) forceScanProc.running = false
+    forceScanProc.running = true
   }
 
   function resolveEnginePath() {
@@ -159,6 +223,7 @@ Panel {
     if (root.opened) {
       selectedPeerIndex = 0
       cursorActive = false
+      root.forceScan()
       root.refresh()
     }
   }
@@ -217,6 +282,15 @@ Panel {
   }
 
   Process {
+    id: forceScanProc
+    command: [root.resolveEnginePath(), "--force-scan"]
+    onExited: function(code) {
+      forceScanProc.running = false
+      root.refresh()
+    }
+  }
+
+  Process {
     id: scanProc
     command: [root.resolveEnginePath(), "--json"]
     onExited: function(code) {
@@ -240,6 +314,7 @@ Panel {
           root.activeUrl = String(d.active_url || "")
           root.savePath = String(d.download_dir || "~/Downloads/omasend")
           root.qrPath = String(d.qr_path || "")
+          root.omaidQrPath = String(d.omaid_qr_path || root.omaidQrFilePath)
           root.totalReceived = Number(d.total_received) || 0
           root.recentFiles = d.recent_files || []
           root.sharedFiles = d.shared_files || []
@@ -249,7 +324,7 @@ Panel {
           root.p2pPeers = d.p2p_discovered_peers || []
           root.p2pPendingTransfer = d.p2p_pending_transfer || null
           root.clipboardVault = d.clipboard_vault || []
-          root.omaId = String(d.p2p_device_id || "")
+          root.omaId = String(d.oma_id || d.p2p_device_id || "")
           root.refreshNonce++
         } catch(e) {}
       }
@@ -262,6 +337,72 @@ Panel {
     repeat: false
     onTriggered: {
       root.omaIdCopiedFeedback = false
+    }
+  }
+
+  Timer {
+    id: pairTimer
+    interval: 1800
+    repeat: false
+    onTriggered: {
+      if (!root.pairStatusError) {
+        root.showOmaIdPairModal = false
+        root.pairInputOmaId = ""
+        root.pairInputName = ""
+        root.pairStatusMsg = ""
+      }
+    }
+  }
+
+  Process {
+    id: screenScanProc
+    command: ["bash", "-c", "rm -f /tmp/oma_qr_scan.png && /usr/bin/grim /tmp/oma_qr_scan.png 2>/dev/null && (/usr/bin/zbarimg -q --raw /tmp/oma_qr_scan.png 2>/dev/null || true) && rm -f /tmp/oma_qr_scan.png"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        screenScanProc.running = false
+        var raw = String(text || "").trim()
+        if (raw.length > 0) {
+          var clean = raw.toUpperCase().replace(/[^A-F0-9]/g, "")
+          if (clean.length >= 16) {
+            root.pairInputOmaId = root.formatInputOmaId(clean.slice(0, 16))
+            root.pairStatusMsg = "QR Kod okundu: " + root.pairInputOmaId
+            root.pairStatusError = false
+          } else {
+            root.pairStatusMsg = "QR Kod içeriğinde 16 haneli OmaID bulunamadı"
+            root.pairStatusError = true
+          }
+        } else {
+          root.pairStatusMsg = "Ekrandan taranabilir QR kod bulunamadı"
+          root.pairStatusError = true
+        }
+      }
+    }
+  }
+
+  Process {
+    id: pasteProc
+    command: ["wl-paste", "--no-newline"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        pasteProc.running = false
+        var raw = String(text || "").trim()
+        if (raw.length > 0) {
+          var clean = raw.toUpperCase().replace(/[^A-F0-9]/g, "")
+          if (clean.length >= 16) {
+            root.pairInputOmaId = root.formatInputOmaId(clean.slice(0, 16))
+            root.pairStatusMsg = "Panodan OmaID aktarıldı: " + root.pairInputOmaId
+            root.pairStatusError = false
+          } else {
+            root.pairStatusMsg = "Panodaki metin 16 haneli OmaID formatında değil"
+            root.pairStatusError = true
+          }
+        } else {
+          root.pairStatusMsg = "Pano boş"
+          root.pairStatusError = true
+        }
+      }
     }
   }
 
@@ -296,6 +437,17 @@ Panel {
     printErrors: false
     onLoaded: root.loadVault(text())
     onLoadFailed: root.clipboardVault = []
+    onFileChanged: reload()
+  }
+
+  FileView {
+    id: peersWatcher
+    path: root.peersPath
+    watchChanges: true
+    atomicWrites: true
+    printErrors: false
+    onLoaded: root.loadDiscoveredPeers(text())
+    onLoadFailed: {}
     onFileChanged: reload()
   }
 
@@ -953,22 +1105,40 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(380))
-    contentHeight: panel.fittedContentHeight(root.showAboutModal ? Math.max(panelColumn.implicitHeight, aboutCol.implicitHeight + Style.space(40)) : panelColumn.implicitHeight)
+    contentHeight: panel.fittedContentHeight(
+      (root.showAboutModal || root.showOmaIdQrModal || root.showOmaIdPairModal) ?
+        Math.max(panelColumn.implicitHeight, (root.showOmaIdPairModal ? (pairCol.implicitHeight + Style.space(40)) : (root.showOmaIdQrModal ? (qrCol.implicitHeight + Style.space(40)) : (aboutCol.implicitHeight + Style.space(40))))) :
+        panelColumn.implicitHeight
+    )
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
       onCloseRequested: {
-        if (root.showAboutModal) {
+        if (root.showOmaIdPairModal) {
+          root.showOmaIdPairModal = false
+          root.pairStatusMsg = ""
+        } else if (root.showOmaIdQrModal) {
+          root.showOmaIdQrModal = false
+        } else if (root.showAboutModal) {
           root.showAboutModal = false
         } else {
           root.close()
         }
       }
       onTabRequested: function(direction) { root.switchPanel(direction) }
-      onMoveRequested: function(dx, dy) { root.moveCursor(dy) }
-      onActivateRequested: root.activateSelected()
+      onMoveRequested: function(dx, dy) {
+        if (!root.showAboutModal && !root.showOmaIdQrModal && !root.showOmaIdPairModal) {
+          root.moveCursor(dy)
+        }
+      }
+      onActivateRequested: {
+        if (!root.showAboutModal && !root.showOmaIdQrModal && !root.showOmaIdPairModal) {
+          root.activateSelected()
+        }
+      }
       onTextKey: function(t) {
+        if (root.showAboutModal || root.showOmaIdQrModal || root.showOmaIdPairModal) return
         if (t === "r" || t === "R") {
           root.refresh()
         } else if (t === "v" || t === "V") {
@@ -1205,7 +1375,82 @@ Panel {
 
               PanelToolTip {
                 visible: copyOmaIdMouse.containsMouse
-                text: "Copy 16-digit OmaID"
+                text: "OmaID Kopyala"
+                fontFamily: root.fontFamily
+              }
+            }
+
+            // QR Göster Button
+            Rectangle {
+              implicitWidth: 26
+              implicitHeight: 26
+              radius: 4
+              color: showQrMouse.containsMouse ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.20) : "transparent"
+              Layout.alignment: Qt.AlignVCenter
+
+              Text {
+                anchors.centerIn: parent
+                textFormat: Text.PlainText
+                text: "󰄲"
+                color: root.showOmaIdQrModal ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              MouseArea {
+                id: showQrMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                  root.showOmaIdQrModal = !root.showOmaIdQrModal
+                  root.showOmaIdPairModal = false
+                  root.showAboutModal = false
+                }
+              }
+
+              PanelToolTip {
+                visible: showQrMouse.containsMouse
+                text: "QR Göster"
+                fontFamily: root.fontFamily
+              }
+            }
+
+            // Barkod / QR Tara / Bağla Button
+            Rectangle {
+              implicitWidth: 26
+              implicitHeight: 26
+              radius: 4
+              color: pairMouse.containsMouse ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.20) : "transparent"
+              Layout.alignment: Qt.AlignVCenter
+
+              Text {
+                anchors.centerIn: parent
+                textFormat: Text.PlainText
+                text: "󰄳"
+                color: root.showOmaIdPairModal ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              MouseArea {
+                id: pairMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                  root.showOmaIdPairModal = !root.showOmaIdPairModal
+                  root.showOmaIdQrModal = false
+                  root.showAboutModal = false
+                  root.pairInputOmaId = ""
+                  root.pairInputName = ""
+                  root.pairStatusMsg = ""
+                }
+              }
+
+              PanelToolTip {
+                visible: pairMouse.containsMouse
+                text: "Barkod / QR Tara / Bağla"
                 fontFamily: root.fontFamily
               }
             }
@@ -1647,6 +1892,478 @@ Panel {
             fontSize: Style.font.caption
             fontFamily: root.fontFamily
             onClicked: root.refresh()
+          }
+        }
+      }
+    }
+
+    // OmaID QR Code Modal Overlay
+    Rectangle {
+      id: omaIdQrOverlay
+      anchors.fill: parent
+      visible: root.showOmaIdQrModal
+      color: Qt.rgba(0.05, 0.05, 0.07, 0.97)
+      z: 99
+
+      MouseArea {
+        anchors.fill: parent
+      }
+
+      Column {
+        id: qrCol
+        anchors.centerIn: parent
+        width: parent.width - Style.space(40)
+        spacing: Style.space(12)
+
+        Row {
+          width: parent.width
+          Item {
+            width: parent.width - closeQrBtn.implicitWidth
+            implicitHeight: qrTitleText.implicitHeight
+            RowLayout {
+              spacing: Style.space(6)
+              Text {
+                text: "󰄲"
+                color: Color.accent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.title
+              }
+              Text {
+                id: qrTitleText
+                text: "OmaID QR Kodu"
+                color: root.bar ? root.bar.foreground : Color.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.title
+                font.bold: true
+              }
+            }
+          }
+
+          Button {
+            id: closeQrBtn
+            text: "✕"
+            bordered: true
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            onClicked: root.showOmaIdQrModal = false
+          }
+        }
+
+        Text {
+          width: parent.width
+          wrapMode: Text.WordWrap
+          text: "Mobil cihazınızdan veya başka bir Omarchy masaüstünden bu QR kodu okutarak anında güvenli AirBridge eşleşmesi kurun."
+          color: root.bar ? root.bar.foreground : Color.foreground
+          opacity: 0.75
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          lineHeight: 1.3
+        }
+
+        // Acrylic Glass QR Container
+        Rectangle {
+          anchors.horizontalCenter: parent.horizontalCenter
+          width: 190
+          height: 190
+          radius: 12
+          color: "#ffffff"
+          border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.5)
+          border.width: 2
+
+          Image {
+            id: omaQrImg
+            anchors.fill: parent
+            anchors.margins: 10
+            source: "file://" + (root.omaidQrPath || root.omaidQrFilePath)
+            sourceSize.width: 170
+            sourceSize.height: 170
+            fillMode: Image.PreserveAspectFit
+            smooth: false
+            cache: false
+          }
+        }
+
+        // Formatted OmaID Text Pill
+        Rectangle {
+          width: parent.width
+          implicitHeight: 36
+          radius: Style.cornerRadius
+          color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.10)
+          border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.35)
+          border.width: 1
+
+          RowLayout {
+            anchors.fill: parent
+            anchors.leftMargin: Style.space(10)
+            anchors.rightMargin: Style.space(10)
+            spacing: Style.space(8)
+
+            Text {
+              text: "󰌆"
+              color: Color.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Text {
+              Layout.fillWidth: true
+              text: root.formatOmaId(root.omaId, true)
+              color: root.bar ? root.bar.foreground : Color.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              font.letterSpacing: 1.2
+              horizontalAlignment: Text.AlignHCenter
+            }
+
+            Rectangle {
+              implicitWidth: 26
+              implicitHeight: 26
+              radius: 4
+              color: modalCopyOmaIdMouse.containsMouse ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.25) : "transparent"
+
+              Text {
+                anchors.centerIn: parent
+                textFormat: Text.PlainText
+                text: root.omaIdCopiedFeedback ? "󰄬" : "󰅟"
+                color: root.omaIdCopiedFeedback ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              MouseArea {
+                id: modalCopyOmaIdMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                  if (root.omaId) {
+                    root.copyText(root.omaId)
+                    root.omaIdCopiedFeedback = true
+                    omaIdCopyTimer.restart()
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        PanelSeparator {
+          width: parent.width
+          foreground: root.bar ? root.bar.foreground : Color.foreground
+        }
+
+        Button {
+          width: parent.width
+          text: root.omaIdCopiedFeedback ? "OmaID Kopyalandı" : "OmaID Panoya Kopyala"
+          iconText: root.omaIdCopiedFeedback ? "󰄬" : "󰅟"
+          bordered: true
+          accent: Color.accent
+          foreground: root.bar ? root.bar.foreground : Color.foreground
+          fontFamily: root.fontFamily
+          fontSize: Style.font.caption
+          onClicked: {
+            if (root.omaId) {
+              root.copyText(root.omaId)
+              root.omaIdCopiedFeedback = true
+              omaIdCopyTimer.restart()
+            }
+          }
+        }
+      }
+    }
+
+    // OmaID Pair & Scan Modal Overlay
+    Rectangle {
+      id: omaIdPairOverlay
+      anchors.fill: parent
+      visible: root.showOmaIdPairModal
+      color: Qt.rgba(0.05, 0.05, 0.07, 0.97)
+      z: 99
+
+      MouseArea {
+        anchors.fill: parent
+      }
+
+      Column {
+        id: pairCol
+        anchors.centerIn: parent
+        width: parent.width - Style.space(40)
+        spacing: Style.space(10)
+
+        Row {
+          width: parent.width
+          Item {
+            width: parent.width - closePairBtn.implicitWidth
+            implicitHeight: pairTitleText.implicitHeight
+            RowLayout {
+              spacing: Style.space(6)
+              Text {
+                text: "󰄳"
+                color: Color.accent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.title
+              }
+              Text {
+                id: pairTitleText
+                text: "OmaID Bağla & QR Tara"
+                color: root.bar ? root.bar.foreground : Color.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.title
+                font.bold: true
+              }
+            }
+          }
+
+          Button {
+            id: closePairBtn
+            text: "✕"
+            bordered: true
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            onClicked: {
+              root.showOmaIdPairModal = false
+              root.pairStatusMsg = ""
+            }
+          }
+        }
+
+        Text {
+          width: parent.width
+          wrapMode: Text.WordWrap
+          text: "Ekrandaki QR kodunu tarayın, panodaki kodu aktarın veya 16 haneli OmaID'yi girerek güvenli cihaz bağlayın."
+          color: root.bar ? root.bar.foreground : Color.foreground
+          opacity: 0.75
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          lineHeight: 1.3
+        }
+
+        // Quick Action Buttons Row (Ekrandan Tara / Panodan Al)
+        RowLayout {
+          width: parent.width
+          spacing: Style.space(8)
+
+          Button {
+            Layout.fillWidth: true
+            text: "Ekrandan QR Tara"
+            iconText: "󰄳"
+            bordered: true
+            accent: Color.accent
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.micro
+            onClicked: root.scanFromScreen()
+          }
+
+          Button {
+            Layout.fillWidth: true
+            text: "Panodan Yapıştır"
+            iconText: "󰅍"
+            bordered: true
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.micro
+            onClicked: root.pasteOmaIdFromClipboard()
+          }
+        }
+
+        // 16-Digit OmaID Input Label & Field
+        Column {
+          width: parent.width
+          spacing: Style.space(4)
+
+          RowLayout {
+            width: parent.width
+            Text {
+              text: "16 HANELİ OMAID"
+              color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.micro
+              font.bold: true
+              font.letterSpacing: 0.8
+            }
+            Item { Layout.fillWidth: true }
+            Text {
+              property int cleanLen: root.pairInputOmaId.replace(/[^A-F0-9]/gi, "").length
+              text: "(" + cleanLen + " / 16)"
+              color: cleanLen === 16 ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.micro
+              font.bold: true
+            }
+          }
+
+          Rectangle {
+            width: parent.width
+            height: 38
+            radius: 6
+            color: Qt.rgba(1.0, 1.0, 1.0, 0.05)
+            border.color: pairOmaIdInput.activeFocus ? Color.accent : (root.pairInputOmaId.replace(/[^A-F0-9]/gi, "").length === 16 ? Color.accent : Qt.rgba(1.0, 1.0, 1.0, 0.15))
+            border.width: 1
+
+            RowLayout {
+              anchors.fill: parent
+              anchors.leftMargin: Style.space(10)
+              anchors.rightMargin: Style.space(10)
+              spacing: Style.space(6)
+
+              TextInput {
+                id: pairOmaIdInput
+                Layout.fillWidth: true
+                text: root.pairInputOmaId
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 1.0
+                color: root.bar ? root.bar.foreground : Color.foreground
+                selectByMouse: true
+                cursorVisible: activeFocus
+                maximumLength: 19
+
+                onTextChanged: {
+                  var formatted = root.formatInputOmaId(text)
+                  if (formatted !== text) {
+                    var oldPos = cursorPosition
+                    root.pairInputOmaId = formatted
+                    cursorPosition = Math.min(formatted.length, oldPos + 1)
+                  } else {
+                    root.pairInputOmaId = text
+                  }
+                }
+
+                Text {
+                  anchors.fill: parent
+                  visible: !pairOmaIdInput.text && !pairOmaIdInput.activeFocus
+                  text: "XXXX-XXXX-XXXX-XXXX"
+                  color: Qt.rgba(1.0, 1.0, 1.0, 0.25)
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  font.letterSpacing: 1.0
+                  verticalAlignment: Text.AlignVCenter
+                }
+              }
+
+              Text {
+                visible: root.pairInputOmaId.replace(/[^A-F0-9]/gi, "").length === 16
+                text: "󰄬"
+                color: Color.accent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+          }
+        }
+
+        // Friendly Device Name Input
+        Column {
+          width: parent.width
+          spacing: Style.space(4)
+
+          Text {
+            text: "CİHAZ ADI (İSTEĞE BAĞLI)"
+            color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.micro
+            font.bold: true
+            font.letterSpacing: 0.8
+          }
+
+          Rectangle {
+            width: parent.width
+            height: 38
+            radius: 6
+            color: Qt.rgba(1.0, 1.0, 1.0, 0.05)
+            border.color: pairNameInput.activeFocus ? Color.accent : Qt.rgba(1.0, 1.0, 1.0, 0.15)
+            border.width: 1
+
+            TextInput {
+              id: pairNameInput
+              anchors.fill: parent
+              anchors.leftMargin: Style.space(10)
+              anchors.rightMargin: Style.space(10)
+              text: root.pairInputName
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              color: root.bar ? root.bar.foreground : Color.foreground
+              selectByMouse: true
+              cursorVisible: activeFocus
+              verticalAlignment: Text.AlignVCenter
+              onTextChanged: root.pairInputName = text
+
+              Text {
+                anchors.fill: parent
+                visible: !pairNameInput.text && !pairNameInput.activeFocus
+                text: "Örn: Telefon, İş Dizüstü"
+                color: Qt.rgba(1.0, 1.0, 1.0, 0.25)
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                verticalAlignment: Text.AlignVCenter
+              }
+            }
+          }
+        }
+
+        // Status Feedback Banner
+        Rectangle {
+          width: parent.width
+          implicitHeight: statusText.implicitHeight + Style.space(8)
+          visible: root.pairStatusMsg.length > 0
+          radius: 6
+          color: root.pairStatusError ? Qt.rgba(0.9, 0.2, 0.2, 0.15) : Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.15)
+          border.color: root.pairStatusError ? "#f7768e" : Color.accent
+          border.width: 1
+
+          Text {
+            id: statusText
+            anchors.centerIn: parent
+            width: parent.width - Style.space(16)
+            wrapMode: Text.WordWrap
+            horizontalAlignment: Text.AlignHCenter
+            text: root.pairStatusMsg
+            color: root.pairStatusError ? "#f7768e" : Color.accent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.micro
+            font.bold: true
+          }
+        }
+
+        PanelSeparator {
+          width: parent.width
+          foreground: root.bar ? root.bar.foreground : Color.foreground
+        }
+
+        // Action Buttons
+        RowLayout {
+          width: parent.width
+          spacing: Style.space(8)
+
+          Button {
+            Layout.fillWidth: true
+            text: "Cihazı Bağla & Eşleştir"
+            iconText: "󰌆"
+            bordered: true
+            accent: Color.accent
+            enabled: root.pairInputOmaId.replace(/[^A-F0-9]/gi, "").length === 16
+            foreground: enabled ? (root.bar ? root.bar.foreground : Color.foreground) : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.8)
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            onClicked: root.bindOmaId(root.pairInputOmaId, root.pairInputName)
+          }
+
+          Button {
+            text: "İptal"
+            bordered: true
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            onClicked: {
+              root.showOmaIdPairModal = false
+              root.pairStatusMsg = ""
+            }
           }
         }
       }

@@ -113,7 +113,7 @@ class DiscoveryManager(private val context: Context) {
         val list = when (mode) {
             DiscoveryMode.OFF -> emptyList()
             DiscoveryMode.KNOWN_PEERS -> {
-                peerMap.values.filter { it.isTrusted || it.id.startsWith("manual_") }
+                peerMap.values.filter { it.isTrusted || it.id.startsWith("manual_") || it.transport == "LAN" || it.transport == "HYBRID" }
             }
             DiscoveryMode.EVERYONE -> {
                 peerMap.values.toList()
@@ -163,12 +163,20 @@ class DiscoveryManager(private val context: Context) {
                         port = NetworkUtils.PORT,
                         mode = _discoveryMode.value.wireMode,
                         bt = isBluetoothEnabled(),
-                        fp = ""
+                        fp = getBluetoothMacAddress()
                     )
                     val payload = json.encodeToString(P2pBeaconPacket.serializer(), beacon).toByteArray(Charsets.UTF_8)
-                    repeat(2) {
+                    repeat(3) {
                         sendBroadcastPacket(socket, payload, NetworkUtils.PORT)
-                        delay(100)
+                        for (peer in peerMap.values) {
+                            if (!peer.ip.startsWith("bt:")) {
+                                try {
+                                    val peerAddr = InetAddress.getByName(peer.ip)
+                                    socket.send(DatagramPacket(payload, payload.size, peerAddr, peer.port))
+                                } catch (_: Exception) {}
+                            }
+                        }
+                        delay(60)
                     }
                     socket.close()
                 } catch (_: Exception) {

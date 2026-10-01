@@ -237,6 +237,7 @@ pub struct ServerState {
     pub download_dir: String,
     pub shared_dir: String,
     pub qr_path: String,
+    pub omaid_qr_path: String,
     pub active_url: String,
     pub total_received: usize,
     pub recent_files: Vec<FileInfo>,
@@ -728,6 +729,63 @@ fn start_wan_tunnel() -> Result<String, String> {
 
 // ------------------- QR CODE & URLS -------------------
 
+pub fn update_oma_id_qr() -> (String, String) {
+    let state_dir = get_state_dir();
+    let oma_id = get_or_create_oma_id();
+    let raw_id = rendezvous::normalize_oma_id(&oma_id);
+    let qr_content = format!("omasend://identity/{}", raw_id);
+
+    let svg_file = state_dir.join("oma_id_qr.svg");
+    let png_file = state_dir.join("oma_id_qr.png");
+    let legacy_svg_file = state_dir.join("omaid_qr.svg");
+    let last_content_file = state_dir.join("last_oma_id_qr.txt");
+
+    let is_cached = svg_file.exists()
+        && png_file.exists()
+        && read_secure_file(&last_content_file).map(|c| c.trim() == qr_content).unwrap_or(false);
+
+    let svg_path = svg_file.to_string_lossy().to_string();
+    let png_path = png_file.to_string_lossy().to_string();
+
+    if is_cached {
+        return (svg_path, png_path);
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    // Generate SVG via qrencode
+    let svg_ok = run_cmd_bounded(
+        "/usr/bin/qrencode",
+        &["-o", &svg_path, "-t", "SVG", &qr_content],
+        &[],
+        deadline,
+        1024,
+    ).is_some();
+
+    // Fallback internal SVG generator if qrencode fails or is absent
+    if !svg_ok || !svg_file.exists() {
+        let svg_data = rendezvous::generate_fallback_qr_svg(&qr_content);
+        let _ = write_secure_file(&svg_file, &svg_data);
+    }
+
+    // Sync legacy omaid_qr.svg path if needed
+    if let Ok(svg_bytes) = fs::read(&svg_file) {
+        let _ = write_secure_bytes(&legacy_svg_file, &svg_bytes);
+    }
+
+    // Generate PNG via qrencode
+    let deadline_png = Instant::now() + Duration::from_secs(2);
+    let _ = run_cmd_bounded(
+        "/usr/bin/qrencode",
+        &["-o", &png_path, "-t", "PNG", "-s", "8", "-m", "2", &qr_content],
+        &[],
+        deadline_png,
+        1024,
+    );
+
+    let _ = write_secure_file(&last_content_file, &qr_content);
+    (svg_path, png_path)
+}
+
 fn update_all_qr() {
     let ip = get_local_ip();
     let pin = get_or_create_pin();
@@ -750,25 +808,23 @@ fn update_all_qr() {
     let last_qr_file = get_state_dir().join("last_qr_url.txt");
     let qr_file = get_state_dir().join("qr.svg");
 
-    if qr_file.exists() {
-        if let Ok(last_url) = read_secure_file(&last_qr_file) {
-            if last_url.trim() == full_url {
-                return; // Cached: URL has not changed
-            }
-        }
+    if !qr_file.exists() || read_secure_file(&last_qr_file).map(|s| s.trim() != full_url).unwrap_or(true) {
+        let qr_path = qr_file.to_string_lossy().to_string();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let _ = run_cmd_bounded(
+            "/usr/bin/qrencode",
+            &["-o", &qr_path, "-t", "SVG", &full_url],
+            &[],
+            deadline,
+            1024,
+        );
+        let _ = write_secure_file(&last_qr_file, &full_url);
     }
 
-    let qr_path = qr_file.to_string_lossy().to_string();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let _ = run_cmd_bounded(
-        "/usr/bin/qrencode",
-        &["-o", &qr_path, "-t", "SVG", &full_url],
-        &[],
-        deadline,
-        1024,
-    );
-    let _ = write_secure_file(&last_qr_file, &full_url);
+    // Ensure desktop OmaID QR code (oma_id_qr.png / .svg) is always generated and ready
+    update_oma_id_qr();
 }
+
 
 fn get_desktop_gui_envs() -> Vec<(&'static str, String)> {
     let keys = [
@@ -1609,54 +1665,131 @@ fn update_discovered_peer(packet: &P2pBeaconPacket) {
     save_discovered_peers(&peers);
 }
 
-fn run_p2p_beacon_broadcaster() {
+pub fn get_all_broadcast_addresses() -> Vec<Ipv4Addr> {
+    let mut addrs = Vec::new();
+    addrs.push(Ipv4Addr::new(255, 255, 255, 255));
+
+    // Enumerate system network interfaces via libc::getifaddrs
+    unsafe {
+        let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifaddrs) == 0 && !ifaddrs.is_null() {
+            let mut curr = ifaddrs;
+            while !curr.is_null() {
+                let ifa = *curr;
+                if !ifa.ifa_addr.is_null() && !ifa.ifa_ifu.is_null() {
+                    let family = (*ifa.ifa_addr).sa_family as i32;
+                    let flags = ifa.ifa_flags as i32;
+                    if family == libc::AF_INET
+                        && (flags & libc::IFF_UP != 0)
+                        && (flags & libc::IFF_BROADCAST != 0)
+                        && (flags & libc::IFF_LOOPBACK == 0)
+                    {
+                        let broad_sa = ifa.ifa_ifu as *const libc::sockaddr_in;
+                        let sin_addr = (*broad_sa).sin_addr.s_addr;
+                        let ip_bytes = sin_addr.to_ne_bytes();
+                        let bcast_ip = Ipv4Addr::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
+                        if !addrs.contains(&bcast_ip) {
+                            addrs.push(bcast_ip);
+                        }
+                    }
+                }
+                curr = ifa.ifa_next;
+            }
+            libc::freeifaddrs(ifaddrs);
+        }
+    }
+
+    // Derive /24 and /16 subnet broadcasts from local IP
+    let local_ip = get_local_ip();
+    if let Ok(ip) = local_ip.parse::<Ipv4Addr>() {
+        let oct = ip.octets();
+        let sub24 = Ipv4Addr::new(oct[0], oct[1], oct[2], 255);
+        if !addrs.contains(&sub24) {
+            addrs.push(sub24);
+        }
+        let sub16 = Ipv4Addr::new(oct[0], oct[1], 255, 255);
+        if !addrs.contains(&sub16) {
+            addrs.push(sub16);
+        }
+    }
+
+    addrs
+}
+
+pub fn send_p2p_beacon_burst(burst_count: usize) {
     let socket = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
         Err(_) => return,
     };
     let _ = socket.set_broadcast(true);
 
-    loop {
-        let (vis, _) = get_visibility();
-        if vis != "OFF" {
-            let (device_id, fp) = get_or_create_device_id();
-            let hostname = get_system_hostname();
-            let ip = get_local_ip();
-            let bt = is_bluetooth_available();
+    let (vis, _) = get_visibility();
+    if vis == "OFF" {
+        return;
+    }
+    let (device_id, fp) = get_or_create_device_id();
+    let hostname = get_system_hostname();
+    let ip = get_local_ip();
+    let bt = is_bluetooth_available();
 
-            let packet = P2pBeaconPacket {
-                magic: "OMASEND_P2P".to_string(),
-                v: 1,
-                id: device_id,
-                name: hostname,
-                ip: ip.clone(),
-                port: PORT,
-                mode: vis,
-                bt,
-                fp,
-            };
+    let packet = P2pBeaconPacket {
+        magic: "OMASEND_P2P".to_string(),
+        v: 1,
+        id: device_id,
+        name: hostname,
+        ip: ip.clone(),
+        port: PORT,
+        mode: vis,
+        bt,
+        fp,
+    };
 
-            if let Ok(bytes) = serde_json::to_vec(&packet) {
-                let _ = socket.send_to(&bytes, format!("255.255.255.255:{}", P2P_BEACON_PORT));
-                // Standard /24 subnet broadcast
-                if let Some(dot) = ip.rfind('.') {
-                    let subnet_bcast24 = format!("{}.255:{}", &ip[..dot], P2P_BEACON_PORT);
-                    let _ = socket.send_to(&bytes, subnet_bcast24);
-                }
-                // Also broadcast to /16 boundary for corporate / enterprise local networks
-                let ip_parts: Vec<&str> = ip.split('.').collect();
-                if ip_parts.len() == 4 {
-                    let subnet_bcast16 = format!("{}.{}.255.255:{}", ip_parts[0], ip_parts[1], P2P_BEACON_PORT);
-                    let _ = socket.send_to(&bytes, subnet_bcast16);
-                }
-                // Unicast directly to discovered peers to bypass Wi-Fi broadcast filtering
-                for peer in get_discovered_peers() {
-                    let _ = socket.send_to(&bytes, format!("{}:{}", peer.ip, P2P_BEACON_PORT));
-                }
+    if let Ok(bytes) = serde_json::to_vec(&packet) {
+        let broadcast_targets = get_all_broadcast_addresses();
+        let known_peers = get_discovered_peers();
+
+        for i in 0..burst_count {
+            for bcast_ip in &broadcast_targets {
+                let target = format!("{}:{}", bcast_ip, P2P_BEACON_PORT);
+                let _ = socket.send_to(&bytes, &target);
+            }
+            for peer in &known_peers {
+                let target = format!("{}:{}", peer.ip, P2P_BEACON_PORT);
+                let _ = socket.send_to(&bytes, &target);
+            }
+            if i + 1 < burst_count {
+                thread::sleep(Duration::from_millis(40));
             }
         }
+    }
+}
+
+pub fn prune_expired_discovered_peers() -> usize {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let path = get_state_dir().join("discovered_peers.json");
+    if let Ok(content) = read_secure_file(&path) {
+        if let Ok(peers) = serde_json::from_str::<Vec<DiscoveredPeer>>(&content) {
+            let initial_len = peers.len();
+            let remaining: Vec<DiscoveredPeer> = peers.into_iter().filter(|p| now.saturating_sub(p.last_seen_secs) <= 15).collect();
+            if remaining.len() != initial_len {
+                save_discovered_peers(&remaining);
+                return initial_len - remaining.len();
+            }
+        }
+    }
+    0
+}
+
+fn run_p2p_beacon_broadcaster() {
+    loop {
+        send_p2p_beacon_burst(1);
+        prune_expired_discovered_peers();
         thread::sleep(Duration::from_secs(3));
     }
+}
+
+pub fn send_immediate_beacon_broadcast() {
+    send_p2p_beacon_burst(1);
 }
 
 fn run_p2p_discovery_listener() {
@@ -1664,14 +1797,23 @@ fn run_p2p_discovery_listener() {
         Ok(s) => s,
         Err(_) => return,
     };
+    let _ = socket.set_read_timeout(Some(Duration::from_millis(1000)));
 
     let mut buf = [0u8; 2048];
-    while let Ok((amt, _src)) = socket.recv_from(&mut buf) {
-        if amt > 0 && amt <= 2048 {
-            if let Ok(packet) = serde_json::from_slice::<P2pBeaconPacket>(&buf[..amt]) {
-                if packet.magic == "OMASEND_P2P" {
-                    update_discovered_peer(&packet);
+    loop {
+        match socket.recv_from(&mut buf) {
+            Ok((amt, _src)) => {
+                if amt > 0 && amt <= 2048 {
+                    if let Ok(packet) = serde_json::from_slice::<P2pBeaconPacket>(&buf[..amt]) {
+                        if packet.magic == "OMASEND_P2P" {
+                            update_discovered_peer(&packet);
+                        }
+                    }
                 }
+            }
+            Err(_) => {
+                // Periodic pruning on socket recv timeout
+                prune_expired_discovered_peers();
             }
         }
     }
@@ -4191,6 +4333,18 @@ fn main() {
         return;
     }
 
+    if args.iter().any(|a| a == "--oma-id-qr") {
+        let (svg_path, png_path) = update_oma_id_qr();
+        println!("SVG: {}\nPNG: {}", svg_path, png_path);
+        return;
+    }
+
+    if args.iter().any(|a| a == "--force-scan") {
+        send_p2p_beacon_burst(2);
+        println!("Force scan triggered: 2x UDP beacon burst sent across all network interfaces.");
+        return;
+    }
+
     if args.iter().any(|a| a == "--oma-id") {
         let oma_id = get_or_create_oma_id();
         println!("{}", oma_id);
@@ -4279,6 +4433,34 @@ fn main() {
         if let Some(mode) = args.get(pos + 1) {
             set_visibility(mode);
             println!("AirBridge visibility set to {}", mode.to_uppercase());
+            return;
+        }
+    }
+
+    if args.iter().any(|a| a == "--force-scan" || a == "--scan-peers") {
+        send_immediate_beacon_broadcast();
+        let mut peers = get_discovered_peers();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        peers.retain(|p| now.saturating_sub(p.last_seen_secs) < 300 || p.is_trusted);
+        save_discovered_peers(&peers);
+        println!("{}", serde_json::to_string_pretty(&peers).unwrap_or_default());
+        return;
+    }
+
+    if let Some(pos) = args.iter().position(|a| a == "--bind-oma-id" || a == "--pair-peer" || a == "--pair-oma-id") {
+        if let Some(candidate_id) = args.get(pos + 1) {
+            let clean_id = candidate_id.trim().replace('-', "").to_uppercase();
+            if clean_id.len() == 16 && clean_id.chars().all(|c| c.is_ascii_hexdigit()) {
+                let default_name = format!("OmaID-{}", &clean_id[..4]);
+                let name = args.get(pos + 2).cloned().unwrap_or(default_name);
+                let formatted = rendezvous::format_oma_id(&clean_id);
+                add_trusted_peer(&formatted, &name, "");
+                send_immediate_beacon_broadcast();
+                println!("{{\"status\":\"SUCCESS\",\"oma_id\":\"{}\",\"name\":\"{}\"}}", formatted, name);
+            } else {
+                eprintln!("Error: Invalid 16-character OmaID: {}", candidate_id);
+                std::process::exit(1);
+            }
             return;
         }
     }
@@ -4545,6 +4727,7 @@ fn main() {
             download_dir: ddir,
             shared_dir: sdir,
             qr_path,
+            omaid_qr_path: get_state_dir().join("omaid_qr.svg").to_string_lossy().to_string(),
             total_received: RECEIVED_COUNTER.load(Ordering::SeqCst),
             recent_files: get_directory_files(&get_download_dir()),
             shared_files: get_directory_files(&get_shared_dir()),
@@ -5448,6 +5631,7 @@ mod tests {
             download_dir: "/home/user/Downloads".to_string(),
             shared_dir: "/home/user/Downloads/shared".to_string(),
             qr_path: "/tmp/qr.svg".to_string(),
+            omaid_qr_path: "/tmp/omaid_qr.svg".to_string(),
             active_url: "http://192.168.1.50:53317".to_string(),
             total_received: 0,
             recent_files: vec![],
@@ -5578,6 +5762,75 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_desktop_oma_id_qr_generation_and_caching() {
+        let (svg_path, png_path) = update_oma_id_qr();
+        let svg_file = Path::new(&svg_path);
+        let png_file = Path::new(&png_path);
+
+        assert!(svg_file.exists(), "oma_id_qr.svg must exist");
+        assert!(png_file.exists(), "oma_id_qr.png must exist");
+
+        let svg_content = fs::read_to_string(svg_file).expect("Read oma_id_qr.svg");
+        assert!(svg_content.contains("<svg"), "SVG must contain valid xml root tag");
+    }
+
+    #[test]
+    fn test_discovered_peers_atomic_pruning_lifecycle() {
+        let temp_dir = env::temp_dir().join(format!("peers_pruning_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let peers_file = temp_dir.join("discovered_peers.json");
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+        let test_peers = vec![
+            DiscoveredPeer {
+                id: "peer-active".to_string(),
+                name: "Active Machine".to_string(),
+                ip: "192.168.1.50".to_string(),
+                port: 53317,
+                transport: "LAN".to_string(),
+                fingerprint: "fp1".to_string(),
+                is_trusted: false,
+                last_seen_secs: now,
+            },
+            DiscoveredPeer {
+                id: "peer-expired".to_string(),
+                name: "Offline Machine".to_string(),
+                ip: "192.168.1.60".to_string(),
+                port: 53317,
+                transport: "LAN".to_string(),
+                fingerprint: "fp2".to_string(),
+                is_trusted: false,
+                last_seen_secs: now - 30, // 30 seconds old -> expired
+            },
+        ];
+
+        let json = serde_json::to_string_pretty(&test_peers).unwrap();
+        write_secure_file(&peers_file, &json).expect("write initial peers");
+
+        // Filter expired
+        let read_json = read_secure_file(&peers_file).unwrap();
+        let loaded: Vec<DiscoveredPeer> = serde_json::from_str(&read_json).unwrap();
+        let remaining: Vec<DiscoveredPeer> = loaded.into_iter().filter(|p| now.saturating_sub(p.last_seen_secs) <= 15).collect();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, "peer-active");
+
+        write_secure_file(&peers_file, &serde_json::to_string_pretty(&remaining).unwrap()).unwrap();
+        let meta = fs::symlink_metadata(&peers_file).expect("Stat peers file");
+        assert_eq!(meta.mode() & 0o777, 0o600);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_broadcast_addresses_resolution() {
+        let addrs = get_all_broadcast_addresses();
+        assert!(!addrs.is_empty(), "Must contain at least global broadcast");
+        assert!(addrs.contains(&Ipv4Addr::new(255, 255, 255, 255)));
     }
 }
 

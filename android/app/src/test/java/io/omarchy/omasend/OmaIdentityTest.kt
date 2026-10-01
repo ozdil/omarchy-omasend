@@ -55,6 +55,35 @@ class OmaIdentityTest {
 
         val spaced = "1234 5678 9012 3456"
         assertEquals(raw, OmaIdentity.unformat(spaced))
+
+        val mixedCase = "1234-abcd-5678-efgh"
+        assertEquals("1234ABCD5678EFGH", OmaIdentity.unformat(mixedCase))
+    }
+
+    @Test
+    fun testParseAndCaseInsensitiveValidation() {
+        val validId = OmaIdentity.generateRandomOmaId()
+        val raw = OmaIdentity.unformat(validId)
+
+        // Parse with hyphens
+        val parsed1 = OmaIdentity.parse(validId)
+        assertNotNull(parsed1)
+        assertEquals(validId, parsed1?.formattedId)
+
+        // Parse without hyphens
+        val parsed2 = OmaIdentity.parse(raw)
+        assertNotNull(parsed2)
+        assertEquals(validId, parsed2?.formattedId)
+
+        // Parse with spaces
+        val spaced = raw.chunked(4).joinToString(" ")
+        val parsed3 = OmaIdentity.parse(spaced)
+        assertNotNull(parsed3)
+        assertEquals(validId, parsed3?.formattedId)
+
+        // Parse invalid returns null
+        val invalidParsed = OmaIdentity.parse("invalid-id-string")
+        assertEquals(null, invalidParsed)
     }
 
     @Test

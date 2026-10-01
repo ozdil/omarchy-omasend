@@ -2940,7 +2940,10 @@ fun EditOmaIdDialog(
 
                 OutlinedTextField(
                     value = input,
-                    onValueChange = { input = it },
+                    onValueChange = { rawNewValue ->
+                        val clean = rawNewValue.replace("-", "").replace(" ", "").uppercase().filter { it.isLetterOrDigit() }.take(16)
+                        input = if (clean.isEmpty()) "" else clean.chunked(4).joinToString("-")
+                    },
                     label = { Text("16 Haneli OmaID") },
                     placeholder = { Text("4829-1048-5729-1104") },
                     singleLine = true,

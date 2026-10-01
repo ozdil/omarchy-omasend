@@ -30,6 +30,7 @@ data class OmaIdentity(
 
         /**
          * Validates a 16-digit OmaID using Luhn mod 10 checksum.
+         * Case-insensitive and supports formatted or unformatted inputs.
          */
         fun isValid(input: String?): Boolean {
             if (input.isNullOrBlank()) return false
@@ -48,6 +49,15 @@ data class OmaIdentity(
                 }
             }
             return sum % 10 == 0
+        }
+
+        /**
+         * Parses and formats any case-insensitive or unformatted OmaID input.
+         * Returns OmaIdentity instance if valid, null otherwise.
+         */
+        fun parse(input: String?): OmaIdentity? {
+            if (!isValid(input)) return null
+            return OmaIdentity(format(input!!))
         }
 
         /**
@@ -73,19 +83,19 @@ data class OmaIdentity(
         }
 
         /**
-         * Formats 16 raw digits into XXXX-XXXX-XXXX-XXXX format.
+         * Formats raw digits into XXXX-XXXX-XXXX-XXXX format.
          */
         fun format(raw: String): String {
             val clean = unformat(raw)
-            if (clean.length != 16) return raw
+            if (clean.isEmpty()) return ""
             return clean.chunked(4).joinToString("-")
         }
 
         /**
-         * Removes spaces and hyphens from formatted OmaID.
+         * Removes spaces and hyphens from OmaID and normalizes to uppercase.
          */
         fun unformat(formatted: String): String {
-            return formatted.replace("-", "").replace(" ", "").trim()
+            return formatted.replace("-", "").replace(" ", "").trim().uppercase()
         }
 
         /**
