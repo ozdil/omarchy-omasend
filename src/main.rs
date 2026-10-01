@@ -167,13 +167,32 @@ pub struct TrustedPeersDb {
     pub peers: Vec<TrustedPeer>,
 }
 
+fn default_clipboard_content_type() -> String {
+    "text".to_string()
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ClipboardItem {
     pub timestamp: u64,
     pub sender: String,
+    #[serde(default = "default_clipboard_content_type")]
+    pub content_type: String, // "text", "image_png", "image_jpeg", "image_webp"
+    #[serde(default)]
     pub text: String,
+    #[serde(default)]
     pub char_count: usize,
+    #[serde(default)]
     pub is_url: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail_base64: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -964,6 +983,275 @@ fn start_download_dir_watcher(download_dir: &Path) {
 }
 
 pub const MAX_CLIPBOARD_VAULT_ITEMS: usize = 20;
+pub const MAX_IMAGE_CLIP_SIZE: usize = 10 * 1024 * 1024; // 10 MiB strict ceiling
+pub const INLINE_IMAGE_CLIP_MAX_SIZE: usize = 512 * 1024; // 512 KiB inline payload ceiling
+pub const MAX_CLIP_STAGING_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB max staging disk usage
+pub const MAX_CLIP_STAGING_FILES: usize = 20; // 20 images max
+
+pub fn compute_image_clipboard_hash(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+pub fn base64_encode(data: &[u8]) -> String {
+    const CHARSET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+
+        let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+        result.push(CHARSET[((n >> 18) & 63) as usize] as char);
+        result.push(CHARSET[((n >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            result.push(CHARSET[((n >> 6) & 63) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(CHARSET[(n & 63) as usize] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    result
+}
+
+pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    let clean: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if clean.len() % 4 != 0 {
+        return Err("Invalid Base64 length".to_string());
+    }
+    let mut out = Vec::with_capacity(clean.len() / 4 * 3);
+    for chunk in clean.chunks_exact(4) {
+        let mut buf = [0u8; 4];
+        let mut pad_count = 0;
+        for (i, &b) in chunk.iter().enumerate() {
+            buf[i] = match b {
+                b'A'..=b'Z' => b - b'A',
+                b'a'..=b'z' => b - b'a' + 26,
+                b'0'..=b'9' => b - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                b'=' => {
+                    pad_count += 1;
+                    0
+                }
+                _ => return Err("Invalid Base64 character".to_string()),
+            };
+        }
+        let n = ((buf[0] as u32) << 18) | ((buf[1] as u32) << 12) | ((buf[2] as u32) << 6) | (buf[3] as u32);
+        out.push(((n >> 16) & 0xFF) as u8);
+        if pad_count < 2 {
+            out.push(((n >> 8) & 0xFF) as u8);
+        }
+        if pad_count < 1 {
+            out.push((n & 0xFF) as u8);
+        }
+    }
+    Ok(out)
+}
+
+pub fn validate_image_header(data: &[u8]) -> Result<(String, u32, u32), String> {
+    if data.is_empty() {
+        return Err("Image data is empty".to_string());
+    }
+    if data.len() > MAX_IMAGE_CLIP_SIZE {
+        return Err(format!("Image size ({} bytes) exceeds 10 MiB limit", data.len()));
+    }
+
+    // Strict SVG, XML, HTML and script injection prevention - SVG is completely forbidden
+    let check_len = data.len().min(1024);
+    let preview = &data[..check_len];
+    if preview.windows(4).any(|w| w.eq_ignore_ascii_case(b"<svg"))
+        || preview.windows(5).any(|w| w.eq_ignore_ascii_case(b"<?xml"))
+        || preview.windows(11).any(|w| w.eq_ignore_ascii_case(b"<html"))
+        || preview.windows(7).any(|w| w.eq_ignore_ascii_case(b"<script"))
+    {
+        return Err("SVG, XML and script-containing payloads are strictly rejected for security".to_string());
+    }
+
+    // 1. PNG Check: \x89PNG\r\n\x1a\n
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        if data.len() < 24 {
+            return Err("PNG data too short for IHDR chunk".to_string());
+        }
+        if &data[12..16] != b"IHDR" {
+            return Err("PNG missing IHDR header".to_string());
+        }
+        let width = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
+        let height = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
+
+        if width == 0 || height == 0 {
+            return Err("Invalid PNG dimensions (0x0)".to_string());
+        }
+        if width > 8192 || height > 8192 {
+            return Err(format!("PNG dimensions ({}x{}) exceed 8192x8192 ceiling", width, height));
+        }
+        return Ok(("image_png".to_string(), width, height));
+    }
+
+    // 2. JPEG Check: \xFF\xD8\xFF
+    if data.starts_with(b"\xFF\xD8\xFF") {
+        let mut offset = 2;
+        let mut width = 0u32;
+        let mut height = 0u32;
+        let len = data.len();
+
+        while offset + 3 < len {
+            if data[offset] != 0xFF {
+                offset += 1;
+                continue;
+            }
+            let marker = data[offset + 1];
+            offset += 2;
+
+            if marker == 0xFF || marker == 0x00 {
+                continue;
+            }
+
+            if marker == 0xD8 || marker == 0xD9 || (0xD0..=0xD7).contains(&marker) {
+                continue;
+            }
+
+            if marker == 0xDA || marker == 0xD9 {
+                break;
+            }
+
+            if offset + 2 > len {
+                break;
+            }
+            let seg_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
+            if seg_len < 2 || offset + seg_len > len {
+                break;
+            }
+
+            let is_sof = matches!(marker, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF);
+            if is_sof {
+                if seg_len >= 7 && offset + 7 <= len {
+                    let h = u16::from_be_bytes([data[offset + 3], data[offset + 4]]) as u32;
+                    let w = u16::from_be_bytes([data[offset + 5], data[offset + 6]]) as u32;
+                    height = h;
+                    width = w;
+                    break;
+                }
+            }
+            offset += seg_len;
+        }
+
+        if width == 0 || height == 0 {
+            return Err("Could not extract valid JPEG dimensions".to_string());
+        }
+        if width > 8192 || height > 8192 {
+            return Err(format!("JPEG dimensions ({}x{}) exceed 8192x8192 ceiling", width, height));
+        }
+        return Ok(("image_jpeg".to_string(), width, height));
+    }
+
+    // 3. WebP Check: RIFF....WEBP
+    if data.len() >= 16 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        let chunk_type = &data[12..16];
+        let mut width = 0u32;
+        let mut height = 0u32;
+
+        if chunk_type == b"VP8 " {
+            if data.len() >= 30 {
+                if data[23] == 0x9D && data[24] == 0x01 && data[25] == 0x2A {
+                    let w = u16::from_le_bytes([data[26], data[27]]) & 0x3FFF;
+                    let h = u16::from_le_bytes([data[28], data[29]]) & 0x3FFF;
+                    width = w as u32;
+                    height = h as u32;
+                }
+            }
+        } else if chunk_type == b"VP8L" {
+            if data.len() >= 25 && data[20] == 0x2F {
+                let bits = u32::from_le_bytes([data[21], data[22], data[23], data[24]]);
+                width = (bits & 0x3FFF) + 1;
+                height = ((bits >> 14) & 0x3FFF) + 1;
+            }
+        } else if chunk_type == b"VP8X" {
+            if data.len() >= 30 {
+                let w = (data[24] as u32) | ((data[25] as u32) << 8) | ((data[26] as u32) << 16);
+                let h = (data[27] as u32) | ((data[28] as u32) << 8) | ((data[29] as u32) << 16);
+                width = w + 1;
+                height = h + 1;
+            }
+        }
+
+        if width == 0 || height == 0 {
+            return Err("Could not extract valid WebP dimensions".to_string());
+        }
+        if width > 8192 || height > 8192 {
+            return Err(format!("WebP dimensions ({}x{}) exceed 8192x8192 ceiling", width, height));
+        }
+        return Ok(("image_webp".to_string(), width, height));
+    }
+
+    Err("Unsupported image format: must be PNG, JPEG, or WebP".to_string())
+}
+
+pub fn get_clip_staging_dir() -> PathBuf {
+    let dir = get_state_dir().join("clip_staging");
+    let _ = fs::create_dir_all(&dir);
+    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    dir
+}
+
+pub fn stage_clipboard_image(data: &[u8], content_type: &str) -> Result<(String, PathBuf), String> {
+    let (_, _, _) = validate_image_header(data)?;
+    let hash = compute_image_clipboard_hash(data);
+    let ext = match content_type {
+        "image_jpeg" => "jpg",
+        "image_webp" => "webp",
+        _ => "png",
+    };
+    let filename = format!("{}.{}", hash, ext);
+    let staging_dir = get_clip_staging_dir();
+    let file_path = staging_dir.join(&filename);
+    write_secure_bytes(&file_path, data)?;
+    let _ = cleanup_clip_staging();
+    Ok((hash, file_path))
+}
+
+pub fn cleanup_clip_staging() -> Result<(), String> {
+    let staging_dir = get_clip_staging_dir();
+    let entries = match fs::read_dir(&staging_dir) {
+        Ok(e) => e,
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Ok(meta) = fs::symlink_metadata(&path) {
+            if meta.file_type().is_symlink() {
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+            if meta.file_type().is_file() {
+                let size = meta.len();
+                let modified = meta.modified().unwrap_or(UNIX_EPOCH);
+                files.push((path, size, modified));
+            }
+        }
+    }
+
+    files.sort_by(|a, b| b.2.cmp(&a.2));
+
+    let mut total_size: u64 = 0;
+    let mut kept_count = 0;
+
+    for (path, size, _) in files {
+        if kept_count < MAX_CLIP_STAGING_FILES && (total_size + size) <= MAX_CLIP_STAGING_BYTES {
+            total_size += size;
+            kept_count += 1;
+        } else {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    Ok(())
+}
 
 pub fn is_probable_url(text: &str) -> bool {
     let t = text.trim();
@@ -981,6 +1269,9 @@ pub fn load_clipboard_vault() -> ClipboardVault {
     if let Ok(content) = read_secure_file(&path) {
         if let Ok(mut vault) = serde_json::from_str::<ClipboardVault>(&content) {
             vault.items.retain(|item| {
+                if item.content_type.starts_with("image_") || item.image_hash.is_some() {
+                    return true;
+                }
                 let s = &item.text;
                 !s.starts_with("\u{FFFD}") &&
                 !s.starts_with("PNG") &&
@@ -994,6 +1285,9 @@ pub fn load_clipboard_vault() -> ClipboardVault {
     if let Ok(content) = read_secure_file(&hist_path) {
         if let Ok(mut vault) = serde_json::from_str::<ClipboardVault>(&content) {
             vault.items.retain(|item| {
+                if item.content_type.starts_with("image_") || item.image_hash.is_some() {
+                    return true;
+                }
                 let s = &item.text;
                 !s.starts_with("\u{FFFD}") &&
                 !s.starts_with("PNG") &&
@@ -1024,14 +1318,62 @@ pub fn add_clipboard_to_vault(sender: &str, text: &str) -> Result<ClipboardItem,
     let item = ClipboardItem {
         timestamp: now,
         sender: sender.to_string(),
+        content_type: "text".to_string(),
         text: text.to_string(),
         char_count: text.chars().count(),
         is_url: is_probable_url(text),
+        image_hash: None,
+        image_size: None,
+        image_width: None,
+        image_height: None,
+        thumbnail_base64: None,
     };
 
     let mut vault = load_clipboard_vault();
     if let Some(first) = vault.items.first() {
-        if first.text == item.text {
+        if first.content_type == "text" && first.text == item.text {
+            return Ok(item);
+        }
+    }
+
+    vault.items.insert(0, item.clone());
+    if vault.items.len() > MAX_CLIPBOARD_VAULT_ITEMS {
+        vault.items.truncate(MAX_CLIPBOARD_VAULT_ITEMS);
+    }
+    save_clipboard_vault(&vault)?;
+    Ok(item)
+}
+
+pub fn add_image_clipboard_to_vault(
+    sender: &str,
+    content_type: &str,
+    image_hash: &str,
+    image_size: u64,
+    image_width: u32,
+    image_height: u32,
+    thumbnail_base64: Option<String>,
+) -> Result<ClipboardItem, String> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let short_hash = if image_hash.len() >= 8 { &image_hash[..8] } else { image_hash };
+    let desc = format!("[Image: {} ({}x{})]", short_hash, image_width, image_height);
+
+    let item = ClipboardItem {
+        timestamp: now,
+        sender: sender.to_string(),
+        content_type: content_type.to_string(),
+        text: desc,
+        char_count: 0,
+        is_url: false,
+        image_hash: Some(image_hash.to_string()),
+        image_size: Some(image_size),
+        image_width: Some(image_width),
+        image_height: Some(image_height),
+        thumbnail_base64,
+    };
+
+    let mut vault = load_clipboard_vault();
+    if let Some(first) = vault.items.first() {
+        if first.image_hash.as_deref() == Some(image_hash) {
             return Ok(item);
         }
     }
@@ -1080,6 +1422,7 @@ fn p2p_push_clipboard_silent(target_ip: &str, text: &str) {
     let payload = serde_json::json!({
         "sender_id": my_id,
         "sender_name": my_name,
+        "content_type": "text",
         "text": text
     });
     let addr = resolve_peer_addr(target_ip);
@@ -1098,16 +1441,141 @@ fn p2p_push_clipboard_silent(target_ip: &str, text: &str) {
     });
 }
 
+pub fn p2p_push_image_clipboard_silent(
+    target_ip: &str,
+    content_type: &str,
+    hash: &str,
+    size: u64,
+    width: u32,
+    height: u32,
+    data: Option<&[u8]>,
+) {
+    if target_ip.is_empty()
+        || target_ip.starts_with("bt:")
+        || (target_ip.len() == 17 && target_ip.chars().filter(|c| *c == ':').count() == 5)
+    {
+        return;
+    }
+    let (my_id, _) = get_or_create_device_id();
+    let my_name = get_system_hostname();
+
+    let image_base64 = if let Some(d) = data {
+        if d.len() <= INLINE_IMAGE_CLIP_MAX_SIZE {
+            Some(base64_encode(d))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let payload = serde_json::json!({
+        "sender_id": my_id,
+        "sender_name": my_name,
+        "content_type": content_type,
+        "image_hash": hash,
+        "image_size": size,
+        "image_width": width,
+        "image_height": height,
+        "image_base64": image_base64,
+        "thumbnail_base64": None::<String>
+    });
+
+    let addr = resolve_peer_addr(target_ip);
+    let req_bytes = payload.to_string().into_bytes();
+    thread::spawn(move || {
+        if let Ok(mut stream) = connect_peer_with_timeout(&addr, Duration::from_millis(2500)) {
+            let http_req = format!(
+                "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                addr, req_bytes.len()
+            );
+            let _ = stream.write_all(http_req.as_bytes());
+            let _ = stream.write_all(&req_bytes);
+            let mut resp = Vec::new();
+            let _ = stream.read_to_end(&mut resp);
+        }
+    });
+}
+
+pub fn p2p_fetch_image_clipboard_and_apply(sender_ip: &str, hash: &str, _content_type: &str) {
+    if sender_ip.is_empty() || hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return;
+    }
+    let ip = sender_ip.to_string();
+    let h = hash.to_string();
+    thread::spawn(move || {
+        let addr = resolve_peer_addr(&ip);
+        if let Ok(mut stream) = connect_peer_with_timeout(&addr, Duration::from_secs(5)) {
+            let http_req = format!(
+                "GET /api/p2p/clipboard/image/{} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                h, addr
+            );
+            if stream.write_all(http_req.as_bytes()).is_ok() {
+                let mut resp_bytes = Vec::new();
+                if stream.read_to_end(&mut resp_bytes).is_ok() {
+                    if let Some(pos) = resp_bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let header_part = String::from_utf8_lossy(&resp_bytes[..pos]);
+                        if header_part.starts_with("HTTP/1.1 200") || header_part.starts_with("HTTP/1.0 200") {
+                            let body_bytes = &resp_bytes[pos + 4..];
+                            if let Ok((verified_ct, _w, _h)) = validate_image_header(body_bytes) {
+                                let computed_hash = compute_image_clipboard_hash(body_bytes);
+                                if computed_hash == h {
+                                    let _ = stage_clipboard_image(body_bytes, &verified_ct);
+                                    let _ = set_pc_image_clipboard(body_bytes, &verified_ct);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
 pub fn start_clipboard_sentinel() {
     thread::spawn(move || {
         let initial_text = get_pc_clipboard();
         if !initial_text.trim().is_empty() {
             let initial_hash = compute_clipboard_hash(&initial_text);
             set_last_synced_clipboard_hash(&initial_hash);
+        } else if let Some((img_bytes, _, _, _)) = get_pc_image_clipboard() {
+            let initial_hash = compute_image_clipboard_hash(&img_bytes);
+            set_last_synced_clipboard_hash(&initial_hash);
         }
 
         loop {
-            thread::sleep(Duration::from_millis(200));
+            thread::sleep(Duration::from_millis(250));
+
+            // Check image clipboard first
+            if let Some((img_bytes, ct, w, h)) = get_pc_image_clipboard() {
+                let img_hash = compute_image_clipboard_hash(&img_bytes);
+                let last_hash = get_last_synced_clipboard_hash();
+
+                if last_hash.as_deref() != Some(&img_hash) {
+                    set_last_synced_clipboard_hash(&img_hash);
+                    let size = img_bytes.len() as u64;
+                    let _ = stage_clipboard_image(&img_bytes, &ct);
+                    let _ = add_image_clipboard_to_vault("Local", &ct, &img_hash, size, w, h, None);
+
+                    let peers = get_discovered_peers();
+                    for peer in peers {
+                        if !peer.ip.is_empty() && !peer.ip.starts_with("bt:") && peer.transport != "BT" && peer.port > 0 {
+                            p2p_push_image_clipboard_silent(
+                                &peer.ip,
+                                &ct,
+                                &img_hash,
+                                size,
+                                w,
+                                h,
+                                Some(&img_bytes),
+                            );
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            // Check text clipboard
             let text = get_pc_clipboard();
             if text.trim().is_empty() {
                 continue;
@@ -1137,8 +1605,8 @@ pub fn is_valid_text_clipboard(data: &[u8]) -> Option<String> {
     if data.is_empty() {
         return None;
     }
-    // Reject binary signatures (PNG, JPEG, GIF, ELF, etc.)
-    if data.starts_with(b"\x89PNG") || data.starts_with(b"\xFF\xD8\xFF") || data.starts_with(b"GIF8") || data.starts_with(b"\x7fELF") {
+    // Reject binary signatures (PNG, JPEG, GIF, ELF, WebP, etc.)
+    if data.starts_with(b"\x89PNG") || data.starts_with(b"\xFF\xD8\xFF") || data.starts_with(b"GIF8") || data.starts_with(b"\x7fELF") || (data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP") {
         return None;
     }
     // Reject if contains null bytes in initial chunk
@@ -1158,6 +1626,42 @@ pub fn is_valid_text_clipboard(data: &[u8]) -> Option<String> {
         Some(trimmed.to_string())
     } else {
         None
+    }
+}
+
+pub fn get_pc_image_clipboard() -> Option<(Vec<u8>, String, u32, u32)> {
+    let env_store = get_desktop_gui_envs();
+    let envs: Vec<(&str, &str)> = env_store.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let deadline = Instant::now() + Duration::from_millis(800);
+
+    if let Some(out) = run_cmd_bounded("/usr/bin/wl-paste", &["--type", "image/png", "--no-newline"], &envs, deadline, MAX_IMAGE_CLIP_SIZE) {
+        if let Ok((ct, w, h)) = validate_image_header(&out) {
+            return Some((out, ct, w, h));
+        }
+    }
+    if let Some(out) = run_cmd_bounded("/usr/bin/xclip", &["-selection", "clipboard", "-o", "-t", "image/png"], &envs, deadline, MAX_IMAGE_CLIP_SIZE) {
+        if let Ok((ct, w, h)) = validate_image_header(&out) {
+            return Some((out, ct, w, h));
+        }
+    }
+    None
+}
+
+pub fn set_pc_image_clipboard(data: &[u8], content_type: &str) -> bool {
+    let env_store = get_desktop_gui_envs();
+    let envs: Vec<(&str, &str)> = env_store.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let deadline = Instant::now() + Duration::from_millis(1200);
+    let mime = match content_type {
+        "image_jpeg" => "image/jpeg",
+        "image_webp" => "image/webp",
+        _ => "image/png",
+    };
+
+    let success = subproc::run_cmd_write_stdin_bounded("/usr/bin/wl-copy", &["--type", mime], &envs, data, deadline);
+    if !success {
+        subproc::run_cmd_write_stdin_bounded("/usr/bin/xclip", &["-selection", "clipboard", "-t", mime], &envs, data, deadline)
+    } else {
+        true
     }
 }
 
@@ -2109,9 +2613,26 @@ fn start_bluetooth_receiver(download_dir: &Path) {
 }
 
 fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
+    if let Some((img_bytes, ct, w, h)) = get_pc_image_clipboard() {
+        let hash = compute_image_clipboard_hash(&img_bytes);
+        let _ = stage_clipboard_image(&img_bytes, &ct);
+        p2p_push_image_clipboard_silent(
+            target_ip,
+            &ct,
+            &hash,
+            img_bytes.len() as u64,
+            w,
+            h,
+            Some(&img_bytes),
+        );
+        println!("Image clipboard ({}) synced to {}", hash, target_ip);
+        notify_desktop("OmaSend AirBridge", &format!("Image clipboard synced to {}.", target_ip));
+        return Ok(());
+    }
+
     let text = get_pc_clipboard();
     if text.is_empty() {
-        notify_desktop("OmaSend AirBridge", "Clipboard is empty. Copy some text first.");
+        notify_desktop("OmaSend AirBridge", "Clipboard is empty. Copy text or an image first.");
         return Err("Clipboard is empty".to_string());
     }
 
@@ -2137,6 +2658,7 @@ fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
     let payload = serde_json::json!({
         "sender_id": my_id,
         "sender_name": my_name,
+        "content_type": "text",
         "text": text
     });
     let addr = resolve_peer_addr(target_ip);
@@ -2180,7 +2702,7 @@ fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
 pub const MAX_HEADER_SIZE: usize = 65536; // 64 KiB header limit
 pub const MAX_BODY_SIZE: usize = 100 * 1024 * 1024; // 100 MiB strict plain upload ceiling
 pub const MAX_ENCRYPTED_UPLOAD_SIZE: usize = 25 * 1024 * 1024; // 25 MiB encrypted upload ceiling
-pub const MAX_CLIPBOARD_BODY: usize = 1024 * 1024; // 1 MiB clipboard limit
+pub const MAX_CLIPBOARD_BODY: usize = 10 * 1024 * 1024; // 10 MiB clipboard limit
 pub const MAX_CONTROL_BODY: usize = 65536; // 64 KiB JSON metadata limit
 pub const IN_MEMORY_BODY_LIMIT: usize = 1024 * 1024; // 1 MiB in-memory cap
 pub const MAX_AGGREGATE_STAGING_BYTES: u64 = 200 * 1024 * 1024; // 200 MiB aggregate disk staging cap
@@ -3354,7 +3876,7 @@ window.addEventListener('load', async function() {{
 
 // ------------------- CONNECTION HANDLER -------------------
 
-fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) {
+pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) {
     let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
     let header_deadline = Instant::now() + Duration::from_secs(HEADER_READ_TIMEOUT_SECS);
 
@@ -3801,6 +4323,63 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
         }
     }
 
+    if req.method == "GET" && req.path.starts_with("/api/p2p/clipboard/image/") {
+        let (vis, _) = get_visibility();
+        if vis == "OFF" {
+            respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Visibility is Off\"}", None, None);
+            return;
+        }
+        let raw_hash = req.path.trim_start_matches("/api/p2p/clipboard/image/").trim();
+        let clean_hash: String = raw_hash.chars().take(64).filter(|c| c.is_ascii_hexdigit()).collect();
+        if clean_hash.len() != 64 {
+            respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid image hash\"}", None, None);
+            return;
+        }
+
+        let staging_dir = get_clip_staging_dir();
+        let candidates = [
+            staging_dir.join(format!("{}.png", clean_hash)),
+            staging_dir.join(format!("{}.jpg", clean_hash)),
+            staging_dir.join(format!("{}.webp", clean_hash)),
+        ];
+
+        for target in &candidates {
+            if target.exists() {
+                if let Ok(meta) = fs::symlink_metadata(target) {
+                    if meta.file_type().is_file() && !meta.file_type().is_symlink() {
+                        let ext = target.extension().and_then(|s| s.to_str()).unwrap_or("png");
+                        let mime = match ext {
+                            "jpg" | "jpeg" => "image/jpeg",
+                            "webp" => "image/webp",
+                            _ => "image/png",
+                        };
+                        if stream_file_zero_copy(&mut stream, target, mime, None, allowed_cors).is_ok() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        respond(&stream, "404 Not Found", "application/json", b"{\"error\":\"Image not found in staging\"}", None, None);
+        return;
+    }
+
+    if req.method == "GET" && req.path == "/api/p2p/clipboard/vault" {
+        let (vis, _) = get_visibility();
+        if vis == "OFF" {
+            respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Visibility is Off\"}", None, None);
+            return;
+        }
+        let vault = load_clipboard_vault();
+        let resp = serde_json::json!({
+            "status": "OK",
+            "count": vault.items.len(),
+            "items": vault.items
+        });
+        respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+        return;
+    }
+
     if req.method == "POST" && req.path == "/api/p2p/clipboard" {
         let (vis, _) = get_visibility();
         if vis == "OFF" {
@@ -3808,13 +4387,13 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             return;
         }
 
-        if content_length > MAX_CLIPBOARD_BODY {
-            respond(&stream, "413 Payload Too Large", "application/json", b"{\"error\":\"Clipboard payload exceeds 1 MiB limit\"}", None, None);
+        if content_length > MAX_IMAGE_CLIP_SIZE {
+            respond(&stream, "413 Payload Too Large", "application/json", b"{\"error\":\"Clipboard payload exceeds 10 MiB limit\"}", None, None);
             return;
         }
 
         let body_deadline = Instant::now() + Duration::from_secs(DEFAULT_BODY_TIMEOUT_SECS);
-        let body = match read_http_body(&mut stream, content_length, &initial_body, body_deadline, false, MAX_CLIPBOARD_BODY) {
+        let body = match read_http_body(&mut stream, content_length, &initial_body, body_deadline, false, MAX_IMAGE_CLIP_SIZE) {
             Some(b) => b,
             None => return,
         };
@@ -3834,8 +4413,67 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
                 respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Peer not trusted\"}", None, None);
                 return;
             }
+
+            let content_type = val["content_type"].as_str().unwrap_or("text");
+
+            // Handle visual clipboard payloads (< 512 KiB Base64 or metadata announcement)
+            if content_type.starts_with("image_") || val.get("image_hash").is_some() {
+                let img_hash = val["image_hash"].as_str();
+                let img_size = val["image_size"].as_u64().unwrap_or(0);
+                let img_w = val["image_width"].as_u64().unwrap_or(0) as u32;
+                let img_h = val["image_height"].as_u64().unwrap_or(0) as u32;
+                let thumb_b64 = val["thumbnail_base64"].as_str().map(|s| s.to_string());
+
+                if let Some(b64_data) = val["image_base64"].as_str() {
+                    if let Ok(raw_bytes) = base64_decode(b64_data) {
+                        if let Ok((verified_ct, w, h)) = validate_image_header(&raw_bytes) {
+                            let computed_hash = compute_image_clipboard_hash(&raw_bytes);
+                            if img_hash.map_or(true, |expected| expected == computed_hash) {
+                                set_last_synced_clipboard_hash(&computed_hash);
+                                let _ = stage_clipboard_image(&raw_bytes, &verified_ct);
+                                let _ = set_pc_image_clipboard(&raw_bytes, &verified_ct);
+                                let _ = add_image_clipboard_to_vault(
+                                    sender_name,
+                                    &verified_ct,
+                                    &computed_hash,
+                                    raw_bytes.len() as u64,
+                                    w,
+                                    h,
+                                    thumb_b64,
+                                );
+                                notify_desktop("OmaSend: Image Clipboard", &format!("Received image ({}x{}) from {}.", w, h, sender_name));
+                                play_clipboard_sound();
+                                respond(&stream, "200 OK", "application/json", b"{\"status\":\"OK\"}", None, None);
+                                return;
+                            }
+                        }
+                    }
+                } else if let Some(hash) = img_hash {
+                    if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                        set_last_synced_clipboard_hash(hash);
+                        let _ = add_image_clipboard_to_vault(
+                            sender_name,
+                            content_type,
+                            hash,
+                            img_size,
+                            img_w,
+                            img_h,
+                            thumb_b64,
+                        );
+                        let peer_ip = val["sender_ip"].as_str().unwrap_or("");
+                        if !peer_ip.is_empty() {
+                            p2p_fetch_image_clipboard_and_apply(peer_ip, hash, content_type);
+                        }
+                        notify_desktop("OmaSend: Image Clipboard", &format!("Received image reference from {}.", sender_name));
+                        play_clipboard_sound();
+                        respond(&stream, "200 OK", "application/json", b"{\"status\":\"OK\"}", None, None);
+                        return;
+                    }
+                }
+            }
+
             if let Some(text) = val["text"].as_str() {
-                if text.len() <= MAX_CLIPBOARD_BODY {
+                if text.len() <= MAX_IMAGE_CLIP_SIZE {
                     let hash = compute_clipboard_hash(text);
                     set_last_synced_clipboard_hash(&hash);
                     set_pc_clipboard(text);
@@ -4107,6 +4745,41 @@ fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) 
             "items": vault.items
         });
         respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+    }
+    else if req.method == "GET" && req.path.starts_with("/api/clipboard/image/") {
+        let raw_hash = req.path.trim_start_matches("/api/clipboard/image/").trim();
+        let clean_hash: String = raw_hash.chars().take(64).filter(|c| c.is_ascii_hexdigit()).collect();
+        if clean_hash.len() != 64 {
+            respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid image hash\"}", None, None);
+            return;
+        }
+
+        let staging_dir = get_clip_staging_dir();
+        let candidates = [
+            staging_dir.join(format!("{}.png", clean_hash)),
+            staging_dir.join(format!("{}.jpg", clean_hash)),
+            staging_dir.join(format!("{}.webp", clean_hash)),
+        ];
+
+        for target in &candidates {
+            if target.exists() {
+                if let Ok(meta) = fs::symlink_metadata(target) {
+                    if meta.file_type().is_file() && !meta.file_type().is_symlink() {
+                        let ext = target.extension().and_then(|s| s.to_str()).unwrap_or("png");
+                        let mime = match ext {
+                            "jpg" | "jpeg" => "image/jpeg",
+                            "webp" => "image/webp",
+                            _ => "image/png",
+                        };
+                        if stream_file_zero_copy(&mut stream, target, mime, None, allowed_cors).is_ok() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        respond(&stream, "404 Not Found", "application/json", b"{\"error\":\"Image not found in staging\"}", None, None);
+        return;
     }
     else if req.method == "GET" && req.path.starts_with("/download/") {
         let filename = sanitize_filename(&urlencoding_decode(req.path.trim_start_matches("/download/")));
@@ -5529,9 +6202,15 @@ mod tests {
         let item = ClipboardItem {
             timestamp: 1727700000,
             sender: "Pixel 9 Pro".to_string(),
+            content_type: "text".to_string(),
             text: "https://omarchy.org/docs".to_string(),
             char_count: 24,
             is_url: true,
+            image_hash: None,
+            image_size: None,
+            image_width: None,
+            image_height: None,
+            thumbnail_base64: None,
         };
 
         let json = serde_json::to_string(&item).expect("Serialize ClipboardItem");
@@ -5592,9 +6271,15 @@ mod tests {
             test_vault.items.insert(0, ClipboardItem {
                 timestamp: 1000 + i,
                 sender: format!("Device {}", i),
+                content_type: "text".to_string(),
                 text: format!("Item number {}", i),
                 char_count: 14,
                 is_url: false,
+                image_hash: None,
+                image_size: None,
+                image_width: None,
+                image_height: None,
+                thumbnail_base64: None,
             });
             if test_vault.items.len() > MAX_CLIPBOARD_VAULT_ITEMS {
                 test_vault.items.truncate(MAX_CLIPBOARD_VAULT_ITEMS);
@@ -5825,6 +6510,286 @@ mod tests {
         let addrs = get_all_broadcast_addresses();
         assert!(!addrs.is_empty(), "Must contain at least global broadcast");
         assert!(addrs.contains(&Ipv4Addr::new(255, 255, 255, 255)));
+    }
+
+    #[test]
+    fn test_image_header_validation_png_jpeg_webp() {
+        // 1. Valid 100x200 PNG
+        let mut png_data = Vec::new();
+        png_data.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        png_data.extend_from_slice(&13u32.to_be_bytes()); // Chunk len
+        png_data.extend_from_slice(b"IHDR");
+        png_data.extend_from_slice(&100u32.to_be_bytes()); // Width = 100
+        png_data.extend_from_slice(&200u32.to_be_bytes()); // Height = 200
+        png_data.extend_from_slice(&[8, 6, 0, 0, 0]); // Bit depth, color type, etc.
+        png_data.extend_from_slice(&[0, 0, 0, 0]); // CRC
+
+        let res = validate_image_header(&png_data);
+        assert!(res.is_ok(), "Valid PNG must pass header validation");
+        let (ct, w, h) = res.unwrap();
+        assert_eq!(ct, "image_png");
+        assert_eq!(w, 100);
+        assert_eq!(h, 200);
+
+        // 2. Valid 320x240 JPEG
+        let mut jpeg_data = Vec::new();
+        jpeg_data.extend_from_slice(b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00");
+        jpeg_data.extend_from_slice(b"\xFF\xC0\x00\x11\x08\x00\xF0\x01\x40\x03\x01\x22\x00\x02\x11\x01\x03\x11\x01"); // SOF0: height=240 (0x00F0), width=320 (0x0140)
+        jpeg_data.extend_from_slice(b"\xFF\xD9");
+
+        let res_jpg = validate_image_header(&jpeg_data);
+        assert!(res_jpg.is_ok(), "Valid JPEG must pass header validation");
+        let (ct_jpg, w_jpg, h_jpg) = res_jpg.unwrap();
+        assert_eq!(ct_jpg, "image_jpeg");
+        assert_eq!(w_jpg, 320);
+        assert_eq!(h_jpg, 240);
+
+        // 3. Valid WebP (VP8X canvas 800x600)
+        let mut webp_data = Vec::new();
+        webp_data.extend_from_slice(b"RIFF");
+        webp_data.extend_from_slice(&38u32.to_le_bytes()); // File size
+        webp_data.extend_from_slice(b"WEBP");
+        webp_data.extend_from_slice(b"VP8X");
+        webp_data.extend_from_slice(&10u32.to_le_bytes()); // Chunk size
+        webp_data.extend_from_slice(&[0u8; 4]); // Flags + reserved
+        // 24-bit canvas width - 1 = 799 (0x00031F)
+        webp_data.push(0x1F);
+        webp_data.push(0x03);
+        webp_data.push(0x00);
+        // 24-bit canvas height - 1 = 599 (0x000257)
+        webp_data.push(0x57);
+        webp_data.push(0x02);
+        webp_data.push(0x00);
+
+        let res_webp = validate_image_header(&webp_data);
+        assert!(res_webp.is_ok(), "Valid WebP must pass header validation");
+        let (ct_webp, w_webp, h_webp) = res_webp.unwrap();
+        assert_eq!(ct_webp, "image_webp");
+        assert_eq!(w_webp, 800);
+        assert_eq!(h_webp, 600);
+
+        // 4. SVG and XML payload rejection
+        let svg_payload = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\"><circle cx=\"50\" cy=\"50\" r=\"40\"/></svg>";
+        assert!(validate_image_header(svg_payload).is_err(), "SVG payloads must be strictly rejected");
+
+        let xml_payload = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><svg></svg>";
+        assert!(validate_image_header(xml_payload).is_err(), "XML payloads must be strictly rejected");
+
+        let script_payload = b"<script>alert(1)</script>";
+        assert!(validate_image_header(script_payload).is_err(), "Script payloads must be strictly rejected");
+
+        // 5. Dimension ceiling rejection (> 8192)
+        let mut huge_png = png_data.clone();
+        huge_png[16..20].copy_from_slice(&9000u32.to_be_bytes()); // 9000 width
+        assert!(validate_image_header(&huge_png).is_err(), "PNG > 8192x8192 must be rejected");
+
+        // 6. Zero dimension rejection
+        let mut zero_png = png_data.clone();
+        zero_png[20..24].copy_from_slice(&0u32.to_be_bytes()); // 0 height
+        assert!(validate_image_header(&zero_png).is_err(), "PNG with 0 dimension must be rejected");
+    }
+
+    #[test]
+    fn test_base64_codec_roundtrip() {
+        let test_cases: &[&[u8]] = &[
+            b"",
+            b"f",
+            b"fo",
+            b"foo",
+            b"foob",
+            b"fooba",
+            b"foobar",
+            b"Omarchy Next-Gen Wireless AirBridge Clipboard Synchronizer",
+            &[0x00, 0xFF, 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xDE, 0xAD, 0xBE, 0xEF],
+        ];
+
+        for &case in test_cases {
+            let encoded = base64_encode(case);
+            let decoded = base64_decode(&encoded).expect("Base64 decode must succeed");
+            assert_eq!(decoded.as_slice(), case, "Base64 roundtrip must be lossless");
+        }
+
+        assert!(base64_decode("Invalid!!").is_err(), "Invalid Base64 characters must return Err");
+        assert!(base64_decode("abc").is_err(), "Invalid Base64 length must return Err");
+    }
+
+    #[test]
+    fn test_clip_staging_and_mode_0600_isolation() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+
+        let mut png_bytes = Vec::new();
+        png_bytes.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        png_bytes.extend_from_slice(&13u32.to_be_bytes());
+        png_bytes.extend_from_slice(b"IHDR");
+        png_bytes.extend_from_slice(&64u32.to_be_bytes());
+        png_bytes.extend_from_slice(&64u32.to_be_bytes());
+        png_bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+        png_bytes.extend_from_slice(&[0, 0, 0, 0]);
+
+        let (hash, staged_path) = stage_clipboard_image(&png_bytes, "image_png").expect("Stage image");
+        assert_eq!(hash.len(), 64);
+        assert!(staged_path.exists());
+
+        // Verify directory is 0700 and file is 0600
+        let dir = get_clip_staging_dir();
+        let dir_meta = fs::symlink_metadata(&dir).expect("Staging dir metadata");
+        assert_eq!(dir_meta.mode() & 0o777, 0o700, "Staging dir must enforce 0700 permissions");
+
+        let file_meta = fs::symlink_metadata(&staged_path).expect("Staged file metadata");
+        assert_eq!(file_meta.mode() & 0o777, 0o600, "Staged image file must enforce 0600 permissions");
+
+        // Verify BLAKE3 hash
+        let expected_hash = compute_image_clipboard_hash(&png_bytes);
+        assert_eq!(hash, expected_hash);
+    }
+
+    #[test]
+    fn test_clip_staging_lru_cleanup_policy() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let staging_dir = get_clip_staging_dir();
+
+        // Create a dummy valid PNG template
+        let mut png_template = Vec::new();
+        png_template.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        png_template.extend_from_slice(&13u32.to_be_bytes());
+        png_template.extend_from_slice(b"IHDR");
+        png_template.extend_from_slice(&32u32.to_be_bytes());
+        png_template.extend_from_slice(&32u32.to_be_bytes());
+        png_template.extend_from_slice(&[8, 6, 0, 0, 0]);
+        png_template.extend_from_slice(&[0, 0, 0, 0]);
+
+        // Stage 25 distinct images
+        for i in 0u32..25u32 {
+            let mut data = png_template.clone();
+            data.extend_from_slice(&i.to_be_bytes());
+            let _ = stage_clipboard_image(&data, "image_png");
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        cleanup_clip_staging().expect("LRU cleanup");
+
+        let entries: Vec<_> = fs::read_dir(&staging_dir).unwrap().flatten().collect();
+        assert!(entries.len() <= MAX_CLIP_STAGING_FILES, "Staging directory file count ({}) must not exceed MAX_CLIP_STAGING_FILES ({})", entries.len(), MAX_CLIP_STAGING_FILES);
+
+        let total_bytes: u64 = entries.iter().map(|e| e.metadata().map(|m| m.len()).unwrap_or(0)).sum();
+        assert!(total_bytes <= MAX_CLIP_STAGING_BYTES, "Total staging bytes ({}) must not exceed MAX_CLIP_STAGING_BYTES ({})", total_bytes, MAX_CLIP_STAGING_BYTES);
+    }
+
+    #[test]
+    fn test_image_clipboard_vault_integration() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let dummy_hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        let item = add_image_clipboard_to_vault(
+            "POCO Pad",
+            "image_png",
+            dummy_hash,
+            102400,
+            1920,
+            1080,
+            Some("dGh1bWJuYWls".to_string()),
+        ).expect("Add image to vault");
+
+        assert_eq!(item.sender, "POCO Pad");
+        assert_eq!(item.content_type, "image_png");
+        assert_eq!(item.image_hash.as_deref(), Some(dummy_hash));
+        assert_eq!(item.image_width, Some(1920));
+        assert_eq!(item.image_height, Some(1080));
+        assert_eq!(item.image_size, Some(102400));
+
+        let vault = load_clipboard_vault();
+        let found = vault.items.iter().find(|i| i.image_hash.as_deref() == Some(dummy_hash));
+        assert!(found.is_some(), "Image item must be persisted and loaded from vault");
+
+        let json = serde_json::to_string(&item).expect("Serialize image ClipboardItem");
+        let parsed: ClipboardItem = serde_json::from_str(&json).expect("Deserialize image ClipboardItem");
+        assert_eq!(parsed.content_type, "image_png");
+        assert_eq!(parsed.image_hash.as_deref(), Some(dummy_hash));
+        assert_eq!(parsed.image_width, Some(1920));
+    }
+
+    #[test]
+    fn test_http_p2p_image_and_vault_endpoints() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        set_visibility("ALL");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
+        let local_addr = listener.local_addr().unwrap();
+
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("Accept client 1");
+            handle_connection(stream, "127.0.0.1", "1234", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+
+            let (stream, _) = listener.accept().expect("Accept client 2");
+            handle_connection(stream, "127.0.0.1", "1234", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+
+            let (stream, _) = listener.accept().expect("Accept client 3");
+            handle_connection(stream, "127.0.0.1", "1234", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+        });
+
+        // 1. Post image clipboard
+        let mut png_data = Vec::new();
+        png_data.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        png_data.extend_from_slice(&13u32.to_be_bytes());
+        png_data.extend_from_slice(b"IHDR");
+        png_data.extend_from_slice(&64u32.to_be_bytes());
+        png_data.extend_from_slice(&64u32.to_be_bytes());
+        png_data.extend_from_slice(&[8, 6, 0, 0, 0]);
+        png_data.extend_from_slice(&[0, 0, 0, 0]);
+
+        let b64 = base64_encode(&png_data);
+        let img_hash = compute_image_clipboard_hash(&png_data);
+
+        let post_payload = serde_json::json!({
+            "sender_id": "test_sender",
+            "sender_name": "Test Device",
+            "content_type": "image_png",
+            "image_hash": img_hash,
+            "image_size": png_data.len(),
+            "image_width": 64,
+            "image_height": 64,
+            "image_base64": b64
+        });
+        let post_bytes = post_payload.to_string().into_bytes();
+
+        let mut client1 = TcpStream::connect(local_addr).expect("Connect client 1");
+        let req1 = format!(
+            "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            local_addr, post_bytes.len()
+        );
+        client1.write_all(req1.as_bytes()).unwrap();
+        client1.write_all(&post_bytes).unwrap();
+        let mut resp1 = String::new();
+        client1.read_to_string(&mut resp1).unwrap();
+        assert!(resp1.starts_with("HTTP/1.1 200 OK"), "POST /api/p2p/clipboard must return 200 OK: {}", resp1);
+
+        // 2. Fetch image via /api/p2p/clipboard/image/<hash>
+        let mut client2 = TcpStream::connect(local_addr).expect("Connect client 2");
+        let req2 = format!(
+            "GET /api/p2p/clipboard/image/{} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            img_hash, local_addr
+        );
+        client2.write_all(req2.as_bytes()).unwrap();
+        let mut resp2 = Vec::new();
+        client2.read_to_end(&mut resp2).unwrap();
+        assert!(resp2.starts_with(b"HTTP/1.1 200 OK"), "GET /api/p2p/clipboard/image/<hash> must return 200 OK");
+        let header_end = resp2.windows(4).position(|w| w == b"\r\n\r\n").expect("HTTP delimiter");
+        let body2 = &resp2[header_end + 4..];
+        assert_eq!(body2, png_data.as_slice(), "Fetched image bytes must match original");
+
+        // 3. Query vault via /api/p2p/clipboard/vault
+        let mut client3 = TcpStream::connect(local_addr).expect("Connect client 3");
+        let req3 = format!(
+            "GET /api/p2p/clipboard/vault HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            local_addr
+        );
+        client3.write_all(req3.as_bytes()).unwrap();
+        let mut resp3 = String::new();
+        client3.read_to_string(&mut resp3).unwrap();
+        assert!(resp3.starts_with("HTTP/1.1 200 OK"), "GET /api/p2p/clipboard/vault must return 200 OK");
+        assert!(resp3.contains(&img_hash), "Vault response must contain stored image hash");
+
+        server_thread.join().expect("Join server thread");
     }
 }
 

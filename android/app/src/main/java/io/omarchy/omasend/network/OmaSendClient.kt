@@ -210,4 +210,69 @@ class OmaSendClient(private val context: Context) {
             Result.failure(e)
         }
     }
+
+    fun sendClipboardPayload(
+        targetIp: String,
+        targetPort: Int,
+        payload: ClipboardPayload
+    ): Result<Unit> {
+        if (!NetworkUtils.isPrivateOrLocalIp(targetIp)) {
+            return Result.failure(SecurityException("Target IP is outside private network scope (RFC 1918/3927)"))
+        }
+        return try {
+            val fullPayload = payload.copy(
+                sender_id = NetworkUtils.getDeviceId(context),
+                sender_name = NetworkUtils.getDeviceName(context),
+                pin = NetworkUtils.getDevicePin(context),
+                token = NetworkUtils.getDeviceSessionKey(context)
+            )
+            val jsonBody = json.encodeToString(ClipboardPayload.serializer(), fullPayload)
+            val request = Request.Builder()
+                .url("http://$targetIp:$targetPort/api/p2p/clipboard")
+                .header("X-OmaSend-PIN", NetworkUtils.getDevicePin(context))
+                .header("X-OmaSend-Key", NetworkUtils.getDeviceSessionKey(context))
+                .post(jsonBody.toRequestBody("application/json".toMediaType()))
+                .build()
+
+            val response = client.newCall(request).execute()
+            if (response.isSuccessful) {
+                Result.success(Unit)
+            } else {
+                Result.failure(Exception("Clipboard sync failed with HTTP ${response.code}"))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    fun fetchClipboardImage(
+        targetIp: String,
+        targetPort: Int,
+        hash: String
+    ): Result<ByteArray> {
+        if (!NetworkUtils.isPrivateOrLocalIp(targetIp)) {
+            return Result.failure(SecurityException("Target IP is outside private network scope (RFC 1918/3927)"))
+        }
+        return try {
+            val request = Request.Builder()
+                .url("http://$targetIp:$targetPort/api/p2p/clipboard/image?hash=$hash")
+                .header("X-OmaSend-PIN", NetworkUtils.getDevicePin(context))
+                .header("X-OmaSend-Key", NetworkUtils.getDeviceSessionKey(context))
+                .get()
+                .build()
+
+            val response = client.newCall(request).execute()
+            if (!response.isSuccessful) {
+                return Result.failure(Exception("HTTP ${response.code} fetching clipboard image"))
+            }
+            val body = response.body ?: return Result.failure(Exception("Empty image body"))
+            val bytes = body.bytes()
+            if (bytes.size > 10 * 1024 * 1024) {
+                return Result.failure(Exception("Image exceeds 10 MiB limit"))
+            }
+            Result.success(bytes)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
 }

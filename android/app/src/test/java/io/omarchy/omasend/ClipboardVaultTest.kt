@@ -173,4 +173,128 @@ class ClipboardVaultTest {
         assertTrue(hashRing.contains(computeSha256("text_37")))
         assertTrue(hashRing.contains(computeSha256("text_100")))
     }
+
+    @Test
+    fun testImageClipboardEntrySerialization() {
+        val imageEntry = ClipboardEntry(
+            id = "img-uuid-42",
+            text = "[Görsel: screenshot.png]",
+            senderName = "omarchy-arch",
+            timestamp = 1710000000000L,
+            isMine = false,
+            contentType = "image/png",
+            imageHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            imageSize = 1048576L,
+            thumbnailBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+            width = 1920,
+            height = 1080
+        )
+
+        val encoded = json.encodeToString(ClipboardEntry.serializer(), imageEntry)
+        assertTrue(encoded.contains("\"contentType\": \"image/png\""))
+        assertTrue(encoded.contains("\"imageHash\": \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\""))
+        assertTrue(encoded.contains("\"imageSize\": 1048576"))
+        assertTrue(encoded.contains("\"width\": 1920"))
+        assertTrue(encoded.contains("\"height\": 1080"))
+
+        val decoded = json.decodeFromString<ClipboardEntry>(encoded)
+        assertEquals("img-uuid-42", decoded.id)
+        assertEquals("[Görsel: screenshot.png]", decoded.text)
+        assertEquals("image/png", decoded.contentType)
+        assertEquals("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", decoded.imageHash)
+        assertEquals(1048576L, decoded.imageSize)
+        assertEquals(1920, decoded.width)
+        assertEquals(1080, decoded.height)
+        assertFalse(decoded.isMine)
+    }
+
+    @Test
+    fun testImageClipboardDeduplicationInVault() {
+        val entries = mutableListOf<ClipboardEntry>()
+        val imgHash = "hash-12345678"
+
+        val item1 = ClipboardEntry(
+            id = "img-1",
+            text = "[Görsel]",
+            senderName = "Desktop",
+            isMine = false,
+            contentType = "image/png",
+            imageHash = imgHash,
+            imageSize = 2048L
+        )
+
+        val item2 = ClipboardEntry(
+            id = "img-2",
+            text = "[Görsel Güncel]",
+            senderName = "Phone",
+            isMine = true,
+            contentType = "image/png",
+            imageHash = imgHash,
+            imageSize = 2048L
+        )
+
+        // Deduplication rule: matching text or matching imageHash
+        for (item in listOf(item1, item2)) {
+            entries.removeAll {
+                (it.imageHash != null && it.imageHash == item.imageHash) ||
+                (it.text.isNotEmpty() && it.text == item.text)
+            }
+            entries.add(0, item)
+        }
+
+        assertEquals(1, entries.size)
+        assertEquals("img-2", entries[0].id)
+        assertTrue(entries[0].isMine)
+        assertEquals(imgHash, entries[0].imageHash)
+    }
+
+    @Test
+    fun testImageCacheLruEvictionSimulation() {
+        val maxTotalSizeBytes = 50L * 1024L * 1024L // 50 MB
+        val maxImageFiles = 20
+
+        data class MockImageFile(val hash: String, val size: Long, val lastModified: Long)
+
+        val files = mutableListOf<MockImageFile>()
+
+        fun evictLruIfNeeded() {
+            var totalSize = files.sumOf { it.size }
+            var fileCount = files.size
+
+            if (totalSize <= maxTotalSizeBytes && fileCount <= maxImageFiles) return
+
+            // Sort oldest first
+            files.sortBy { it.lastModified }
+
+            val it = files.iterator()
+            while (it.hasNext() && (totalSize > maxTotalSizeBytes || fileCount > maxImageFiles)) {
+                val f = it.next()
+                totalSize -= f.size
+                fileCount--
+                it.remove()
+            }
+        }
+
+        // Add 25 image files of 1 MB each -> exceeds 20 file limit
+        for (i in 1..25) {
+            files.add(MockImageFile(hash = "hash_$i", size = 1024L * 1024L, lastModified = i.toLong()))
+            evictLruIfNeeded()
+        }
+
+        assertEquals(maxImageFiles, files.size)
+        // First 5 should have been evicted
+        assertFalse(files.any { it.hash == "hash_1" })
+        assertFalse(files.any { it.hash == "hash_5" })
+        assertTrue(files.any { it.hash == "hash_6" })
+        assertTrue(files.any { it.hash == "hash_25" })
+
+        // Add 2 large 30 MB files -> exceeds 50 MB total size limit
+        files.clear()
+        files.add(MockImageFile(hash = "large_1", size = 30L * 1024L * 1024L, lastModified = 100L))
+        files.add(MockImageFile(hash = "large_2", size = 30L * 1024L * 1024L, lastModified = 200L))
+        evictLruIfNeeded()
+
+        assertEquals(1, files.size)
+        assertEquals("large_2", files.first().hash)
+    }
 }

@@ -78,4 +78,33 @@ class ProtocolSerializationTest {
         assertEquals("482910", decoded.pin)
         assertEquals("session_token_xyz", decoded.token)
     }
+
+    @Test
+    fun testImageClipboardPayloadSerialization() {
+        val payload = ClipboardPayload(
+            sender_id = "device-laptop",
+            sender_name = "Laptop",
+            text = "[Görsel: capture.png]",
+            pin = "123456",
+            token = "auth_tok_abc",
+            content_type = "image/png",
+            image_hash = "abc123456789deadbeef",
+            image_size = 2097152L,
+            thumbnail_base64 = "base64thumb==",
+            width = 2560,
+            height = 1440,
+            image_data_base64 = "base64fulldata=="
+        )
+        val raw = json.encodeToString(ClipboardPayload.serializer(), payload)
+        val decoded = json.decodeFromString<ClipboardPayload>(raw)
+
+        assertEquals("device-laptop", decoded.sender_id)
+        assertEquals("image/png", decoded.content_type)
+        assertEquals("abc123456789deadbeef", decoded.image_hash)
+        assertEquals(2097152L, decoded.image_size)
+        assertEquals("base64thumb==", decoded.thumbnail_base64)
+        assertEquals(2560, decoded.width)
+        assertEquals(1440, decoded.height)
+        assertEquals("base64fulldata==", decoded.image_data_base64)
+    }
 }

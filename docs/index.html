@@ -555,11 +555,100 @@
       align-items: flex-start;
       justify-content: space-between;
       gap: 12px;
-      transition: border-color 0.2s;
+      transition: all 0.2s ease;
     }
 
     .clipboard-item:hover {
       border-color: var(--border-light);
+    }
+
+    .clipboard-item-image {
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .clipboard-image-main {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      width: 100%;
+    }
+
+    .clipboard-thumb-wrapper {
+      position: relative;
+      width: 72px;
+      height: 72px;
+      min-width: 72px;
+      border-radius: var(--radius-sm);
+      overflow: hidden;
+      background: rgba(0, 0, 0, 0.4);
+      border: 1px solid var(--border-light);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .clipboard-thumb-wrapper:hover .clipboard-thumb-img {
+      transform: scale(1.08);
+    }
+
+    .clipboard-thumb-img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      transition: transform 0.2s ease;
+    }
+
+    .clipboard-image-meta-col {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    .clipboard-badge-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .clipboard-badge-size {
+      background: rgba(122, 162, 247, 0.16);
+      color: var(--accent);
+      border: 1px solid rgba(122, 162, 247, 0.3);
+      padding: 2px 6px;
+      border-radius: var(--radius-sm);
+      font-size: 0.68rem;
+      font-weight: 700;
+    }
+
+    .clipboard-badge-device {
+      background: rgba(187, 154, 247, 0.15);
+      color: var(--accent-purple);
+      border: 1px solid rgba(187, 154, 247, 0.3);
+      padding: 2px 6px;
+      border-radius: var(--radius-sm);
+      font-size: 0.68rem;
+      font-weight: 600;
+    }
+
+    .clipboard-image-name {
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: var(--text-main);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .clipboard-card-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 2px;
     }
 
     .clipboard-item-text {
@@ -573,6 +662,30 @@
       font-size: 0.68rem;
       color: var(--text-dim);
       white-space: nowrap;
+    }
+
+    /* Image Preview Modal Box */
+    .modal-box-image {
+      max-width: 600px;
+      width: 100%;
+    }
+
+    .modal-image-container {
+      width: 100%;
+      max-height: 400px;
+      background: rgba(0, 0, 0, 0.6);
+      border-radius: var(--radius-md);
+      border: 1px solid var(--border);
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .modal-preview-img {
+      max-width: 100%;
+      max-height: 400px;
+      object-fit: contain;
     }
 
     /* Direct Network Settings Modal / Drawer */
@@ -941,6 +1054,48 @@
     </div>
   </div>
 
+  <!-- Image Preview & Download Modal -->
+  <div class="modal-backdrop" id="image-modal">
+    <div class="modal-box modal-box-image">
+      <div class="id-card-title" style="width: 100%;">
+        <span id="modal-image-title">CLIPBOARD IMAGE PREVIEW</span>
+        <button class="icon-btn" id="btn-close-image-modal" style="width:28px; height:28px;">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
+        </button>
+      </div>
+
+      <div class="modal-image-container">
+        <img id="modal-image-view" class="modal-preview-img" src="" alt="Full Preview">
+      </div>
+
+      <div style="display: flex; align-items: center; justify-content: space-between; width: 100%; font-size: 0.75rem; color: var(--text-muted);">
+        <span id="modal-image-meta">0 KB // PNG</span>
+        <span id="modal-image-sender">Remote Device</span>
+      </div>
+
+      <div style="display: flex; gap: 10px; width: 100%;">
+        <button class="btn-action" id="btn-modal-download-image" style="flex: 1;">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+            <polyline points="7 10 12 15 17 10"></polyline>
+            <line x1="12" y1="15" x2="12" y2="3"></line>
+          </svg>
+          <span>DOWNLOAD IMAGE</span>
+        </button>
+        <button class="btn-secondary" id="btn-modal-copy-image" style="flex: 1;">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+          </svg>
+          <span>COPY TO OS</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
   <!-- Toast Container -->
   <div id="toast-container"></div>
 
@@ -1280,7 +1435,7 @@
       // 5. WEBRTC & SIGNALING ENGINE
       // ==========================================
       class OmaWebRTC {
-        constructor(localId, onStatusChange, onProgress, onFileReceived, onClipboardReceived) {
+        constructor(localId, onStatusChange, onProgress, onFileReceived, onClipboardReceived, onClipboardImageReceived) {
           this.localId = localId;
           this.targetId = null;
           this.pc = null;
@@ -1289,11 +1444,13 @@
           this.onProgress = onProgress;
           this.onFileReceived = onFileReceived;
           this.onClipboardReceived = onClipboardReceived;
+          this.onClipboardImageReceived = onClipboardImageReceived;
 
           this.CHUNK_SIZE = 64 * 1024; // 64 KB
           this.incomingFile = null;
           this.receivedChunks = [];
           this.receivedBytes = 0;
+          this.imageChunks = {};
 
           this.rtcConfig = {
             iceServers: [
@@ -1366,6 +1523,30 @@
               } else if (msg.type === 'clipboard') {
                 this.onClipboardReceived(msg.text, msg.sender || 'Remote Device');
                 sounds.playClipboardClick();
+              } else if (msg.type === 'clipboard-image') {
+                if (this.onClipboardImageReceived) {
+                  this.onClipboardImageReceived(msg);
+                  sounds.playClipboardClick();
+                }
+              } else if (msg.type === 'clipboard-image-chunk') {
+                if (!this.imageChunks) this.imageChunks = {};
+                if (!this.imageChunks[msg.id]) this.imageChunks[msg.id] = new Array(msg.total);
+                this.imageChunks[msg.id][msg.index] = msg.chunk;
+                
+                const receivedCount = this.imageChunks[msg.id].filter(x => x !== undefined).length;
+                if (receivedCount === msg.total) {
+                  const fullJson = this.imageChunks[msg.id].join('');
+                  delete this.imageChunks[msg.id];
+                  try {
+                    const fullMsg = JSON.parse(fullJson);
+                    if (this.onClipboardImageReceived) {
+                      this.onClipboardImageReceived(fullMsg);
+                      sounds.playClipboardClick();
+                    }
+                  } catch(e) {
+                    console.error('Failed to parse reassembled clipboard image', e);
+                  }
+                }
               }
             } catch(e) {
               console.error('DataChannel JSON error', e);
@@ -1450,6 +1631,31 @@
           }));
           sounds.playClipboardClick();
         }
+
+        sendClipboardImage(imageMsg) {
+          if (!this.dc || this.dc.readyState !== 'open') {
+            throw new Error('DataChannel is not open');
+          }
+          const str = JSON.stringify(imageMsg);
+          const CHUNK_LEN = 16384; // 16 KB safe text slices
+          if (str.length <= CHUNK_LEN) {
+            this.dc.send(str);
+          } else {
+            const totalChunks = Math.ceil(str.length / CHUNK_LEN);
+            const msgId = 'img_' + Math.random().toString(36).substring(2, 9);
+            for (let i = 0; i < totalChunks; i++) {
+              const chunk = str.slice(i * CHUNK_LEN, (i + 1) * CHUNK_LEN);
+              this.dc.send(JSON.stringify({
+                type: 'clipboard-image-chunk',
+                id: msgId,
+                index: i,
+                total: totalChunks,
+                chunk: chunk
+              }));
+            }
+          }
+          sounds.playClipboardClick();
+        }
       }
 
       // ==========================================
@@ -1513,6 +1719,15 @@
         statusText.textContent = text.toUpperCase();
       }
 
+      // Format Bytes Utility
+      function formatBytes(bytes) {
+        const b = Number(bytes) || 0;
+        if (b <= 0) return '0 B';
+        if (b < 1024) return b + ' B';
+        if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
+        return (b / (1024 * 1024)).toFixed(1) + ' MB';
+      }
+
       // Progress Tracker
       function handleProgress(id, name, current, total, state) {
         let item = document.getElementById(`transfer-${id}`);
@@ -1566,11 +1781,28 @@
       function addClipboardEntry(text, sender) {
         if (!text || text.trim() === '') return;
         clipboardVault.unshift({
+          isImage: false,
+          type: 'text',
           text,
           sender,
           time: new Date().toLocaleTimeString()
         });
-        if (clipboardVault.length > 20) clipboardVault.pop();
+        if (clipboardVault.length > 30) clipboardVault.pop();
+        renderClipboardVault();
+      }
+
+      function addClipboardImageEntry(imageMsg, sender) {
+        clipboardVault.unshift({
+          isImage: true,
+          type: 'image',
+          data: imageMsg.data,
+          name: imageMsg.name || 'Pasted Image',
+          size: imageMsg.size || 0,
+          format: imageMsg.format || 'image/png',
+          sender: sender || imageMsg.sender || 'Remote Device',
+          time: new Date().toLocaleTimeString()
+        });
+        if (clipboardVault.length > 30) clipboardVault.pop();
         renderClipboardVault();
       }
 
@@ -1581,31 +1813,176 @@
           return;
         }
 
-        clipboardList.innerHTML = clipboardVault.map((item, idx) => `
-          <div class="clipboard-item">
-            <div class="clipboard-item-text">${escapeHtml(item.text)}</div>
-            <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 4px;">
-              <span class="clipboard-item-meta">${item.sender} // ${item.time}</span>
-              <button class="btn-secondary" style="padding: 4px 8px; font-size: 0.68rem;" onclick="window.copyVaultItem(${idx})">
-                COPY
-              </button>
+        clipboardList.innerHTML = clipboardVault.map((item, idx) => {
+          if (item.isImage || item.type === 'image' || item.data) {
+            const formatShort = (item.format || 'image/png').replace(/^image\//i, '').toUpperCase();
+            const sizeStr = formatBytes(item.size);
+            return `
+              <div class="clipboard-item clipboard-item-image">
+                <div class="clipboard-image-main">
+                  <div class="clipboard-thumb-wrapper" onclick="window.previewVaultImage(${idx})" title="Click to preview full image">
+                    <img src="${item.data}" alt="Clipboard Preview" class="clipboard-thumb-img" />
+                  </div>
+                  <div class="clipboard-image-meta-col">
+                    <div class="clipboard-badge-row">
+                      <span class="clipboard-badge-size">${sizeStr} ${formatShort}</span>
+                      <span class="clipboard-badge-device">${escapeHtml(item.sender)}</span>
+                    </div>
+                    <div class="clipboard-image-name">${escapeHtml(item.name || 'image.png')}</div>
+                    <span class="clipboard-item-meta">${item.time}</span>
+                  </div>
+                </div>
+                <div class="clipboard-card-actions">
+                  <button class="btn-secondary" style="padding: 4px 10px; font-size: 0.7rem;" onclick="window.downloadVaultImage(${idx})">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                      <polyline points="7 10 12 15 17 10"></polyline>
+                      <line x1="12" y1="15" x2="12" y2="3"></line>
+                    </svg>
+                    <span>DOWNLOAD</span>
+                  </button>
+                  <button class="btn-secondary" style="padding: 4px 10px; font-size: 0.7rem;" onclick="window.copyVaultImage(${idx})">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                    </svg>
+                    <span>COPY IMAGE</span>
+                  </button>
+                </div>
+              </div>
+            `;
+          }
+
+          return `
+            <div class="clipboard-item">
+              <div class="clipboard-item-text">${escapeHtml(item.text)}</div>
+              <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 4px;">
+                <span class="clipboard-item-meta">${item.sender} // ${item.time}</span>
+                <button class="btn-secondary" style="padding: 4px 8px; font-size: 0.68rem;" onclick="window.copyVaultItem(${idx})">
+                  COPY
+                </button>
+              </div>
             </div>
-          </div>
-        `).join('');
+          `;
+        }).join('');
       }
 
       function escapeHtml(str) {
-        return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
       }
 
       window.copyVaultItem = async function(idx) {
         const item = clipboardVault[idx];
-        if (item) {
+        if (item && item.text) {
           await navigator.clipboard.writeText(item.text);
           sounds.playClipboardClick();
           showToast('Copied to local clipboard!', 'success');
         }
       };
+
+      // Image Preview Modal Management
+      const imageModal = document.getElementById('image-modal');
+      const modalImageView = document.getElementById('modal-image-view');
+      const modalImageTitle = document.getElementById('modal-image-title');
+      const modalImageMeta = document.getElementById('modal-image-meta');
+      const modalImageSender = document.getElementById('modal-image-sender');
+      const btnCloseImageModal = document.getElementById('btn-close-image-modal');
+      const btnModalDownloadImage = document.getElementById('btn-modal-download-image');
+      const btnModalCopyImage = document.getElementById('btn-modal-copy-image');
+      let currentModalItem = null;
+
+      window.previewVaultImage = function(idx) {
+        const item = clipboardVault[idx];
+        if (!item) return;
+        currentModalItem = item;
+        modalImageView.src = item.data;
+        modalImageTitle.textContent = item.name || 'CLIPBOARD IMAGE PREVIEW';
+        modalImageMeta.textContent = `${formatBytes(item.size)} // ${(item.format || 'image/png').toUpperCase()}`;
+        modalImageSender.textContent = `${item.sender} (${item.time})`;
+        imageModal.classList.add('active');
+      };
+
+      btnCloseImageModal.addEventListener('click', () => {
+        imageModal.classList.remove('active');
+        currentModalItem = null;
+      });
+
+      imageModal.addEventListener('click', (e) => {
+        if (e.target === imageModal) {
+          imageModal.classList.remove('active');
+          currentModalItem = null;
+        }
+      });
+
+      window.downloadVaultImage = function(idx) {
+        const item = idx >= 0 ? clipboardVault[idx] : currentModalItem;
+        if (!item || !item.data) return;
+        const a = document.createElement('a');
+        a.href = item.data;
+        a.download = item.name || `omasend_image_${Date.now()}.png`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        sounds.playDropSound();
+        showToast(`Downloaded '${a.download}'`, 'success');
+      };
+
+      btnModalDownloadImage.addEventListener('click', () => {
+        if (currentModalItem) {
+          window.downloadVaultImage(-1);
+        }
+      });
+
+      window.copyVaultImage = async function(idx) {
+        const item = idx >= 0 ? clipboardVault[idx] : currentModalItem;
+        if (!item || !item.data) return;
+
+        try {
+          const resp = await fetch(item.data);
+          const blob = await resp.blob();
+          const mime = blob.type || item.format || 'image/png';
+          
+          if (navigator.clipboard && navigator.clipboard.write) {
+            if (mime === 'image/png') {
+              const clipItem = new ClipboardItem({ 'image/png': blob });
+              await navigator.clipboard.write([clipItem]);
+              sounds.playClipboardClick();
+              showToast('Image copied to system clipboard!', 'success');
+              return;
+            } else {
+              const img = new Image();
+              img.onload = async () => {
+                const canvas = document.createElement('canvas');
+                canvas.width = img.width;
+                canvas.height = img.height;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0);
+                canvas.toBlob(async (pngBlob) => {
+                  try {
+                    const clipItem = new ClipboardItem({ 'image/png': pngBlob });
+                    await navigator.clipboard.write([clipItem]);
+                    sounds.playClipboardClick();
+                    showToast('Image copied to clipboard as PNG!', 'success');
+                  } catch(e) {
+                    showToast('Direct image clipboard copy not supported by browser', 'error');
+                  }
+                }, 'image/png');
+              };
+              img.src = item.data;
+              return;
+            }
+          }
+          showToast('Clipboard image write not supported in this browser', 'error');
+        } catch(e) {
+          showToast('Failed to copy image: ' + e.message, 'error');
+        }
+      };
+
+      btnModalCopyImage.addEventListener('click', () => {
+        if (currentModalItem) {
+          window.copyVaultImage(-1);
+        }
+      });
 
       // WebRTC Instance
       const rtc = new OmaWebRTC(
@@ -1616,8 +1993,94 @@
         (text, sender) => {
           addClipboardEntry(text, sender);
           showToast(`Clipboard synced from ${sender}`, 'success');
+        },
+        (imgMsg) => {
+          addClipboardImageEntry(imgMsg, imgMsg.sender || 'Remote Peer');
+          showToast(`Image clipboard synced from ${imgMsg.sender || 'Remote Peer'}`, 'success');
         }
       );
+
+      // ==========================================
+      // GLOBAL PASTE LISTENER (Ctrl+V Image & Text Interceptor)
+      // ==========================================
+      window.addEventListener('paste', async (e) => {
+        if (!e.clipboardData) return;
+        const items = e.clipboardData.items;
+        if (!items) return;
+
+        for (let i = 0; i < items.length; i++) {
+          const item = items[i];
+          if (item.type.indexOf('image') !== -1) {
+            const file = item.getAsFile();
+            if (file) {
+              e.preventDefault();
+              handlePastedImage(file);
+              return;
+            }
+          }
+        }
+      });
+
+      function handlePastedImage(file) {
+        sounds.playDropSound();
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const dataUrl = e.target.result;
+          const mimeType = file.type || 'image/png';
+          const ext = mimeType === 'image/jpeg' ? 'jpg' : (mimeType === 'image/webp' ? 'webp' : 'png');
+          const fileName = file.name && file.name !== 'image.png' ? file.name : `pasted_${Date.now()}.${ext}`;
+
+          const imageMsg = {
+            type: 'clipboard-image',
+            format: mimeType,
+            size: file.size,
+            data: dataUrl,
+            name: fileName,
+            timestamp: Date.now(),
+            sender: `Web Client (${myOmaId.slice(0, 4)})`
+          };
+
+          addClipboardImageEntry(imageMsg, 'Local Web (Pasted)');
+          showToast(`Captured pasted image (${formatBytes(file.size)})`, 'success');
+
+          if (rtc.dc && rtc.dc.readyState === 'open') {
+            try {
+              rtc.sendClipboardImage(imageMsg);
+              showToast('Pushed image to remote clipboard!', 'success');
+            } catch(err) {
+              showToast(`Failed to send image: ${err.message}`, 'error');
+            }
+          } else {
+            pushClipboardImageRest(imageMsg);
+          }
+        };
+        reader.readAsDataURL(file);
+      }
+
+      async function pushClipboardImageRest(imageMsg) {
+        const bridgeUrl = localStorage.getItem('omasend_bridge_url') || 'http://127.0.0.1:53317';
+        try {
+          const resp = await fetch(`${bridgeUrl}/api/p2p/clipboard`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              sender_id: myOmaId,
+              sender_name: 'OmaSend Web Portal',
+              item_type: 'image',
+              mime_type: imageMsg.format || 'image/png',
+              size_bytes: imageMsg.size || 0,
+              image_data: imageMsg.data,
+              text: imageMsg.data
+            })
+          });
+          if (resp.ok) {
+            sounds.playClipboardClick();
+            showToast('Pushed image to local daemon via REST bridge!', 'success');
+          }
+        } catch(e) {
+          // Stored locally in web history
+        }
+      }
 
       // Connect Button
       btnConnect.addEventListener('click', () => {

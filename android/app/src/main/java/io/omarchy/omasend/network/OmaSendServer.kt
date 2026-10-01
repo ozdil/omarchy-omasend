@@ -265,6 +265,9 @@ class OmaSendServer(private val context: Context) {
                 method == "POST" && path == "/api/p2p/clipboard" -> {
                     handleClipboard(input, output, headers, query, contentLength, peerIp, remainingDeadline)
                 }
+                method == "GET" && path == "/api/p2p/clipboard/image" -> {
+                    handleClipboardImageDownload(output, query)
+                }
                 else -> {
                     sendResponse(output, 404, "Not Found", "application/json", "{\"error\":\"Not found\"}")
                 }
@@ -558,26 +561,74 @@ class OmaSendServer(private val context: Context) {
         // Authorized: reset failed attempts
         recordAuthAttempt(peerIp, true)
 
+        val app = context.applicationContext as? io.omarchy.omasend.OmaSendApp
         val vault = io.omarchy.omasend.repository.ClipboardVault.getInstance(context)
-        vault.processIncomingClipboard(payload.text, payload.sender_name)
+        vault.processIncomingPayload(payload, peerIp, NetworkUtils.PORT, app?.client)
 
         Handler(Looper.getMainLooper()).post {
             try {
                 val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                val clip = ClipData.newPlainText("OmaSend", payload.text)
-                clipboard?.setPrimaryClip(clip)
+                if (payload.content_type == "image" && !payload.image_hash.isNullOrBlank()) {
+                    val imgFile = vault.getImageFile(payload.image_hash)
+                    if (imgFile.exists() && imgFile.length() > 0) {
+                        val contentUri = androidx.core.content.FileProvider.getUriForFile(
+                            context,
+                            "${context.packageName}.fileprovider",
+                            imgFile
+                        )
+                        val clip = ClipData.newUri(context.contentResolver, "OmaSend Image", contentUri)
+                        clipboard?.setPrimaryClip(clip)
+                    }
+                } else if (payload.text.isNotBlank()) {
+                    val clip = ClipData.newPlainText("OmaSend", payload.text)
+                    clipboard?.setPrimaryClip(clip)
+                }
             } catch (_: Exception) {}
 
             try {
-                val app = context.applicationContext as? io.omarchy.omasend.OmaSendApp
                 app?.soundEngine?.playReceiveSound()
                 app?.hapticController?.onClipboardReceived()
             } catch (_: Exception) {}
 
-            onClipboardReceived?.invoke(payload.sender_name, payload.text)
+            val notifyText = if (payload.content_type == "image") "Görsel" else payload.text
+            onClipboardReceived?.invoke(payload.sender_name, notifyText)
         }
 
         sendResponse(output, 200, "OK", "application/json", "{\"status\":\"OK\"}")
+    }
+
+    private fun handleClipboardImageDownload(output: OutputStream, query: String) {
+        val hash = getQueryParam(query, "hash")
+        if (hash.isBlank() || !hash.matches(Regex("^[a-fA-F0-9]{64}$"))) {
+            sendResponse(output, 400, "Bad Request", "application/json", "{\"error\":\"Invalid image hash\"}")
+            return
+        }
+
+        val vault = io.omarchy.omasend.repository.ClipboardVault.getInstance(context)
+        val file = vault.getImageFile(hash)
+        if (!file.exists() || file.length() <= 0) {
+            sendResponse(output, 404, "Not Found", "application/json", "{\"error\":\"Image not found\"}")
+            return
+        }
+
+        if (file.length() > 10 * 1024 * 1024L) {
+            sendResponse(output, 400, "Bad Request", "application/json", "{\"error\":\"Image exceeds 10 MiB limit\"}")
+            return
+        }
+
+        try {
+            val bytes = file.readBytes()
+            val header = "HTTP/1.1 200 OK\r\n" +
+                    "Content-Type: image/png\r\n" +
+                    "Content-Length: ${bytes.size}\r\n" +
+                    "Connection: close\r\n" +
+                    "\r\n"
+            output.write(header.toByteArray(Charsets.UTF_8))
+            output.write(bytes)
+            output.flush()
+        } catch (_: Exception) {
+            sendResponse(output, 500, "Internal Server Error", "application/json", "{\"error\":\"Failed to read image\"}")
+        }
     }
 
     private fun getQueryParam(query: String, param: String): String {

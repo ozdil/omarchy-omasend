@@ -57,19 +57,33 @@ data class TransferDecision(
 data class ClipboardPayload(
     val sender_id: String,
     val sender_name: String,
-    val text: String,
+    val text: String = "",
     val pin: String? = null,
-    val token: String? = null
+    val token: String? = null,
+    val content_type: String = "text",
+    val image_hash: String? = null,
+    val image_size: Long? = null,
+    val thumbnail_base64: String? = null,
+    val width: Int? = null,
+    val height: Int? = null,
+    val image_data_base64: String? = null
 )
 
 @Serializable
 data class ClipboardEntry(
     val id: String = java.util.UUID.randomUUID().toString(),
-    val text: String,
+    val text: String = "",
     val senderName: String,
     val timestamp: Long = System.currentTimeMillis(),
-    val isMine: Boolean = false
+    val isMine: Boolean = false,
+    val contentType: String = "text",
+    val imageHash: String? = null,
+    val imageSize: Long? = null,
+    val thumbnailBase64: String? = null,
+    val width: Int? = null,
+    val height: Int? = null
 )
+
 
 sealed class TransferProgressState {
     object Idle : TransferProgressState()

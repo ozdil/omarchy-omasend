@@ -42,6 +42,12 @@ Panel {
   property bool showAboutModal: false
   property bool showOmaIdQrModal: false
   property bool showOmaIdPairModal: false
+  property bool showImagePreviewModal: false
+  property string previewImageSource: ""
+  property string previewImageMeta: ""
+  property string previewImageSender: ""
+  property string previewImageTimestamp: ""
+  property string previewImageFilePath: ""
 
   // 16-Digit OmaID & Profile State
   property string omaId: ""
@@ -258,6 +264,111 @@ Panel {
     copyProc.running = true
   }
 
+  function isImageVaultItem(item) {
+    if (!item) return false
+    if (String(item.content_type || "").startsWith("image") || item.kind === "image" || item.type === "image" || item.item_type === "image" || item.is_image === true) return true
+    if (item.image_path || item.thumbnail_path || item.image_data || item.thumbnail || item.thumbnail_base64) return true
+    if (typeof item.text === "string" && (item.text.startsWith("data:image/") || (item.text.startsWith("file://") && /\.(png|jpe?g|webp|gif|svg)$/i.test(item.text)))) return true
+    return false
+  }
+
+  function resolveVaultImageSource(item) {
+    if (!item) return ""
+    if (item.thumbnail_base64) {
+      return item.thumbnail_base64.startsWith("data:image/") ? item.thumbnail_base64 : ("data:image/png;base64," + item.thumbnail_base64)
+    }
+    if (item.image_path) {
+      return item.image_path.startsWith("file://") ? item.image_path : ("file://" + item.image_path)
+    }
+    if (item.thumbnail_path) {
+      return item.thumbnail_path.startsWith("file://") ? item.thumbnail_path : ("file://" + item.thumbnail_path)
+    }
+    if (item.image_data) {
+      return item.image_data.startsWith("data:image/") ? item.image_data : ("data:image/png;base64," + item.image_data)
+    }
+    if (item.thumbnail) {
+      return item.thumbnail.startsWith("data:image/") ? item.thumbnail : ("data:image/png;base64," + item.thumbnail)
+    }
+    if (typeof item.text === "string") {
+      if (item.text.startsWith("data:image/")) return item.text
+      if (item.text.startsWith("file://")) return item.text
+      if (item.text.startsWith("/") && /\.(png|jpe?g|webp|gif|svg)$/i.test(item.text)) return "file://" + item.text
+    }
+    return ""
+  }
+
+  function resolveVaultImageFilePath(item) {
+    if (!item) return ""
+    if (item.image_path) return item.image_path.replace(/^file:\/\//, "")
+    if (typeof item.text === "string" && item.text.startsWith("/")) return item.text.replace(/^file:\/\//, "")
+    if (typeof item.text === "string" && item.text.startsWith("file://")) return item.text.replace(/^file:\/\//, "")
+    return ""
+  }
+
+  function formatVaultImageSize(item) {
+    if (!item) return "PNG"
+    var size = Number(item.image_size || item.size_bytes || item.file_size || item.size || 0)
+    var rawMime = String(item.content_type || item.mime_type || item.format || "PNG").replace(/^image[_\/]/i, "").toUpperCase()
+    var mime = rawMime === "TEXT" ? "PNG" : rawMime
+    if (size <= 0) return mime
+    if (size < 1024) return size + " B " + mime
+    if (size < 1024 * 1024) return (size / 1024).toFixed(1) + " KB " + mime
+    return (size / (1024 * 1024)).toFixed(1) + " MB " + mime
+  }
+
+  function formatVaultTimestamp(ts) {
+    if (!ts) return ""
+    if (typeof ts === "string") return ts
+    try {
+      var d = new Date(ts > 1e11 ? ts : ts * 1000)
+      var h = d.getHours().toString().padStart(2, "0")
+      var m = d.getMinutes().toString().padStart(2, "0")
+      return h + ":" + m
+    } catch(e) {
+      return ""
+    }
+  }
+
+  function getDeviceBadge(sender) {
+    var s = String(sender || "").toLowerCase()
+    if (s.includes("phone") || s.includes("mobile") || s.includes("android") || s.includes("ios") || s.includes("cell")) {
+      return { icon: "󰏲", label: sender || "Phone" }
+    }
+    if (s === "local" || s.includes("local pc")) {
+      return { icon: "󰌢", label: "Local PC" }
+    }
+    return { icon: "󰌢", label: sender || "Device" }
+  }
+
+  function copyImageToClipboard(filePath, dataUrl) {
+    if (copyImageProc.running) copyImageProc.running = false
+    if (filePath && filePath !== "") {
+      var clean = filePath.replace(/^file:\/\//, "")
+      copyImageProc.command = ["bash", "-c", "wl-copy --type image/png < \"$1\"", "--", clean]
+      copyImageProc.running = true
+    } else if (dataUrl && dataUrl.startsWith("data:image/")) {
+      var b64 = dataUrl.replace(/^data:image\/[a-z0-9+]+;base64,/i, "")
+      copyImageProc.command = ["bash", "-c", "echo \"$1\" | base64 -d | wl-copy --type image/png", "--", b64]
+      copyImageProc.running = true
+    }
+  }
+
+  function exportImageToExportsDir(filePath, dataUrl, customName) {
+    var home = Quickshell.env("HOME") || "/home/ozdil"
+    var exportDir = home + "/Pictures/OmaStudio_Exports"
+    var baseName = customName || ("omasend_" + Date.now() + ".png")
+    if (exportImageProc.running) exportImageProc.running = false
+    if (filePath && filePath !== "") {
+      var clean = filePath.replace(/^file:\/\//, "")
+      exportImageProc.command = ["bash", "-c", "mkdir -p \"$1\" && cp \"$2\" \"$1/$3\"", "--", exportDir, clean, baseName]
+      exportImageProc.running = true
+    } else if (dataUrl && dataUrl.startsWith("data:image/")) {
+      var b64 = dataUrl.replace(/^data:image\/[a-z0-9+]+;base64,/i, "")
+      exportImageProc.command = ["bash", "-c", "mkdir -p \"$1\" && echo \"$2\" | base64 -d > \"$1/$3\"", "--", exportDir, b64, baseName]
+      exportImageProc.running = true
+    }
+  }
+
   function openFolder() {
     if (folderProc.running) folderProc.running = false
     folderProc.command = ["xdg-open", root.savePath]
@@ -423,6 +534,8 @@ Panel {
   }
 
   Process { id: copyProc }
+  Process { id: copyImageProc }
+  Process { id: exportImageProc }
   Process { id: folderProc }
   Process {
     id: playSendSoundProc
@@ -1781,14 +1894,25 @@ Panel {
             model: root.clipboardVault ? root.clipboardVault.slice(0, 10) : []
 
             Rectangle {
+              id: vaultCardRect
               required property var modelData
               required property int index
+              readonly property bool isImage: root.isImageVaultItem(modelData)
+              readonly property string imageSrc: isImage ? root.resolveVaultImageSource(modelData) : ""
+              readonly property string imagePath: isImage ? root.resolveVaultImageFilePath(modelData) : ""
+              readonly property var devBadge: root.getDeviceBadge(modelData.sender)
+              readonly property string sizeText: isImage ? root.formatVaultImageSize(modelData) : ((modelData.char_count || (modelData.text ? modelData.text.length : 0)) + " chars")
+              readonly property string timeText: root.formatVaultTimestamp(modelData.timestamp || modelData.time)
+
               width: clipboardVaultSection.width
-              implicitHeight: clipCol.implicitHeight + Style.space(12)
+              implicitHeight: cardContentCol.implicitHeight + Style.space(14)
               radius: Style.cornerRadius
-              color: Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
-              border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.28)
+              color: cardMouse.containsMouse ? Style.hoverFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent) : Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
+              border.color: cardMouse.containsMouse ? Color.accent : Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.28)
               border.width: 1
+
+              Behavior on color { ColorAnimation { duration: 150 } }
+              Behavior on border.color { ColorAnimation { duration: 150 } }
 
               // 1px specular highlight inner rim
               Rectangle {
@@ -1801,49 +1925,159 @@ Panel {
               }
 
               MouseArea {
+                id: cardMouse
                 anchors.fill: parent
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
                 onClicked: {
-                  if (modelData && modelData.text) {
+                  if (vaultCardRect.isImage) {
+                    root.copyImageToClipboard(vaultCardRect.imagePath, vaultCardRect.imageSrc)
+                  } else if (modelData && modelData.text) {
                     root.copyText(modelData.text)
+                  }
+                }
+                onDoubleClicked: {
+                  if (vaultCardRect.isImage) {
+                    root.previewImageSource = vaultCardRect.imageSrc
+                    root.previewImageFilePath = vaultCardRect.imagePath
+                    root.previewImageMeta = vaultCardRect.sizeText
+                    root.previewImageSender = vaultCardRect.devBadge.label
+                    root.previewImageTimestamp = vaultCardRect.timeText
+                    root.showImagePreviewModal = true
                   }
                 }
               }
 
               Column {
-                id: clipCol
+                id: cardContentCol
                 anchors.left: parent.left
                 anchors.right: parent.right
                 anchors.top: parent.top
                 anchors.margins: Style.space(8)
-                spacing: Style.space(4)
+                spacing: Style.space(6)
 
+                // Header Row (Device, Timestamp, Size Badge)
                 RowLayout {
                   width: parent.width
                   spacing: Style.space(6)
 
+                  // Device Badge
+                  Rectangle {
+                    implicitHeight: 18
+                    implicitWidth: devBadgeRow.implicitWidth + Style.space(10)
+                    radius: Style.cornerRadius
+                    color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.16)
+                    border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.3)
+                    border.width: 1
+
+                    RowLayout {
+                      id: devBadgeRow
+                      anchors.centerIn: parent
+                      spacing: Style.space(4)
+                      Text {
+                        textFormat: Text.PlainText
+                        text: vaultCardRect.devBadge.icon
+                        color: Color.accent
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+                      Text {
+                        textFormat: Text.PlainText
+                        text: vaultCardRect.devBadge.label
+                        color: Color.accent
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                      }
+                    }
+                  }
+
                   Text {
                     textFormat: Text.PlainText
-                    text: modelData.sender === "Local" ? "󰌢 Local PC" : ("󰏲 " + (modelData.sender || "Device"))
-                    color: Color.accent
+                    visible: vaultCardRect.timeText !== ""
+                    text: vaultCardRect.timeText
+                    color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
-                    font.bold: true
                   }
 
                   Item { Layout.fillWidth: true }
 
-                  Text {
-                    textFormat: Text.PlainText
-                    text: (modelData.char_count || (modelData.text ? modelData.text.length : 0)) + " chars"
-                    color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
+                  // Size / Char Count Badge
+                  Rectangle {
+                    implicitHeight: 18
+                    implicitWidth: sizeBadgeText.implicitWidth + Style.space(10)
+                    radius: Style.cornerRadius
+                    color: Qt.rgba(1.0, 1.0, 1.0, 0.05)
+                    border.color: Qt.rgba(1.0, 1.0, 1.0, 0.12)
+                    border.width: 1
+
+                    Text {
+                      id: sizeBadgeText
+                      anchors.centerIn: parent
+                      textFormat: Text.PlainText
+                      text: vaultCardRect.sizeText
+                      color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.3)
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
                   }
                 }
 
+                // Image Item View
+                Column {
+                  visible: vaultCardRect.isImage
+                  width: parent.width
+                  spacing: Style.space(6)
+
+                  Rectangle {
+                    width: parent.width
+                    implicitHeight: Math.min(130, Math.max(70, parent.width * 0.42))
+                    radius: Style.cornerRadius
+                    color: Qt.rgba(0.0, 0.0, 0.0, 0.35)
+                    clip: true
+                    border.color: Qt.rgba(1.0, 1.0, 1.0, 0.08)
+                    border.width: 1
+
+                    Image {
+                      anchors.fill: parent
+                      anchors.margins: 2
+                      source: vaultCardRect.imageSrc
+                      fillMode: Image.PreserveAspectFit
+                      asynchronous: true
+                      smooth: true
+                    }
+                  }
+
+                  RowLayout {
+                    width: parent.width
+                    spacing: Style.space(6)
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "Click: Copy | Double-click: Preview"
+                      color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.8)
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption - 1
+                      Layout.fillWidth: true
+                      elide: Text.ElideRight
+                    }
+
+                    Button {
+                      text: "󰮝 Export"
+                      bordered: true
+                      fontSize: Style.font.caption - 1
+                      fontFamily: root.fontFamily
+                      onClicked: {
+                        root.exportImageToExportsDir(vaultCardRect.imagePath, vaultCardRect.imageSrc)
+                      }
+                    }
+                  }
+                }
+
+                // Text Item View
                 Text {
+                  visible: !vaultCardRect.isImage
                   width: parent.width
                   textFormat: Text.PlainText
                   text: modelData.text || ""
@@ -1851,7 +2085,7 @@ Panel {
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   elide: Text.ElideRight
-                  maximumLineCount: 2
+                  maximumLineCount: 3
                   wrapMode: Text.Wrap
                 }
               }
@@ -2363,6 +2597,133 @@ Panel {
             onClicked: {
               root.showOmaIdPairModal = false
               root.pairStatusMsg = ""
+            }
+          }
+        }
+      }
+    }
+
+    // Image Preview & Export Modal Overlay
+    Rectangle {
+      id: imagePreviewOverlay
+      anchors.fill: parent
+      visible: root.showImagePreviewModal
+      color: Qt.rgba(0.05, 0.05, 0.07, 0.97)
+      z: 99
+
+      MouseArea {
+        anchors.fill: parent
+      }
+
+      Column {
+        id: imagePreviewCol
+        anchors.centerIn: parent
+        width: parent.width - Style.space(32)
+        spacing: Style.space(12)
+
+        RowLayout {
+          width: parent.width
+          spacing: Style.space(6)
+
+          Text {
+            text: "󰹉"
+            color: Color.accent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.title
+          }
+
+          Text {
+            text: "Görsel Önizleme // OmaSend Vault"
+            color: root.bar ? root.bar.foreground : Color.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            font.bold: true
+            Layout.fillWidth: true
+            elide: Text.ElideRight
+          }
+
+          Button {
+            text: "✕"
+            bordered: true
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            onClicked: root.showImagePreviewModal = false
+          }
+        }
+
+        // Enlarged Preview Image Box
+        Rectangle {
+          width: parent.width
+          implicitHeight: Math.min(280, parent.width * 0.8)
+          radius: Style.cornerRadius
+          color: Qt.rgba(0.0, 0.0, 0.0, 0.55)
+          border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.35)
+          border.width: 1
+          clip: true
+
+          Image {
+            anchors.fill: parent
+            anchors.margins: 4
+            source: root.previewImageSource
+            fillMode: Image.PreserveAspectFit
+            asynchronous: true
+            smooth: true
+          }
+        }
+
+        // Metadata Strip
+        RowLayout {
+          width: parent.width
+          spacing: Style.space(8)
+
+          Text {
+            textFormat: Text.PlainText
+            text: "Boyut: " + root.previewImageMeta
+            color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.3)
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Item { Layout.fillWidth: true }
+
+          Text {
+            textFormat: Text.PlainText
+            visible: root.previewImageSender !== ""
+            text: "Kaynak: " + root.previewImageSender
+            color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.3)
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
+
+        // Action Buttons
+        RowLayout {
+          width: parent.width
+          spacing: Style.space(8)
+
+          Button {
+            Layout.fillWidth: true
+            text: "Panoya Kopyala"
+            iconText: "󰅏"
+            bordered: true
+            fontSize: Style.font.caption
+            fontFamily: root.fontFamily
+            onClicked: {
+              root.copyImageToClipboard(root.previewImageFilePath, root.previewImageSource)
+            }
+          }
+
+          Button {
+            Layout.fillWidth: true
+            text: "Dışa Aktar"
+            iconText: "󰮝"
+            bordered: true
+            accent: Color.accent
+            fontSize: Style.font.caption
+            fontFamily: root.fontFamily
+            onClicked: {
+              root.exportImageToExportsDir(root.previewImageFilePath, root.previewImageSource)
             }
           }
         }

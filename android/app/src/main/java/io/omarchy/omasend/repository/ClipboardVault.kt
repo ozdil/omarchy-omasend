@@ -34,6 +34,14 @@ class ClipboardVault private constructor(private val context: Context) {
         File(context.filesDir, VAULT_FILE_NAME)
     }
 
+    val imageCacheDir: File by lazy {
+        File(context.cacheDir, "clipboard_images").apply {
+            if (!exists()) {
+                mkdirs()
+            }
+        }
+    }
+
     private val _entries = MutableStateFlow<List<ClipboardEntry>>(emptyList())
     val entries: StateFlow<List<ClipboardEntry>> = _entries.asStateFlow()
 
@@ -52,16 +60,60 @@ class ClipboardVault private constructor(private val context: Context) {
 
     init {
         loadEntries()
+        evictLruCacheIfNeeded()
+    }
+
+    fun getImageFile(hash: String): File {
+        if (!imageCacheDir.exists()) imageCacheDir.mkdirs()
+        return File(imageCacheDir, "$hash.png")
+    }
+
+    fun hasImage(hash: String): Boolean {
+        if (hash.isBlank()) return false
+        val file = getImageFile(hash)
+        return file.exists() && file.length() > 0
+    }
+
+    fun evictLruCacheIfNeeded() {
+        try {
+            if (!imageCacheDir.exists()) return
+            val files = imageCacheDir.listFiles()?.filter { it.isFile && !it.name.endsWith(".tmp") } ?: return
+            val maxImages = 20
+            val maxTotalBytes = 50L * 1024L * 1024L // 50 MB
+            val sorted = files.sortedBy { it.lastModified() }
+            var currentTotalBytes = sorted.sumOf { it.length() }
+            var currentCount = sorted.size
+
+            for (file in sorted) {
+                if (currentCount <= maxImages && currentTotalBytes <= maxTotalBytes) {
+                    break
+                }
+                val size = file.length()
+                if (file.delete()) {
+                    currentCount--
+                    currentTotalBytes -= size
+                }
+            }
+        } catch (_: Exception) {}
+    }
+
+    fun saveImageBytes(hash: String, bytes: ByteArray): File {
+        if (!imageCacheDir.exists()) imageCacheDir.mkdirs()
+        val file = File(imageCacheDir, "$hash.png")
+        val tmpFile = File(imageCacheDir, "$hash.tmp")
+        tmpFile.writeBytes(bytes)
+        tmpFile.renameTo(file)
+        file.setLastModified(System.currentTimeMillis())
+        evictLruCacheIfNeeded()
+        return file
     }
 
     fun computeHash(text: String): String {
-        return try {
-            val digest = MessageDigest.getInstance("SHA-256")
-            val hashBytes = digest.digest(text.toByteArray(Charsets.UTF_8))
-            hashBytes.joinToString("") { "%02x".format(it) }
-        } catch (_: Exception) {
-            text.hashCode().toString()
-        }
+        return NetworkUtils.computeSha256(text)
+    }
+
+    fun computeImageHash(bytes: ByteArray): String {
+        return NetworkUtils.computeSha256(bytes)
     }
 
     fun recordHash(hash: String) {
@@ -98,20 +150,42 @@ class ClipboardVault private constructor(private val context: Context) {
         recordHash(hash)
     }
 
-    fun addEntry(text: String, senderName: String, isMine: Boolean): ClipboardEntry? {
-        if (text.isBlank()) return null
+    fun addEntry(
+        text: String = "",
+        senderName: String,
+        isMine: Boolean,
+        contentType: String = "text",
+        imageHash: String? = null,
+        imageSize: Long? = null,
+        thumbnailBase64: String? = null,
+        width: Int? = null,
+        height: Int? = null
+    ): ClipboardEntry? {
+        if (contentType == "text" && text.isBlank()) return null
+        if (contentType == "image" && imageHash.isNullOrBlank()) return null
+
         val entry = ClipboardEntry(
             id = UUID.randomUUID().toString(),
             text = text,
             senderName = senderName,
             timestamp = System.currentTimeMillis(),
-            isMine = isMine
+            isMine = isMine,
+            contentType = contentType,
+            imageHash = imageHash,
+            imageSize = imageSize,
+            thumbnailBase64 = thumbnailBase64,
+            width = width,
+            height = height
         )
 
         scope.launch {
             mutex.withLock {
                 val current = _entries.value.toMutableList()
-                current.removeAll { it.text == text }
+                if (contentType == "image" && imageHash != null) {
+                    current.removeAll { it.contentType == "image" && it.imageHash == imageHash }
+                } else if (text.isNotBlank()) {
+                    current.removeAll { it.contentType == "text" && it.text == text }
+                }
                 current.add(0, entry)
                 val trimmed = current.take(MAX_VAULT_ITEMS)
                 _entries.value = trimmed
@@ -124,7 +198,83 @@ class ClipboardVault private constructor(private val context: Context) {
     fun processIncomingClipboard(text: String, senderName: String): ClipboardEntry? {
         if (text.isBlank()) return null
         updateLastReceivedHash(text)
-        return addEntry(text, senderName, isMine = false)
+        return addEntry(text = text, senderName = senderName, isMine = false, contentType = "text")
+    }
+
+    fun processIncomingPayload(
+        payload: io.omarchy.omasend.model.ClipboardPayload,
+        peerIp: String = "",
+        peerPort: Int = NetworkUtils.PORT,
+        client: io.omarchy.omasend.network.OmaSendClient? = null
+    ): ClipboardEntry? {
+        if (payload.content_type == "image") {
+            val hash = payload.image_hash ?: return null
+            recordHash(hash)
+
+            // 1. Direct write if payload contains image data (< 512 KiB)
+            if (!payload.image_data_base64.isNullOrBlank()) {
+                try {
+                    val bytes = android.util.Base64.decode(payload.image_data_base64, android.util.Base64.DEFAULT)
+                    saveImageBytes(hash, bytes)
+                } catch (_: Exception) {}
+            } else if (payload.image_size != null && payload.image_size <= 512 * 1024L && !payload.thumbnail_base64.isNullOrBlank()) {
+                try {
+                    val bytes = android.util.Base64.decode(payload.thumbnail_base64, android.util.Base64.DEFAULT)
+                    saveImageBytes(hash, bytes)
+                } catch (_: Exception) {}
+            }
+
+            // 2. Lazy on-demand download if 512 KiB - 10 MiB
+            if (!hasImage(hash) && client != null && peerIp.isNotBlank() && peerPort > 0) {
+                scope.launch {
+                    try {
+                        val fetchResult = client.fetchClipboardImage(peerIp, peerPort, hash)
+                        fetchResult.getOrNull()?.let { bytes ->
+                            saveImageBytes(hash, bytes)
+                        }
+                    } catch (_: Exception) {}
+                }
+            }
+
+            val displayText = payload.text.ifBlank {
+                val sizeStr = payload.image_size?.let { NetworkUtils.formatBytes(it) } ?: ""
+                if (sizeStr.isNotBlank()) "Görsel ($sizeStr)" else "Görsel"
+            }
+
+            return addEntry(
+                text = displayText,
+                senderName = payload.sender_name,
+                isMine = false,
+                contentType = "image",
+                imageHash = hash,
+                imageSize = payload.image_size,
+                thumbnailBase64 = payload.thumbnail_base64,
+                width = payload.width,
+                height = payload.height
+            )
+        } else {
+            return processIncomingClipboard(payload.text, payload.sender_name)
+        }
+    }
+
+    suspend fun fetchAndCacheImage(
+        client: io.omarchy.omasend.network.OmaSendClient,
+        peerIp: String,
+        peerPort: Int,
+        hash: String
+    ): File? {
+        if (hasImage(hash)) {
+            val file = getImageFile(hash)
+            file.setLastModified(System.currentTimeMillis())
+            return file
+        }
+        return try {
+            val res = client.fetchClipboardImage(peerIp, peerPort, hash)
+            val bytes = res.getOrNull() ?: return null
+            saveImageBytes(hash, bytes)
+        } catch (_: Exception) {
+            null
+        }
     }
 
     fun processLocalClipboard(context: Context, app: OmaSendApp) {
@@ -142,7 +292,7 @@ class ClipboardVault private constructor(private val context: Context) {
 
             recordHash(hash)
             val deviceName = NetworkUtils.getDeviceName(context)
-            addEntry(text = text, senderName = deviceName, isMine = true)
+            addEntry(text = text, senderName = deviceName, isMine = true, contentType = "text")
 
             val peers = app.discoveryManager.peers.value
             if (peers.isNotEmpty()) {

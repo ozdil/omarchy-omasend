@@ -120,4 +120,19 @@ object NetworkUtils {
 
         return false
     }
+
+    fun computeSha256(bytes: ByteArray): String {
+        return try {
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+            val hashBytes = digest.digest(bytes)
+            hashBytes.joinToString("") { "%02x".format(it) }
+        } catch (_: Exception) {
+            bytes.contentHashCode().toString()
+        }
+    }
+
+    fun computeSha256(text: String): String {
+        return computeSha256(text.toByteArray(Charsets.UTF_8))
+    }
 }
+
