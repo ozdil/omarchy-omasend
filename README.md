@@ -24,7 +24,11 @@ Plugin ID: ozdil.omasend
   - Native Android Companion: Dedicated Kotlin and Jetpack Compose mobile app with LRA tactile haptic feedback (CLICK, THUD, QUICK_RISE), bidirectional transfers, and universal clipboard bridge.
   - 3-Tier Visibility Control: Off, Known (Trusted Peers Only - Default), and Everyone (10 Minutes Temporary Discovery).
   - Gatekeeper Consent: Untrusted devices require explicit approval before transfer begins.
-  - Universal Clipboard Sync: Bidirectional encrypted Wayland and Android clipboard synchronization between Omarchy desktops and mobile devices with a single click.
+  - Universal Multi-Format Clipboard Vault & WebP Micro-Thumbnails:
+    - Real-time bidirectional clipboard sync supporting both text and image payloads (PNG, JPEG, WebP).
+    - Integrated WebP Micro-Thumbnail Engine: Automatically generates ultra-compact 96x96 WebP thumbnails (3-5 KB) in an isolated sandbox for instant zero-latency preview rendering without downloading large 10 MB raw files.
+    - Compact Clipboard Vault UI: Quick copy on click, double-click lightbox modal preview, and one-click export to ~/Pictures/OmaStudio_Exports/.
+    - Strict local staging isolation in ~/.local/state/omarchy/omasend/clip_staging/ with atomic mode 0600 file permissions and 50 MiB LRU eviction cap.
 - Zero-Knowledge End-to-End Encryption (E2EE):
   - Hardware-accelerated AES-256-GCM encryption via the native Web Crypto API (crypto.subtle).
   - Cryptographic session key is passed strictly inside the URL hash fragment (#key=...), which never reaches HTTP request headers or server logs (RFC 3986).
@@ -35,7 +39,7 @@ Plugin ID: ozdil.omasend
   - Local Area Network (LAN): Full-speed transfer (300-800 Mbps) over local Wi-Fi.
   - Wide Area Network (Global WAN Tunnel): Secure HTTPS tunnel using cloudflared without requiring router port forwarding or static IP.
 - Hardened Rust Engine:
-  - Compliant with Omarchy Linux Security Standards (AGENTS.md): isolated process groups, monotonic execution deadlines, atomic file operations (mode 0600), and buffer overrun protection.
+  - Compliant with Omarchy Linux Security Standards: isolated process groups, monotonic execution deadlines, atomic file operations (mode 0600), and buffer overrun protection.
 
 ---
 

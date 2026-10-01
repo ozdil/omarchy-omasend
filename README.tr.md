@@ -20,7 +20,11 @@ Eklenti Kimliği: ozdil.omasend
   - Yerel Android İstemcisi: Sistem paylaşım menüsü, çift yönlü aktarımlar ve evrensel pano köprüsü.
   - 3 Kademeli Görünürlük Kontrolü: Kapalı (Off), Yalnızca Tanınanlar (Known - Varsayılan) ve Herkes (Everyone - 10 dakikalık geçici keşif).
   - Gatekeeper İzin Kapısı: Hiçbir dosya sessizce kabul edilmez. Alıcıya gönderici adı, dosya listesi ve boyutuyla onay bildirimi çıkarılır; transfer yalnızca açık onay ile başlar.
-  - Evrensel Pano Senkronizasyonu: Omarchy Wayland ve Android panoları arasında çift yönlü şifreli pano eşitlemesi.
+  - Çoklu Ortam Pano Kasası ve WebP Mikro-Önizleme Motoru:
+    - Metinlerin yanı sıra görselleri (PNG, JPEG, WebP) çift yönlü olarak masaüstü ve telefon arasında senkronize eder.
+    - Dahili WebP Önizleme Motoru: Kopyalanan görseller için 96x96 piksel boyutunda (~3-5 KB) hafif mikro-önizlemeler üreterek büyük dosyalar indirilmeden Pano Kasası kartlarında sıfır gecikmeli gerçek görsel sunumu sağlar.
+    - Kompakt Pano Kasası: Tek tıklamayla panoya kopyalama, çift tıklamayla tam ekran önizleme ve ~/Pictures/OmaStudio_Exports/ klasörüne anında dışa aktarma.
+    - Güvenli İzolasyon: ~/.local/state/omarchy/omasend/clip_staging/ altında 0600 dosya izinleri ve 50 MiB LRU temizleme sınırı.
 - Sıfır Bilgili Uçtan Uca Şifreleme (E2EE):
   - Donanım hızlandırmalı AES-256-GCM ve BLAKE3 kriptografik bütünlük doğrulaması.
   - Oturum anahtarı URL'nin karma (#key=...) bölümünde taşınarak sunucu loglarına ve başlıklara açık sızması imkansız kılınır (RFC 3986).
