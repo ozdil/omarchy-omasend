@@ -121,6 +121,80 @@ object NetworkUtils {
         return false
     }
 
+    const val SOCKET_BUFFER_SIZE: Int = 256 * 1024 // 256 KiB socket buffer for IEEE 802.11 throughput
+    const val IO_CHUNK_SIZE: Int = 128 * 1024 // 128 KiB chunked I/O stream alignment
+    const val IPTOS_THROUGHPUT: Int = 0x08 // RFC 791/1349 Throughput optimization
+
+    /**
+     * Configures a socket with IEEE 802.11 wireless and TCP high-throughput options:
+     * - TCP_NODELAY = true (disables Nagle algorithm to eliminate transmission latency spikes)
+     * - SO_SNDBUF = 256 KiB
+     * - SO_RCVBUF = 256 KiB
+     * - IP Traffic Class / TOS = 0x08 (Throughput / WMM queue optimization)
+     */
+    fun configureHighThroughputSocket(socket: java.net.Socket) {
+        try {
+            socket.tcpNoDelay = true
+            socket.sendBufferSize = SOCKET_BUFFER_SIZE
+            socket.receiveBufferSize = SOCKET_BUFFER_SIZE
+            socket.trafficClass = IPTOS_THROUGHPUT
+        } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * Acquires a high-performance Wi-Fi Lock to prevent IEEE 802.11 power saving throttling during transfers.
+     */
+    fun acquireHighPerfWifiLock(
+        context: Context,
+        tag: String = "OmaSend:HighPerfTransfer"
+    ): android.net.wifi.WifiManager.WifiLock? {
+        return try {
+            val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? android.net.wifi.WifiManager
+                ?: return null
+            val lockMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+            } else {
+                @Suppress("DEPRECATION")
+                android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            }
+            wifiManager.createWifiLock(lockMode, tag).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Safely releases a Wi-Fi Lock.
+     */
+    fun releaseWifiLock(lock: android.net.wifi.WifiManager.WifiLock?) {
+        try {
+            if (lock != null && lock.isHeld) {
+                lock.release()
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * Executes a block within the scope of a high-performance Wi-Fi Lock, ensuring guaranteed release.
+     */
+    inline fun <T> withHighPerfWifiLock(
+        context: Context,
+        tag: String = "OmaSend:HighPerfTransfer",
+        block: () -> T
+    ): T {
+        val lock = acquireHighPerfWifiLock(context, tag)
+        return try {
+            block()
+        } finally {
+            releaseWifiLock(lock)
+        }
+    }
+
     fun computeSha256(bytes: ByteArray): String {
         return try {
             val digest = java.security.MessageDigest.getInstance("SHA-256")

@@ -106,6 +106,17 @@ object TransferBridge {
         )
     }
 
+    /**
+     * Executes a Wi-Fi transfer task under a high-performance Wi-Fi Lock to prevent IEEE 802.11 power save throttling.
+     */
+    inline fun <T> withWifiLock(
+        context: Context,
+        tag: String = "OmaSend:BridgeTransfer",
+        block: () -> T
+    ): T {
+        return NetworkUtils.withHighPerfWifiLock(context, tag, block)
+    }
+
     val OBEX_OPP_UUID: UUID = UUID.fromString("00001105-0000-1000-8000-00805F9B34FB")
 
     /**

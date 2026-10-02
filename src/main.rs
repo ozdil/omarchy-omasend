@@ -382,6 +382,48 @@ fn read_secure_file(path: &Path) -> Result<String, String> {
     fs::read_to_string(path).map_err(|e| format!("Failed to read {:?}: {}", path, e))
 }
 
+pub fn safe_verify_file(path: &Path) -> Result<u64, String> {
+    let meta = fs::symlink_metadata(path).map_err(|e| format!("Failed to stat {:?}: {}", path, e))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!("Security violation: {:?} is a symlink", path));
+    }
+    if !meta.file_type().is_file() {
+        return Err(format!("Security violation: {:?} is not a regular file", path));
+    }
+    let current_uid = get_current_uid();
+    if meta.uid() != current_uid {
+        return Err(format!(
+            "Security violation: {:?} is owned by UID {}, expected current user UID {}",
+            path,
+            meta.uid(),
+            current_uid
+        ));
+    }
+    Ok(meta.len())
+}
+
+pub fn compute_file_military_hashes(path: &Path) -> Result<(String, String, String), String> {
+    let _ = safe_verify_file(path)?;
+    let mut file = fs::File::open(path).map_err(|e| format!("Failed to open {:?}: {}", path, e))?;
+    let mut blake3_hasher = blake3::Hasher::new();
+    let mut sha = Sha256::new();
+    let mut md5_ctx = md5::Context::new();
+    let mut buf = [0u8; 131072]; // 128 KiB chunk aligned with IEEE 802.11 A-MPDU
+    loop {
+        let n = file.read(&mut buf).map_err(|e| format!("Failed to read {:?}: {}", path, e))?;
+        if n == 0 {
+            break;
+        }
+        blake3_hasher.update(&buf[..n]);
+        sha.update(&buf[..n]);
+        md5_ctx.consume(&buf[..n]);
+    }
+    let blake3_hex = blake3_hasher.finalize().to_hex().to_string();
+    let sha256_hex = hex::encode(sha.finalize());
+    let md5_hex = format!("{:x}", md5_ctx.compute());
+    Ok((blake3_hex, sha256_hex, md5_hex))
+}
+
 /// Reads any normal file safely:
 /// - Rejects untrusted symlinks
 /// - Must be regular file
@@ -2550,6 +2592,7 @@ fn connect_peer_with_timeout(addr_str: &str, timeout: Duration) -> Result<TcpStr
     }
     for addr in addrs {
         if let Ok(s) = TcpStream::connect_timeout(&addr, timeout) {
+            let _ = s.set_nodelay(true);
             let _ = s.set_read_timeout(Some(Duration::from_secs(15)));
             let _ = s.set_write_timeout(Some(Duration::from_secs(15)));
             return Ok(s);
@@ -2571,18 +2614,14 @@ fn resolve_peer_addr(target_ip: &str) -> String {
 }
 
 fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String> {
-    let file_bytes = safe_read_file(file_path).map_err(|e| format!("Security check failed: {}", e))?;
+    let size_bytes = safe_verify_file(file_path).map_err(|e| format!("Security check failed: {}", e))?;
     let file_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-    let size_bytes = file_bytes.len() as u64;
 
     let (my_id, _) = get_or_create_device_id();
     let my_name = get_system_hostname();
 
-    let blake3_hex = blake3::hash(&file_bytes).to_hex().to_string();
-    let mut sha = Sha256::new();
-    sha.update(&file_bytes);
-    let sha256_hex = hex::encode(sha.finalize());
-    let md5_hex = format!("{:x}", md5::compute(&file_bytes));
+    let (blake3_hex, sha256_hex, md5_hex) = compute_file_military_hashes(file_path)
+        .map_err(|e| format!("Failed to compute file hashes: {}", e))?;
 
     // 1. Send transfer request
     let request_payload = serde_json::json!({
@@ -2681,16 +2720,26 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
 
     println!("Peer accepted! Streaming file '{}' ({} bytes, sha256: {})...", file_name, size_bytes, sha256_hex);
 
-    // 3. Upload file
+    // 3. Upload file via 128 KiB streaming chunks
     let mut upload_stream = connect_peer_with_timeout(&addr, Duration::from_secs(6))
         .map_err(|e| format!("Failed to connect to peer for upload: {}", e))?;
     let encoded_filename = urlencoding_encode(&file_name);
     let upload_header = format!(
         "POST /api/p2p/upload?token={}&filename={}&sha256={}&md5={} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/octet-stream\r\nX-File-SHA256: {}\r\nX-File-MD5: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        token, encoded_filename, sha256_hex, md5_hex, addr, sha256_hex, md5_hex, file_bytes.len()
+        token, encoded_filename, sha256_hex, md5_hex, addr, sha256_hex, md5_hex, size_bytes
     );
     upload_stream.write_all(upload_header.as_bytes()).map_err(|e| e.to_string())?;
-    upload_stream.write_all(&file_bytes).map_err(|e| e.to_string())?;
+
+    let mut file = fs::File::open(file_path).map_err(|e| format!("Failed to open file for upload: {}", e))?;
+    let mut chunk_buf = [0u8; 131072]; // 128 KiB chunk aligned with IEEE 802.11 A-MPDU
+    loop {
+        let n = file.read(&mut chunk_buf).map_err(|e| format!("Failed to read file chunk: {}", e))?;
+        if n == 0 {
+            break;
+        }
+        upload_stream.write_all(&chunk_buf[..n]).map_err(|e| format!("Failed to send chunk to peer: {}", e))?;
+    }
+    upload_stream.flush().map_err(|e| format!("Failed to flush upload stream: {}", e))?;
 
     let mut final_resp = String::new();
     let _ = upload_stream.read_to_string(&mut final_resp);
@@ -3043,6 +3092,8 @@ pub struct StagedFile {
     pub persisted: bool,
     pub reservation: Option<StagingReservationGuard>,
     pub blake3_hash: Option<String>,
+    pub sha256_hash: Option<String>,
+    pub md5_hash: Option<String>,
 }
 
 impl StagedFile {
@@ -3058,6 +3109,27 @@ impl StagedFile {
             persisted: false,
             reservation,
             blake3_hash,
+            sha256_hash: None,
+            md5_hash: None,
+        }
+    }
+
+    pub fn with_hashes(
+        path: PathBuf,
+        size: u64,
+        reservation: Option<StagingReservationGuard>,
+        blake3_hash: Option<String>,
+        sha256_hash: Option<String>,
+        md5_hash: Option<String>,
+    ) -> Self {
+        Self {
+            path,
+            size,
+            persisted: false,
+            reservation,
+            blake3_hash,
+            sha256_hash,
+            md5_hash,
         }
     }
 
@@ -3135,11 +3207,16 @@ impl HttpBody {
                 Ok((blake3_hex, sha_hex, md5_hex))
             }
             HttpBody::Staged(staged) => {
+                if let (Some(b), Some(s), Some(m)) = (&staged.blake3_hash, &staged.sha256_hash, &staged.md5_hash) {
+                    return Ok((b.clone(), s.clone(), m.clone()));
+                }
                 let mut file = fs::File::open(&staged.path).map_err(|e| format!("Failed to open staged file: {}", e))?;
                 let mut blake3_hasher = blake3::Hasher::new();
                 let need_blake3 = staged.blake3_hash.is_none();
                 let mut sha = Sha256::new();
+                let need_sha = staged.sha256_hash.is_none();
                 let mut md5_ctx = md5::Context::new();
+                let need_md5 = staged.md5_hash.is_none();
                 let mut buf = [0u8; 131072]; // 128 KiB streaming chunk
                 loop {
                     let n = file.read(&mut buf).map_err(|e| format!("Failed to read staged file: {}", e))?;
@@ -3149,15 +3226,25 @@ impl HttpBody {
                     if need_blake3 {
                         blake3_hasher.update(&buf[..n]);
                     }
-                    sha.update(&buf[..n]);
-                    md5_ctx.consume(&buf[..n]);
+                    if need_sha {
+                        sha.update(&buf[..n]);
+                    }
+                    if need_md5 {
+                        md5_ctx.consume(&buf[..n]);
+                    }
                 }
                 let blake3_hex = match &staged.blake3_hash {
                     Some(h) => h.clone(),
                     None => blake3_hasher.finalize().to_hex().to_string(),
                 };
-                let sha_hex = hex::encode(sha.finalize());
-                let md5_hex = format!("{:x}", md5_ctx.compute());
+                let sha_hex = match &staged.sha256_hash {
+                    Some(h) => h.clone(),
+                    None => hex::encode(sha.finalize()),
+                };
+                let md5_hex = match &staged.md5_hash {
+                    Some(h) => h.clone(),
+                    None => format!("{:x}", md5_ctx.compute()),
+                };
                 Ok((blake3_hex, sha_hex, md5_hex))
             }
         }
@@ -3401,16 +3488,20 @@ pub fn read_http_body<S: TimeoutStream>(
         };
 
         let mut blake3_hasher = blake3::Hasher::new();
+        let mut sha_hasher = Sha256::new();
+        let mut md5_ctx = md5::Context::new();
         let copy_len = initial_len.min(content_length);
         if stage_file.write_all(&initial_body[..copy_len]).is_err() {
             let _ = fs::remove_file(&stage_path);
             return None;
         }
         blake3_hasher.update(&initial_body[..copy_len]);
+        sha_hasher.update(&initial_body[..copy_len]);
+        md5_ctx.consume(&initial_body[..copy_len]);
 
         let mut remaining = content_length.saturating_sub(copy_len);
         let mut total_written = copy_len as u64;
-        let mut stream_chunk = [0u8; 131072]; // 128 KiB streaming chunk
+        let mut stream_chunk = [0u8; 131072]; // 128 KiB streaming chunk aligned with IEEE 802.11 A-MPDU
 
         while remaining > 0 {
             let to_read = remaining.min(stream_chunk.len());
@@ -3425,6 +3516,8 @@ pub fn read_http_body<S: TimeoutStream>(
                         return None;
                     }
                     blake3_hasher.update(&stream_chunk[..n]);
+                    sha_hasher.update(&stream_chunk[..n]);
+                    md5_ctx.consume(&stream_chunk[..n]);
                     total_written = total_written.saturating_add(n as u64);
                     remaining = remaining.saturating_sub(n);
                 }
@@ -3441,7 +3534,16 @@ pub fn read_http_body<S: TimeoutStream>(
         }
 
         let blake3_hex = blake3_hasher.finalize().to_hex().to_string();
-        let staged = StagedFile::new(stage_path, total_written, Some(reservation), Some(blake3_hex));
+        let sha256_hex = hex::encode(sha_hasher.finalize());
+        let md5_hex = format!("{:x}", md5_ctx.compute());
+        let staged = StagedFile::with_hashes(
+            stage_path,
+            total_written,
+            Some(reservation),
+            Some(blake3_hex),
+            Some(sha256_hex),
+            Some(md5_hex),
+        );
         Some(HttpBody::Staged(staged))
     }
 }
@@ -5177,6 +5279,7 @@ fn run_server() {
     start_clipboard_sentinel();
 
     for mut s in listener.incoming().flatten() {
+        let _ = s.set_nodelay(true);
         let client_ip = s.peer_addr().map(|a| a.ip()).unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
         let guard = match try_acquire_connection(client_ip) {
             Some(g) => g,
@@ -6163,6 +6266,8 @@ mod tests {
             persisted: true,
             reservation: None,
             blake3_hash: None,
+            sha256_hash: None,
+            md5_hash: None,
         };
 
         let res = fake_staged.to_bytes();

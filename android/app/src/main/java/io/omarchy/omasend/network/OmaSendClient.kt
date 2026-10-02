@@ -15,8 +15,35 @@ import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okio.BufferedSink
 import java.io.InputStream
+import java.net.InetAddress
+import java.net.Socket
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
+import javax.net.SocketFactory
+
+private class HighPerfSocketFactory(
+    private val delegate: SocketFactory = SocketFactory.getDefault()
+) : SocketFactory() {
+    override fun createSocket(): Socket {
+        return delegate.createSocket().also { NetworkUtils.configureHighThroughputSocket(it) }
+    }
+
+    override fun createSocket(host: String, port: Int): Socket {
+        return delegate.createSocket(host, port).also { NetworkUtils.configureHighThroughputSocket(it) }
+    }
+
+    override fun createSocket(host: String, port: Int, localHost: InetAddress, localPort: Int): Socket {
+        return delegate.createSocket(host, port, localHost, localPort).also { NetworkUtils.configureHighThroughputSocket(it) }
+    }
+
+    override fun createSocket(host: InetAddress, port: Int): Socket {
+        return delegate.createSocket(host, port).also { NetworkUtils.configureHighThroughputSocket(it) }
+    }
+
+    override fun createSocket(address: InetAddress, port: Int, localAddress: InetAddress, localPort: Int): Socket {
+        return delegate.createSocket(address, port, localAddress, localPort).also { NetworkUtils.configureHighThroughputSocket(it) }
+    }
+}
 
 class OmaSendClient(private val context: Context) {
     private val json = Json {
@@ -24,6 +51,7 @@ class OmaSendClient(private val context: Context) {
         ignoreUnknownKeys = true
     }
     private val client = OkHttpClient.Builder()
+        .socketFactory(HighPerfSocketFactory())
         .connectTimeout(5, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(60, TimeUnit.SECONDS)
@@ -136,6 +164,7 @@ class OmaSendClient(private val context: Context) {
             return Result.failure(SecurityException("Target IP is outside private network scope (RFC 1918/3927)"))
         }
         val speedCalculator = TransferSpeedCalculator(totalBytes)
+        val wifiLock = NetworkUtils.acquireHighPerfWifiLock(context, "OmaSend:ClientUpload")
         return try {
             val encodedName = URLEncoder.encode(filename, "UTF-8")
             val countingBody = object : RequestBody() {
@@ -143,7 +172,7 @@ class OmaSendClient(private val context: Context) {
                 override fun contentLength() = totalBytes
 
                 override fun writeTo(sink: BufferedSink) {
-                    val buffer = ByteArray(65536)
+                    val buffer = ByteArray(NetworkUtils.IO_CHUNK_SIZE)
                     var uploaded = 0L
                     var read: Int
                     while (inputStream.read(buffer).also { read = it } != -1) {
@@ -152,6 +181,7 @@ class OmaSendClient(private val context: Context) {
                         val metrics = speedCalculator.update(uploaded)
                         onProgress(uploaded, totalBytes, metrics.percent, metrics.speedMBps, metrics.etaSeconds)
                     }
+                    sink.flush()
                 }
             }
 
@@ -169,6 +199,7 @@ class OmaSendClient(private val context: Context) {
         } catch (e: Exception) {
             Result.failure(e)
         } finally {
+            NetworkUtils.releaseWifiLock(wifiLock)
             try {
                 inputStream.close()
             } catch (_: Exception) {

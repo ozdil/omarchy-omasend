@@ -111,8 +111,10 @@ object StorageUtils {
                     ?: return Pair(false, "Failed to create MediaStore entry")
 
                 try {
-                    resolver.openOutputStream(uri)?.use { out ->
-                        pipeStreamWithBackpressure(inputStream, out, totalBytes, deadlineMs, speedCalculator, onProgressWithMetrics)
+                    resolver.openOutputStream(uri)?.let { rawOut ->
+                        java.io.BufferedOutputStream(rawOut, STREAM_CHUNK_SIZE).use { out ->
+                            pipeStreamWithBackpressure(inputStream, out, totalBytes, deadlineMs, speedCalculator, onProgressWithMetrics)
+                        }
                     } ?: throw java.io.IOException("Cannot open output stream for MediaStore URI")
 
                     contentValues.clear()
@@ -152,7 +154,7 @@ object StorageUtils {
                 }
 
                 try {
-                    FileOutputStream(target).use { out ->
+                    java.io.BufferedOutputStream(FileOutputStream(target), STREAM_CHUNK_SIZE).use { out ->
                         pipeStreamWithBackpressure(inputStream, out, totalBytes, deadlineMs, speedCalculator, onProgressWithMetrics)
                     }
                     _incomingTransferMetrics.value = null

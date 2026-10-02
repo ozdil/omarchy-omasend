@@ -52,4 +52,30 @@ class NetworkUtilsTest {
         assertEquals("1.5 MB", NetworkUtils.formatBytes(1572864))
         assertEquals("2.00 GB", NetworkUtils.formatBytes(2147483648))
     }
+
+    @Test
+    fun testSocketTuningConstants() {
+        assertEquals(256 * 1024, NetworkUtils.SOCKET_BUFFER_SIZE)
+        assertEquals(128 * 1024, NetworkUtils.IO_CHUNK_SIZE)
+        assertEquals(0x08, NetworkUtils.IPTOS_THROUGHPUT)
+    }
+
+    @Test
+    fun testConfigureHighThroughputSocket() {
+        val server = java.net.ServerSocket(0)
+        val port = server.localPort
+        val clientSocket = java.net.Socket("127.0.0.1", port)
+        val serverSideSocket = server.accept()
+
+        NetworkUtils.configureHighThroughputSocket(clientSocket)
+        NetworkUtils.configureHighThroughputSocket(serverSideSocket)
+
+        assertTrue(clientSocket.tcpNoDelay)
+        assertTrue(clientSocket.sendBufferSize > 0)
+        assertTrue(clientSocket.receiveBufferSize > 0)
+
+        clientSocket.close()
+        serverSideSocket.close()
+        server.close()
+    }
 }

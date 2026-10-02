@@ -96,8 +96,10 @@ class OmaSendServer(private val context: Context) {
         if (serverJob != null && serverJob?.isActive == true) return
         serverJob = scope.launch {
             try {
-                serverSocket = ServerSocket(NetworkUtils.PORT).apply {
+                serverSocket = ServerSocket().apply {
                     reuseAddress = true
+                    receiveBufferSize = NetworkUtils.SOCKET_BUFFER_SIZE
+                    bind(java.net.InetSocketAddress(NetworkUtils.PORT))
                 }
 
                 while (isActive) {
@@ -106,6 +108,7 @@ class OmaSendServer(private val context: Context) {
                     } catch (_: Exception) {
                         break
                     }
+                    NetworkUtils.configureHighThroughputSocket(clientSocket)
 
                     // Strict RFC 1918 / 3927 private network scope check BEFORE launching work
                     val remoteAddr = clientSocket.inetAddress
@@ -400,13 +403,15 @@ class OmaSendServer(private val context: Context) {
         val uploadDurationMs = ((contentLength / (512 * 1024L)).coerceIn(30L, 600L)) * 1000L
         val uploadDeadline = System.currentTimeMillis() + uploadDurationMs
 
-        val (saved, finalName) = StorageUtils.saveIncomingStream(
-            context = context,
-            filename = filename,
-            inputStream = input,
-            totalBytes = contentLength,
-            deadlineMs = uploadDeadline
-        )
+        val (saved, finalName) = NetworkUtils.withHighPerfWifiLock(context, "OmaSend:ServerUpload") {
+            StorageUtils.saveIncomingStream(
+                context = context,
+                filename = filename,
+                inputStream = input,
+                totalBytes = contentLength,
+                deadlineMs = uploadDeadline
+            )
+        }
 
         if (saved) {
             pendingTransfers.remove(token)
