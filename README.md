@@ -1,7 +1,7 @@
 # OmaSend - Zero-Knowledge AirBridge and E2EE Transfer for Omarchy Linux
 
 [![Omarchy Verified Plugin](https://img.shields.io/badge/Omarchy-Verified_Plugin-22c55e?style=for-the-badge&logo=omarchy)](https://github.com/ozdil)
-[![Release v1.7.0](https://img.shields.io/badge/Release-v1.7.0-38BDF8?style=for-the-badge&logo=rust)](https://github.com/ozdil/omarchy-omasend/releases)
+[![Release v1.7.1](https://img.shields.io/badge/Release-v1.7.1-38BDF8?style=for-the-badge&logo=rust)](https://github.com/ozdil/omarchy-omasend/releases)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy_Me_A_Coffee-Support_Development-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/ozdil)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](LICENSE)
 
@@ -12,7 +12,7 @@
 - **Author:** Ozan Özdil (ozdil)  
 - **License:** MIT  
 - **Plugin ID:** `ozdil.omasend`  
-- **Version:** `1.7.0`  
+- **Version:** `1.7.1`  
 - **Default Font:** `JetBrainsMono Nerd Font`
 
 ---

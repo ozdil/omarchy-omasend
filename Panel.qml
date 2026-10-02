@@ -68,7 +68,7 @@ Panel {
   readonly property string manifestPath: Qt.resolvedUrl("manifest.json").toString().replace(/^file:\/\//, "")
   readonly property string manifestFallbackPath: (Quickshell.env("HOME") || "/home/ozdil") + "/.config/omarchy/plugins/ozdil.omasend/manifest.json"
 
-  property string pluginVersion: "1.7.0"
+  property string pluginVersion: "1.7.1"
   property string pluginDescription: "AirBridge P2P, E2EE Secure Local & Network File Transfer System"
   property string pluginAuthor: "Ozan Özdil (@ozdil)"
   property string pluginLicense: "MIT"
@@ -1309,7 +1309,7 @@ Panel {
               RowLayout {
                 spacing: Style.space(4)
                 Text {
-                  text: "OMAID"
+                  text: "OMAID (BU CİHAZ)"
                   color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.micro

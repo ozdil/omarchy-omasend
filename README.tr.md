@@ -1,7 +1,7 @@
 # OmaSend - Omarchy Linux İçin Sıfır Bilgili AirBridge ve E2EE Aktarım Merkezi
 
 [![Omarchy Onaylı Eklenti](https://img.shields.io/badge/Omarchy-Verified_Plugin-22c55e?style=for-the-badge&logo=omarchy)](https://github.com/ozdil)
-[![Sürüm v1.7.0](https://img.shields.io/badge/S%C3%BCr%C3%BCm-v1.7.0-38BDF8?style=for-the-badge&logo=rust)](https://github.com/ozdil/omarchy-omasend/releases)
+[![Sürüm v1.7.1](https://img.shields.io/badge/S%C3%BCr%C3%BCm-v1.7.1-38BDF8?style=for-the-badge&logo=rust)](https://github.com/ozdil/omarchy-omasend/releases)
 [![Kahve Ismarla](https://img.shields.io/badge/Buy_Me_A_Coffee-Geli%C5%9Ftiriciye_Destek-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/ozdil)
 [![Lisans: MIT](https://img.shields.io/badge/Lisans-MIT-blue?style=for-the-badge)](LICENSE)
 
@@ -12,7 +12,7 @@
 - **Geliştirici:** Ozan Özdil (ozdil)  
 - **Lisans:** MIT  
 - **Eklenti Kimliği:** `ozdil.omasend`  
-- **Sürüm:** `1.7.0`  
+- **Sürüm:** `1.7.1`  
 - **Varsayılan Yazı Tipi:** `JetBrainsMono Nerd Font`
 
 ---
