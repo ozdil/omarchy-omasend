@@ -1,6 +1,6 @@
 # Maintainer: Ozan Özdil <ozan@pm.me>
 pkgname=omarchy-omasend
-pkgver=1.5.0
+pkgver=1.8.0
 pkgrel=1
 pkgdesc="Wireless AirBridge, QR file transfer, and cross-device sharing plugin for Omarchy Linux"
 arch=('x86_64')
