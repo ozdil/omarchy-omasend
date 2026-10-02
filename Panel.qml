@@ -68,7 +68,7 @@ Panel {
   readonly property string manifestPath: Qt.resolvedUrl("manifest.json").toString().replace(/^file:\/\//, "")
   readonly property string manifestFallbackPath: (Quickshell.env("HOME") || "/home/ozdil") + "/.config/omarchy/plugins/ozdil.omasend/manifest.json"
 
-  property string pluginVersion: "1.7.1"
+  property string pluginVersion: "1.7.2"
   property string pluginDescription: "AirBridge P2P, E2EE Secure Local & Network File Transfer System"
   property string pluginAuthor: "Ozan Özdil (@ozdil)"
   property string pluginLicense: "MIT"
@@ -1763,8 +1763,8 @@ Panel {
 
                   Text {
                     textFormat: Text.PlainText
-                    text: modelData.transport === "WAN" ? "OmaID Paired (WAN)" : (modelData.transport === "DIRECT" ? "Direct Peer (LAN)" : "OmaID Paired (LAN)")
-                    color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
+                    text: modelData.last_seen_secs === 0 ? "OmaID Eşleşmiş (Çevrimdışı / Beklemede)" : (modelData.transport === "WAN" ? "OmaID Eşleşmiş (WAN Çevrimiçi)" : "OmaID Eşleşmiş (LAN Çevrimiçi)")
+                    color: modelData.last_seen_secs === 0 ? Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 2.0) : Color.accent
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                     elide: Text.ElideRight

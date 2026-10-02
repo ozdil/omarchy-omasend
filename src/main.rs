@@ -2079,12 +2079,30 @@ fn get_discovered_peers() -> Vec<DiscoveredPeer> {
     }
 
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let my_oma_id = get_or_create_oma_id();
+    let my_norm = rendezvous::normalize_oma_id(&my_oma_id);
+    let (my_id, _) = get_or_create_device_id();
+
     let mut peers = Vec::new();
     let path = get_state_dir().join("discovered_peers.json");
     if let Ok(content) = read_secure_file(&path) {
         if let Ok(loaded) = serde_json::from_str::<Vec<DiscoveredPeer>>(&content) {
-            // Prune peers older than 15s
-            peers = loaded.into_iter().filter(|p| now.saturating_sub(p.last_seen_secs) <= 15).collect();
+            // Prune peers older than 15s and filter out self device / self OmaID
+            peers = loaded
+                .into_iter()
+                .filter(|p| {
+                    if now.saturating_sub(p.last_seen_secs) > 15 {
+                        return false;
+                    }
+                    if p.id == my_id {
+                        return false;
+                    }
+                    if !p.oma_id.is_empty() && rendezvous::normalize_oma_id(&p.oma_id) == my_norm {
+                        return false;
+                    }
+                    true
+                })
+                .collect();
         }
     }
 
@@ -2096,6 +2114,40 @@ fn get_discovered_peers() -> Vec<DiscoveredPeer> {
     if vis == "KNOWN" {
         peers.retain(|p| p.is_trusted);
     }
+
+    // Include paired OmaID peers that are currently offline so they remain visible in Paired Devices
+    let paired = load_paired_peers();
+    for p in paired {
+        let p_norm = rendezvous::normalize_oma_id(&p.oma_id);
+        if p_norm.is_empty() || p_norm == my_norm {
+            continue;
+        }
+        let exists = peers.iter().any(|dp| {
+            (!dp.oma_id.is_empty() && rendezvous::normalize_oma_id(&dp.oma_id) == p_norm)
+                || dp.id == p.oma_id
+        });
+        if !exists {
+            peers.push(DiscoveredPeer {
+                id: format!("paired_{}", p_norm),
+                oma_id: p.oma_id.clone(),
+                name: p.name.clone(),
+                ip: p.ip.clone().unwrap_or_default(),
+                port: 53317,
+                transport: "OMAID".to_string(),
+                fingerprint: p.oma_id.clone(),
+                is_trusted: true,
+                last_seen_secs: 0, // Standby / Offline indicator
+            });
+        }
+    }
+
+    // Sort: Online trusted first, then standby trusted, then alphabetical
+    peers.sort_by(|a, b| {
+        b.is_trusted
+            .cmp(&a.is_trusted)
+            .then_with(|| (b.last_seen_secs > 0).cmp(&(a.last_seen_secs > 0)))
+            .then_with(|| a.name.cmp(&b.name))
+    });
 
     peers
 }

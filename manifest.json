@@ -3,7 +3,7 @@
   "id": "ozdil.omasend",
   "name": "omasend",
   "description": "Wireless AirBridge, QR file sharing, zero-copy hybrid image clipboard sync, and cross-device local transfer for Omarchy Linux.",
-  "version": "1.7.1",
+  "version": "1.7.2",
   "author": "Ozan Özdil",
   "license": "MIT",
   "kinds": [
