@@ -2112,7 +2112,7 @@ fn get_discovered_peers() -> Vec<DiscoveredPeer> {
     }
 
     if vis == "KNOWN" {
-        peers.retain(|p| p.is_trusted);
+        peers.retain(|p| p.is_trusted || is_local_subnet_or_private_ip(&p.ip));
     }
 
     // Include paired OmaID peers that are currently offline so they remain visible in Paired Devices
@@ -2327,6 +2327,7 @@ pub fn send_p2p_beacon_burst(burst_count: usize) {
     if let Ok(bytes) = serde_json::to_vec(&packet) {
         let broadcast_targets = get_all_broadcast_addresses();
         let known_peers = get_discovered_peers();
+        let paired_ips = get_active_paired_peer_ips();
 
         for i in 0..burst_count {
             for bcast_ip in &broadcast_targets {
@@ -2334,8 +2335,16 @@ pub fn send_p2p_beacon_burst(burst_count: usize) {
                 let _ = socket.send_to(&bytes, &target);
             }
             for peer in &known_peers {
-                let target = format!("{}:{}", peer.ip, P2P_BEACON_PORT);
-                let _ = socket.send_to(&bytes, &target);
+                if !peer.ip.is_empty() {
+                    let target = format!("{}:{}", peer.ip, P2P_BEACON_PORT);
+                    let _ = socket.send_to(&bytes, &target);
+                }
+            }
+            for paired_ip in &paired_ips {
+                if !paired_ip.is_empty() {
+                    let target = format!("{}:{}", paired_ip, P2P_BEACON_PORT);
+                    let _ = socket.send_to(&bytes, &target);
+                }
             }
             if i + 1 < burst_count {
                 thread::sleep(Duration::from_millis(40));
