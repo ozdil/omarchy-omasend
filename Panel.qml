@@ -73,6 +73,24 @@ Panel {
   readonly property string peersPath: (Quickshell.env("HOME") || "/home/ozdil") + "/.local/state/omarchy/omasend/discovered_peers.json"
   readonly property string omaidQrFilePath: (Quickshell.env("HOME") || "/home/ozdil") + "/.local/state/omarchy/omasend/omaid_qr.svg"
   readonly property string clipStagingPath: (Quickshell.env("HOME") || "/home/ozdil") + "/.local/state/omarchy/omasend/clip_staging"
+  readonly property string manifestPath: Qt.resolvedUrl("manifest.json").toString().replace(/^file:\/\//, "")
+  readonly property string manifestFallbackPath: (Quickshell.env("HOME") || "/home/ozdil") + "/.config/omarchy/plugins/ozdil.omasend/manifest.json"
+
+  property string pluginVersion: "1.6.4"
+  property string pluginDescription: "AirBridge P2P, E2EE Secure Local & Network File Transfer System"
+  property string pluginAuthor: "Ozan Özdil (@ozdil)"
+  property string pluginLicense: "MIT"
+
+  function loadManifest(rawJson) {
+    try {
+      if (!rawJson) return
+      var parsed = JSON.parse(rawJson)
+      if (parsed.version) root.pluginVersion = parsed.version
+      if (parsed.description) root.pluginDescription = parsed.description
+      if (parsed.author) root.pluginAuthor = parsed.author
+      if (parsed.license) root.pluginLicense = parsed.license
+    } catch(e) {}
+  }
 
   function formatOmaId(id, revealed) {
     if (!id || String(id).trim() === "") return "---- ---- ---- ----"
@@ -589,6 +607,29 @@ Panel {
     printErrors: false
     onLoaded: root.loadDiscoveredPeers(text())
     onLoadFailed: {}
+    onFileChanged: reload()
+  }
+
+  FileView {
+    id: manifestWatcher
+    path: root.manifestPath
+    watchChanges: true
+    atomicWrites: true
+    printErrors: false
+    onLoaded: root.loadManifest(text())
+    onLoadFailed: {
+      manifestFallbackWatcher.reload()
+    }
+    onFileChanged: reload()
+  }
+
+  FileView {
+    id: manifestFallbackWatcher
+    path: root.manifestFallbackPath
+    watchChanges: true
+    atomicWrites: true
+    printErrors: false
+    onLoaded: root.loadManifest(text())
     onFileChanged: reload()
   }
 
@@ -2938,9 +2979,9 @@ Panel {
         Text {
           width: parent.width
           wrapMode: Text.WordWrap
-          text: "Version: 1.5.0\nDeveloper: Ozan Ozdil (@ozdil)\nLicense: MIT\nAirBridge P2P, E2EE Secure Local & Network File Transfer System"
+          text: "Sürüm: " + root.pluginVersion + "\nGeliştirici: " + root.pluginAuthor + "\nLisans: " + root.pluginLicense + "\n" + root.pluginDescription
           color: root.bar ? root.bar.foreground : Color.foreground
-          opacity: 0.7
+          opacity: 0.8
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           lineHeight: 1.3
