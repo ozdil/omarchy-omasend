@@ -61,7 +61,6 @@ Panel {
   readonly property color hoverFill: bar ? Style.hoverFillFor(bar.foreground, Color.accent) : "transparent"
   readonly property color selectedFill: bar ? Style.selectedFillFor(bar.foreground, Color.accent) : "transparent"
   readonly property string fontFamily: (root.bar && root.bar.fontFamily) ? root.bar.fontFamily : ((typeof Style !== "undefined" && Style.font && Style.font.family) ? Style.font.family : "JetBrainsMono Nerd Font, JetBrains Mono, monospace")
-  readonly property string vaultPath: (Quickshell.env("HOME") || "/home/ozdil") + "/.local/state/omarchy/omasend/clipboard_vault.json"
   readonly property string peersPath: (Quickshell.env("HOME") || "/home/ozdil") + "/.local/state/omarchy/omasend/discovered_peers.json"
   readonly property string omaidQrFilePath: (Quickshell.env("HOME") || "/home/ozdil") + "/.local/state/omarchy/omasend/omaid_qr.svg"
   readonly property string clipStagingPath: (Quickshell.env("HOME") || "/home/ozdil") + "/.local/state/omarchy/omasend/clip_staging"
@@ -107,18 +106,6 @@ Panel {
       parts.push(clean.slice(i, i + 4))
     }
     return parts.join("-")
-  }
-
-  function loadVault(content) {
-    try {
-      if (!content || String(content).trim() === "") return
-      var parsed = JSON.parse(content)
-      if (parsed && Array.isArray(parsed.items)) {
-        root.clipboardVault = parsed.items
-      } else if (Array.isArray(parsed)) {
-        root.clipboardVault = parsed
-      }
-    } catch(e) {}
   }
 
   function loadDiscoveredPeers(content) {
@@ -360,7 +347,6 @@ Panel {
           root.p2pVisibilityRemainingSecs = Number(d.p2p_visibility_remaining_secs) || 0
           root.p2pPeers = d.p2p_discovered_peers || []
           root.p2pPendingTransfer = d.p2p_pending_transfer || null
-          root.clipboardVault = d.clipboard_vault || []
           root.omaId = String(d.oma_id || d.p2p_device_id || "")
           root.refreshNonce++
         } catch(e) {}
