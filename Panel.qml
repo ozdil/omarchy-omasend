@@ -2450,27 +2450,74 @@ Panel {
           width: parent.width
           spacing: Style.space(8)
 
-          Button {
+          Rectangle {
             Layout.fillWidth: true
-            text: "Ekrandan QR Tara"
-            iconText: "󰄳"
-            bordered: true
-            accent: Color.accent
-            foreground: root.bar ? root.bar.foreground : Color.foreground
-            fontFamily: root.fontFamily
-            fontSize: Style.font.micro
-            onClicked: root.scanFromScreen()
+            height: 34
+            radius: 6
+            color: scanHover.containsMouse ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.18) : Qt.rgba(1.0, 1.0, 1.0, 0.06)
+            border.color: scanHover.containsMouse ? Color.accent : Qt.rgba(1.0, 1.0, 1.0, 0.15)
+            border.width: 1
+
+            RowLayout {
+              anchors.centerIn: parent
+              spacing: Style.space(6)
+              Text {
+                text: "󰄳"
+                color: Color.accent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+              Text {
+                text: "Ekrandan Tara"
+                color: root.bar ? root.bar.foreground : Color.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.micro
+                font.bold: true
+              }
+            }
+
+            MouseArea {
+              id: scanHover
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.scanFromScreen()
+            }
           }
 
-          Button {
+          Rectangle {
             Layout.fillWidth: true
-            text: "Panodan Yapıştır"
-            iconText: "󰅍"
-            bordered: true
-            foreground: root.bar ? root.bar.foreground : Color.foreground
-            fontFamily: root.fontFamily
-            fontSize: Style.font.micro
-            onClicked: root.pasteOmaIdFromClipboard()
+            height: 34
+            radius: 6
+            color: pasteHover.containsMouse ? Qt.rgba(1.0, 1.0, 1.0, 0.12) : Qt.rgba(1.0, 1.0, 1.0, 0.06)
+            border.color: pasteHover.containsMouse ? Qt.rgba(1.0, 1.0, 1.0, 0.3) : Qt.rgba(1.0, 1.0, 1.0, 0.15)
+            border.width: 1
+
+            RowLayout {
+              anchors.centerIn: parent
+              spacing: Style.space(6)
+              Text {
+                text: "󰅍"
+                color: root.bar ? root.bar.foreground : Color.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+              Text {
+                text: "Panodan Al"
+                color: root.bar ? root.bar.foreground : Color.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.micro
+                font.bold: true
+              }
+            }
+
+            MouseArea {
+              id: pasteHover
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.pasteOmaIdFromClipboard()
+            }
           }
         }
 
@@ -2645,28 +2692,72 @@ Panel {
           width: parent.width
           spacing: Style.space(8)
 
-          Button {
+          Rectangle {
+            id: pairActionBtn
             Layout.fillWidth: true
-            text: "Cihazı Bağla & Eşleştir"
-            iconText: "󰌆"
-            bordered: true
-            accent: Color.accent
-            enabled: root.pairInputOmaId.replace(/[^A-F0-9]/gi, "").length === 16
-            foreground: enabled ? (root.bar ? root.bar.foreground : Color.foreground) : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.8)
-            fontFamily: root.fontFamily
-            fontSize: Style.font.caption
-            onClicked: root.bindOmaId(root.pairInputOmaId, root.pairInputName)
+            height: 36
+            radius: 6
+            property bool isReady: root.pairInputOmaId.replace(/[^A-F0-9]/gi, "").length === 16
+            color: isReady
+              ? (pairActionHover.containsMouse ? Qt.darker(Color.accent, 1.15) : Color.accent)
+              : Qt.rgba(1.0, 1.0, 1.0, 0.05)
+            border.color: isReady ? Color.accent : Qt.rgba(1.0, 1.0, 1.0, 0.12)
+            border.width: 1
+
+            RowLayout {
+              anchors.centerIn: parent
+              spacing: Style.space(6)
+              Text {
+                text: "󰌆"
+                color: pairActionBtn.isReady ? "#000000" : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.8)
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+              }
+              Text {
+                text: "Cihazı Bağla"
+                color: pairActionBtn.isReady ? "#000000" : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.8)
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+              }
+            }
+
+            MouseArea {
+              id: pairActionHover
+              anchors.fill: parent
+              enabled: pairActionBtn.isReady
+              hoverEnabled: true
+              cursorShape: pairActionBtn.isReady ? Qt.PointingHandCursor : Qt.ArrowCursor
+              onClicked: root.bindOmaId(root.pairInputOmaId, root.pairInputName)
+            }
           }
 
-          Button {
-            text: "İptal"
-            bordered: true
-            foreground: root.bar ? root.bar.foreground : Color.foreground
-            fontFamily: root.fontFamily
-            fontSize: Style.font.caption
-            onClicked: {
-              root.showOmaIdPairModal = false
-              root.pairStatusMsg = ""
+          Rectangle {
+            Layout.preferredWidth: 60
+            height: 36
+            radius: 6
+            color: cancelHover.containsMouse ? Qt.rgba(1.0, 1.0, 1.0, 0.12) : Qt.rgba(1.0, 1.0, 1.0, 0.05)
+            border.color: Qt.rgba(1.0, 1.0, 1.0, 0.15)
+            border.width: 1
+
+            Text {
+              anchors.centerIn: parent
+              text: "İptal"
+              color: root.bar ? root.bar.foreground : Color.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            MouseArea {
+              id: cancelHover
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: {
+                root.showOmaIdPairModal = false
+                root.pairStatusMsg = ""
+              }
             }
           }
         }
