@@ -42,8 +42,8 @@ class DiscoverySimulationTest {
                 "ip": "192.168.1.100",
                 "port": 53317,
                 "mode": "ALL",
-                "bt": false,
-                "fp": "sha256:abc12345"
+                "oma_id": "4829-1048-5729-1104",
+                "fp": "4829-1048-5729-1104"
             }
         """.trimIndent()
 
@@ -55,8 +55,8 @@ class DiscoverySimulationTest {
         assertEquals("192.168.1.100", parsed.ip)
         assertEquals(53317, parsed.port)
         assertEquals("ALL", parsed.mode)
-        assertFalse(parsed.bt)
-        assertEquals("sha256:abc12345", parsed.fp)
+        assertEquals("4829-1048-5729-1104", parsed.oma_id)
+        assertEquals("4829-1048-5729-1104", parsed.fp)
 
         // Simulate converting beacon packet to DiscoveredPeer model
         val peer = DiscoveredPeer(
@@ -64,13 +64,16 @@ class DiscoverySimulationTest {
             name = parsed.name,
             ip = parsed.ip,
             port = parsed.port,
-            transport = if (parsed.bt) "BT+LAN" else "LAN",
+            transport = "LAN",
+            omaId = parsed.oma_id,
             fingerprint = parsed.fp,
+            isTrusted = true,
             lastSeen = System.currentTimeMillis()
         )
 
         assertEquals("arch-linux-desktop-99", peer.id)
         assertEquals("LAN", peer.transport)
+        assertEquals("4829-1048-5729-1104", peer.omaId)
         assertTrue(peer.lastSeen > 0)
     }
 

@@ -1,66 +1,51 @@
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
     
-    <!-- Concentric Radar Rings -->
+    <!-- Concentric Soft Radar Background -->
     <path
-        android:strokeColor="#2238BDF8"
+        android:strokeColor="#2038BDF8"
         android:strokeWidth="1"
-        android:pathData="M54,54m-40,0a40,40 0 1,0 80,0a40,40 0 1,0 -80,0" />
+        android:pathData="M54,54m-38,0a38,38 0 1,0 76,0a38,38 0 1,0 -76,0" />
     <path
-        android:strokeColor="#4438BDF8"
+        android:strokeColor="#3538BDF8"
         android:strokeWidth="1"
-        android:pathData="M54,54m-28,0a28,28 0 1,0 56,0a28,28 0 1,0 -56,0" />
-    <path
-        android:strokeColor="#6638BDF8"
-        android:strokeWidth="1.2"
-        android:pathData="M54,54m-17,0a17,17 0 1,0 34,0a17,17 0 1,0 -34,0" />
+        android:pathData="M54,54m-24,0a24,24 0 1,0 48,0a24,24 0 1,0 -48,0" />
 
-    <!-- Crosshair reticle -->
+    <!-- Aerodynamic Stealth Paper Plane (Centered 54,54) -->
+    <!-- Left Outer Wing -->
     <path
-        android:strokeColor="#3338BDF8"
-        android:strokeWidth="0.8"
-        android:pathData="M14,54h80M54,14v80" />
+        android:fillColor="#00F2FE"
+        android:pathData="M54,20 L22,78 L45,72 Z" />
 
-    <!-- Radar Sweep Sector / Beam -->
+    <!-- Left Inner Fuselage -->
     <path
-        android:fillColor="#1A00E5FF"
-        android:pathData="M54,54 L84,36 A36,36 0 0,0 72,20 Z" />
-    <path
-        android:strokeColor="#8038BDF8"
-        android:strokeWidth="1.5"
-        android:pathData="M54,54 L84,36" />
+        android:fillColor="#0284C7"
+        android:pathData="M54,20 L45,72 L54,86 Z" />
 
-    <!-- Target Blips -->
+    <!-- Right Inner Fuselage -->
+    <path
+        android:fillColor="#0369A1"
+        android:pathData="M54,20 L54,86 L63,72 Z" />
+
+    <!-- Right Outer Wing -->
     <path
         android:fillColor="#38BDF8"
-        android:pathData="M78,38m-2,0a2,2 0 1,0 4,0a2,2 0 1,0 -4,0" />
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M78,38m-0.8,0a0.8,0.8 0 1,0 1.6,0a0.8,0.8 0 1,0 -1.6,0" />
+        android:pathData="M54,20 L63,72 L86,78 Z" />
 
+    <!-- Underwing Exhaust / Thruster -->
     <path
-        android:fillColor="#A8CD76"
-        android:pathData="M32,72m-1.8,0a1.8,1.8 0 1,0 3.6,0a1.8,1.8 0 1,0 -3.6,0" />
+        android:fillColor="#1E293B"
+        android:pathData="M45,72 L54,80 L54,86 Z" />
     <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M32,72m-0.7,0a0.7,0.7 0 1,0 1.4,0a0.7,0.7 0 1,0 -1.4,0" />
+        android:fillColor="#0F172A"
+        android:pathData="M63,72 L54,80 L54,86 Z" />
 
+    <!-- Ion Thruster Core Energy Point -->
     <path
-        android:fillColor="#818CF8"
-        android:pathData="M62,80m-1.5,0a1.5,1.5 0 1,0 3,0a1.5,1.5 0 1,0 -3,0" />
-
-    <!-- AirBridge Supersonic Wing Craft (Center) -->
-    <path
-        android:fillColor="#38BDF8"
-        android:pathData="M67,41 L42,52 L51,51 Z" />
-    <path
-        android:fillColor="#1D4ED8"
-        android:pathData="M67,41 L51,51 L56,66 Z" />
-    <path
-        android:strokeColor="#FFFFFF"
-        android:strokeWidth="1"
-        android:pathData="M51,51 L67,41" />
+        android:fillColor="#22C55E"
+        android:pathData="M54,81m-2.5,0a2.5,2.5 0 1,0 5,0a2.5,2.5 0 1,0 -5,0" />
 </vector>

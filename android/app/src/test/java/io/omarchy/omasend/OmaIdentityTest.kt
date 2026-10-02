@@ -87,6 +87,21 @@ class OmaIdentityTest {
     }
 
     @Test
+    fun testRfc4231HmacSha256TestVectors() {
+        val key1 = ByteArray(20) { 0x0b.toByte() }
+        val data1 = "Hi There".toByteArray(Charsets.UTF_8)
+        val hmac1 = OmaIdentity.hmacSha256(key1, data1)
+        val hex1 = hmac1.joinToString("") { "%02x".format(it) }
+        assertEquals("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7", hex1)
+
+        val key2 = "Jefe".toByteArray(Charsets.UTF_8)
+        val data2 = "what do ya want for nothing?".toByteArray(Charsets.UTF_8)
+        val hmac2 = OmaIdentity.hmacSha256(key2, data2)
+        val hex2 = hmac2.joinToString("") { "%02x".format(it) }
+        assertEquals("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843", hex2)
+    }
+
+    @Test
     fun testBlindTopicDerivationHmacSha256() {
         val omaId1 = "4829-1048-5729-1104"
         val omaId2 = "9999-8888-7777-6666"
@@ -98,13 +113,18 @@ class OmaIdentityTest {
         assertEquals("Topic should be 64-char hex SHA-256 HMAC", 64, topic2.length)
         assertTrue(topic1.all { it in "0123456789abcdef" })
 
-        // Deterministic
+        // Deterministic & unformat-invariant
         assertEquals(topic1, OmaIdentity.deriveBlindTopic(omaId1))
+        assertEquals(topic1, OmaIdentity.deriveBlindTopic(OmaIdentity.unformat(omaId1)))
         assertNotEquals(topic1, topic2)
 
-        // Custom salt variation
-        val customTopic = OmaIdentity.deriveBlindTopic(omaId1, "custom-salt-v2")
-        assertNotEquals(topic1, customTopic)
+        // HKDF Key Derivation deterministic & 32 bytes
+        val key1 = OmaIdentity.deriveRendezvousKey(omaId1)
+        val key2 = OmaIdentity.deriveRendezvousKey(omaId2)
+        assertEquals(32, key1.size)
+        assertEquals(32, key2.size)
+        assertTrue(key1.contentEquals(OmaIdentity.deriveRendezvousKey(OmaIdentity.unformat(omaId1))))
+        assertFalse(key1.contentEquals(key2))
     }
 
     @Test

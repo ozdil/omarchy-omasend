@@ -61,7 +61,7 @@ class OmaSendApp : Application() {
             }
             onCellularAvailable = {
                 wanDiscoveryEngine.setNetworkMode(NetworkTransportMode.WAN)
-                discoveryManager.refreshBluetoothPeers()
+                discoveryManager.forceRefresh()
             }
             onNetworkChanged = { state ->
                 if (state.isLanAvailable) {

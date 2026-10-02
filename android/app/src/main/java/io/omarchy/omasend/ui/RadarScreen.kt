@@ -258,7 +258,7 @@ fun RadarScreen(
                                 app.discoveryManager.forceRefresh()
                                 refreshRecentFiles()
                                 isRefreshing = false
-                                Toast.makeText(context, "Ağ ve Bluetooth eşleri güncellendi", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, "Ağ eşleri ve OmaID bağlantıları güncellendi", Toast.LENGTH_SHORT).show()
                             }
                         },
                         modifier = Modifier.size(38.dp)
@@ -568,8 +568,9 @@ fun RadarScreen(
                 showQrScannerDialog = false
                 scope.launch {
                     val formatted = OmaIdentity.format(scannedId)
-                    Toast.makeText(context, "OmaID okundu: $formatted. Cihaz eşleştiriliyor...", Toast.LENGTH_LONG).show()
+                    app.discoveryManager.addPairedOmaId(formatted)
                     app.discoveryManager.forceRefresh()
+                    Toast.makeText(context, "OmaID eşleşti: $formatted", Toast.LENGTH_LONG).show()
                 }
             }
         )
@@ -999,16 +1000,14 @@ fun ModernPeerCard(
             Surface(
                 shape = CircleShape,
                 color = when (peer.transport) {
-                    "BT" -> MaterialTheme.colorScheme.tertiaryContainer
-                    "HYBRID" -> MaterialTheme.colorScheme.secondaryContainer
+                    "WAN" -> MaterialTheme.colorScheme.secondaryContainer
+                    "DIRECT" -> MaterialTheme.colorScheme.tertiaryContainer
                     else -> MaterialTheme.colorScheme.primaryContainer
                 },
                 modifier = Modifier.size(46.dp)
             ) {
                 Box(contentAlignment = Alignment.Center) {
-                    val icon = if (peer.transport == "BT") {
-                        Icons.Default.Bluetooth
-                    } else if (peer.name.lowercase().contains("phone") || peer.name.lowercase().contains("android")) {
+                    val icon = if (peer.name.lowercase().contains("phone") || peer.name.lowercase().contains("android")) {
                         Icons.Default.PhoneAndroid
                     } else if (peer.name.lowercase().contains("laptop") || peer.name.lowercase().contains("thinkpad")) {
                         Icons.Default.Laptop
@@ -1019,8 +1018,8 @@ fun ModernPeerCard(
                         icon,
                         contentDescription = null,
                         tint = when (peer.transport) {
-                            "BT" -> MaterialTheme.colorScheme.onTertiaryContainer
-                            "HYBRID" -> MaterialTheme.colorScheme.onSecondaryContainer
+                            "WAN" -> MaterialTheme.colorScheme.onSecondaryContainer
+                            "DIRECT" -> MaterialTheme.colorScheme.onTertiaryContainer
                             else -> MaterialTheme.colorScheme.onPrimaryContainer
                         },
                         modifier = Modifier.size(24.dp)
@@ -1056,22 +1055,31 @@ fun ModernPeerCard(
                 }
                 Spacer(modifier = Modifier.height(2.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
+                    val isPaired = peer.isTrusted || peer.omaId.isNotEmpty()
+                    val transportLabel = when {
+                        peer.transport == "WAN" -> "WAN"
+                        peer.transport == "DIRECT" -> "DIRECT"
+                        isPaired -> "OMAID"
+                        else -> "LAN"
+                    }
                     Surface(
                         shape = RoundedCornerShape(6.dp),
-                        color = when (peer.transport) {
-                            "BT" -> MaterialTheme.colorScheme.tertiary.copy(alpha = 0.15f)
-                            "HYBRID" -> MaterialTheme.colorScheme.secondary.copy(alpha = 0.15f)
+                        color = when (transportLabel) {
+                            "WAN" -> MaterialTheme.colorScheme.secondary.copy(alpha = 0.15f)
+                            "DIRECT" -> MaterialTheme.colorScheme.tertiary.copy(alpha = 0.15f)
+                            "OMAID" -> Color(0xFF10B981).copy(alpha = 0.15f)
                             else -> MaterialTheme.colorScheme.primary.copy(alpha = 0.15f)
                         }
                     ) {
                         Text(
-                            text = peer.transport,
+                            text = transportLabel,
                             modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
                             style = MaterialTheme.typography.labelSmall,
                             fontWeight = FontWeight.Bold,
-                            color = when (peer.transport) {
-                                "BT" -> MaterialTheme.colorScheme.tertiary
-                                "HYBRID" -> MaterialTheme.colorScheme.secondary
+                            color = when (transportLabel) {
+                                "WAN" -> MaterialTheme.colorScheme.secondary
+                                "DIRECT" -> MaterialTheme.colorScheme.tertiary
+                                "OMAID" -> Color(0xFF059669)
                                 else -> MaterialTheme.colorScheme.primary
                             }
                         )
@@ -1083,7 +1091,7 @@ fun ModernPeerCard(
                             color = Color(0xFFF59E0B).copy(alpha = 0.15f)
                         ) {
                             Text(
-                                text = "GÜVENİLİR",
+                                text = "EŞLEŞMİŞ",
                                 modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
                                 style = MaterialTheme.typography.labelSmall,
                                 fontWeight = FontWeight.Bold,
@@ -1093,7 +1101,7 @@ fun ModernPeerCard(
                     }
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = if (peer.ip.startsWith("bt:")) "Bluetooth Paired" else "${peer.ip}:${peer.port}",
+                        text = if (peer.omaId.isNotEmpty()) OmaIdentity.format(peer.omaId) else "${peer.ip}:${peer.port}",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         fontFamily = FontFamily.Monospace,
@@ -1190,7 +1198,7 @@ fun CleanEmptyStateCard(
                 text = when (discoveryMode) {
                     DiscoveryMode.OFF -> "Cihazları görmek için görünürlüğü 'Herkes' veya 'Bilinenler' olarak açın."
                     DiscoveryMode.KNOWN_PEERS -> "Yalnızca güvenilir olarak işaretlenen veya eşleşen cihazlar listelenir. Yakındaki tüm cihazları görmek için 'Herkes' moduna geçebilirsiniz."
-                    DiscoveryMode.EVERYONE -> "Masaüstünde OmaSend'in açık olduğundan emin olun. Cihazlar farklı ağdaysa Bluetooth eşleştirmesini kontrol edin."
+                    DiscoveryMode.EVERYONE -> "Masaüstünde OmaSend'in açık olduğundan emin olun. Cihazlar farklı ağdaysa OmaID QR kodu ile eşleştirmeyi kontrol edin."
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1403,7 +1411,7 @@ fun TargetDeviceSelectionDialog(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Icon(
-                                    if (peer.transport == "BT") Icons.Default.Bluetooth else Icons.Default.Computer,
+                                    if (peer.name.lowercase().contains("phone") || peer.name.lowercase().contains("android")) Icons.Default.PhoneAndroid else Icons.Default.Computer,
                                     contentDescription = null,
                                     tint = MaterialTheme.colorScheme.primary,
                                     modifier = Modifier.size(24.dp)
@@ -1416,7 +1424,7 @@ fun TargetDeviceSelectionDialog(
                                         fontWeight = FontWeight.Bold
                                     )
                                     Text(
-                                        text = "${peer.ip} • ${peer.transport}",
+                                        text = if (peer.omaId.isNotEmpty()) "${peer.ip} • OmaID: ${OmaIdentity.format(peer.omaId)}" else "${peer.ip} • ${peer.transport}",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
@@ -1932,8 +1940,8 @@ fun InfoDialog(onDismiss: () -> Unit) {
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         InfoDialogRow("Ağ Protokolü", "P2P AirBridge + UDP Beacon (53317)")
-                        InfoDialogRow("Çevrimdışı Taşıma", "Bluetooth OBEX Push (OPP)")
-                        InfoDialogRow("Şifreleme & Bütünlük", "SHA-256 Checksum + Token Auth")
+                        InfoDialogRow("Uçtan Uca Kimlik", "16 Haneli Luhn OmaID + Rendezvous")
+                        InfoDialogRow("Şifreleme & Bütünlük", "AES-256-GCM + SHA-256 Checksum")
                         InfoDialogRow("Geliştirici", "Ozan Özdil (Omarchy Linux)")
                     }
                 }
@@ -2051,60 +2059,6 @@ suspend fun sendFileUriToPeer(
                 fileSize = context.contentResolver.openInputStream(uri)?.use { it.available().toLong() } ?: 0L
             }
 
-            // Bluetooth direct transfer
-            if (peer.transport == "BT" || peer.ip.startsWith("bt:")) {
-                withContext(Dispatchers.Main) {
-                    onState(TransferProgressState.Transferring(
-                        isUploading = true,
-                        peerName = peer.name,
-                        fileName = fileName,
-                        bytesTransferred = 0L,
-                        totalBytes = fileSize,
-                        percent = 0
-                    ))
-                }
-                val btMac = peer.fingerprint.ifEmpty { peer.ip }
-                val stream = context.contentResolver.openInputStream(uri)
-                if (stream != null) {
-                    val obexResult = stream.use { s ->
-                        TransferBridge.sendViaBluetoothDirectObexWithMetrics(
-                            context = context,
-                            targetMac = btMac,
-                            fileName = fileName,
-                            fileSize = fileSize,
-                            inputStream = s
-                        ) { sent, total, pct, speedMBps, etaSeconds ->
-                            withContext(Dispatchers.Main) {
-                                onState(TransferProgressState.Transferring(
-                                    isUploading = true,
-                                    peerName = peer.name,
-                                    fileName = fileName,
-                                    bytesTransferred = sent,
-                                    totalBytes = total,
-                                    percent = pct,
-                                    speedMBps = speedMBps,
-                                    etaSeconds = etaSeconds
-                                ))
-                            }
-                        }
-                    }
-                    if (obexResult.isSuccess) {
-                        withContext(Dispatchers.Main) {
-                            app.soundEngine.playSendSound()
-                            app.hapticController.onDropBounce()
-                            onState(TransferProgressState.Success("'$fileName' Bluetooth ile aktarıldı!"))
-                        }
-                        return@withContext
-                    }
-                }
-                // Fallback to system Bluetooth sharing if direct RFCOMM could not connect
-                withContext(Dispatchers.Main) {
-                    onState(TransferProgressState.Idle)
-                    TransferBridge.sendViaBluetooth(context, listOf(uri), targetMac = btMac)
-                }
-                return@withContext
-            }
-
             withContext(Dispatchers.Main) {
                 onState(TransferProgressState.Requesting(peer.name, fileName))
             }
@@ -2113,56 +2067,6 @@ suspend fun sendFileUriToPeer(
             val requestResult = app.client.sendTransferRequest(peer.ip, peer.port, listOf(fileInfo))
 
             val token = requestResult.getOrElse {
-                if (peer.transport == "HYBRID" || peer.fingerprint.isNotEmpty() || peer.ip.startsWith("bt:")) {
-                    val btMac = peer.fingerprint.ifEmpty { peer.ip }
-                    withContext(Dispatchers.Main) {
-                        Toast.makeText(context, "Wi-Fi yanıt vermedi. Bluetooth ile aktarılıyor...", Toast.LENGTH_SHORT).show()
-                        onState(TransferProgressState.Transferring(
-                            isUploading = true,
-                            peerName = peer.name,
-                            fileName = fileName,
-                            bytesTransferred = 0L,
-                            totalBytes = fileSize,
-                            percent = 0
-                        ))
-                    }
-                    val stream = context.contentResolver.openInputStream(uri)
-                    if (stream != null) {
-                        val obexResult = stream.use { s ->
-                            TransferBridge.sendViaBluetoothDirectObexWithMetrics(
-                                context = context,
-                                targetMac = btMac,
-                                fileName = fileName,
-                                fileSize = fileSize,
-                                inputStream = s
-                            ) { sent, total, pct, speedMBps, etaSeconds ->
-                                withContext(Dispatchers.Main) {
-                                    onState(TransferProgressState.Transferring(
-                                        isUploading = true,
-                                        peerName = peer.name,
-                                        fileName = fileName,
-                                        bytesTransferred = sent,
-                                        totalBytes = total,
-                                        percent = pct,
-                                        speedMBps = speedMBps,
-                                        etaSeconds = etaSeconds
-                                    ))
-                                }
-                            }
-                        }
-                        if (obexResult.isSuccess) {
-                            withContext(Dispatchers.Main) {
-                                onState(TransferProgressState.Success("'$fileName' Bluetooth ile aktarıldı!"))
-                            }
-                            return@withContext
-                        }
-                    }
-                    withContext(Dispatchers.Main) {
-                        onState(TransferProgressState.Idle)
-                        TransferBridge.sendViaBluetooth(context, listOf(uri), targetMac = btMac)
-                    }
-                    return@withContext
-                }
                 withContext(Dispatchers.Main) {
                     onState(TransferProgressState.Error(it.message ?: "Transfer isteği başarısız oldu"))
                 }
@@ -2225,12 +2129,7 @@ suspend fun sendClipboardToPeer(
     peer: DiscoveredPeer,
     onState: (TransferProgressState) -> Unit
 ) {
-    if (peer.transport == "BT" || peer.ip.startsWith("bt:")) {
-        withContext(Dispatchers.Main) {
-            Toast.makeText(context, "Pano senkronizasyonu yalnızca Wi-Fi (LAN) bağlantısıyla desteklenir.", Toast.LENGTH_SHORT).show()
-        }
-        return
-    }
+    if (peer.port <= 0) return
 
     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
     val clip = clipboard?.primaryClip

@@ -25,8 +25,30 @@ data class OmaIdentity(
         private const val PREFS_NAME = "omasend_identity_store"
         private const val KEY_OMA_ID = "active_oma_id"
         private const val KEY_CREATED_AT = "oma_id_created_at"
-        private const val DEFAULT_SALT = "omasend-gh-rendezvous-v1"
-        private const val KEY_DERIVATION_SALT = ":omasend-e2ee-key-v1"
+        private val RENDEZVOUS_SALT = "omasend-e2ee-rendezvous-salt-v1".toByteArray(Charsets.UTF_8)
+        private val RENDEZVOUS_INFO = "omasend-e2ee-rendezvous-aes256-gcm-key-v1".toByteArray(Charsets.UTF_8)
+        private val RENDEZVOUS_TOPIC_KEY = "omasend-gh-rendezvous-v1".toByteArray(Charsets.UTF_8)
+
+        /**
+         * Standard RFC 2104 HMAC-SHA256 calculation.
+         */
+        fun hmacSha256(key: ByteArray, data: ByteArray): ByteArray {
+            val mac = Mac.getInstance("HmacSHA256")
+            val secretKey = SecretKeySpec(key, "HmacSHA256")
+            mac.init(secretKey)
+            return mac.doFinal(data)
+        }
+
+        /**
+         * Standard RFC 5869 HKDF-SHA256 extraction and expansion for 32-byte key derivation.
+         */
+        fun hkdfSha256(ikm: ByteArray, salt: ByteArray, info: ByteArray): ByteArray {
+            val prk = hmacSha256(salt, ikm)
+            val infoWithCounter = ByteArray(info.size + 1)
+            System.arraycopy(info, 0, infoWithCounter, 0, info.size)
+            infoWithCounter[info.size] = 0x01.toByte()
+            return hmacSha256(prk, infoWithCounter)
+        }
 
         /**
          * Validates a 16-digit OmaID using Luhn mod 10 checksum.
@@ -99,25 +121,31 @@ data class OmaIdentity(
         }
 
         /**
-         * Derives a 64-character hex blind rendezvous topic using HMAC-SHA256.
+         * Computes the 64-character hex topic ID for blinded rendezvous using HMAC-SHA256.
+         * 100% byte-compatible with Rust rendezvous.rs compute_rendezvous_topic.
          */
-        fun deriveBlindTopic(omaId: String, salt: String = DEFAULT_SALT): String {
+        fun deriveBlindTopic(omaId: String, customTopicKey: ByteArray = RENDEZVOUS_TOPIC_KEY): String {
             val raw = unformat(omaId)
-            val mac = Mac.getInstance("HmacSHA256")
-            val secretKey = SecretKeySpec(raw.toByteArray(Charsets.UTF_8), "HmacSHA256")
-            mac.init(secretKey)
-            val hmacBytes = mac.doFinal(salt.toByteArray(Charsets.UTF_8))
-            return hmacBytes.joinToString("") { "%02x".format(it) }
+            val ikm = raw.toByteArray(Charsets.UTF_8)
+            val topicBytes = hmacSha256(ikm, customTopicKey)
+            return topicBytes.joinToString("") { "%02x".format(it) }
+        }
+
+        /**
+         * Derives a 256-bit symmetric key from OmaID using RFC 5869 HKDF-SHA256.
+         * 100% byte-compatible with Rust rendezvous.rs derive_rendezvous_key.
+         */
+        fun deriveRendezvousKey(omaId: String): ByteArray {
+            val raw = unformat(omaId)
+            val ikm = raw.toByteArray(Charsets.UTF_8)
+            return hkdfSha256(ikm, RENDEZVOUS_SALT, RENDEZVOUS_INFO)
         }
 
         /**
          * Derives a 256-bit AES key from OmaID.
          */
         fun deriveAesKey(omaId: String): SecretKeySpec {
-            val raw = unformat(omaId)
-            val md = MessageDigest.getInstance("SHA-256")
-            val keyBytes = md.digest((raw + KEY_DERIVATION_SALT).toByteArray(Charsets.UTF_8))
-            return SecretKeySpec(keyBytes, "AES")
+            return SecretKeySpec(deriveRendezvousKey(omaId), "AES")
         }
 
         /**

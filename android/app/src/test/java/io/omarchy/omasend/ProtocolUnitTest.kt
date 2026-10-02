@@ -28,8 +28,8 @@ class ProtocolUnitTest {
             ip = "192.168.1.55",
             port = 53317,
             mode = "ALL",
-            bt = false,
-            fp = "a1b2c3d4"
+            oma_id = "4829-1048-5729-1104",
+            fp = "4829-1048-5729-1104"
         )
         val serialized = json.encodeToString(P2pBeaconPacket.serializer(), packet)
         assertTrue(serialized.contains("\"magic\":\"OMASEND_P2P\""))

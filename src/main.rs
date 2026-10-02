@@ -145,10 +145,12 @@ pub struct FileInfo {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DiscoveredPeer {
     pub id: String,
+    #[serde(default)]
+    pub oma_id: String,
     pub name: String,
     pub ip: String,
     pub port: u16,
-    pub transport: String, // "LAN", "BT", or "HYBRID"
+    pub transport: String, // "LAN"
     pub fingerprint: String,
     pub is_trusted: bool,
     pub last_seen_secs: u64,
@@ -232,11 +234,12 @@ pub struct P2pBeaconPacket {
     pub magic: String,
     pub v: u32,
     pub id: String,
+    #[serde(default)]
+    pub oma_id: String,
     pub name: String,
     pub ip: String,
     pub port: u16,
     pub mode: String,
-    pub bt: bool,
     pub fp: String,
 }
 
@@ -261,12 +264,11 @@ pub struct ServerState {
     pub total_received: usize,
     pub recent_files: Vec<FileInfo>,
     pub shared_files: Vec<FileInfo>,
-    // AirBridge P2P & Bluetooth
+    // AirBridge P2P (Strict OmaID)
     pub p2p_device_id: String,
     pub p2p_hostname: String,
     pub p2p_visibility: String,
     pub p2p_visibility_remaining_secs: u64,
-    pub p2p_bluetooth_available: bool,
     pub p2p_discovered_peers: Vec<DiscoveredPeer>,
     pub p2p_pending_transfer: Option<PendingFileTransfer>,
     pub clipboard_vault: Vec<ClipboardItem>,
@@ -1641,28 +1643,49 @@ fn play_clipboard_sound() {
     });
 }
 
+fn get_active_paired_peer_ips() -> Vec<String> {
+    let paired = load_paired_peers();
+    let discovered = get_discovered_peers();
+    let mut ips = Vec::new();
+
+    for p in &paired {
+        let p_norm = rendezvous::normalize_oma_id(&p.oma_id);
+        if let Some(disc) = discovered.iter().find(|d| rendezvous::normalize_oma_id(&d.oma_id) == p_norm || d.id == p.oma_id) {
+            if !disc.ip.is_empty() && !ips.contains(&disc.ip) {
+                ips.push(disc.ip.clone());
+            }
+        } else if let Some(ref static_ip) = p.ip {
+            if !static_ip.is_empty() && !ips.contains(static_ip) {
+                ips.push(static_ip.clone());
+            }
+        }
+    }
+    ips
+}
+
 fn p2p_push_clipboard_silent(target_ip: &str, text: &str) {
-    if target_ip.is_empty()
-        || target_ip.starts_with("bt:")
-        || (target_ip.len() == 17 && target_ip.chars().filter(|c| *c == ':').count() == 5)
-    {
+    if target_ip.is_empty() {
         return;
     }
     let (my_id, _) = get_or_create_device_id();
+    let my_oma_id = get_or_create_oma_id();
     let my_name = get_system_hostname();
     let payload = serde_json::json!({
-        "sender_id": my_id,
+        "sender_id": my_oma_id,
+        "oma_id": my_oma_id,
+        "device_id": my_id,
         "sender_name": my_name,
         "content_type": "text",
         "text": text
     });
     let addr = resolve_peer_addr(target_ip);
     let req_bytes = payload.to_string().into_bytes();
+    let oma_id_hdr = my_oma_id.clone();
     thread::spawn(move || {
         if let Ok(mut stream) = connect_peer_with_timeout(&addr, Duration::from_millis(1500)) {
             let http_req = format!(
-                "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                addr, req_bytes.len()
+                "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-OmaSend-OmaID: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                addr, oma_id_hdr, req_bytes.len()
             );
             let _ = stream.write_all(http_req.as_bytes());
             let _ = stream.write_all(&req_bytes);
@@ -1681,13 +1704,11 @@ pub fn p2p_push_image_clipboard_silent(
     height: u32,
     data: Option<&[u8]>,
 ) {
-    if target_ip.is_empty()
-        || target_ip.starts_with("bt:")
-        || (target_ip.len() == 17 && target_ip.chars().filter(|c| *c == ':').count() == 5)
-    {
+    if target_ip.is_empty() {
         return;
     }
     let (my_id, _) = get_or_create_device_id();
+    let my_oma_id = get_or_create_oma_id();
     let my_name = get_system_hostname();
 
     let image_base64 = if let Some(d) = data {
@@ -1714,7 +1735,9 @@ pub fn p2p_push_image_clipboard_silent(
     };
 
     let payload = serde_json::json!({
-        "sender_id": my_id,
+        "sender_id": my_oma_id,
+        "oma_id": my_oma_id,
+        "device_id": my_id,
         "sender_name": my_name,
         "content_type": content_type,
         "image_hash": hash,
@@ -1727,11 +1750,12 @@ pub fn p2p_push_image_clipboard_silent(
 
     let addr = resolve_peer_addr(target_ip);
     let req_bytes = payload.to_string().into_bytes();
+    let oma_id_hdr = my_oma_id.clone();
     thread::spawn(move || {
         if let Ok(mut stream) = connect_peer_with_timeout(&addr, Duration::from_millis(2500)) {
             let http_req = format!(
-                "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                addr, req_bytes.len()
+                "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-OmaSend-OmaID: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                addr, oma_id_hdr, req_bytes.len()
             );
             let _ = stream.write_all(http_req.as_bytes());
             let _ = stream.write_all(&req_bytes);
@@ -1820,19 +1844,17 @@ pub fn start_clipboard_sentinel() {
                     };
                     let _ = add_image_clipboard_to_vault("Local", &ct, &img_hash, size, w, h, thumb_b64);
 
-                    let peers = get_discovered_peers();
-                    for peer in peers {
-                        if !peer.ip.is_empty() && !peer.ip.starts_with("bt:") && peer.transport != "BT" && peer.port > 0 {
-                            p2p_push_image_clipboard_silent(
-                                &peer.ip,
-                                &ct,
-                                &img_hash,
-                                size,
-                                w,
-                                h,
-                                Some(&img_bytes),
-                            );
-                        }
+                    let target_ips = get_active_paired_peer_ips();
+                    for target_ip in target_ips {
+                        p2p_push_image_clipboard_silent(
+                            &target_ip,
+                            &ct,
+                            &img_hash,
+                            size,
+                            w,
+                            h,
+                            Some(&img_bytes),
+                        );
                     }
                     continue;
                 }
@@ -1855,11 +1877,9 @@ pub fn start_clipboard_sentinel() {
             set_last_synced_clipboard_hash(&hash);
             let _ = add_clipboard_to_vault("Local", &text);
 
-            let peers = get_discovered_peers();
-            for peer in peers {
-                if !peer.ip.is_empty() && !peer.ip.starts_with("bt:") && peer.transport != "BT" && peer.port > 0 {
-                    p2p_push_clipboard_silent(&peer.ip, &text);
-                }
+            let target_ips = get_active_paired_peer_ips();
+            for target_ip in target_ips {
+                p2p_push_clipboard_silent(&target_ip, &text);
             }
         }
     });
@@ -2026,7 +2046,7 @@ fn get_directory_files(dir: &Path) -> Vec<FileInfo> {
     files
 }
 
-// ------------------- P2P AIRDROP & BLUETOOTH MODULE -------------------
+// ------------------- P2P AIRBRIDGE MODULE (STRICT OMAID) -------------------
 
 fn urlencoding_encode(input: &str) -> String {
     let mut out = String::new();
@@ -2109,6 +2129,7 @@ fn broadcast_offline_beacon() {
     };
     let _ = socket.set_broadcast(true);
     let (device_id, fp) = get_or_create_device_id();
+    let oma_id = get_or_create_oma_id();
     let hostname = get_system_hostname();
     let ip = get_local_ip();
 
@@ -2116,11 +2137,11 @@ fn broadcast_offline_beacon() {
         magic: "OMASEND_P2P".to_string(),
         v: 1,
         id: device_id,
+        oma_id,
         name: hostname,
         ip: ip.clone(),
         port: PORT,
         mode: "OFF".to_string(),
-        bt: is_bluetooth_available(),
         fp,
     };
 
@@ -2154,6 +2175,18 @@ fn set_visibility(mode: &str) {
     }
 }
 
+pub fn load_paired_peers() -> Vec<rendezvous::PairedPeer> {
+    rendezvous::load_paired_peers(&get_state_dir())
+}
+
+pub fn is_peer_paired(oma_id: &str) -> bool {
+    rendezvous::is_peer_paired(oma_id, &get_state_dir())
+}
+
+pub fn add_paired_peer(oma_id: &str, name: &str, ip: Option<&str>) -> Result<rendezvous::PairedPeer, String> {
+    rendezvous::add_paired_peer(oma_id, name, ip, &get_state_dir())
+}
+
 fn load_trusted_peers() -> Vec<TrustedPeer> {
     let path = get_state_dir().join("trusted_peers.json");
     if let Ok(content) = read_secure_file(&path) {
@@ -2165,11 +2198,13 @@ fn load_trusted_peers() -> Vec<TrustedPeer> {
 }
 
 fn is_peer_trusted(peer_id: &str) -> bool {
-    let peers = load_trusted_peers();
-    peers.iter().any(|p| p.id == peer_id)
+    is_peer_paired(peer_id) || load_trusted_peers().iter().any(|p| p.id == peer_id)
 }
 
 fn add_trusted_peer(id: &str, name: &str, fingerprint: &str) {
+    if rendezvous::validate_oma_id(id) {
+        let _ = add_paired_peer(id, name, None);
+    }
     let mut peers = load_trusted_peers();
     if !peers.iter().any(|p| p.id == id) {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -2185,81 +2220,6 @@ fn add_trusted_peer(id: &str, name: &str, fingerprint: &str) {
             let _ = write_secure_file(&path, &s);
         }
     }
-}
-
-fn is_bluetooth_available() -> bool {
-    let deadline = Instant::now() + Duration::from_millis(400);
-    if let Some(out) = run_cmd_bounded("/usr/bin/bluetoothctl", &["show"], &[], deadline, 4096) {
-        let s = String::from_utf8_lossy(&out);
-        return s.contains("Powered: yes");
-    }
-    false
-}
-
-fn is_accessory_device(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    lower.contains("controller")
-        || lower.contains("gamepad")
-        || lower.contains("joystick")
-        || lower.contains("mouse")
-        || lower.contains("keyboard")
-        || lower.contains("headset")
-        || lower.contains("headphones")
-        || lower.contains("earbuds")
-        || lower.contains("airpods")
-        || lower.contains("beats")
-        || lower.contains("buds")
-        || lower.contains("sound")
-        || lower.contains("audio")
-        || lower.contains("tws")
-        || lower.contains("watch")
-        || lower.contains("speaker")
-}
-
-pub fn parse_bluetooth_paired_devices(output: &str, now: u64) -> Vec<DiscoveredPeer> {
-    let mut peers = Vec::new();
-    for line in output.lines() {
-        let trimmed = line.trim();
-        // Line format: "Device 4C:E2:0F:FD:5E:06 POCO X8 Pro Max"
-        if let Some(rest) = trimmed.strip_prefix("Device ") {
-            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
-            if parts.len() == 2 {
-                let mac = parts[0].trim();
-                let name = parts[1].trim();
-                if is_accessory_device(name) {
-                    continue;
-                }
-                if mac.len() == 17 && mac.chars().filter(|c| *c == ':').count() == 5 {
-                    let clean_id = format!("bt_{}", mac.replace(':', ""));
-                    peers.push(DiscoveredPeer {
-                        id: clean_id,
-                        name: name.to_string(),
-                        ip: format!("bt:{}", mac),
-                        port: 0,
-                        transport: "BT".to_string(),
-                        fingerprint: mac.to_string(),
-                        is_trusted: true,
-                        last_seen_secs: now,
-                    });
-                }
-            }
-        }
-    }
-    peers
-}
-
-fn get_bluetooth_paired_peers() -> Vec<DiscoveredPeer> {
-    if !is_bluetooth_available() {
-        return Vec::new();
-    }
-    let deadline = Instant::now() + Duration::from_millis(600);
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-
-    if let Some(out) = run_cmd_bounded("/usr/bin/bluetoothctl", &["devices", "Paired"], &[], deadline, 4096) {
-        let output_str = String::from_utf8_lossy(&out);
-        return parse_bluetooth_paired_devices(&output_str, now);
-    }
-    Vec::new()
 }
 
 fn get_pending_transfer() -> Option<PendingFileTransfer> {
@@ -2294,46 +2254,25 @@ fn get_discovered_peers() -> Vec<DiscoveredPeer> {
     }
 
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let mut lan_peers = Vec::new();
+    let mut peers = Vec::new();
     let path = get_state_dir().join("discovered_peers.json");
     if let Ok(content) = read_secure_file(&path) {
-        if let Ok(peers) = serde_json::from_str::<Vec<DiscoveredPeer>>(&content) {
+        if let Ok(loaded) = serde_json::from_str::<Vec<DiscoveredPeer>>(&content) {
             // Prune peers older than 15s
-            lan_peers = peers.into_iter().filter(|p| now.saturating_sub(p.last_seen_secs) <= 15).collect();
+            peers = loaded.into_iter().filter(|p| now.saturating_sub(p.last_seen_secs) <= 15).collect();
         }
     }
 
-    let bt_peers = get_bluetooth_paired_peers();
-    let mut merged = Vec::new();
-
-    for mut lan_peer in lan_peers {
-        let has_bt_match = bt_peers.iter().any(|b| {
-            b.name.eq_ignore_ascii_case(&lan_peer.name)
-                || lan_peer.name.to_lowercase().contains(&b.name.to_lowercase())
-                || b.name.to_lowercase().contains(&lan_peer.name.to_lowercase())
-        });
-        if has_bt_match {
-            lan_peer.transport = "HYBRID".to_string();
-        }
-        merged.push(lan_peer);
-    }
-
-    for bt_peer in bt_peers {
-        let already_merged = merged.iter().any(|p| {
-            p.name.eq_ignore_ascii_case(&bt_peer.name)
-                || p.id == bt_peer.id
-                || p.fingerprint == bt_peer.fingerprint
-        });
-        if !already_merged {
-            merged.push(bt_peer);
-        }
+    for p in &mut peers {
+        p.is_trusted = is_peer_paired(&p.oma_id) || is_peer_trusted(&p.id);
+        p.transport = "LAN".to_string();
     }
 
     if vis == "KNOWN" {
-        merged.retain(|p| p.is_trusted);
+        peers.retain(|p| p.is_trusted);
     }
 
-    merged
+    peers
 }
 
 fn save_discovered_peers(peers: &[DiscoveredPeer]) {
@@ -2372,7 +2311,8 @@ fn is_local_subnet_or_private_ip(ip: &str) -> bool {
 fn update_discovered_peer(packet: &P2pBeaconPacket) {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let (my_id, _) = get_or_create_device_id();
-    if packet.id == my_id {
+    let my_oma_id = get_or_create_oma_id();
+    if packet.id == my_id || (!packet.oma_id.is_empty() && rendezvous::normalize_oma_id(&packet.oma_id) == rendezvous::normalize_oma_id(&my_oma_id)) {
         return;
     }
 
@@ -2380,7 +2320,7 @@ fn update_discovered_peer(packet: &P2pBeaconPacket) {
     if packet.mode == "OFF" || packet.mode == "STOP" {
         let mut peers = get_discovered_peers();
         let initial_len = peers.len();
-        peers.retain(|p| p.id != packet.id && p.ip != packet.ip);
+        peers.retain(|p| p.id != packet.id && p.ip != packet.ip && (p.oma_id.is_empty() || p.oma_id != packet.oma_id));
         if peers.len() != initial_len {
             save_discovered_peers(&peers);
         }
@@ -2391,36 +2331,37 @@ fn update_discovered_peer(packet: &P2pBeaconPacket) {
     if vis == "OFF" {
         return;
     }
-    let trusted = is_peer_trusted(&packet.id);
+    let is_paired = (!packet.oma_id.is_empty() && is_peer_paired(&packet.oma_id)) || is_peer_trusted(&packet.id);
     let is_local_net = is_local_subnet_or_private_ip(&packet.ip);
-    if vis == "KNOWN" && !trusted && !is_local_net && packet.mode != "EVERYONE" {
+    if vis == "KNOWN" && !is_paired && !is_local_net && packet.mode != "EVERYONE" {
         return;
     }
 
-    let transport = if packet.bt && is_bluetooth_available() {
-        "HYBRID".to_string()
-    } else {
-        "LAN".to_string()
-    };
+    // If paired OmaID, immediately sync and ensure current active IP is recorded
+    if !packet.oma_id.is_empty() && is_peer_paired(&packet.oma_id) {
+        let _ = add_paired_peer(&packet.oma_id, &packet.name, Some(&packet.ip));
+    }
 
     let mut peers = get_discovered_peers();
-    if let Some(existing) = peers.iter_mut().find(|p| p.id == packet.id) {
+    if let Some(existing) = peers.iter_mut().find(|p| (!packet.oma_id.is_empty() && p.oma_id == packet.oma_id) || p.id == packet.id) {
+        existing.oma_id = packet.oma_id.clone();
         existing.name = packet.name.clone();
         existing.ip = packet.ip.clone();
         existing.port = packet.port;
-        existing.transport = transport;
+        existing.transport = "LAN".to_string();
         existing.fingerprint = packet.fp.clone();
-        existing.is_trusted = trusted;
+        existing.is_trusted = is_paired;
         existing.last_seen_secs = now;
     } else {
         peers.push(DiscoveredPeer {
             id: packet.id.clone(),
+            oma_id: packet.oma_id.clone(),
             name: packet.name.clone(),
             ip: packet.ip.clone(),
             port: packet.port,
-            transport,
+            transport: "LAN".to_string(),
             fingerprint: packet.fp.clone(),
-            is_trusted: trusted,
+            is_trusted: is_paired,
             last_seen_secs: now,
         });
     }
@@ -2490,19 +2431,19 @@ pub fn send_p2p_beacon_burst(burst_count: usize) {
         return;
     }
     let (device_id, fp) = get_or_create_device_id();
+    let oma_id = get_or_create_oma_id();
     let hostname = get_system_hostname();
     let ip = get_local_ip();
-    let bt = is_bluetooth_available();
 
     let packet = P2pBeaconPacket {
         magic: "OMASEND_P2P".to_string(),
         v: 1,
         id: device_id,
+        oma_id,
         name: hostname,
         ip: ip.clone(),
         port: PORT,
         mode: vis,
-        bt,
         fp,
     };
 
@@ -2618,6 +2559,7 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
     let file_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
 
     let (my_id, _) = get_or_create_device_id();
+    let my_oma_id = get_or_create_oma_id();
     let my_name = get_system_hostname();
 
     let (blake3_hex, sha256_hex, md5_hex) = compute_file_military_hashes(file_path)
@@ -2625,7 +2567,9 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
 
     // 1. Send transfer request
     let request_payload = serde_json::json!({
-        "sender_id": my_id,
+        "sender_id": my_oma_id,
+        "oma_id": my_oma_id,
+        "device_id": my_id,
         "sender_name": my_name,
         "sender_ip": get_local_ip(),
         "files": [
@@ -2653,8 +2597,8 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
     };
     let req_bytes = request_payload.to_string().into_bytes();
     let http_req = format!(
-        "POST /api/p2p/request HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        addr, req_bytes.len()
+        "POST /api/p2p/request HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-OmaSend-OmaID: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        addr, my_oma_id, req_bytes.len()
     );
     stream.write_all(http_req.as_bytes()).map_err(|e| e.to_string())?;
     stream.write_all(&req_bytes).map_err(|e| e.to_string())?;
@@ -2749,140 +2693,6 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
     Ok(())
 }
 
-pub fn sanitize_bluetooth_mac(raw: &str) -> Option<String> {
-    let clean: String = raw.chars().filter(|c| c.is_ascii_hexdigit() || *c == ':').collect();
-    if clean.len() == 17 && clean.chars().filter(|c| *c == ':').count() == 5 {
-        Some(clean)
-    } else {
-        None
-    }
-}
-
-pub fn p2p_send_file_via_bluetooth(mac: &str, file_path: &Path) -> Result<(), String> {
-    let clean_mac = sanitize_bluetooth_mac(mac)
-        .ok_or_else(|| format!("Invalid Bluetooth MAC address format: '{}'", mac))?;
-
-    let _ = safe_read_file(file_path).map_err(|e| format!("Security check failed: {}", e))?;
-    let file_str = file_path.to_str().ok_or_else(|| "Invalid file path UTF-8".to_string())?;
-    let file_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-
-    notify_desktop(
-        "OmaSend Bluetooth",
-        &format!("Sending '{}' via Bluetooth to {}...", file_name, clean_mac),
-    );
-
-    let bin = if Path::new("/usr/bin/bt-obex").exists() {
-        "/usr/bin/bt-obex"
-    } else {
-        return Err("Bluetooth OBEX tool (/usr/bin/bt-obex) not found on system. Install bluez-tools/bluez-obex.".to_string());
-    };
-
-    let deadline = Instant::now() + Duration::from_secs(180);
-    println!("Initiating Bluetooth OBEX push to {} for file: {}", clean_mac, file_str);
-    let mut envs = Vec::new();
-    if let Ok(val) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
-        envs.push(("DBUS_SESSION_BUS_ADDRESS", val));
-    }
-    if let Ok(val) = std::env::var("XDG_RUNTIME_DIR") {
-        envs.push(("XDG_RUNTIME_DIR", val));
-    }
-    let env_refs: Vec<(&str, &str)> = envs.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    if let Some(out) = run_cmd_bounded(bin, &["-p", &clean_mac, file_str], &env_refs, deadline, 8192) {
-        let resp = String::from_utf8_lossy(&out);
-        if resp.to_lowercase().contains("error") || resp.to_lowercase().contains("failed") {
-            notify_desktop(
-                "OmaSend Bluetooth",
-                &format!("Bluetooth transfer failed for '{}': {}", file_name, resp.trim()),
-            );
-            return Err(format!("Bluetooth transfer failed: {}", resp.trim()));
-        }
-        notify_desktop(
-            "OmaSend Bluetooth",
-            &format!("'{}' successfully sent via Bluetooth to {}!", file_name, clean_mac),
-        );
-        Ok(())
-    } else {
-        notify_desktop(
-            "OmaSend Bluetooth",
-            &format!("Bluetooth transfer timed out for '{}'.", file_name),
-        );
-        Err("Bluetooth transfer timed out or failed to connect.".to_string())
-    }
-}
-
-fn ensure_obex_service_running() {
-    if let Ok(config_home) = std::env::var("XDG_CONFIG_HOME")
-        .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.config", h)))
-    {
-        let dropin_dir = PathBuf::from(config_home).join("systemd/user/obex.service.d");
-        let dropin_file = dropin_dir.join("override.conf");
-        if !dropin_file.exists() {
-            let _ = fs::create_dir_all(&dropin_dir);
-            let content = "[Service]\nExecStart=\nExecStart=/usr/lib/bluetooth/obexd -r %h/Downloads -a\n";
-            let _ = fs::write(&dropin_file, content);
-            let mut envs = Vec::new();
-            if let Ok(val) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
-                envs.push(("DBUS_SESSION_BUS_ADDRESS", val));
-            }
-            if let Ok(val) = std::env::var("XDG_RUNTIME_DIR") {
-                envs.push(("XDG_RUNTIME_DIR", val));
-            }
-            let env_refs: Vec<(&str, &str)> = envs.iter().map(|(k, v)| (*k, v.as_str())).collect();
-            let dl = Instant::now() + Duration::from_millis(500);
-            let _ = run_cmd_bounded("/usr/bin/systemctl", &["--user", "daemon-reload"], &env_refs, dl, 1024);
-        }
-    }
-
-    let mut envs = Vec::new();
-    if let Ok(val) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
-        envs.push(("DBUS_SESSION_BUS_ADDRESS", val));
-    }
-    if let Ok(val) = std::env::var("XDG_RUNTIME_DIR") {
-        envs.push(("XDG_RUNTIME_DIR", val));
-    }
-    let env_refs: Vec<(&str, &str)> = envs.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    let deadline = Instant::now() + Duration::from_millis(500);
-    let _ = run_cmd_bounded("/usr/bin/systemctl", &["--user", "restart", "obex.service"], &env_refs, deadline, 1024);
-}
-
-fn start_bluetooth_receiver(download_dir: &Path) {
-    if !is_bluetooth_available() {
-        return;
-    }
-    let deadline = Instant::now() + Duration::from_millis(500);
-    if let Some(out) = run_cmd_bounded("/usr/bin/pgrep", &["-f", "bt-obex -s"], &[], deadline, 256) {
-        if !out.is_empty() {
-            return;
-        }
-    }
-    ensure_obex_service_running();
-    let dir_str = download_dir.to_string_lossy().to_string();
-    let _ = fs::create_dir_all(download_dir);
-
-    if Path::new("/usr/bin/bt-obex").exists() {
-        thread::spawn(move || {
-            let mut cmd = Command::new("/usr/bin/bt-obex");
-            cmd.args(["-s", &dir_str, "-y"])
-                .env_clear()
-                .env("PATH", "/usr/bin:/bin")
-                .env("LC_ALL", "C");
-            if let Ok(val) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
-                cmd.env("DBUS_SESSION_BUS_ADDRESS", val);
-            }
-            if let Ok(val) = std::env::var("XDG_RUNTIME_DIR") {
-                cmd.env("XDG_RUNTIME_DIR", val);
-            }
-            cmd.stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .process_group(0);
-            if let Ok(mut child) = cmd.spawn() {
-                let _ = child.wait();
-            }
-        });
-    }
-}
-
 fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
     if let Some((img_bytes, ct, w, h)) = get_pc_image_clipboard() {
         let hash = compute_image_clipboard_hash(&img_bytes);
@@ -2907,27 +2717,13 @@ fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
         return Err("Clipboard is empty".to_string());
     }
 
-    if target_ip.starts_with("bt:") || (target_ip.len() == 17 && target_ip.chars().filter(|c| *c == ':').count() == 5) {
-        let mac = target_ip.strip_prefix("bt:").unwrap_or(target_ip);
-        let temp_clip = get_state_dir().join("clipboard_share.txt");
-        let _ = write_secure_file(&temp_clip, &text);
-        match p2p_send_file_via_bluetooth(mac, &temp_clip) {
-            Ok(()) => {
-                println!("Clipboard text sent via Bluetooth to {}", mac);
-                notify_desktop("OmaSend AirBridge", "Clipboard text sent via Bluetooth.");
-                return Ok(());
-            }
-            Err(e) => {
-                notify_desktop("OmaSend AirBridge", &format!("Bluetooth clipboard send failed: {}", e));
-                return Err(e);
-            }
-        }
-    }
-
     let (my_id, _) = get_or_create_device_id();
+    let my_oma_id = get_or_create_oma_id();
     let my_name = get_system_hostname();
     let payload = serde_json::json!({
-        "sender_id": my_id,
+        "sender_id": my_oma_id,
+        "oma_id": my_oma_id,
+        "device_id": my_id,
         "sender_name": my_name,
         "content_type": "text",
         "text": text
@@ -2936,17 +2732,6 @@ fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
     let mut stream = match connect_peer_with_timeout(&addr, Duration::from_secs(4)) {
         Ok(s) => s,
         Err(e) => {
-            let bt_peers = get_bluetooth_paired_peers();
-            if let Some(bt_match) = bt_peers.first() {
-                let mac = bt_match.ip.strip_prefix("bt:").unwrap_or(&bt_match.ip);
-                notify_desktop("OmaSend AirBridge", &format!("LAN unreachable. Attempting Bluetooth clipboard sync to {}...", bt_match.name));
-                let temp_clip = get_state_dir().join("clipboard_share.txt");
-                let _ = write_secure_file(&temp_clip, &text);
-                if let Ok(()) = p2p_send_file_via_bluetooth(mac, &temp_clip) {
-                    notify_desktop("OmaSend AirBridge", "Clipboard text sent via Bluetooth fallback.");
-                    return Ok(());
-                }
-            }
             notify_desktop(
                 "OmaSend AirBridge",
                 &format!("Connection failed to {}. Ensure peer is online.", target_ip),
@@ -2956,8 +2741,8 @@ fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
     };
     let req_bytes = payload.to_string().into_bytes();
     let http_req = format!(
-        "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        addr, req_bytes.len()
+        "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-OmaSend-OmaID: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        addr, my_oma_id, req_bytes.len()
     );
     stream.write_all(http_req.as_bytes()).map_err(|e| e.to_string())?;
     stream.write_all(&req_bytes).map_err(|e| e.to_string())?;
@@ -4305,13 +4090,72 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
     if req.path == "/api/p2p/ping" {
         let (id, _) = get_or_create_device_id();
         let (vis, _) = get_visibility();
+        let my_oma_id = get_or_create_oma_id();
         let resp = serde_json::json!({
             "status": "OK",
-            "id": id,
+            "id": my_oma_id.clone(),
+            "oma_id": my_oma_id,
+            "device_id": id,
             "name": get_system_hostname(),
             "mode": vis
         });
         respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+        return;
+    }
+
+    if req.method == "POST" && req.path == "/api/p2p/pair" {
+        let (vis, _) = get_visibility();
+        if vis == "OFF" {
+            let err = serde_json::json!({ "error": "Recipient AirBridge visibility is turned Off" });
+            respond(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
+            return;
+        }
+
+        if content_length > MAX_CONTROL_BODY {
+            let err = serde_json::json!({ "error": "Request payload exceeds control limit" });
+            respond(&stream, "413 Payload Too Large", "application/json", err.to_string().as_bytes(), None, None);
+            return;
+        }
+
+        let body_deadline = Instant::now() + Duration::from_secs(DEFAULT_BODY_TIMEOUT_SECS);
+        let body = match read_http_body(&mut stream, content_length, &initial_body, body_deadline, false, MAX_CONTROL_BODY) {
+            Some(b) => b,
+            None => return,
+        };
+
+        let body_slice = match body.as_slice() {
+            Some(s) => s,
+            None => {
+                respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid request\"}", None, None);
+                return;
+            }
+        };
+
+        if let Ok(req_data) = serde_json::from_slice::<serde_json::Value>(body_slice) {
+            let peer_oma_id = req_data.get("oma_id")
+                .or_else(|| req_data.get("sender_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let peer_name = req_data["name"].as_str().or_else(|| req_data["sender_name"].as_str()).unwrap_or("Paired Device");
+            let peer_ip = req_data["ip"].as_str().or_else(|| req_data["sender_ip"].as_str());
+
+            if rendezvous::validate_oma_id(peer_oma_id) {
+                let _ = add_paired_peer(peer_oma_id, peer_name, peer_ip);
+                let my_oma_id = get_or_create_oma_id();
+                let my_name = get_system_hostname();
+                let resp = serde_json::json!({
+                    "status": "PAIRED",
+                    "oma_id": my_oma_id,
+                    "name": my_name
+                });
+                respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+                return;
+            } else {
+                respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid OmaID\"}", None, None);
+                return;
+            }
+        }
+        respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid JSON\"}", None, None);
         return;
     }
 
@@ -4321,8 +4165,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         let resp = serde_json::json!({
             "peers": peers,
             "visibility": vis,
-            "remaining_secs": remaining,
-            "bluetooth_available": is_bluetooth_available()
+            "remaining_secs": remaining
         });
         respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
         return;
@@ -4363,13 +4206,19 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             }
         };
 
-        let sender_id = req_data["sender_id"].as_str().unwrap_or("unknown").to_string();
+        let sender_id = req_data.get("oma_id")
+            .or_else(|| req_data.get("sender_oma_id"))
+            .or_else(|| req_data.get("sender_id"))
+            .and_then(|v| v.as_str())
+            .or_else(|| req.get_header("x-omasend-omaid"))
+            .unwrap_or("unknown")
+            .to_string();
         let sender_name = req_data["sender_name"].as_str().unwrap_or("Unknown Omarchy Device").to_string();
         let sender_ip = req_data["sender_ip"].as_str().unwrap_or("").to_string();
-        let is_trusted = is_peer_trusted(&sender_id);
+        let is_trusted = is_peer_paired(&sender_id) || is_peer_trusted(&sender_id);
 
-        if vis == "KNOWN" && !is_trusted {
-            let err = serde_json::json!({ "error": "Peer is not in trusted peers list and visibility is set to Known Only" });
+        if !is_trusted {
+            let err = serde_json::json!({ "error": "Peer OmaID is not paired with this device" });
             respond(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
             return;
         }
@@ -4730,11 +4579,16 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             }
         };
         if let Ok(val) = serde_json::from_slice::<serde_json::Value>(body_slice) {
-            let sender_id = val["sender_id"].as_str().unwrap_or_default();
+            let sender_id = val.get("oma_id")
+                .or_else(|| val.get("sender_oma_id"))
+                .or_else(|| val.get("sender_id"))
+                .and_then(|v| v.as_str())
+                .or_else(|| req.get_header("x-omasend-omaid"))
+                .unwrap_or_default();
             let sender_name = val["sender_name"].as_str().unwrap_or("Nearby Device");
-            let is_trusted = is_peer_trusted(sender_id);
-            if vis == "KNOWN" && !is_trusted {
-                respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Peer not trusted\"}", None, None);
+            let is_trusted = is_peer_paired(sender_id) || is_peer_trusted(sender_id);
+            if !is_trusted {
+                respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Peer OmaID is not paired\"}", None, None);
                 return;
             }
 
@@ -5274,7 +5128,6 @@ fn run_server() {
     // Spawn P2P AirBridge discovery threads
     thread::spawn(run_p2p_discovery_listener);
     thread::spawn(run_p2p_beacon_broadcaster);
-    start_bluetooth_receiver(&get_download_dir());
     start_download_dir_watcher(&get_download_dir());
     start_clipboard_sentinel();
 
@@ -5441,14 +5294,21 @@ fn main() {
 
     if let Some(pos) = args.iter().position(|a| a == "--bind-oma-id" || a == "--pair-peer" || a == "--pair-oma-id") {
         if let Some(candidate_id) = args.get(pos + 1) {
-            let clean_id = candidate_id.trim().replace('-', "").to_uppercase();
-            if clean_id.len() == 16 && clean_id.chars().all(|c| c.is_ascii_hexdigit()) {
-                let default_name = format!("OmaID-{}", &clean_id[..4]);
+            let norm = rendezvous::normalize_oma_id(candidate_id);
+            if rendezvous::validate_oma_id(&norm) {
+                let default_name = format!("OmaID-{}", &norm[..4]);
                 let name = args.get(pos + 2).cloned().unwrap_or(default_name);
-                let formatted = rendezvous::format_oma_id(&clean_id);
-                add_trusted_peer(&formatted, &name, "");
-                send_immediate_beacon_broadcast();
-                println!("{{\"status\":\"SUCCESS\",\"oma_id\":\"{}\",\"name\":\"{}\"}}", formatted, name);
+                let ip_arg = args.get(pos + 3).map(|s| s.as_str());
+                match add_paired_peer(&norm, &name, ip_arg) {
+                    Ok(peer) => {
+                        send_immediate_beacon_broadcast();
+                        println!("{{\"status\":\"SUCCESS\",\"oma_id\":\"{}\",\"name\":\"{}\"}}", peer.oma_id, peer.name);
+                    }
+                    Err(e) => {
+                        eprintln!("Error pairing OmaID: {}", e);
+                        std::process::exit(1);
+                    }
+                }
             } else {
                 eprintln!("Error: Invalid 16-character OmaID: {}", candidate_id);
                 std::process::exit(1);
@@ -5472,6 +5332,7 @@ fn main() {
                 if pending.token == *token {
                     pending.status = "ACCEPTED".to_string();
                     save_pending_transfer(&pending);
+                    let _ = add_paired_peer(&pending.sender_id, &pending.sender_name, Some(&pending.sender_ip));
                     add_trusted_peer(&pending.sender_id, &pending.sender_name, "");
                     notify_desktop("OmaSend AirBridge", "Transfer accepted. Receiving files...");
                     println!("Transfer accepted");
@@ -5530,25 +5391,9 @@ fn main() {
         };
 
         let path = Path::new(&file_path_str);
-        if target.starts_with("bt:") || (target.len() == 17 && target.chars().filter(|c| *c == ':').count() == 5) {
-            let mac = target.strip_prefix("bt:").unwrap_or(&target);
-            match p2p_send_file_via_bluetooth(mac, path) {
-                Ok(()) => println!("File sent successfully via Bluetooth to {}", mac),
-                Err(e) => eprintln!("Error sending file via Bluetooth: {}", e),
-            }
-        } else {
-            match p2p_send_file_to_peer(&target, path) {
-                Ok(()) => println!("File sent successfully to {}", target),
-                Err(e) => {
-                    eprintln!("Error sending file via LAN: {}", e);
-                    let bt_peers = get_bluetooth_paired_peers();
-                    if let Some(bt_match) = bt_peers.first() {
-                        let mac = bt_match.ip.strip_prefix("bt:").unwrap_or(&bt_match.ip);
-                        println!("Falling back to Bluetooth transfer for {} ({})", bt_match.name, mac);
-                        let _ = p2p_send_file_via_bluetooth(mac, path);
-                    }
-                }
-            }
+        match p2p_send_file_to_peer(&target, path) {
+            Ok(()) => println!("File sent successfully to {}", target),
+            Err(e) => eprintln!("Error sending file: {}", e),
         }
         return;
     }
@@ -5568,30 +5413,9 @@ fn main() {
                 let chosen = String::from_utf8_lossy(&out).trim().to_string();
                 if !chosen.is_empty() {
                     let path = Path::new(&chosen);
-                    if target.starts_with("bt:") || (target.len() == 17 && target.chars().filter(|c| *c == ':').count() == 5) {
-                        let mac = target.strip_prefix("bt:").unwrap_or(target);
-                        match p2p_send_file_via_bluetooth(mac, path) {
-                            Ok(()) => println!("File successfully sent via Bluetooth to {}", mac),
-                            Err(e) => eprintln!("Error sending file via Bluetooth: {}", e),
-                        }
-                    } else {
-                        match p2p_send_file_to_peer(target, path) {
-                            Ok(()) => println!("File successfully sent to {}", target),
-                            Err(e) => {
-                                eprintln!("Error sending file via LAN: {}", e);
-                                let bt_peers = get_bluetooth_paired_peers();
-                                if let Some(bt_match) = bt_peers.first() {
-                                    let mac = bt_match.ip.strip_prefix("bt:").unwrap_or(&bt_match.ip);
-                                    notify_desktop(
-                                        "OmaSend AirBridge",
-                                        &format!("LAN unreachable. Attempting Bluetooth transfer to {}...", bt_match.name),
-                                    );
-                                    if let Err(bt_err) = p2p_send_file_via_bluetooth(mac, path) {
-                                        eprintln!("Bluetooth fallback error: {}", bt_err);
-                                    }
-                                }
-                            }
-                        }
+                    match p2p_send_file_to_peer(target, path) {
+                        Ok(()) => println!("File successfully sent to {}", target),
+                        Err(e) => eprintln!("Error sending file: {}", e),
                     }
                 }
             }
@@ -5727,7 +5551,6 @@ fn main() {
             p2p_hostname: get_system_hostname(),
             p2p_visibility: vis,
             p2p_visibility_remaining_secs: rem,
-            p2p_bluetooth_available: is_bluetooth_available(),
             p2p_discovered_peers: get_discovered_peers(),
             p2p_pending_transfer: get_pending_transfer(),
             clipboard_vault: get_clipboard_vault_items(),
@@ -5886,18 +5709,18 @@ mod tests {
             magic: "OMASEND_P2P".to_string(),
             v: 1,
             id: "abc123".to_string(),
+            oma_id: "4829-1048-5729-1104".to_string(),
             name: "Omarchy-PC".to_string(),
             ip: "192.168.1.81".to_string(),
             port: 8844,
             mode: "KNOWN".to_string(),
-            bt: true,
             fp: "deadbeef".to_string(),
         };
         let serialized = serde_json::to_string(&packet).expect("Must serialize");
         let deserialized: P2pBeaconPacket = serde_json::from_str(&serialized).expect("Must deserialize");
         assert_eq!(deserialized.magic, "OMASEND_P2P");
         assert_eq!(deserialized.id, "abc123");
-        assert!(deserialized.bt);
+        assert_eq!(deserialized.oma_id, "4829-1048-5729-1104");
     }
 
     #[test]
@@ -6031,30 +5854,59 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_bluetooth_paired_devices() {
-        let sample = "Device 4C:E2:0F:FD:5E:06 POCO X8 Pro Max\nDevice 40:8E:2C:6A:13:DE Xbox Wireless Controller\nInvalid Line\nDevice short invalid";
-        let peers = parse_bluetooth_paired_devices(sample, 1000);
-        // Xbox Wireless Controller should be filtered out
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].name, "POCO X8 Pro Max");
-        assert_eq!(peers[0].ip, "bt:4C:E2:0F:FD:5E:06");
-        assert_eq!(peers[0].transport, "BT");
-        assert_eq!(peers[0].id, "bt_4CE20FFD5E06");
-    }
+    fn test_p2p_request_and_clipboard_require_paired_oma_id() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        set_visibility("KNOWN");
 
-    #[test]
-    fn test_sanitize_bluetooth_mac() {
-        assert_eq!(
-            sanitize_bluetooth_mac("4C:E2:0F:FD:5E:06"),
-            Some("4C:E2:0F:FD:5E:06".to_string())
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
+        let local_addr = listener.local_addr().unwrap();
+
+        let server_thread = thread::spawn(move || {
+            let (stream1, _) = listener.accept().expect("Accept client 1");
+            handle_connection(stream1, "127.0.0.1", "1234", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+
+            let (stream2, _) = listener.accept().expect("Accept client 2");
+            handle_connection(stream2, "127.0.0.1", "1234", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+        });
+
+        // 1. Unpaired client sending clipboard -> must return 403 Forbidden
+        let mut client1 = TcpStream::connect(local_addr).expect("Connect client 1");
+        let unauth_payload = serde_json::json!({
+            "sender_id": "unpaired_oma_id_9999",
+            "sender_name": "Rogue Device",
+            "content_type": "text",
+            "text": "malicious clipboard injection"
+        });
+        let unauth_bytes = unauth_payload.to_string().into_bytes();
+        let req1 = format!(
+            "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            local_addr, unauth_bytes.len()
         );
-        assert_eq!(
-            sanitize_bluetooth_mac("4c:e2:0f:fd:5e:06"),
-            Some("4c:e2:0f:fd:5e:06".to_string())
+        client1.write_all(req1.as_bytes()).unwrap();
+        client1.write_all(&unauth_bytes).unwrap();
+        let mut resp1 = String::new();
+        client1.read_to_string(&mut resp1).unwrap();
+        assert!(resp1.starts_with("HTTP/1.1 403 Forbidden"), "Unpaired client must be rejected with 403: {}", resp1);
+
+        // 2. Unpaired client sending transfer request -> must return 403 Forbidden
+        let mut client2 = TcpStream::connect(local_addr).expect("Connect client 2");
+        let req_payload = serde_json::json!({
+            "sender_id": "unpaired_sender",
+            "sender_name": "Rogue Device",
+            "files": [{"name": "evil.sh", "size_bytes": 100}]
+        });
+        let req_bytes = req_payload.to_string().into_bytes();
+        let req2 = format!(
+            "POST /api/p2p/request HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            local_addr, req_bytes.len()
         );
-        assert_eq!(sanitize_bluetooth_mac("invalid_mac"), None);
-        assert_eq!(sanitize_bluetooth_mac("4C:E2:0F:FD:5E"), None);
-        assert_eq!(sanitize_bluetooth_mac("4C:E2:0F:FD:5E:06:99"), None);
+        client2.write_all(req2.as_bytes()).unwrap();
+        client2.write_all(&req_bytes).unwrap();
+        let mut resp2 = String::new();
+        client2.read_to_string(&mut resp2).unwrap();
+        assert!(resp2.starts_with("HTTP/1.1 403 Forbidden"), "Unpaired transfer request must be rejected with 403: {}", resp2);
+
+        server_thread.join().expect("Join server thread");
     }
 
     #[test]
@@ -6646,7 +6498,6 @@ mod tests {
             p2p_hostname: "omarchy-node".to_string(),
             p2p_visibility: "ALL".to_string(),
             p2p_visibility_remaining_secs: 0,
-            p2p_bluetooth_available: false,
             p2p_discovered_peers: vec![],
             p2p_pending_transfer: None,
             clipboard_vault: vec![],
@@ -6795,6 +6646,7 @@ mod tests {
         let test_peers = vec![
             DiscoveredPeer {
                 id: "peer-active".to_string(),
+                oma_id: "1234-5678-9012-3456".to_string(),
                 name: "Active Machine".to_string(),
                 ip: "192.168.1.50".to_string(),
                 port: 53317,
@@ -6805,6 +6657,7 @@ mod tests {
             },
             DiscoveredPeer {
                 id: "peer-expired".to_string(),
+                oma_id: "9876-5432-1098-7654".to_string(),
                 name: "Offline Machine".to_string(),
                 ip: "192.168.1.60".to_string(),
                 port: 53317,
@@ -7039,6 +6892,9 @@ mod tests {
     fn test_http_p2p_image_and_vault_endpoints() {
         let _guard = TEST_SYNC_MUTEX.lock().unwrap();
         set_visibility("ALL");
+        let valid_raw_oma_id = rendezvous::generate_raw_oma_id();
+        let valid_peer_oma_id = rendezvous::format_oma_id(&valid_raw_oma_id);
+        let _ = add_paired_peer(&valid_peer_oma_id, "Test Device", None);
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
         let local_addr = listener.local_addr().unwrap();
@@ -7068,7 +6924,8 @@ mod tests {
         let img_hash = compute_image_clipboard_hash(&png_data);
 
         let post_payload = serde_json::json!({
-            "sender_id": "test_sender",
+            "oma_id": valid_peer_oma_id,
+            "sender_id": valid_peer_oma_id,
             "sender_name": "Test Device",
             "content_type": "image_png",
             "image_hash": img_hash,
@@ -7081,8 +6938,8 @@ mod tests {
 
         let mut client1 = TcpStream::connect(local_addr).expect("Connect client 1");
         let req1 = format!(
-            "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            local_addr, post_bytes.len()
+            "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-OmaSend-OmaID: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            local_addr, valid_peer_oma_id, post_bytes.len()
         );
         client1.write_all(req1.as_bytes()).unwrap();
         client1.write_all(&post_bytes).unwrap();

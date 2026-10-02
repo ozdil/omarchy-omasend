@@ -32,10 +32,9 @@ Panel {
   property var sharedFiles: []
   property int refreshNonce: 0
 
-  // AirBridge P2P & Bluetooth properties
+  // AirBridge P2P (Strict OmaID) properties
   property string p2pVisibility: "KNOWN"
   property int p2pVisibilityRemainingSecs: 0
-  property bool p2pBtAvailable: false
   property var p2pPeers: []
   property var p2pPendingTransfer: null
   property var clipboardVault: []
@@ -76,7 +75,7 @@ Panel {
   readonly property string manifestPath: Qt.resolvedUrl("manifest.json").toString().replace(/^file:\/\//, "")
   readonly property string manifestFallbackPath: (Quickshell.env("HOME") || "/home/ozdil") + "/.config/omarchy/plugins/ozdil.omasend/manifest.json"
 
-  property string pluginVersion: "1.6.4"
+  property string pluginVersion: "1.7.0"
   property string pluginDescription: "AirBridge P2P, E2EE Secure Local & Network File Transfer System"
   property string pluginAuthor: "Ozan Özdil (@ozdil)"
   property string pluginLicense: "MIT"
@@ -477,7 +476,6 @@ Panel {
           root.sharedFiles = d.shared_files || []
           root.p2pVisibility = String(d.p2p_visibility || "KNOWN")
           root.p2pVisibilityRemainingSecs = Number(d.p2p_visibility_remaining_secs) || 0
-          root.p2pBtAvailable = Boolean(d.p2p_bluetooth_available)
           root.p2pPeers = d.p2p_discovered_peers || []
           root.p2pPendingTransfer = d.p2p_pending_transfer || null
           root.clipboardVault = d.clipboard_vault || []
@@ -1887,7 +1885,7 @@ Panel {
 
                   Text {
                     textFormat: Text.PlainText
-                    text: modelData.transport === "BT" ? "Bluetooth Paired" : "Ready to Send"
+                    text: modelData.transport === "WAN" ? "OmaID Paired (WAN)" : (modelData.transport === "DIRECT" ? "Direct Peer (LAN)" : "OmaID Paired (LAN)")
                     color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption

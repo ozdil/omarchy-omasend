@@ -11,7 +11,7 @@ data class P2pBeaconPacket(
     val ip: String,
     val port: Int = 53317,
     val mode: String = "ALL",
-    val bt: Boolean = false,
+    val oma_id: String = "",
     val fp: String = ""
 )
 
@@ -21,6 +21,7 @@ data class DiscoveredPeer(
     val ip: String,
     val port: Int = 53317,
     val transport: String = "LAN",
+    val omaId: String = "",
     val fingerprint: String = "",
     val isTrusted: Boolean = false,
     val lastSeen: Long = System.currentTimeMillis()

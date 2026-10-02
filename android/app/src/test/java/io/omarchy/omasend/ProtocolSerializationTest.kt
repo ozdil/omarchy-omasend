@@ -28,16 +28,16 @@ class ProtocolSerializationTest {
             ip = "192.168.1.50",
             port = 53317,
             mode = "ALL",
-            bt = true,
-            fp = "AA:BB:CC:DD:EE:FF"
+            oma_id = "1234-5678-9012-3456",
+            fp = "1234-5678-9012-3456"
         )
         val raw = json.encodeToString(P2pBeaconPacket.serializer(), beacon)
         val decoded = json.decodeFromString<P2pBeaconPacket>(raw)
 
         assertEquals("OMASEND_P2P", decoded.magic)
         assertEquals("android-node-01", decoded.id)
-        assertTrue(decoded.bt)
-        assertEquals("AA:BB:CC:DD:EE:FF", decoded.fp)
+        assertEquals("1234-5678-9012-3456", decoded.oma_id)
+        assertEquals("1234-5678-9012-3456", decoded.fp)
     }
 
     @Test

@@ -172,6 +172,98 @@ pub fn get_or_create_oma_id(state_dir: &Path) -> String {
     generate_new_oma_id(state_dir)
 }
 
+// ------------------- OMAID PAIRED PEERS & TRUST STORE -------------------
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PairedPeer {
+    pub oma_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
+    pub paired_at: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct PairedPeersDb {
+    pub peers: Vec<PairedPeer>,
+}
+
+/// Loads paired OmaID peers from paired_peers.json in state_dir (0600 mode)
+pub fn load_paired_peers(state_dir: &Path) -> Vec<PairedPeer> {
+    let path = state_dir.join("paired_peers.json");
+    if let Ok(content) = crate::read_secure_file(&path) {
+        if let Ok(db) = serde_json::from_str::<PairedPeersDb>(&content) {
+            return db.peers;
+        }
+    }
+    Vec::new()
+}
+
+/// Verifies whether an OmaID is in the paired peers list
+pub fn is_peer_paired(oma_id: &str, state_dir: &Path) -> bool {
+    let norm = normalize_oma_id(oma_id);
+    if norm.len() != 16 {
+        return false;
+    }
+    let peers = load_paired_peers(state_dir);
+    peers.iter().any(|p| normalize_oma_id(&p.oma_id) == norm)
+}
+
+/// Adds or updates a paired peer in paired_peers.json with 0600 permissions
+pub fn add_paired_peer(
+    oma_id: &str,
+    name: &str,
+    ip: Option<&str>,
+    state_dir: &Path,
+) -> Result<PairedPeer, String> {
+    let norm = normalize_oma_id(oma_id);
+    if !validate_oma_id(&norm) {
+        return Err(format!("Invalid 16-digit Luhn OmaID: '{}'", oma_id));
+    }
+    let formatted = format_oma_id(&norm);
+    let mut peers = load_paired_peers(state_dir);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    if let Some(existing) = peers.iter_mut().find(|p| normalize_oma_id(&p.oma_id) == norm) {
+        if !name.trim().is_empty() {
+            existing.name = name.to_string();
+        }
+        if let Some(ip_str) = ip {
+            if !ip_str.trim().is_empty() {
+                existing.ip = Some(ip_str.to_string());
+            }
+        }
+        let peer_clone = existing.clone();
+        let db = PairedPeersDb { peers };
+        let path = state_dir.join("paired_peers.json");
+        let s = serde_json::to_string_pretty(&db)
+            .map_err(|e| format!("Serialization failed: {}", e))?;
+        crate::write_secure_file(&path, &s)?;
+        Ok(peer_clone)
+    } else {
+        let peer = PairedPeer {
+            oma_id: formatted,
+            name: if name.trim().is_empty() {
+                format!("OmaID-{}", &norm[..4])
+            } else {
+                name.to_string()
+            },
+            ip: ip.filter(|s| !s.trim().is_empty()).map(|s| s.to_string()),
+            paired_at: now,
+        };
+        peers.push(peer.clone());
+        let db = PairedPeersDb { peers };
+        let path = state_dir.join("paired_peers.json");
+        let s = serde_json::to_string_pretty(&db)
+            .map_err(|e| format!("Serialization failed: {}", e))?;
+        crate::write_secure_file(&path, &s)?;
+        Ok(peer)
+    }
+}
+
 // ------------------- BLINDED RENDEZVOUS & KDF -------------------
 
 const RENDEZVOUS_SALT: &[u8] = b"omasend-e2ee-rendezvous-salt-v1";
@@ -891,5 +983,40 @@ mod tests {
         assert!(svg.ends_with("</svg>"));
         assert!(svg.contains(r#"<rect width="256" height="256""#));
         assert!(svg.contains(r##"fill="#111827""##));
+    }
+
+    #[test]
+    fn test_paired_peers_lifecycle_and_0600() {
+        let temp_dir = env::temp_dir().join(format!("oma_pair_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let raw_id = generate_raw_oma_id();
+        assert!(!is_peer_paired(&raw_id, &temp_dir));
+
+        let paired = add_paired_peer(&raw_id, "Alice Workstation", Some("192.168.1.55"), &temp_dir).expect("Add paired peer");
+        assert_eq!(paired.name, "Alice Workstation");
+        assert_eq!(paired.ip, Some("192.168.1.55".to_string()));
+        assert!(is_peer_paired(&raw_id, &temp_dir));
+        assert!(is_peer_paired(&paired.oma_id, &temp_dir));
+
+        let peers_file = temp_dir.join("paired_peers.json");
+        assert!(peers_file.exists());
+        let meta = fs::symlink_metadata(&peers_file).expect("Stat paired_peers.json");
+        assert_eq!(meta.mode() & 0o777, 0o600, "paired_peers.json must have 0600 permissions");
+
+        // Update IP for existing peer
+        let updated = add_paired_peer(&raw_id, "Alice Workstation Updated", Some("10.0.0.99"), &temp_dir).expect("Update paired peer");
+        assert_eq!(updated.name, "Alice Workstation Updated");
+        assert_eq!(updated.ip, Some("10.0.0.99".to_string()));
+
+        let loaded = load_paired_peers(&temp_dir);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].ip, Some("10.0.0.99".to_string()));
+
+        // Invalid OmaID must fail
+        assert!(add_paired_peer("1234-invalid", "Bad", None, &temp_dir).is_err());
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }
