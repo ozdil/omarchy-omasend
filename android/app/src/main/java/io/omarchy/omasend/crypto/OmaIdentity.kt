@@ -104,6 +104,8 @@ data class OmaIdentity(
             return format(raw)
         }
 
+        fun generate(): String = generateRandomOmaId()
+
         /**
          * Formats raw digits into XXXX-XXXX-XXXX-XXXX format.
          */

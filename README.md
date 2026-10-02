@@ -1,66 +1,62 @@
 # OmaSend - Zero-Knowledge AirBridge and E2EE Transfer for Omarchy Linux
 
 [![Omarchy Verified Plugin](https://img.shields.io/badge/Omarchy-Verified_Plugin-22c55e?style=for-the-badge&logo=omarchy)](https://github.com/ozdil)
-
+[![Release v1.7.0](https://img.shields.io/badge/Release-v1.7.0-38BDF8?style=for-the-badge&logo=rust)](https://github.com/ozdil/omarchy-omasend/releases)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy_Me_A_Coffee-Support_Development-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/ozdil)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](LICENSE)
 
 ![omasend Preview](preview.png)
 
-Cross-device file transfer, encrypted clipboard bridge, Omarchy AirDrop P2P, and global WAN portal with Zero-Knowledge AES-256-GCM encryption for Omarchy Linux.
+> **Cross-device sovereign file transfer, encrypted clipboard vault, 16-digit Luhn OmaID pairing, and global WAN portal with Zero-Knowledge AES-256-GCM encryption for Omarchy Linux, Android, and Modern Web Browsers.**
 
-Author: Ozan Ozdil (ozdil)  
-License: MIT  
-Plugin ID: ozdil.omasend
+- **Author:** Ozan Özdil (ozdil)  
+- **License:** MIT  
+- **Plugin ID:** `ozdil.omasend`  
+- **Version:** `1.7.0`  
+- **Default Font:** `JetBrainsMono Nerd Font`
 
 ---
 
-## Features
+## Key Features
 
-- Omarchy AirDrop P2P (PC-to-PC and Mobile Direct Transfer):
-  - AirDrop-Grade Zero-Click Transfer: Transfers from paired/trusted devices are auto-accepted instantly without manual prompt friction, streaming directly to disk with mode 0600 security.
-  - 440px Radiant Sonar Waves: Hardware-accelerated 5-layer radial sonar animation expanding from the bar icon center with sub-pixel alignment, orientation safety (top/bottom/left/right), and visual target lock-on.
-  - Single-Touch Trust Promotion: Unknown devices in Everyone mode prompt recipient once, and upon acceptance are seamlessly promoted to trusted peers for future instant transfers.
+- **16-Digit Luhn Mod 10 OmaID Pairing & Blinded Rendezvous:**
+  - Zero-account, zero-server device pairing using RFC 2104 HMAC-SHA256 Blinded Rendezvous topics and RFC 5869 HKDF-SHA256 symmetric key derivation.
+  - Generates verifiable 16-digit device identifiers with Luhn mod 10 checksum validation (`XXXX-XXXX-XXXX-XXXX`).
+  - Strict zero-trust connection filter: Unpaired devices are rejected before staging data.
+- **Universal Multi-Format Clipboard Vault & WebP Micro-Thumbnails:**
+  - Real-time bidirectional clipboard sync supporting text and image payloads (PNG, JPEG, WebP).
+  - Integrated WebP Micro-Thumbnail Engine: Automatically generates ultra-compact 96x96 WebP thumbnails (3-5 KB) in an isolated sandbox for instant zero-latency preview rendering.
+  - Compact Clipboard Vault UI: One-click copy, double-click lightbox modal preview, and instant export to `~/Pictures/OmaStudio_Exports/`.
+  - Strict local staging isolation in `~/.local/state/omarchy/omasend/clip_staging/` with atomic mode 0600 file permissions and 50 MiB LRU eviction cap.
+- **Omarchy AirBridge P2P (PC-to-PC, Android, and Web Direct Transfer):**
+  - Instant Zero-Click Transfer: Transfers from paired/trusted devices are auto-accepted instantly without manual prompt friction, streaming directly to disk with mode 0600 security.
+  - Hardware-accelerated radial sonar radar visualization expanding from the bar icon center.
   - Zero-Config Discovery: Automatically discovers neighboring Omarchy Linux desktops and Android devices on the same local network using UDP beacons (port 53317).
-  - Native Android Companion: Dedicated Kotlin and Jetpack Compose mobile app with CameraX zero-GMS QR/Barcode scanner, LRA tactile haptic feedback (CLICK, THUD, QUICK_RISE), bidirectional transfers, and universal clipboard bridge.
-  - Zero-GMS OmaID Barcode & QR Scanner:
-    - High-performance on-device QR/Barcode scanner built with CameraX and ZXing without Google Play Services or Firebase telemetry dependencies.
-    - Features acrylic viewfinder overlay with pulsing laser animation, torch toggle, gallery image QR decoding, and clipboard OmaID auto-detection.
   - 3-Tier Visibility Control: Off, Known (Trusted Peers Only - Default), and Everyone (10 Minutes Temporary Discovery).
-  - Gatekeeper Consent: Untrusted devices require explicit approval before transfer begins.
-  - Universal Multi-Format Clipboard Vault & WebP Micro-Thumbnails:
-    - Real-time bidirectional clipboard sync supporting both text and image payloads (PNG, JPEG, WebP).
-    - Integrated WebP Micro-Thumbnail Engine: Automatically generates ultra-compact 96x96 WebP thumbnails (3-5 KB) in an isolated sandbox for instant zero-latency preview rendering without downloading large 10 MB raw files.
-    - Compact Clipboard Vault UI: Quick copy on click, double-click lightbox modal preview, and one-click export to ~/Pictures/OmaStudio_Exports/.
-    - Strict local staging isolation in ~/.local/state/omarchy/omasend/clip_staging/ with atomic mode 0600 file permissions and 50 MiB LRU eviction cap.
-- Zero-Knowledge End-to-End Encryption (E2EE):
-  - Hardware-accelerated AES-256-GCM encryption via the native Web Crypto API (crypto.subtle).
-  - Cryptographic session key is passed strictly inside the URL hash fragment (#key=...), which never reaches HTTP request headers or server logs (RFC 3986).
-- Zero-Install Mobile Portal:
-  - Scan the QR code with any smartphone camera to open the encrypted web portal in Safari or Chrome. No apps required on mobile devices.
-  - Send photos, videos, and documents directly to your desktop.
-- Hybrid Network Modes (LAN and Global WAN):
-  - Local Area Network (LAN): Full-speed transfer (300-800 Mbps) over local Wi-Fi.
-  - Wide Area Network (Global WAN Tunnel): Secure HTTPS tunnel using cloudflared without requiring router port forwarding or static IP.
-- Hardened Rust Engine:
-  - Compliant with Omarchy Linux Security Standards: isolated process groups, monotonic execution deadlines, atomic file operations (mode 0600), and buffer overrun protection.
+- **Zero-Knowledge End-to-End Encryption (E2EE):**
+  - Hardware-accelerated AES-256-GCM encryption with BLAKE3 cryptographic integrity checksums.
+  - Session key is passed strictly inside the URL hash fragment (`#key=...`), which never reaches HTTP request headers or server logs (RFC 3986).
+- **Multi-Platform Ecosystem:**
+  - **Linux Desktop Plugin:** Native Quickshell QML widget and hardened Rust daemon (`omasend-engine`).
+  - **Android Native App:** Kotlin & Jetpack Compose app with CameraX zero-GMS QR/Barcode scanner and tactile haptic feedback ([ozdil/omasend-android](https://github.com/ozdil/omasend-android)).
+  - **Web PWA Client:** Zero-install web client with Web Crypto API and offline service worker caching ([ozdil/omasend-web](https://github.com/ozdil/omasend-web)).
+- **Hardened HANCORE Rust Engine:**
+  - Compliant with Omarchy Linux Security Standards: isolated process groups (`process_group(0)`), monotonic execution deadlines, atomic temporary file operations (mode 0600), `prctl(PR_SET_DUMPABLE, 0)`, and RAM zeroization (`Zeroize`).
 
 ---
 
 ## Requirements
 
-- cargo and rustc (Rust toolchain, for building the native engine)
-- qrencode (for generating QR codes in SVG format)
-- wl-clipboard (provides wl-copy and wl-paste on Wayland)
-- libnotify (desktop notifications via notify-send)
-- zenity (GTK file selection dialog)
-- cloudflared (optional, required for Global WAN Tunnel mode; system package)
+- `cargo` and `rustc` (Rust toolchain, for building the native engine)
+- `quickshell` (Omarchy desktop panel runtime)
+- `wl-clipboard` (provides `wl-copy` and `wl-paste` on Wayland)
+- `libnotify` (desktop notifications via `notify-send`)
+- `zenity` (GTK file selection dialog)
+- `cloudflared` (optional, required for Global WAN Tunnel mode)
 
 ---
 
 ## Installation and Setup
-
-### Why Building from Source is Required
-Under the Omarchy Linux Security Standards (AGENTS.md Rule 5.3), precompiled binaries are strictly forbidden from Git repositories to guarantee user system integrity. Therefore, the native engine must be compiled from source on your local machine after adding the plugin.
 
 ### Step 1: Add the Plugin to Omarchy
 ```bash
@@ -72,128 +68,38 @@ Navigate to the plugin directory and run the automated build script:
 ```bash
 cd ~/.config/omarchy/plugins/ozdil.omasend && ./build.sh
 ```
-This script compiles the engine using `cargo build --release --locked`, installs the binary (`omasend-engine`) with proper permissions, and restarts the Omarchy shell automatically.
+This script compiles the engine using `cargo build --release --locked`, installs the binary (`omasend-engine`) with mode 0755 permissions, verifies cryptographic provenance, and restarts the Omarchy shell automatically.
 
-### Step 3: Firewall Configuration (Zero Configuration on Omarchy Linux)
-Omarchy Linux pre-configures and permits port 53317 (TCP and UDP) out of the box for local network sharing, meaning OmaSend requires zero manual firewall configuration under standard Omarchy installations.
-
-
-### Step 4: Add to Top Bar (Optional)
+### Step 3: Top Bar Placement (Optional)
 If not automatically present in your panel, add `ozdil.omasend` to `bar.layout.right` in `~/.config/omarchy/shell.json`:
 ```json
 {
   "id": "ozdil.omasend"
 }
 ```
-Then restart the shell:
+Then reload the shell:
 ```bash
 omarchy-restart-shell
 ```
 
-### 3. OmaSend for Android (Companion Application)
+---
 
-OmaSend features an official native Android companion app built with modern Kotlin, Jetpack Compose, and Material 3. It provides seamless, bidirectional file streaming and clipboard synchronization directly from your mobile device.
+## Multi-Platform Ecosystem Links
 
-- **Source Repository:** [ozdil/omasend-android](https://github.com/ozdil/omasend-android)
-
-#### Official Google Play Closed Beta:
-OmaSend for Android is distributed officially via Google Play:
-1. **Join Tester Community:** [OmaSend Testers Google Group](https://groups.google.com/g/omasend-testers) *(Click "Join group")*
-2. **Opt-in to Beta:** [Google Play Testing Opt-in](https://play.google.com/apps/testing/io.omarchy.omasend) *(Click "Become a tester")*
-3. **Download on Google Play:** [OmaSend on Google Play](https://play.google.com/store/apps/details?id=io.omarchy.omasend)
-
-#### Build from Source:
-```bash
-cd ~/.config/omarchy/plugins/ozdil.omasend && ./build-android.sh
-
-# Install directly via ADB:
-adb install -r omasend-debug.apk
-```
+- **Android Companion App:** [ozdil/omasend-android](https://github.com/ozdil/omasend-android)
+- **Web PWA Client:** [ozdil/omasend-web](https://github.com/ozdil/omasend-web)
+- **Google Play Closed Beta:** [Join Google Group](https://groups.google.com/g/omasend-testers) & [Opt-in on Google Play](https://play.google.com/apps/testing/io.omarchy.omasend)
 
 ---
 
-## How It Works and Usage Guide
+## Security & Privacy Policy
 
-Click the paper plane icon in the Omarchy top bar to open the OmaSend panel.
+OmaSend operates with a strict **Zero-Trust, Zero-Knowledge** architecture. It does not collect telemetry, track users, or transmit data through centralized intermediary servers. All communications are direct peer-to-peer or end-to-end encrypted with authenticated ephemeral keys.
 
-### 1. Omarchy AirDrop P2P (PC-to-PC and Mobile Sharing)
-- Device Discovery: Computers and Android phones running OmaSend on the same local network automatically appear under "AIRBRIDGE DISCOVERED DEVICES" with their hostname, device model, and IP.
-- Visibility Modes:
-  - KNOWN PEERS ONLY (Default): Only previously paired devices can see you.
-  - EVERYONE (10M): Temporarily visible to all nearby devices for 10 minutes.
-- Sending Files: Click the "SEND" button next to any discovered peer to open the file picker. Selected files will be transmitted directly.
-- Syncing Clipboard: Click the "CLIPBOARD" button to instantly sync your current Wayland desktop clipboard to the target computer or phone.
-- Recipient Consent: Incoming transfers show an interactive prompt with sender information and file details. Approved transfers are downloaded directly to `~/Downloads/omasend/` (or `Downloads/OmaSend` on Android).
-
-### 2. Android System Share Sheet Integration
-- In any Android app (Google Photos, Gallery, Files, Chrome), tap "Share".
-- Select "Send via OmaSend" from the system share sheet.
-- Tap your Omarchy PC (`ggs4`, `jonsbo`) to stream the file or photo directly to your desktop.
-
-### 3. Mobile to PC Transfer via Browser (Zero-Install Web Portal)
-1. Open the OmaSend panel and select LAN mode.
-2. Scan the displayed QR code with your smartphone camera.
-3. The portal automatically pairs with the 4-digit PIN and loads the AES-256 encryption key.
-4. Upload files directly from your mobile browser into `~/Downloads/omasend/`.
-5. Files placed in `~/Downloads/omasend/shared/` on your PC can be downloaded from the mobile portal.
-6. Use the clipboard box to send text between mobile and PC in real time.
-
-### 4. Global WAN Tunnel
-- When devices are on different networks or cellular data, switch to "WAN" mode in the panel.
-- OmaSend initiates an end-to-end encrypted HTTPS tunnel through cloudflared.
-- Transfer files securely across the internet without opening ports.
-
----
-
-## Security and Architecture Standards
-
-OmaSend complies strictly with the Omarchy Linux Security Architecture, elevating it from a standard consumer tool (like LocalSend) to a **Military-Grade, Zero-Trust** enterprise architecture.
-
-### Military-Grade Security Architecture (vs. Standard Consumer Tools like LocalSend)
-
-While tools like LocalSend provide practical local file sharing using Flutter/Dart and standard garbage collection, OmaSend enforces strict hardware and kernel-level security guarantees:
-
-1. **Anti-Forensics & RAM Zeroization (Memory Scrubbing):**
-   - **OmaSend:** Cryptographic keys, in-flight transit buffers, and sensitive data are scrubbed from RAM immediately after use via `try...finally` blocks (using the `zeroize` crate in Rust and `StorageUtils.wipeMemory(buffer.fill(0))` in Android). Even if a device is seized and a memory dump is extracted, the data cannot be recovered.
-   - **Standard Tools:** Rely on automated Garbage Collection (e.g., Dart VM). Keys and sensitive data can remain in RAM indefinitely without guaranteed memory scrubbing (`mlock` or `explicit_bzero`).
-
-2. **Linux Kernel Sandboxing & Isolation:**
-   - **OmaSend:** Enforces application sandboxing directly at the kernel level using **Landlock LSM** (Linux Security Module), strictly limiting filesystem access. Additionally, `PR_SET_DUMPABLE=0` (preventing core dumps) and `PR_SET_NO_NEW_PRIVS=1` flags are enforced to neutralize process hijacking at the hardware/OS level.
-   - **Standard Tools:** Run with standard user privileges without deep kernel isolation, which has historically exposed them to Path Traversal (e.g., CVE-2025-27142).
-
-3. **Quantum-Resilient Cryptography:**
-   - **OmaSend:** Integrates **BLAKE3**, a high-performance, quantum-resilient Merkle tree cryptographic hashing algorithm for stream and protocol header validation, alongside standard SHA-256 and MD5.
-   - **Standard Tools:** Utilize classical SHA-256 for basic fingerprinting and standard TLS, lacking post-quantum cryptographic hashing structures.
-
-4. **Technology Stack & Memory Safety:**
-   - **OmaSend:** The core engine is built in **Rust**, offering high-performance, strict memory safety, and low-level hardware control without a garbage collector. The Android companion is built natively in **Kotlin** for deep OS integration.
-   - **Standard Tools:** Often built on cross-platform frameworks (e.g., Flutter/Dart), which limits deep OS-specific security integrations.
-
-### Omarchy Hancore Compliance
-- Subprocess Isolation: Processes run in isolated process groups (`cmd.process_group(0)`) with non-blocking I/O (`fcntl O_NONBLOCK`) and bounded polling.
-- Strict File Permissions: Sensitive state files (`trusted_peers.json`, `device_id.key`) and in-flight staging parts are written atomically with mode 0600. Download and staging directories enforce mode 0700. Symlinks are strictly rejected.
-- Concurrency Caps & DoS Protection: Strict global cap (max 32 active connections) and per-peer IP cap (max 4 active connections) enforced at socket accept before spawning worker threads; excess requests are rejected early with HTTP 429.
-- Monotonic Socket Deadlines: End-to-end socket reads across both headers and body enforce an immutable monotonic deadline (30s) recalculating remaining durations dynamically, neutralizing Slowloris drip-feeding attacks.
-- Strict Supply-Chain & Android Dependency Verification: The Android companion build strictly verifies every direct, plugin, and transitive dependency against committed cryptographic SHA-256 digests in `android/gradle/verification-metadata.xml` with strict mode enforced (`org.gradle.dependency.verification=strict`). Building the companion will fail immediately if any downloaded artifact does not match its pinned cryptographic checksum.
-- Early Header-First Authentication: Request headers are parsed and strictly authenticated (via PIN rate-limiter or transfer token) *before* reading or staging any request body bytes. Unauthenticated or forbidden requests are rejected immediately with HTTP 401/403 without touching disk or allocating body buffers.
-- Endpoint-Specific Body Ceilings:
-  - Clipboard endpoints (`/api/clipboard*`): strictly capped at 1 MiB.
-  - Control and signaling endpoints: strictly capped at 64 KiB.
-  - Plain file uploads (`/upload`, `/api/p2p/upload`): capped at 100 MiB and streamed directly to disk.
-  - Encrypted uploads (`/api/upload-encrypted`): strictly capped at 25 MiB with a global concurrency ceiling of 2 concurrent decryption workers, bounding server-wide peak decryption RAM to ~100 MiB.
-- Atomic Aggregate Staging Reservation: Global aggregate cap of 200 MiB across all in-flight staging files guarded by atomic state and disk space pre-check, eliminating TOCTOU races on filesystem storage.
-- Plain Text UI: All dynamic strings in QML use `textFormat: Text.PlainText` to prevent script and markup injection.
-
----
-
-## Support & Sponsorship
-
-If you find OmaSend useful and want to support independent, open-source Linux development:
-
-<a href="https://buymeacoffee.com/ozdil" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 50px !important;width: 180px !important;" ></a>
+For detailed security policies, review [PRIVACY_POLICY.md](PRIVACY_POLICY.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+This project is licensed under the **MIT License**. See [LICENSE](LICENSE) for details.

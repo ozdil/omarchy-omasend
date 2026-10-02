@@ -3348,14 +3348,29 @@ fun EditOmaIdDialog(
         onDismissRequest = onDismiss,
         title = {
             Text(
-                text = "OmaID Bağla / Değiştir",
+                text = "P2P Cihaz Kimliği (OmaID)",
                 fontWeight = FontWeight.Bold
             )
         },
         text = {
             Column(modifier = Modifier.fillMaxWidth()) {
+                Surface(
+                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f),
+                    shape = RoundedCornerShape(6.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "GİRİŞ / HESAP GEREKMEZ • P2P",
+                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
                 Text(
-                    text = "Mevcut 16 haneli hesabınızı veya başka bir cihazın kimliğini bağlayın.",
+                    text = "OmaSend sunucu kaydı gerektirmeyen anonim bir yerel aktarım aracıdır. Cihazınıza özel 16 haneli P2P eşleşme kimliğini buradan görebilir, değiştirebilir veya rastgele üretebilirsiniz.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -3368,7 +3383,7 @@ fun EditOmaIdDialog(
                         val clean = rawNewValue.replace("-", "").replace(" ", "").uppercase().filter { it.isLetterOrDigit() }.take(16)
                         input = if (clean.isEmpty()) "" else clean.chunked(4).joinToString("-")
                     },
-                    label = { Text("16 Haneli OmaID") },
+                    label = { Text("16 Haneli P2P OmaID") },
                     placeholder = { Text("4829-1048-5729-1104") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
@@ -3381,19 +3396,35 @@ fun EditOmaIdDialog(
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                if (input.isNotBlank()) {
-                    if (isValid) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    TextButton(
+                        onClick = { input = OmaIdentity.generate() },
+                        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp)
+                    ) {
                         Text(
-                            text = "Geçerli 16 haneli Luhn mod 10 kimliği",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = Color(0xFF10B981)
+                            text = "Rastgele Yeni Kimlik",
+                            style = MaterialTheme.typography.labelSmall
                         )
-                    } else {
-                        Text(
-                            text = "Geçersiz Luhn mod 10 sağlama toplamı veya eksik basamak",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.error
-                        )
+                    }
+
+                    if (input.isNotBlank()) {
+                        if (isValid) {
+                            Text(
+                                text = "[Luhn mod 10 Doğrulandı]",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Color(0xFF10B981)
+                            )
+                        } else {
+                            Text(
+                                text = "[Geçersiz Checksum]",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
                     }
                 }
             }
@@ -3403,12 +3434,12 @@ fun EditOmaIdDialog(
                 onClick = { onSave(input) },
                 enabled = isValid
             ) {
-                Text("Kaydet")
+                Text("Kaydet & Kullan")
             }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) {
-                Text("İptal")
+                Text("Kapat")
             }
         }
     )
