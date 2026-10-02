@@ -82,7 +82,6 @@ fun RadarScreen(
     val scope = rememberCoroutineScope()
     val peers by app.discoveryManager.peers.collectAsState()
     val discoveryMode by app.discoveryManager.discoveryMode.collectAsState()
-    val clipboardEntries by app.clipboardVault.entries.collectAsState()
     var omaIdentity by remember { mutableStateOf(app.omaIdentity) }
     val wanStatus by app.wanDiscoveryEngine.status.collectAsState()
 
@@ -94,8 +93,6 @@ fun RadarScreen(
     var showDirectIpDialog by remember { mutableStateOf(false) }
     var showRenameDialog by remember { mutableStateOf(false) }
     var showTargetSelectorDialog by remember { mutableStateOf(false) }
-    var showClipboardVaultDialog by remember { mutableStateOf(false) }
-    var previewImageEntry by remember { mutableStateOf<ClipboardEntry?>(null) }
     var showOmaIdQrDialog by remember { mutableStateOf(false) }
     var showQrScannerDialog by remember { mutableStateOf(false) }
     var showEditOmaIdDialog by remember { mutableStateOf(false) }
@@ -304,17 +301,6 @@ fun RadarScreen(
                         )
                     }
                     IconButton(
-                        onClick = { showClipboardVaultDialog = true },
-                        modifier = Modifier.size(38.dp)
-                    ) {
-                        Icon(
-                            Icons.Default.ContentPaste,
-                            contentDescription = "Pano Hafızası",
-                            modifier = Modifier.size(20.dp),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    IconButton(
                         onClick = { showInfoDialog = true },
                         modifier = Modifier.size(38.dp)
                     ) {
@@ -393,9 +379,6 @@ fun RadarScreen(
                             PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
                         )
                     },
-                    onOpenClipboardVault = {
-                        showClipboardVaultDialog = true
-                    },
                     onShowWebPortal = { showQrDialog = true }
                 )
             }
@@ -421,7 +404,7 @@ fun RadarScreen(
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
-                            text = "YAKINDAKİ CİHAZLAR",
+                            text = "EŞLEŞMİŞ CİHAZLAR (OMAID)",
                             style = MaterialTheme.typography.titleSmall,
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.primary,
@@ -477,19 +460,6 @@ fun RadarScreen(
                 }
             }
 
-            // 5. Canli Pano Hafizasi (Clipboard Vault - Son Kopyalananlar)
-            if (clipboardEntries.isNotEmpty()) {
-                item {
-                    ClipboardVaultHeroCard(
-                        app = app,
-                        entries = clipboardEntries.take(6),
-                        totalCount = clipboardEntries.size,
-                        onOpenVault = { showClipboardVaultDialog = true },
-                        onPreviewImage = { entry -> previewImageEntry = entry }
-                    )
-                }
-            }
-
             // 6. Son Alınan Dosyalar (Ekstra Kolaylık Özelliği)
             if (recentFiles.isNotEmpty()) {
                 item {
@@ -536,22 +506,6 @@ fun RadarScreen(
 
     if (showInfoDialog) {
         InfoDialog(onDismiss = { showInfoDialog = false })
-    }
-
-    if (showClipboardVaultDialog) {
-        ClipboardVaultDialog(
-            app = app,
-            onDismiss = { showClipboardVaultDialog = false },
-            onPreviewImage = { entry -> previewImageEntry = entry }
-        )
-    }
-
-    if (previewImageEntry != null) {
-        ClipboardImagePreviewDialog(
-            app = app,
-            entry = previewImageEntry!!,
-            onDismiss = { previewImageEntry = null }
-        )
     }
 
     if (showOmaIdQrDialog) {
@@ -884,7 +838,6 @@ fun LocalDeviceHeroCard(
 fun QuickSendHubCard(
     onPickFiles: () -> Unit,
     onPickMedia: () -> Unit,
-    onOpenClipboardVault: () -> Unit,
     onShowWebPortal: () -> Unit
 ) {
     Column(modifier = Modifier.fillMaxWidth()) {
@@ -913,12 +866,6 @@ fun QuickSendHubCard(
                 icon = Icons.Default.Image,
                 modifier = Modifier.weight(1f),
                 onClick = onPickMedia
-            )
-            QuickActionItem(
-                title = "Pano Hafızası",
-                icon = Icons.Default.ContentPaste,
-                modifier = Modifier.weight(1f),
-                onClick = onOpenClipboardVault
             )
             QuickActionItem(
                 title = "Web Portal",
@@ -1184,8 +1131,8 @@ fun CleanEmptyStateCard(
             Text(
                 text = when (discoveryMode) {
                     DiscoveryMode.OFF -> "Ağ Taraması Duraklatıldı"
-                    DiscoveryMode.KNOWN_PEERS -> "Kayıtlı Güvenilir Cihaz Yok"
-                    DiscoveryMode.EVERYONE -> "Yakında Cihaz Aranıyor..."
+                    DiscoveryMode.KNOWN_PEERS -> "Eşleşmiş Cihaz Bulunmuyor"
+                    DiscoveryMode.EVERYONE -> "OmaID Cihazları Aranıyor..."
                 },
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
@@ -1197,7 +1144,7 @@ fun CleanEmptyStateCard(
             Text(
                 text = when (discoveryMode) {
                     DiscoveryMode.OFF -> "Cihazları görmek için görünürlüğü 'Herkes' veya 'Bilinenler' olarak açın."
-                    DiscoveryMode.KNOWN_PEERS -> "Yalnızca güvenilir olarak işaretlenen veya eşleşen cihazlar listelenir. Yakındaki tüm cihazları görmek için 'Herkes' moduna geçebilirsiniz."
+                    DiscoveryMode.KNOWN_PEERS -> "Yalnızca eşleşmiş veya aynı 16 haneli OmaID'yi paylaşan cihazlar listelenir. Yeni bir cihaz bağlamak için yukarıdaki 'QR Tara' butonunu kullanabilirsiniz."
                     DiscoveryMode.EVERYONE -> "Masaüstünde OmaSend'in açık olduğundan emin olun. Cihazlar farklı ağdaysa OmaID QR kodu ile eşleştirmeyi kontrol edin."
                 },
                 style = MaterialTheme.typography.bodySmall,
@@ -2240,733 +2187,9 @@ fun getDeviceTypeBadge(senderName: String): String {
     }
 }
 
-fun copyImageToClipboard(context: Context, app: OmaSendApp, file: File) {
-    try {
-        val uri = FileProvider.getUriForFile(
-            context,
-            "${context.packageName}.fileprovider",
-            file
-        )
-        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-        val clip = ClipData.newUri(context.contentResolver, "OmaSend Image", uri)
-        clipboard?.setPrimaryClip(clip)
-        app.hapticController.onClipTick()
-        Toast.makeText(context, "Görsel panoya kopyalandı", Toast.LENGTH_SHORT).show()
-    } catch (e: Exception) {
-        Toast.makeText(context, "Panoya kopyalanamadı: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
-    }
-}
 
-fun saveImageToGallery(context: Context, imageFile: File): Boolean {
-    return try {
-        val filename = "OmaSend_${System.currentTimeMillis()}.png"
-        val values = android.content.ContentValues().apply {
-            put(android.provider.MediaStore.Images.Media.DISPLAY_NAME, filename)
-            put(android.provider.MediaStore.Images.Media.MIME_TYPE, "image/png")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(android.provider.MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/OmaSend")
-                put(android.provider.MediaStore.Images.Media.IS_PENDING, 1)
-            }
-        }
-        val uri = context.contentResolver.insert(android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-            ?: return false
-        context.contentResolver.openOutputStream(uri)?.use { out ->
-            imageFile.inputStream().use { input ->
-                input.copyTo(out)
-            }
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            values.clear()
-            values.put(android.provider.MediaStore.Images.Media.IS_PENDING, 0)
-            context.contentResolver.update(uri, values, null, null)
-        }
-        true
-    } catch (_: Exception) {
-        false
-    }
-}
 
-@OptIn(ExperimentalFoundationApi::class)
-@Composable
-fun ClipboardImageVaultItem(
-    app: OmaSendApp,
-    item: ClipboardEntry,
-    onPreview: () -> Unit
-) {
-    val context = LocalContext.current
-    val hash = item.imageHash ?: ""
-    val file = remember(hash) { app.clipboardVault.getImageFile(hash) }
-    val thumbFile = remember(hash) { app.clipboardVault.getThumbnailFile(hash) }
-    var bitmap by remember(hash) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
-    val timeFormat = remember { java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()) }
 
-    LaunchedEffect(hash, item.thumbnailBase64) {
-        withContext(Dispatchers.IO) {
-            // 1. Önce <hash>_thumb.webp dosyası
-            if (thumbFile.exists() && thumbFile.length() > 0) {
-                try {
-                    val bmp = android.graphics.BitmapFactory.decodeFile(thumbFile.absolutePath)
-                    if (bmp != null) {
-                        bitmap = bmp.asImageBitmap()
-                        return@withContext
-                    }
-                } catch (_: Exception) {}
-            }
-
-            // 2. Yoksa entry.thumbnailBase64 çözümlenir
-            if (!item.thumbnailBase64.isNullOrBlank()) {
-                try {
-                    val bytes = io.omarchy.omasend.engine.ThumbnailEngine.decodeBase64(item.thumbnailBase64)
-                    if (bytes != null && bytes.isNotEmpty()) {
-                        val bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                        if (bmp != null) {
-                            bitmap = bmp.asImageBitmap()
-                            return@withContext
-                        }
-                    }
-                } catch (_: Exception) {}
-            }
-
-            // 3. Dosya sistemindeki ana görselden thumbnail türetme veya yükleme
-            if (file.exists() && file.length() > 0) {
-                try {
-                    val res = io.omarchy.omasend.engine.ThumbnailEngine.generateAndCacheThumbnail(
-                        context,
-                        file.readBytes(),
-                        hash
-                    )
-                    if (res.file != null && res.file.exists() && res.file.length() > 0) {
-                        val bmp = android.graphics.BitmapFactory.decodeFile(res.file.absolutePath)
-                        if (bmp != null) {
-                            bitmap = bmp.asImageBitmap()
-                            return@withContext
-                        }
-                    }
-                    val bmp = android.graphics.BitmapFactory.decodeFile(file.absolutePath)
-                    if (bmp != null) {
-                        bitmap = bmp.asImageBitmap()
-                        return@withContext
-                    }
-                } catch (_: Exception) {}
-            }
-        }
-    }
-
-    ElevatedCard(
-        modifier = Modifier
-            .fillMaxWidth()
-            .combinedClickable(
-                onClick = {
-                    if (file.exists() && file.length() > 0) {
-                        copyImageToClipboard(context, app, file)
-                    } else {
-                        onPreview()
-                    }
-                },
-                onLongClick = onPreview
-            ),
-        shape = RoundedCornerShape(14.dp),
-        colors = CardDefaults.elevatedCardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceContainer
-        )
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(44.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(MaterialTheme.colorScheme.surfaceContainerHighest)
-                    .clickable { onPreview() },
-                contentAlignment = Alignment.Center
-            ) {
-                if (bitmap != null) {
-                    Image(
-                        bitmap = bitmap!!,
-                        contentDescription = "Önizleme",
-                        modifier = Modifier.fillMaxSize(),
-                        contentScale = ContentScale.Crop
-                    )
-                } else {
-                    Icon(
-                        Icons.Default.Image,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(22.dp)
-                    )
-                }
-            }
-
-            Spacer(modifier = Modifier.width(12.dp))
-
-            Column(modifier = Modifier.weight(1f)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Surface(
-                            shape = RoundedCornerShape(6.dp),
-                            color = if (item.isMine) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.secondaryContainer
-                        ) {
-                            Text(
-                                text = if (item.isMine) "Bu Cihaz" else getDeviceTypeBadge(item.senderName),
-                                style = MaterialTheme.typography.labelSmall,
-                                fontWeight = FontWeight.Bold,
-                                color = if (item.isMine) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSecondaryContainer,
-                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                            )
-                        }
-
-                        Surface(
-                            shape = RoundedCornerShape(6.dp),
-                            color = MaterialTheme.colorScheme.tertiaryContainer
-                        ) {
-                            val sizeLabel = item.imageSize?.let { NetworkUtils.formatBytes(it) } ?: ""
-                            Text(
-                                text = if (sizeLabel.isNotBlank()) "$sizeLabel PNG" else "PNG",
-                                style = MaterialTheme.typography.labelSmall,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.onTertiaryContainer,
-                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                            )
-                        }
-                    }
-
-                    Text(
-                        text = timeFormat.format(java.util.Date(item.timestamp)),
-                        style = MaterialTheme.typography.labelSmall,
-                        fontFamily = FontFamily.Monospace,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(4.dp))
-
-                Text(
-                    text = if (item.width != null && item.height != null) "${item.width} x ${item.height}" else "Görsel Pano Öğesi",
-                    style = MaterialTheme.typography.bodySmall,
-                    fontFamily = FontFamily.Monospace,
-                    color = MaterialTheme.colorScheme.onSurface
-                )
-            }
-
-            Spacer(modifier = Modifier.width(8.dp))
-
-            IconButton(
-                onClick = {
-                    if (file.exists() && file.length() > 0) {
-                        copyImageToClipboard(context, app, file)
-                    } else {
-                        onPreview()
-                    }
-                },
-                modifier = Modifier.size(32.dp)
-            ) {
-                Icon(
-                    Icons.Default.ContentCopy,
-                    contentDescription = "Panoya Kopyala",
-                    tint = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.size(16.dp)
-                )
-            }
-        }
-    }
-}
-
-@Composable
-fun ClipboardImagePreviewDialog(
-    app: OmaSendApp,
-    entry: ClipboardEntry,
-    onDismiss: () -> Unit
-) {
-    val context = LocalContext.current
-    val hash = entry.imageHash ?: ""
-    val file = remember(hash) { app.clipboardVault.getImageFile(hash) }
-    val thumbFile = remember(hash) { app.clipboardVault.getThumbnailFile(hash) }
-    var bitmap by remember(hash) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
-    var isLoading by remember { mutableStateOf(false) }
-
-    LaunchedEffect(hash) {
-        withContext(Dispatchers.IO) {
-            if (file.exists() && file.length() > 0) {
-                try {
-                    val bmp = android.graphics.BitmapFactory.decodeFile(file.absolutePath)
-                    if (bmp != null) {
-                        bitmap = bmp.asImageBitmap()
-                        return@withContext
-                    }
-                } catch (_: Exception) {}
-            }
-            if (thumbFile.exists() && thumbFile.length() > 0) {
-                try {
-                    val bmp = android.graphics.BitmapFactory.decodeFile(thumbFile.absolutePath)
-                    if (bmp != null) {
-                        bitmap = bmp.asImageBitmap()
-                    }
-                } catch (_: Exception) {}
-            } else if (!entry.thumbnailBase64.isNullOrBlank()) {
-                try {
-                    val bytes = io.omarchy.omasend.engine.ThumbnailEngine.decodeBase64(entry.thumbnailBase64)
-                    if (bytes != null && bytes.isNotEmpty()) {
-                        val bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                        if (bmp != null) {
-                            bitmap = bmp.asImageBitmap()
-                        }
-                    }
-                } catch (_: Exception) {}
-            }
-            if (!file.exists() || file.length() == 0L) {
-                isLoading = true
-                val peers = app.discoveryManager.peers.value
-                val peer = peers.firstOrNull { it.name == entry.senderName }
-                if (peer != null && peer.port > 0) {
-                    val fetched = app.clipboardVault.fetchAndCacheImage(app.client, peer.ip, peer.port, hash)
-                    if (fetched != null && fetched.exists()) {
-                        try {
-                            val bmp = android.graphics.BitmapFactory.decodeFile(fetched.absolutePath)
-                            if (bmp != null) {
-                                bitmap = bmp.asImageBitmap()
-                            }
-                        } catch (_: Exception) {}
-                    }
-                }
-                isLoading = false
-            }
-        }
-    }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = "Görsel Önizleme",
-                    fontWeight = FontWeight.Bold,
-                    style = MaterialTheme.typography.titleMedium
-                )
-                Surface(
-                    shape = RoundedCornerShape(6.dp),
-                    color = MaterialTheme.colorScheme.primaryContainer
-                ) {
-                    val sizeLabel = entry.imageSize?.let { NetworkUtils.formatBytes(it) } ?: ""
-                    Text(
-                        text = if (sizeLabel.isNotBlank()) "$sizeLabel PNG" else "PNG",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onPrimaryContainer,
-                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                    )
-                }
-            }
-        },
-        text = {
-            Column(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = 160.dp, max = 320.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(MaterialTheme.colorScheme.surfaceContainerHighest),
-                    contentAlignment = Alignment.Center
-                ) {
-                    if (bitmap != null) {
-                        Image(
-                            bitmap = bitmap!!,
-                            contentDescription = "Pano Görseli",
-                            modifier = Modifier.fillMaxWidth(),
-                            contentScale = ContentScale.Fit
-                        )
-                    } else if (isLoading) {
-                        CircularProgressIndicator(modifier = Modifier.size(36.dp))
-                    } else {
-                        Icon(
-                            Icons.Default.Image,
-                            contentDescription = null,
-                            modifier = Modifier.size(48.dp),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(12.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    val senderBadge = if (entry.isMine) "Bu Cihaz" else getDeviceTypeBadge(entry.senderName)
-                    Text(
-                        text = "Kaynak: $senderBadge",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    if (entry.width != null && entry.height != null) {
-                        Text(
-                            text = "${entry.width} x ${entry.height}",
-                            style = MaterialTheme.typography.bodySmall,
-                            fontFamily = FontFamily.Monospace,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(
-                    onClick = {
-                        val saved = saveImageToGallery(context, file)
-                        if (saved) {
-                            app.hapticController.onClipTick()
-                            Toast.makeText(context, "Galeriye kaydedildi", Toast.LENGTH_SHORT).show()
-                        } else {
-                            Toast.makeText(context, "Galeriye kaydedilemedi", Toast.LENGTH_SHORT).show()
-                        }
-                    }
-                ) {
-                    Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("Galeriye Kaydet")
-                }
-                Button(
-                    onClick = {
-                        if (file.exists() && file.length() > 0) {
-                            copyImageToClipboard(context, app, file)
-                        } else {
-                            Toast.makeText(context, "Görsel henüz indirilmedi", Toast.LENGTH_SHORT).show()
-                        }
-                    }
-                ) {
-                    Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("Kopyala")
-                }
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text("Kapat")
-            }
-        }
-    )
-}
-
-@Composable
-fun ClipboardVaultHeroCard(
-    app: OmaSendApp,
-    entries: List<ClipboardEntry>,
-    totalCount: Int,
-    onOpenVault: () -> Unit,
-    onPreviewImage: (ClipboardEntry) -> Unit
-) {
-    val context = LocalContext.current
-    val timeFormat = remember { java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()) }
-
-    Column(modifier = Modifier.fillMaxWidth()) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 4.dp, vertical = 2.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = "PANO HAFIZASI",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.primary,
-                    letterSpacing = 0.8.sp
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Surface(
-                    shape = RoundedCornerShape(6.dp),
-                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.15f)
-                ) {
-                    Text(
-                        text = "CANLI SENKRON",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                    )
-                }
-            }
-
-            TextButton(
-                onClick = onOpenVault,
-                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
-            ) {
-                Text(
-                    text = "Tümü ($totalCount)",
-                    style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.Bold
-                )
-            }
-        }
-
-        Spacer(modifier = Modifier.height(6.dp))
-
-        Column(
-            modifier = Modifier.fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            entries.forEach { item ->
-                if (item.contentType == "image" || item.imageHash != null) {
-                    ClipboardImageVaultItem(
-                        app = app,
-                        item = item,
-                        onPreview = { onPreviewImage(item) }
-                    )
-                } else {
-                    ElevatedCard(
-                        onClick = {
-                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                            val clip = ClipData.newPlainText("OmaSend", item.text)
-                            app.clipboardVault.updateLastReceivedHash(item.text)
-                            clipboard?.setPrimaryClip(clip)
-                            app.hapticController.onClipTick()
-                            Toast.makeText(context, "Panoya kopyalandı", Toast.LENGTH_SHORT).show()
-                        },
-                        shape = RoundedCornerShape(14.dp),
-                        colors = CardDefaults.elevatedCardColors(
-                            containerColor = MaterialTheme.colorScheme.surfaceContainer
-                        ),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(12.dp)
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Surface(
-                                    shape = RoundedCornerShape(6.dp),
-                                    color = if (item.isMine) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.secondaryContainer
-                                ) {
-                                    Text(
-                                        text = if (item.isMine) "Bu Cihaz" else getDeviceTypeBadge(item.senderName),
-                                        style = MaterialTheme.typography.labelSmall,
-                                        fontWeight = FontWeight.Bold,
-                                        color = if (item.isMine) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSecondaryContainer,
-                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                    )
-                                }
-
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Text(
-                                        text = timeFormat.format(java.util.Date(item.timestamp)),
-                                        style = MaterialTheme.typography.labelSmall,
-                                        fontFamily = FontFamily.Monospace,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Icon(
-                                        Icons.Default.ContentCopy,
-                                        contentDescription = "Panoya Kopyala",
-                                        tint = MaterialTheme.colorScheme.primary,
-                                        modifier = Modifier.size(14.dp)
-                                    )
-                                }
-                            }
-
-                            Spacer(modifier = Modifier.height(6.dp))
-
-                            Text(
-                                text = item.text,
-                                style = MaterialTheme.typography.bodySmall,
-                                fontFamily = FontFamily.Monospace,
-                                maxLines = 2,
-                                overflow = TextOverflow.Ellipsis,
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-fun ClipboardVaultDialog(
-    app: OmaSendApp,
-    onDismiss: () -> Unit,
-    onPreviewImage: (ClipboardEntry) -> Unit
-) {
-    val context = LocalContext.current
-    val entries by app.clipboardVault.entries.collectAsState()
-    val timeFormat = remember { java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()) }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = "Pano Hafızası",
-                    fontWeight = FontWeight.Bold,
-                    style = MaterialTheme.typography.titleMedium
-                )
-                if (entries.isNotEmpty()) {
-                    TextButton(
-                        onClick = {
-                            app.clipboardVault.clear()
-                            Toast.makeText(context, "Pano geçmişi temizlendi", Toast.LENGTH_SHORT).show()
-                        }
-                    ) {
-                        Text(
-                            text = "Temizle",
-                            color = MaterialTheme.colorScheme.error,
-                            style = MaterialTheme.typography.labelSmall
-                        )
-                    }
-                }
-            }
-        },
-        text = {
-            if (entries.isEmpty()) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 24.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = "Kayıtlı pano öğesi bulunmuyor",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            } else {
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 420.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    items(entries, key = { it.id }) { item ->
-                        if (item.contentType == "image" || item.imageHash != null) {
-                            ClipboardImageVaultItem(
-                                app = app,
-                                item = item,
-                                onPreview = { onPreviewImage(item) }
-                            )
-                        } else {
-                            Surface(
-                                shape = RoundedCornerShape(12.dp),
-                                color = MaterialTheme.colorScheme.surfaceContainerHigh,
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Column(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(10.dp)
-                                ) {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Surface(
-                                            shape = RoundedCornerShape(6.dp),
-                                            color = if (item.isMine) {
-                                                MaterialTheme.colorScheme.primaryContainer
-                                            } else {
-                                                MaterialTheme.colorScheme.secondaryContainer
-                                            }
-                                        ) {
-                                            Text(
-                                                text = if (item.isMine) "Yerel" else "Gelen: ${getDeviceTypeBadge(item.senderName)}",
-                                                style = MaterialTheme.typography.labelSmall,
-                                                fontWeight = FontWeight.Bold,
-                                                color = if (item.isMine) {
-                                                    MaterialTheme.colorScheme.onPrimaryContainer
-                                                } else {
-                                                    MaterialTheme.colorScheme.onSecondaryContainer
-                                                },
-                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                            )
-                                        }
-                                        Text(
-                                            text = timeFormat.format(java.util.Date(item.timestamp)),
-                                            style = MaterialTheme.typography.labelSmall,
-                                            fontFamily = FontFamily.Monospace,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
-                                    Spacer(modifier = Modifier.height(6.dp))
-                                    Text(
-                                        text = item.text,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        fontFamily = FontFamily.Monospace,
-                                        maxLines = 3,
-                                        overflow = TextOverflow.Ellipsis,
-                                        color = MaterialTheme.colorScheme.onSurface
-                                    )
-                                    Spacer(modifier = Modifier.height(6.dp))
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.End
-                                    ) {
-                                        TextButton(
-                                            onClick = {
-                                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                                                val clip = ClipData.newPlainText("OmaSend", item.text)
-                                                app.clipboardVault.updateLastReceivedHash(item.text)
-                                                clipboard?.setPrimaryClip(clip)
-                                                app.hapticController.onClipTick()
-                                                Toast.makeText(context, "Panoya kopyalandı", Toast.LENGTH_SHORT).show()
-                                            },
-                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
-                                        ) {
-                                            Icon(
-                                                Icons.Default.ContentCopy,
-                                                contentDescription = null,
-                                                modifier = Modifier.size(14.dp)
-                                            )
-                                            Spacer(modifier = Modifier.width(4.dp))
-                                            Text(text = "Kopyala", style = MaterialTheme.typography.labelSmall)
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            Button(onClick = onDismiss) {
-                Text("Kapat")
-            }
-        }
-    )
-}
 
 // ------------------- OMAID VE AĞ DURUMU BİLEŞENLERİ -------------------
 

@@ -1461,165 +1461,11 @@ pub fn is_probable_url(text: &str) -> bool {
 }
 
 pub fn load_clipboard_vault() -> ClipboardVault {
-    let path = get_state_dir().join("clipboard_vault.json");
-    if let Ok(content) = read_secure_file(&path) {
-        if let Ok(mut vault) = serde_json::from_str::<ClipboardVault>(&content) {
-            vault.items.retain(|item| {
-                if item.content_type.starts_with("image_") || item.image_hash.is_some() {
-                    return true;
-                }
-                let s = &item.text;
-                !s.starts_with("\u{FFFD}") &&
-                !s.starts_with("PNG") &&
-                s.chars().filter(|c| *c == '\u{FFFD}').count() < 2 &&
-                s.chars().take(100).filter(|c| c.is_control() && *c != '\n' && *c != '\r' && *c != '\t').count() < 2
-            });
-            return vault;
-        }
-    }
-    let hist_path = get_state_dir().join("clipboard_history.json");
-    if let Ok(content) = read_secure_file(&hist_path) {
-        if let Ok(mut vault) = serde_json::from_str::<ClipboardVault>(&content) {
-            vault.items.retain(|item| {
-                if item.content_type.starts_with("image_") || item.image_hash.is_some() {
-                    return true;
-                }
-                let s = &item.text;
-                !s.starts_with("\u{FFFD}") &&
-                !s.starts_with("PNG") &&
-                s.chars().filter(|c| *c == '\u{FFFD}').count() < 2 &&
-                s.chars().take(100).filter(|c| c.is_control() && *c != '\n' && *c != '\r' && *c != '\t').count() < 2
-            });
-            return vault;
-        }
-    }
     ClipboardVault::default()
 }
 
-pub fn save_clipboard_vault(vault: &ClipboardVault) -> Result<(), String> {
-    let path = get_state_dir().join("clipboard_vault.json");
-    let content = serde_json::to_string_pretty(vault).map_err(|e| e.to_string())?;
-    write_secure_file(&path, &content)?;
-    let hist_path = get_state_dir().join("clipboard_history.json");
-    let _ = write_secure_file(&hist_path, &content);
-    Ok(())
-}
-
-pub fn add_clipboard_to_vault(sender: &str, text: &str) -> Result<ClipboardItem, String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Err("Clipboard text is empty".to_string());
-    }
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let item = ClipboardItem {
-        timestamp: now,
-        sender: sender.to_string(),
-        content_type: "text".to_string(),
-        text: text.to_string(),
-        char_count: text.chars().count(),
-        is_url: is_probable_url(text),
-        image_hash: None,
-        image_size: None,
-        image_width: None,
-        image_height: None,
-        thumbnail_base64: None,
-    };
-
-    let mut vault = load_clipboard_vault();
-    if let Some(first) = vault.items.first() {
-        if first.content_type == "text" && first.text == item.text {
-            return Ok(item);
-        }
-    }
-
-    vault.items.insert(0, item.clone());
-    if vault.items.len() > MAX_CLIPBOARD_VAULT_ITEMS {
-        vault.items.truncate(MAX_CLIPBOARD_VAULT_ITEMS);
-    }
-    save_clipboard_vault(&vault)?;
-    Ok(item)
-}
-
-pub fn add_image_clipboard_to_vault(
-    sender: &str,
-    content_type: &str,
-    image_hash: &str,
-    image_size: u64,
-    image_width: u32,
-    image_height: u32,
-    thumbnail_base64: Option<String>,
-) -> Result<ClipboardItem, String> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let short_hash = if image_hash.len() >= 8 { &image_hash[..8] } else { image_hash };
-    let desc = format!("[Image: {} ({}x{})]", short_hash, image_width, image_height);
-
-    let final_thumb = thumbnail_base64.or_else(|| {
-        let staging_dir = get_clip_staging_dir();
-        let thumb_path = staging_dir.join(format!("{}_thumb.webp", image_hash));
-        if thumb_path.exists() {
-            if let Ok(meta) = fs::symlink_metadata(&thumb_path) {
-                if meta.file_type().is_file() && !meta.file_type().is_symlink() && meta.len() > 0 && meta.len() <= 1024 * 1024 {
-                    if let Ok(bytes) = safe_read_file(&thumb_path) {
-                        if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-                            return Some(format!("data:image/webp;base64,{}", base64_encode(&bytes)));
-                        }
-                    }
-                }
-            }
-        }
-        let candidates = [
-            staging_dir.join(format!("{}.png", image_hash)),
-            staging_dir.join(format!("{}.jpg", image_hash)),
-            staging_dir.join(format!("{}.webp", image_hash)),
-        ];
-        for cand in &candidates {
-            if cand.exists() {
-                return generate_webp_thumbnail_for_staging(cand, image_hash);
-            }
-        }
-        None
-    });
-
-    let item = ClipboardItem {
-        timestamp: now,
-        sender: sender.to_string(),
-        content_type: content_type.to_string(),
-        text: desc,
-        char_count: 0,
-        is_url: false,
-        image_hash: Some(image_hash.to_string()),
-        image_size: Some(image_size),
-        image_width: Some(image_width),
-        image_height: Some(image_height),
-        thumbnail_base64: final_thumb,
-    };
-
-    let mut vault = load_clipboard_vault();
-    if let Some(first) = vault.items.first_mut() {
-        if first.image_hash.as_deref() == Some(image_hash) {
-            let mut updated = false;
-            if first.thumbnail_base64.is_none() && item.thumbnail_base64.is_some() {
-                first.thumbnail_base64 = item.thumbnail_base64.clone();
-                updated = true;
-            }
-            let cloned = first.clone();
-            if updated {
-                let _ = save_clipboard_vault(&vault);
-            }
-            return Ok(cloned);
-        }
-    }
-
-    vault.items.insert(0, item.clone());
-    if vault.items.len() > MAX_CLIPBOARD_VAULT_ITEMS {
-        vault.items.truncate(MAX_CLIPBOARD_VAULT_ITEMS);
-    }
-    save_clipboard_vault(&vault)?;
-    Ok(item)
-}
-
 pub fn get_clipboard_vault_items() -> Vec<ClipboardItem> {
-    load_clipboard_vault().items
+    Vec::new()
 }
 
 
@@ -1788,21 +1634,7 @@ pub fn p2p_fetch_image_clipboard_and_apply(sender_ip: &str, hash: &str, _content
                             if let Ok((verified_ct, _w, _h)) = validate_image_header(body_bytes) {
                                 let computed_hash = compute_image_clipboard_hash(body_bytes);
                                 if computed_hash == h {
-                                    let staged_res = stage_clipboard_image(body_bytes, &verified_ct);
-                                    let thumb_b64 = if let Ok((_, ref staged_path)) = staged_res {
-                                        generate_webp_thumbnail_for_staging(staged_path, &computed_hash)
-                                    } else {
-                                        None
-                                    };
-                                    let _ = add_image_clipboard_to_vault(
-                                        &ip,
-                                        &verified_ct,
-                                        &computed_hash,
-                                        body_bytes.len() as u64,
-                                        _w,
-                                        _h,
-                                        thumb_b64,
-                                    );
+                                    let _ = stage_clipboard_image(body_bytes, &verified_ct);
                                     let _ = set_pc_image_clipboard(body_bytes, &verified_ct);
                                 }
                             }
@@ -1836,13 +1668,7 @@ pub fn start_clipboard_sentinel() {
                 if last_hash.as_deref() != Some(&img_hash) {
                     set_last_synced_clipboard_hash(&img_hash);
                     let size = img_bytes.len() as u64;
-                    let staged_res = stage_clipboard_image(&img_bytes, &ct);
-                    let thumb_b64 = if let Ok((_, ref staged_path)) = staged_res {
-                        generate_webp_thumbnail_for_staging(staged_path, &img_hash)
-                    } else {
-                        None
-                    };
-                    let _ = add_image_clipboard_to_vault("Local", &ct, &img_hash, size, w, h, thumb_b64);
+                    let _ = stage_clipboard_image(&img_bytes, &ct);
 
                     let target_ips = get_active_paired_peer_ips();
                     for target_ip in target_ips {
@@ -1875,7 +1701,6 @@ pub fn start_clipboard_sentinel() {
             }
 
             set_last_synced_clipboard_hash(&hash);
-            let _ = add_clipboard_to_vault("Local", &text);
 
             let target_ips = get_active_paired_peer_ips();
             for target_ip in target_ips {
@@ -4543,11 +4368,10 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Visibility is Off\"}", None, None);
             return;
         }
-        let vault = load_clipboard_vault();
         let resp = serde_json::json!({
             "status": "OK",
-            "count": vault.items.len(),
-            "items": vault.items
+            "count": 0,
+            "items": []
         });
         respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
         return;
@@ -4597,10 +4421,6 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             // Handle visual clipboard payloads (< 512 KiB Base64 or metadata announcement)
             if content_type.starts_with("image_") || val.get("image_hash").is_some() {
                 let img_hash = val["image_hash"].as_str();
-                let img_size = val["image_size"].as_u64().unwrap_or(0);
-                let img_w = val["image_width"].as_u64().unwrap_or(0) as u32;
-                let img_h = val["image_height"].as_u64().unwrap_or(0) as u32;
-                let thumb_b64 = val["thumbnail_base64"].as_str().map(|s| s.to_string());
 
                 if let Some(b64_data) = val["image_base64"].as_str() {
                     if let Ok(raw_bytes) = base64_decode(b64_data) {
@@ -4610,15 +4430,6 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                                 set_last_synced_clipboard_hash(&computed_hash);
                                 let _ = stage_clipboard_image(&raw_bytes, &verified_ct);
                                 let _ = set_pc_image_clipboard(&raw_bytes, &verified_ct);
-                                let _ = add_image_clipboard_to_vault(
-                                    sender_name,
-                                    &verified_ct,
-                                    &computed_hash,
-                                    raw_bytes.len() as u64,
-                                    w,
-                                    h,
-                                    thumb_b64,
-                                );
                                 notify_desktop("OmaSend: Image Clipboard", &format!("Received image ({}x{}) from {}.", w, h, sender_name));
                                 play_clipboard_sound();
                                 respond(&stream, "200 OK", "application/json", b"{\"status\":\"OK\"}", None, None);
@@ -4629,15 +4440,6 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                 } else if let Some(hash) = img_hash {
                     if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
                         set_last_synced_clipboard_hash(hash);
-                        let _ = add_image_clipboard_to_vault(
-                            sender_name,
-                            content_type,
-                            hash,
-                            img_size,
-                            img_w,
-                            img_h,
-                            thumb_b64,
-                        );
                         let peer_ip = val["sender_ip"].as_str().unwrap_or("");
                         if !peer_ip.is_empty() {
                             p2p_fetch_image_clipboard_and_apply(peer_ip, hash, content_type);
@@ -4655,7 +4457,6 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                     let hash = compute_clipboard_hash(text);
                     set_last_synced_clipboard_hash(&hash);
                     set_pc_clipboard(text);
-                    let _ = add_clipboard_to_vault(sender_name, text);
                     notify_desktop("OmaSend: Universal Clipboard", &format!("Received clipboard text from {}.", sender_name));
                     play_clipboard_sound();
                     respond(&stream, "200 OK", "application/json", b"{\"status\":\"OK\"}", None, None);
@@ -4851,7 +4652,6 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                 let hash = compute_clipboard_hash(&text);
                 set_last_synced_clipboard_hash(&hash);
                 set_pc_clipboard(&text);
-                let _ = add_clipboard_to_vault("Web Client (E2EE)", &text);
                 notify_desktop(
                     "OmaSend: E2EE Clipboard Received",
                     &format!("Encrypted clipboard updated ({} chars):\n{}", text.len(), text.chars().take(60).collect::<String>()),
@@ -4908,7 +4708,6 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             let hash = compute_clipboard_hash(&text);
             set_last_synced_clipboard_hash(&hash);
             set_pc_clipboard(&text);
-            let _ = add_clipboard_to_vault("Web Client", &text);
             notify_desktop("OmaSend: Clipboard Received", &format!("Clipboard updated from device ({} chars)", text.len()));
             play_clipboard_sound();
             let resp = serde_json::json!({ "status": "OK" });
@@ -4916,11 +4715,10 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         }
     }
     else if req.method == "GET" && (req.path == "/api/clipboard-vault" || req.path == "/api/clipboard/vault" || req.path == "/api/clipboard-history") {
-        let vault = load_clipboard_vault();
         let resp = serde_json::json!({
             "status": "OK",
-            "count": vault.items.len(),
-            "items": vault.items
+            "count": 0,
+            "items": []
         });
         respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
     }
@@ -6400,29 +6198,18 @@ mod tests {
     }
 
     #[test]
-    fn test_clipboard_vault_lifecycle_and_0600_permissions() {
+    fn test_instant_clipboard_delivery_and_hash_tracking() {
         let _guard = TEST_SYNC_MUTEX.lock().unwrap();
         let test_text = format!("Unique test note {}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos());
-        
-        let item = add_clipboard_to_vault("POCO Phone", &test_text).expect("Add to clipboard vault");
-        assert_eq!(item.sender, "POCO Phone");
-        assert_eq!(item.text, test_text);
-        assert_eq!(item.char_count, test_text.chars().count());
+        let expected_hash = compute_clipboard_hash(&test_text);
+        assert_eq!(expected_hash.len(), 64);
+
+        set_last_synced_clipboard_hash(&expected_hash);
+        let retrieved = get_last_synced_clipboard_hash();
+        assert_eq!(retrieved.as_deref(), Some(expected_hash.as_str()));
 
         let vault = load_clipboard_vault();
-        assert!(!vault.items.is_empty());
-        assert_eq!(vault.items[0].text, test_text);
-
-        // Verify file permissions are strictly 0600
-        let vault_file = get_state_dir().join("clipboard_vault.json");
-        let meta = fs::symlink_metadata(&vault_file).expect("clipboard_vault.json must exist");
-        assert_eq!(meta.mode() & 0o777, 0o600, "clipboard_vault.json must enforce 0600 permissions");
-
-        let hist_file = get_state_dir().join("clipboard_history.json");
-        if hist_file.exists() {
-            let hist_meta = fs::symlink_metadata(&hist_file).expect("clipboard_history.json must exist");
-            assert_eq!(hist_meta.mode() & 0o777, 0o600, "clipboard_history.json must enforce 0600 permissions");
-        }
+        assert!(vault.items.is_empty(), "Clipboard vault must not persist items to disk");
     }
 
     #[test]
@@ -6856,36 +6643,77 @@ mod tests {
     }
 
     #[test]
-    fn test_image_clipboard_vault_integration() {
+    fn test_image_clipboard_hash_and_metadata_serialization() {
         let _guard = TEST_SYNC_MUTEX.lock().unwrap();
         let dummy_hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-        let item = add_image_clipboard_to_vault(
-            "POCO Pad",
-            "image_png",
-            dummy_hash,
-            102400,
-            1920,
-            1080,
-            Some("dGh1bWJuYWls".to_string()),
-        ).expect("Add image to vault");
-
-        assert_eq!(item.sender, "POCO Pad");
-        assert_eq!(item.content_type, "image_png");
-        assert_eq!(item.image_hash.as_deref(), Some(dummy_hash));
-        assert_eq!(item.image_width, Some(1920));
-        assert_eq!(item.image_height, Some(1080));
-        assert_eq!(item.image_size, Some(102400));
-
-        let vault = load_clipboard_vault();
-        let found = vault.items.iter().find(|i| i.image_hash.as_deref() == Some(dummy_hash));
-        assert!(found.is_some(), "Image item must be persisted and loaded from vault");
+        let item = ClipboardItem {
+            timestamp: 1727700000,
+            sender: "POCO Pad".to_string(),
+            content_type: "image_png".to_string(),
+            text: format!("[Image: {} (1920x1080)]", &dummy_hash[..8]),
+            char_count: 0,
+            is_url: false,
+            image_hash: Some(dummy_hash.to_string()),
+            image_size: Some(102400),
+            image_width: Some(1920),
+            image_height: Some(1080),
+            thumbnail_base64: Some("dGh1bWJuYWls".to_string()),
+        };
 
         let json = serde_json::to_string(&item).expect("Serialize image ClipboardItem");
         let parsed: ClipboardItem = serde_json::from_str(&json).expect("Deserialize image ClipboardItem");
         assert_eq!(parsed.content_type, "image_png");
         assert_eq!(parsed.image_hash.as_deref(), Some(dummy_hash));
         assert_eq!(parsed.image_width, Some(1920));
+
+        let vault = load_clipboard_vault();
+        assert!(vault.items.is_empty(), "Clipboard vault must not persist items to disk");
+    }
+
+    #[test]
+    fn test_http_p2p_instant_text_clipboard_sync() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        set_visibility("ALL");
+        let valid_raw_oma_id = rendezvous::generate_raw_oma_id();
+        let valid_peer_oma_id = rendezvous::format_oma_id(&valid_raw_oma_id);
+        let _ = add_paired_peer(&valid_peer_oma_id, "Instant Device", None);
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
+        let local_addr = listener.local_addr().unwrap();
+
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("Accept text client");
+            handle_connection(stream, "127.0.0.1", "1234", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+        });
+
+        let test_text = "Instant P2P text transmission test without vault persistence";
+        let text_hash = compute_clipboard_hash(test_text);
+
+        let post_payload = serde_json::json!({
+            "oma_id": valid_peer_oma_id,
+            "sender_id": valid_peer_oma_id,
+            "sender_name": "Instant Device",
+            "content_type": "text",
+            "text": test_text
+        });
+        let post_bytes = post_payload.to_string().into_bytes();
+
+        let mut client = TcpStream::connect(local_addr).expect("Connect client");
+        let req = format!(
+            "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-OmaSend-OmaID: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            local_addr, valid_peer_oma_id, post_bytes.len()
+        );
+        client.write_all(req.as_bytes()).unwrap();
+        client.write_all(&post_bytes).unwrap();
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "POST /api/p2p/clipboard must return 200 OK: {}", resp);
+
+        let last_synced = get_last_synced_clipboard_hash();
+        assert_eq!(last_synced.as_deref(), Some(text_hash.as_str()), "Last synced hash must be updated to prevent echo");
+
+        server_thread.join().expect("Join server thread");
     }
 
     #[test]
@@ -6971,7 +6799,7 @@ mod tests {
         let mut resp3 = String::new();
         client3.read_to_string(&mut resp3).unwrap();
         assert!(resp3.starts_with("HTTP/1.1 200 OK"), "GET /api/p2p/clipboard/vault must return 200 OK");
-        assert!(resp3.contains(&img_hash), "Vault response must contain stored image hash");
+        assert!(resp3.contains("\"items\":[]"), "Vault response must return empty items list");
 
         server_thread.join().expect("Join server thread");
     }
