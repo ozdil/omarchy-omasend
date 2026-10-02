@@ -44,7 +44,7 @@ Panel {
   // 16-Digit OmaID & Profile State
   property string omaId: ""
   property string omaidQrPath: ""
-  property bool omaIdRevealed: false
+  property bool omaIdRevealed: true
   property bool omaIdCopiedFeedback: false
 
   // OmaID Pairing & Scan State
@@ -165,7 +165,8 @@ Panel {
   }
 
   function resolveEnginePath() {
-    return Qt.resolvedUrl("omasend-engine").toString().replace(/^file:\/\//, "")
+    var home = Quickshell.env("HOME") || "/home/ozdil"
+    return home + "/.local/bin/omasend-engine"
   }
 
   function executeAction(args) {
@@ -180,6 +181,10 @@ Panel {
     if (!serverProc.running) {
       serverProc.running = true
     }
+    if (omaIdDirectReadProc.running) {
+      omaIdDirectReadProc.running = false
+    }
+    omaIdDirectReadProc.running = true
     if (scanProc.running) {
       scanProc.running = false
     }
@@ -289,6 +294,22 @@ Panel {
     function refresh(): void { root.refresh() }
     function setVisibility(mode: string): void { root.setP2pVisibility(mode) }
     function sendFile(ip: string): void { root.sendFileTo(ip) }
+  }
+
+  Process {
+    id: omaIdDirectReadProc
+    command: ["cat", (Quickshell.env("HOME") || "/home/ozdil") + "/.local/state/omarchy/omasend/oma_id"]
+    running: true
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        omaIdDirectReadProc.running = false
+        var val = String(text || "").trim()
+        if (val.length >= 16) {
+          root.omaId = val
+        }
+      }
+    }
   }
 
   // Persistent background HTTP daemon
@@ -1267,7 +1288,7 @@ Panel {
         // OmaID Profile & Connection Mode Indicator
         Rectangle {
           width: parent.width
-          implicitHeight: omaidRow.implicitHeight + Style.space(12)
+          implicitHeight: omaidCardContent.implicitHeight + Style.space(16)
           radius: Style.cornerRadius
           color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.07)
           border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.28)
@@ -1283,259 +1304,268 @@ Panel {
             border.width: 1
           }
 
-          RowLayout {
-            id: omaidRow
+          ColumnLayout {
+            id: omaidCardContent
             anchors.fill: parent
-            anchors.leftMargin: Style.space(10)
-            anchors.rightMargin: Style.space(10)
-            spacing: Style.space(8)
+            anchors.margins: Style.space(8)
+            spacing: Style.space(6)
 
-            // OmaID Icon (Nerd Font Glyph)
-            Text {
-              textFormat: Text.PlainText
-              text: "󰌆"
-              color: Color.accent
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              Layout.alignment: Qt.AlignVCenter
-            }
-
-            // OmaID Label & Value
-            Column {
+            // Header Row: [󰌆] OMAID (BU CİHAZ) ... [• P2P / LAN]
+            RowLayout {
               Layout.fillWidth: true
-              Layout.alignment: Qt.AlignVCenter
-              spacing: 1
+              spacing: Style.space(6)
 
-              RowLayout {
-                spacing: Style.space(4)
-                Text {
-                  text: "OMAID (BU CİHAZ)"
-                  color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.micro
-                  font.bold: true
-                  font.letterSpacing: 0.8
-                }
-                Text {
-                  visible: root.omaIdCopiedFeedback
-                  text: "COPIED"
-                  color: Color.accent
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.micro
-                  font.bold: true
-                }
+              Text {
+                textFormat: Text.PlainText
+                text: "󰌆"
+                color: Color.accent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                Layout.alignment: Qt.AlignVCenter
               }
 
               Text {
+                text: "OMAID (BU CİHAZ)"
+                color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.micro
+                font.bold: true
+                font.letterSpacing: 0.8
+                Layout.alignment: Qt.AlignVCenter
+              }
+
+              Text {
+                visible: root.omaIdCopiedFeedback
+                text: "COPIED"
+                color: Color.accent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.micro
+                font.bold: true
+                Layout.alignment: Qt.AlignVCenter
+              }
+
+              Item {
+                Layout.fillWidth: true
+              }
+
+              // Connection Mode Indicator Badge (LAN / WAN / P2P)
+              Rectangle {
+                implicitWidth: modeRow.implicitWidth + Style.space(8)
+                implicitHeight: 20
+                radius: 4
+                color: {
+                  if (root.wanActive) return Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.20)
+                  if (root.activeMode === "P2P" || root.p2pVisibility !== "OFF") return Qt.rgba(0.73, 0.60, 0.97, 0.20)
+                  return Qt.rgba(0.62, 0.81, 0.42, 0.20)
+                }
+                border.color: {
+                  if (root.wanActive) return Color.accent
+                  if (root.activeMode === "P2P" || root.p2pVisibility !== "OFF") return "#bb9af7"
+                  return "#9ece6a"
+                }
+                border.width: 1
+                Layout.alignment: Qt.AlignVCenter
+
+                RowLayout {
+                  id: modeRow
+                  anchors.centerIn: parent
+                  spacing: 4
+
+                  Rectangle {
+                    width: 6
+                    height: 6
+                    radius: 3
+                    color: {
+                      if (root.wanActive) return Color.accent
+                      if (root.activeMode === "P2P" || root.p2pVisibility !== "OFF") return "#bb9af7"
+                      return "#9ece6a"
+                    }
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: {
+                      if (root.wanActive) return "WAN"
+                      if (root.activeMode === "P2P" || root.p2pVisibility !== "OFF") return "P2P"
+                      return "LAN"
+                    }
+                    color: root.bar ? root.bar.foreground : Color.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.micro
+                    font.bold: true
+                    font.letterSpacing: 0.5
+                  }
+                }
+
+                PanelToolTip {
+                  text: root.wanActive ? "Cloudflare WAN Tunnel Active" : (root.p2pVisibility !== "OFF" ? "AirBridge P2P WebRTC Active" : "LAN Local Network Only")
+                  fontFamily: root.fontFamily
+                }
+              }
+            }
+
+            // Body Row: 16-Digit Code and Action Buttons
+            RowLayout {
+              Layout.fillWidth: true
+              spacing: Style.space(6)
+
+              Text {
+                Layout.fillWidth: true
                 text: root.formatOmaId(root.omaId, root.omaIdRevealed)
                 color: root.bar ? root.bar.foreground : Color.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 font.bold: true
                 font.letterSpacing: 1.0
-              }
-            }
-
-            // Reveal/Mask Button
-            Rectangle {
-              implicitWidth: 26
-              implicitHeight: 26
-              radius: 4
-              color: revealMouse.containsMouse ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.20) : "transparent"
-              Layout.alignment: Qt.AlignVCenter
-
-              Text {
-                anchors.centerIn: parent
-                textFormat: Text.PlainText
-                text: root.omaIdRevealed ? "󰈉" : "󰈈"
-                color: root.omaIdRevealed ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.3)
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
+                Layout.alignment: Qt.AlignVCenter
+                elide: Text.ElideRight
               }
 
-              MouseArea {
-                id: revealMouse
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: {
-                  root.omaIdRevealed = !root.omaIdRevealed
-                }
-              }
-
-              PanelToolTip {
-                visible: revealMouse.containsMouse
-                text: root.omaIdRevealed ? "Mask OmaID" : "Reveal OmaID"
-                fontFamily: root.fontFamily
-              }
-            }
-
-            // Copy OmaID Button
-            Rectangle {
-              implicitWidth: 26
-              implicitHeight: 26
-              radius: 4
-              color: copyOmaIdMouse.containsMouse ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.20) : "transparent"
-              Layout.alignment: Qt.AlignVCenter
-
-              Text {
-                anchors.centerIn: parent
-                textFormat: Text.PlainText
-                text: "󰅟"
-                color: root.omaIdCopiedFeedback ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-
-              MouseArea {
-                id: copyOmaIdMouse
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: {
-                  if (root.omaId) {
-                    root.copyText(root.omaId)
-                    root.omaIdCopiedFeedback = true
-                    omaIdCopyTimer.restart()
-                  }
-                }
-              }
-
-              PanelToolTip {
-                visible: copyOmaIdMouse.containsMouse
-                text: "OmaID Kopyala"
-                fontFamily: root.fontFamily
-              }
-            }
-
-            // QR Göster Button
-            Rectangle {
-              implicitWidth: 26
-              implicitHeight: 26
-              radius: 4
-              color: showQrMouse.containsMouse ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.20) : "transparent"
-              Layout.alignment: Qt.AlignVCenter
-
-              Text {
-                anchors.centerIn: parent
-                textFormat: Text.PlainText
-                text: "󰄲"
-                color: root.showOmaIdQrModal ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-
-              MouseArea {
-                id: showQrMouse
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: {
-                  root.showOmaIdQrModal = !root.showOmaIdQrModal
-                  root.showOmaIdPairModal = false
-                  root.showAboutModal = false
-                }
-              }
-
-              PanelToolTip {
-                visible: showQrMouse.containsMouse
-                text: "QR Göster"
-                fontFamily: root.fontFamily
-              }
-            }
-
-            // Barkod / QR Tara / Bağla Button
-            Rectangle {
-              implicitWidth: 26
-              implicitHeight: 26
-              radius: 4
-              color: pairMouse.containsMouse ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.20) : "transparent"
-              Layout.alignment: Qt.AlignVCenter
-
-              Text {
-                anchors.centerIn: parent
-                textFormat: Text.PlainText
-                text: "󰄳"
-                color: root.showOmaIdPairModal ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-
-              MouseArea {
-                id: pairMouse
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: {
-                  root.showOmaIdPairModal = !root.showOmaIdPairModal
-                  root.showOmaIdQrModal = false
-                  root.showAboutModal = false
-                  root.pairInputOmaId = ""
-                  root.pairInputName = ""
-                  root.pairStatusMsg = ""
-                }
-              }
-
-              PanelToolTip {
-                visible: pairMouse.containsMouse
-                text: "Barkod / QR Tara / Bağla"
-                fontFamily: root.fontFamily
-              }
-            }
-
-            // Connection Mode Indicator Badge (LAN / WAN / P2P)
-            Rectangle {
-              implicitWidth: modeRow.implicitWidth + Style.space(10)
-              implicitHeight: 22
-              radius: 4
-              color: {
-                if (root.wanActive) return Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.20)
-                if (root.activeMode === "P2P" || root.p2pVisibility !== "OFF") return Qt.rgba(0.73, 0.60, 0.97, 0.20)
-                return Qt.rgba(0.62, 0.81, 0.42, 0.20)
-              }
-              border.color: {
-                if (root.wanActive) return Color.accent
-                if (root.activeMode === "P2P" || root.p2pVisibility !== "OFF") return "#bb9af7"
-                return "#9ece6a"
-              }
-              border.width: 1
-              Layout.alignment: Qt.AlignVCenter
-
-              RowLayout {
-                id: modeRow
-                anchors.centerIn: parent
-                spacing: 4
-
-                // Dot Indicator
-                Rectangle {
-                  width: 6
-                  height: 6
-                  radius: 3
-                  color: {
-                    if (root.wanActive) return Color.accent
-                    if (root.activeMode === "P2P" || root.p2pVisibility !== "OFF") return "#bb9af7"
-                    return "#9ece6a"
-                  }
-                }
+              // Reveal/Mask Button
+              Rectangle {
+                implicitWidth: 26
+                implicitHeight: 26
+                radius: 4
+                color: revealMouse.containsMouse ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.20) : "transparent"
+                Layout.alignment: Qt.AlignVCenter
 
                 Text {
+                  anchors.centerIn: parent
                   textFormat: Text.PlainText
-                  text: {
-                    if (root.wanActive) return "WAN"
-                    if (root.activeMode === "P2P" || root.p2pVisibility !== "OFF") return "P2P"
-                    return "LAN"
-                  }
-                  color: root.bar ? root.bar.foreground : Color.foreground
+                  text: root.omaIdRevealed ? "󰈉" : "󰈈"
+                  color: root.omaIdRevealed ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.3)
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.micro
-                  font.bold: true
-                  font.letterSpacing: 0.5
+                  font.pixelSize: Style.font.caption
+                }
+
+                MouseArea {
+                  id: revealMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    root.omaIdRevealed = !root.omaIdRevealed
+                  }
+                }
+
+                PanelToolTip {
+                  visible: revealMouse.containsMouse
+                  text: root.omaIdRevealed ? "Mask OmaID" : "Reveal OmaID"
+                  fontFamily: root.fontFamily
                 }
               }
 
-              PanelToolTip {
-                text: root.wanActive ? "Cloudflare WAN Tunnel Active" : (root.p2pVisibility !== "OFF" ? "AirBridge P2P WebRTC Active" : "LAN Local Network Only")
-                fontFamily: root.fontFamily
+              // Copy OmaID Button
+              Rectangle {
+                implicitWidth: 26
+                implicitHeight: 26
+                radius: 4
+                color: copyOmaIdMouse.containsMouse ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.20) : "transparent"
+                Layout.alignment: Qt.AlignVCenter
+
+                Text {
+                  anchors.centerIn: parent
+                  textFormat: Text.PlainText
+                  text: "󰅟"
+                  color: root.omaIdCopiedFeedback ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                MouseArea {
+                  id: copyOmaIdMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    if (root.omaId) {
+                      root.copyText(root.omaId)
+                      root.omaIdCopiedFeedback = true
+                      omaIdCopyTimer.restart()
+                    }
+                  }
+                }
+
+                PanelToolTip {
+                  visible: copyOmaIdMouse.containsMouse
+                  text: "OmaID Kopyala"
+                  fontFamily: root.fontFamily
+                }
+              }
+
+              // QR Göster Button
+              Rectangle {
+                implicitWidth: 26
+                implicitHeight: 26
+                radius: 4
+                color: showQrMouse.containsMouse ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.20) : "transparent"
+                Layout.alignment: Qt.AlignVCenter
+
+                Text {
+                  anchors.centerIn: parent
+                  textFormat: Text.PlainText
+                  text: "󰄲"
+                  color: root.showOmaIdQrModal ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                MouseArea {
+                  id: showQrMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    root.showOmaIdQrModal = !root.showOmaIdQrModal
+                    root.showOmaIdPairModal = false
+                    root.showAboutModal = false
+                  }
+                }
+
+                PanelToolTip {
+                  visible: showQrMouse.containsMouse
+                  text: "QR Göster"
+                  fontFamily: root.fontFamily
+                }
+              }
+
+              // Barkod / QR Tara / Bağla Button
+              Rectangle {
+                implicitWidth: 26
+                implicitHeight: 26
+                radius: 4
+                color: pairMouse.containsMouse ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.20) : "transparent"
+                Layout.alignment: Qt.AlignVCenter
+
+                Text {
+                  anchors.centerIn: parent
+                  textFormat: Text.PlainText
+                  text: "󰄳"
+                  color: root.showOmaIdPairModal ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                MouseArea {
+                  id: pairMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    root.showOmaIdPairModal = !root.showOmaIdPairModal
+                    root.showOmaIdQrModal = false
+                    root.showAboutModal = false
+                    root.pairInputOmaId = ""
+                    root.pairInputName = ""
+                    root.pairStatusMsg = ""
+                  }
+                }
+
+                PanelToolTip {
+                  visible: pairMouse.containsMouse
+                  text: "Barkod / QR Tara / Bağla"
+                  fontFamily: root.fontFamily
+                }
               }
             }
           }
