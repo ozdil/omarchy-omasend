@@ -1693,97 +1693,116 @@ Panel {
             fontFamily: root.fontFamily
           }
 
-          Repeater {
-            model: root.p2pVisibility === "OFF" ? [] : root.p2pPeers
+          Flickable {
+            id: peersFlickable
+            width: parent.width
+            implicitHeight: Math.min(peersCol.implicitHeight, Style.space(220))
+            contentWidth: width
+            contentHeight: peersCol.implicitHeight
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
 
-            CursorSurface {
-              id: peerRow
-              required property var modelData
-              required property int index
-              width: peersSection.width
-              implicitHeight: peerRowContent.implicitHeight + Style.spacing.rowPaddingX
-              foreground: root.bar ? root.bar.foreground : Color.foreground
-              fill: root.hoverFill
-              currentFill: root.selectedFill
-              current: false
-              hasCursor: root.cursorActive && root.selectedPeerIndex === index
+            Column {
+              id: peersCol
+              width: parent.width
+              spacing: Style.space(6)
 
-              MouseArea {
-                id: rowMouse
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onEntered: {
-                  root.cursorActive = true
-                  root.selectedPeerIndex = index
-                }
-                onClicked: {
-                  root.sendFileTo(modelData.ip)
-                }
-              }
+              Repeater {
+                model: root.p2pVisibility === "OFF" ? [] : root.p2pPeers
 
-              Item {
-                id: peerRowContent
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                anchors.leftMargin: Style.space(10)
-                anchors.rightMargin: Style.space(10)
-                implicitHeight: Math.max(devIcon.implicitHeight, devInfo.implicitHeight, actionBtns.implicitHeight)
+                CursorSurface {
+                  id: peerRow
+                  required property var modelData
+                  required property int index
+                  width: peersCol.width
+                  implicitHeight: peerRowContent.implicitHeight + Style.spacing.rowPaddingX
+                  foreground: root.bar ? root.bar.foreground : Color.foreground
+                  fill: root.hoverFill
+                  currentFill: root.selectedFill
+                  current: false
+                  hasCursor: root.cursorActive && root.selectedPeerIndex === index
 
-                Text {
-                  id: devIcon
-                  textFormat: Text.PlainText
-                  text: modelData.transport === "BT" ? "" : (modelData.transport === "HYBRID" ? "󱘖" : "")
-                  color: root.bar ? root.bar.foreground : Color.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.heading
-                  anchors.left: parent.left
-                  anchors.verticalCenter: parent.verticalCenter
-                }
-
-                Column {
-                  id: devInfo
-                  spacing: Style.space(1)
-                  anchors.left: devIcon.right
-                  anchors.leftMargin: Style.space(10)
-                  anchors.right: actionBtns.left
-                  anchors.rightMargin: Style.space(8)
-                  anchors.verticalCenter: parent.verticalCenter
-
-                  Text {
-                    textFormat: Text.PlainText
-                    text: modelData.name || "Omarchy Device"
-                    color: root.bar ? root.bar.foreground : Color.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.body
-                    elide: Text.ElideRight
-                    width: parent.width
+                  MouseArea {
+                    id: rowMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onEntered: {
+                      root.cursorActive = true
+                      root.selectedPeerIndex = index
+                    }
+                    onClicked: {
+                      if (modelData.ip) root.sendFileTo(modelData.ip)
+                    }
                   }
 
-                  Text {
-                    textFormat: Text.PlainText
-                    text: modelData.last_seen_secs === 0 ? "OmaID Eşleşmiş (Çevrimdışı / Beklemede)" : (modelData.transport === "WAN" ? "OmaID Eşleşmiş (WAN Çevrimiçi)" : "OmaID Eşleşmiş (LAN Çevrimiçi)")
-                    color: modelData.last_seen_secs === 0 ? Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 2.0) : Color.accent
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    elide: Text.ElideRight
-                    width: parent.width
-                  }
-                }
+                  Item {
+                    id: peerRowContent
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.leftMargin: Style.space(10)
+                    anchors.rightMargin: Style.space(10)
+                    implicitHeight: Math.max(devIcon.implicitHeight, devInfo.implicitHeight, actionBtns.implicitHeight)
 
-                RowLayout {
-                  id: actionBtns
-                  anchors.right: parent.right
-                  anchors.verticalCenter: parent.verticalCenter
-                  spacing: Style.space(6)
+                    Text {
+                      id: devIcon
+                      textFormat: Text.PlainText
+                      text: modelData.transport === "BT" ? "" : (modelData.transport === "HYBRID" ? "󱘖" : "")
+                      color: root.bar ? root.bar.foreground : Color.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.heading
+                      anchors.left: parent.left
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
 
-                  PanelActionButton {
-                    iconText: "󰛄"
-                    tooltipText: "Send File"
-                    foreground: root.bar ? root.bar.foreground : Color.foreground
-                    fontFamily: root.fontFamily
-                    onClicked: root.sendFileTo(modelData.ip)
+                    Column {
+                      id: devInfo
+                      spacing: Style.space(1)
+                      anchors.left: devIcon.right
+                      anchors.leftMargin: Style.space(10)
+                      anchors.right: actionBtns.left
+                      anchors.rightMargin: Style.space(8)
+                      anchors.verticalCenter: parent.verticalCenter
+
+                      Text {
+                        textFormat: Text.PlainText
+                        text: modelData.name || "Omarchy Device"
+                        color: root.bar ? root.bar.foreground : Color.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                        elide: Text.ElideRight
+                        width: parent.width
+                      }
+
+                      Text {
+                        textFormat: Text.PlainText
+                        text: modelData.last_seen_secs === 0 ? "OmaID Eşleşmiş (Çevrimdışı / Beklemede)" : (modelData.transport === "WAN" ? "OmaID Eşleşmiş (WAN Çevrimiçi)" : "OmaID Eşleşmiş (LAN Çevrimiçi)")
+                        color: modelData.last_seen_secs === 0 ? Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 2.0) : Color.accent
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        elide: Text.ElideRight
+                        width: parent.width
+                      }
+                    }
+
+                    RowLayout {
+                      id: actionBtns
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(6)
+
+                      PanelActionButton {
+                        iconText: "󰛄"
+                        tooltipText: modelData.ip ? "Send File" : "Device Offline"
+                        foreground: root.bar ? root.bar.foreground : Color.foreground
+                        fontFamily: root.fontFamily
+                        opacity: modelData.ip ? 1.0 : 0.4
+                        onClicked: {
+                          if (modelData.ip) root.sendFileTo(modelData.ip)
+                        }
+                      }
+                    }
                   }
                 }
               }
