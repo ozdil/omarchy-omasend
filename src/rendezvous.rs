@@ -181,6 +181,8 @@ pub struct PairedPeer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ip: Option<String>,
     pub paired_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -216,6 +218,17 @@ pub fn add_paired_peer(
     ip: Option<&str>,
     state_dir: &Path,
 ) -> Result<PairedPeer, String> {
+    add_paired_peer_with_token(oma_id, name, ip, None, state_dir)
+}
+
+/// Adds or updates a paired peer with an explicit or generated authentication token
+pub fn add_paired_peer_with_token(
+    oma_id: &str,
+    name: &str,
+    ip: Option<&str>,
+    token: Option<&str>,
+    state_dir: &Path,
+) -> Result<PairedPeer, String> {
     let norm = normalize_oma_id(oma_id);
     if !validate_oma_id(&norm) {
         return Err(format!("Invalid 16-digit Luhn OmaID: '{}'", oma_id));
@@ -236,6 +249,11 @@ pub fn add_paired_peer(
                 existing.ip = Some(ip_str.to_string());
             }
         }
+        if let Some(tok) = token {
+            if !tok.trim().is_empty() {
+                existing.auth_token = Some(tok.to_string());
+            }
+        }
         let peer_clone = existing.clone();
         let db = PairedPeersDb { peers };
         let path = state_dir.join("paired_peers.json");
@@ -244,6 +262,15 @@ pub fn add_paired_peer(
         crate::write_secure_file(&path, &s)?;
         Ok(peer_clone)
     } else {
+        let auth_token = token
+            .filter(|t| !t.trim().is_empty())
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| {
+                let mut rand_bytes = [0u8; 32];
+                let _ = getrandom::getrandom(&mut rand_bytes);
+                hex::encode(rand_bytes)
+            });
+
         let peer = PairedPeer {
             oma_id: formatted,
             name: if name.trim().is_empty() {
@@ -253,6 +280,7 @@ pub fn add_paired_peer(
             },
             ip: ip.filter(|s| !s.trim().is_empty()).map(|s| s.to_string()),
             paired_at: now,
+            auth_token: Some(auth_token),
         };
         peers.push(peer.clone());
         let db = PairedPeersDb { peers };
