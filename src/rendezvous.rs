@@ -30,13 +30,13 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     }
 
     let mut inner_hasher = Sha256::new();
-    inner_hasher.update(&ipad);
+    inner_hasher.update(ipad);
     inner_hasher.update(data);
     let inner_hash = inner_hasher.finalize();
 
     let mut outer_hasher = Sha256::new();
-    outer_hasher.update(&opad);
-    outer_hasher.update(&inner_hash);
+    outer_hasher.update(opad);
+    outer_hasher.update(inner_hash);
     let outer_hash = outer_hasher.finalize();
 
     let mut out = [0u8; 32];
@@ -90,7 +90,7 @@ pub fn luhn_verify(all_16_digits: &[u8]) -> bool {
         }
         sum += val;
     }
-    sum % 10 == 0
+    sum.is_multiple_of(10)
 }
 
 /// Normalizes an OmaID string by extracting only ASCII decimal digits
@@ -433,7 +433,7 @@ pub fn parse_stun_response(buf: &[u8], tx_id: &[u8; 12]) -> Option<SocketAddr> {
         return None;
     }
     let msg_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
-    if &buf[4..8] != &[0x21, 0x12, 0xa4, 0x42] {
+    if buf[4..8] != [0x21, 0x12, 0xa4, 0x42] {
         return None;
     }
     if &buf[8..20] != tx_id {
@@ -556,6 +556,7 @@ pub fn parse_github_anchor_payload(
 }
 
 /// Publishes local rendezvous discovery record to ~/.local/state/omarchy/omasend/rendezvous_anchor.json
+#[allow(clippy::too_many_arguments)]
 pub fn publish_local_rendezvous_anchor(
     oma_id: &str,
     local_ip: &str,
@@ -739,7 +740,7 @@ pub fn generate_fallback_qr_svg(content: &str) -> String {
         for y in 0..7 {
             for x in 0..7 {
                 let is_outer = x == 0 || x == 6 || y == 0 || y == 6;
-                let is_inner = x >= 2 && x <= 4 && y >= 2 && y <= 4;
+                let is_inner = (2..=4).contains(&x) && (2..=4).contains(&y);
                 mat[start_y + y][start_x + x] = is_outer || is_inner;
             }
         }
@@ -751,15 +752,17 @@ pub fn generate_fallback_qr_svg(content: &str) -> String {
     draw_finder(&mut matrix, 0, grid_size - 7);
 
     // Timing patterns
+    #[allow(clippy::needless_range_loop)]
     for i in 8..(grid_size - 8) {
-        matrix[6][i] = i % 2 == 0;
-        matrix[i][6] = i % 2 == 0;
+        let is_even = i.is_multiple_of(2);
+        matrix[6][i] = is_even;
+        matrix[i][6] = is_even;
     }
 
     // Populate data modules deterministically using content hash
     let mut byte_idx = 0;
-    for y in 0..grid_size {
-        for x in 0..grid_size {
+    for (y, row) in matrix.iter_mut().enumerate().take(grid_size) {
+        for (x, cell) in row.iter_mut().enumerate().take(grid_size) {
             // Skip finder zones
             if (x < 8 && y < 8) || (x >= grid_size - 8 && y < 8) || (x < 8 && y >= grid_size - 8) {
                 continue;
@@ -769,15 +772,15 @@ pub fn generate_fallback_qr_svg(content: &str) -> String {
             }
             let h_byte = hash[byte_idx % hash.len()];
             let bit = (h_byte >> ((x + y * 7) % 8)) & 1;
-            matrix[y][x] = bit == 1;
+            *cell = bit == 1;
             byte_idx += 1;
         }
     }
 
     let mut paths = String::new();
-    for y in 0..grid_size {
-        for x in 0..grid_size {
-            if matrix[y][x] {
+    for (y, row) in matrix.iter().enumerate().take(grid_size) {
+        for (x, &filled) in row.iter().enumerate().take(grid_size) {
+            if filled {
                 let px = offset + x * module_size;
                 let py = offset + y * module_size;
                 paths.push_str(&format!(

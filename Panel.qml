@@ -85,7 +85,7 @@ Panel {
 
   function formatOmaId(id, revealed) {
     if (!id || String(id).trim() === "") return "---- ---- ---- ----"
-    var clean = String(id).toUpperCase().replace(/[^A-F0-9]/g, "")
+    var clean = String(id).replace(/[^0-9]/g, "")
     if (!revealed) {
       if (clean.length >= 16) {
         return "••••-••••-••••-" + clean.slice(12, 16)
@@ -100,7 +100,7 @@ Panel {
 
   function formatInputOmaId(val) {
     if (!val) return ""
-    var clean = String(val).toUpperCase().replace(/[^A-F0-9]/g, "").slice(0, 16)
+    var clean = String(val).replace(/[^0-9]/g, "").slice(0, 16)
     var parts = []
     for (var i = 0; i < clean.length; i += 4) {
       parts.push(clean.slice(i, i + 4))
@@ -119,9 +119,9 @@ Panel {
   }
 
   function bindOmaId(targetId, targetName) {
-    var clean = String(targetId || "").toUpperCase().replace(/[^A-F0-9]/g, "")
+    var clean = String(targetId || "").replace(/[^0-9]/g, "")
     if (clean.length !== 16) {
-      root.pairStatusMsg = "Geçersiz OmaID (16 hex karakter olmalı)"
+      root.pairStatusMsg = "Geçersiz OmaID (16 haneli rakam olmalı)"
       root.pairStatusError = true
       return
     }
@@ -386,7 +386,7 @@ Panel {
         screenScanProc.running = false
         var raw = String(text || "").trim()
         if (raw.length > 0) {
-          var clean = raw.toUpperCase().replace(/[^A-F0-9]/g, "")
+          var clean = raw.replace(/[^0-9]/g, "")
           if (clean.length >= 16) {
             root.pairInputOmaId = root.formatInputOmaId(clean.slice(0, 16))
             root.pairStatusMsg = "QR Kod okundu: " + root.pairInputOmaId
@@ -412,7 +412,7 @@ Panel {
         pasteProc.running = false
         var raw = String(text || "").trim()
         if (raw.length > 0) {
-          var clean = raw.toUpperCase().replace(/[^A-F0-9]/g, "")
+          var clean = raw.replace(/[^0-9]/g, "")
           if (clean.length >= 16) {
             root.pairInputOmaId = root.formatInputOmaId(clean.slice(0, 16))
             root.pairStatusMsg = "Panodan OmaID aktarıldı: " + root.pairInputOmaId
@@ -2183,7 +2183,7 @@ Panel {
             }
             Item { Layout.fillWidth: true }
             Text {
-              property int cleanLen: root.pairInputOmaId.replace(/[^A-F0-9]/gi, "").length
+              property int cleanLen: root.pairInputOmaId.replace(/[^0-9]/g, "").length
               text: "(" + cleanLen + " / 16)"
               color: cleanLen === 16 ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
               font.family: root.fontFamily
@@ -2197,7 +2197,7 @@ Panel {
             height: 38
             radius: 6
             color: Qt.rgba(1.0, 1.0, 1.0, 0.05)
-            border.color: pairOmaIdInput.activeFocus ? Color.accent : (root.pairInputOmaId.replace(/[^A-F0-9]/gi, "").length === 16 ? Color.accent : Qt.rgba(1.0, 1.0, 1.0, 0.15))
+            border.color: pairOmaIdInput.activeFocus ? Color.accent : (root.pairInputOmaId.replace(/[^0-9]/g, "").length === 16 ? Color.accent : Qt.rgba(1.0, 1.0, 1.0, 0.15))
             border.width: 1
 
             RowLayout {
@@ -2233,7 +2233,7 @@ Panel {
                 Text {
                   anchors.fill: parent
                   visible: !pairOmaIdInput.text && !pairOmaIdInput.activeFocus
-                  text: "XXXX-XXXX-XXXX-XXXX"
+                  text: "0000-0000-0000-0000"
                   color: Qt.rgba(1.0, 1.0, 1.0, 0.25)
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -2244,7 +2244,7 @@ Panel {
               }
 
               Text {
-                visible: root.pairInputOmaId.replace(/[^A-F0-9]/gi, "").length === 16
+                visible: root.pairInputOmaId.replace(/[^0-9]/g, "").length === 16
                 text: "󰄬"
                 color: Color.accent
                 font.family: root.fontFamily
@@ -2342,7 +2342,7 @@ Panel {
             Layout.fillWidth: true
             height: 36
             radius: 6
-            property bool isReady: root.pairInputOmaId.replace(/[^A-F0-9]/gi, "").length === 16
+            property bool isReady: root.pairInputOmaId.replace(/[^0-9]/g, "").length === 16
             color: isReady
               ? (pairActionHover.containsMouse ? Qt.darker(Color.accent, 1.15) : Color.accent)
               : Qt.rgba(1.0, 1.0, 1.0, 0.05)

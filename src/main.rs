@@ -1038,7 +1038,7 @@ pub fn compute_image_clipboard_hash(bytes: &[u8]) -> String {
 
 pub fn base64_encode(data: &[u8]) -> String {
     const CHARSET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0];
         let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
@@ -1063,10 +1063,11 @@ pub fn base64_encode(data: &[u8]) -> String {
 
 pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     let clean: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    if clean.len() % 4 != 0 {
+    if !clean.len().is_multiple_of(4) {
         return Err("Invalid Base64 length".to_string());
     }
     let mut out = Vec::with_capacity(clean.len() / 4 * 3);
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     for chunk in clean.chunks_exact(4) {
         let mut buf = [0u8; 4];
         let mut pad_count = 0;
@@ -1171,14 +1172,12 @@ pub fn validate_image_header(data: &[u8]) -> Result<(String, u32, u32), String> 
             }
 
             let is_sof = matches!(marker, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF);
-            if is_sof {
-                if seg_len >= 7 && offset + 7 <= len {
-                    let h = u16::from_be_bytes([data[offset + 3], data[offset + 4]]) as u32;
-                    let w = u16::from_be_bytes([data[offset + 5], data[offset + 6]]) as u32;
-                    height = h;
-                    width = w;
-                    break;
-                }
+            if is_sof && seg_len >= 7 && offset + 7 <= len {
+                let h = u16::from_be_bytes([data[offset + 3], data[offset + 4]]) as u32;
+                let w = u16::from_be_bytes([data[offset + 5], data[offset + 6]]) as u32;
+                height = h;
+                width = w;
+                break;
             }
             offset += seg_len;
         }
@@ -1199,13 +1198,11 @@ pub fn validate_image_header(data: &[u8]) -> Result<(String, u32, u32), String> 
         let mut height = 0u32;
 
         if chunk_type == b"VP8 " {
-            if data.len() >= 30 {
-                if data[23] == 0x9D && data[24] == 0x01 && data[25] == 0x2A {
-                    let w = u16::from_le_bytes([data[26], data[27]]) & 0x3FFF;
-                    let h = u16::from_le_bytes([data[28], data[29]]) & 0x3FFF;
-                    width = w as u32;
-                    height = h as u32;
-                }
+            if data.len() >= 30 && data[23] == 0x9D && data[24] == 0x01 && data[25] == 0x2A {
+                let w = u16::from_le_bytes([data[26], data[27]]) & 0x3FFF;
+                let h = u16::from_le_bytes([data[28], data[29]]) & 0x3FFF;
+                width = w as u32;
+                height = h as u32;
             }
         } else if chunk_type == b"VP8L" {
             if data.len() >= 25 && data[20] == 0x2F {
@@ -1213,13 +1210,11 @@ pub fn validate_image_header(data: &[u8]) -> Result<(String, u32, u32), String> 
                 width = (bits & 0x3FFF) + 1;
                 height = ((bits >> 14) & 0x3FFF) + 1;
             }
-        } else if chunk_type == b"VP8X" {
-            if data.len() >= 30 {
-                let w = (data[24] as u32) | ((data[25] as u32) << 8) | ((data[26] as u32) << 16);
-                let h = (data[27] as u32) | ((data[28] as u32) << 8) | ((data[29] as u32) << 16);
-                width = w + 1;
-                height = h + 1;
-            }
+        } else if chunk_type == b"VP8X" && data.len() >= 30 {
+            let w = (data[24] as u32) | ((data[25] as u32) << 8) | ((data[26] as u32) << 16);
+            let h = (data[27] as u32) | ((data[28] as u32) << 8) | ((data[29] as u32) << 16);
+            width = w + 1;
+            height = h + 1;
         }
 
         if width == 0 || height == 0 {
@@ -1291,15 +1286,9 @@ pub fn generate_webp_thumbnail_for_staging(image_path: &Path, hash_hex: &str) ->
         }
     }
 
-    let input_str = match image_path.to_str() {
-        Some(s) => s,
-        None => return None,
-    };
+    let input_str = image_path.to_str()?;
     let tmp_thumb_path = staging_dir.join(format!(".tmp_{}_thumb.webp", hash_hex));
-    let tmp_out_str = match tmp_thumb_path.to_str() {
-        Some(s) => s,
-        None => return None,
-    };
+    let tmp_out_str = tmp_thumb_path.to_str()?;
 
     let _ = fs::remove_file(&tmp_thumb_path);
 
@@ -1419,7 +1408,7 @@ pub fn cleanup_clip_staging() -> Result<(), String> {
         }
     }
 
-    files.sort_by(|a, b| b.2.cmp(&a.2));
+    files.sort_by_key(|a| std::cmp::Reverse(a.2));
 
     let mut total_size: u64 = 0;
     let mut kept_count = 0;
@@ -1480,10 +1469,8 @@ fn play_clipboard_sound() {
             ("/usr/bin/pw-play", &["/usr/share/sounds/freedesktop/stereo/message.oga"]),
         ];
         for (bin, args) in sound_candidates {
-            if Path::new(bin).exists() {
-                if run_cmd_bounded(bin, args, &envs, deadline, 1024).is_some() {
-                    break;
-                }
+            if Path::new(bin).exists() && run_cmd_bounded(bin, args, &envs, deadline, 1024).is_some() {
+                break;
             }
         }
     });
@@ -2479,6 +2466,10 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
     let (blake3_hex, sha256_hex, md5_hex) = compute_file_military_hashes(file_path)
         .map_err(|e| format!("Failed to compute file hashes: {}", e))?;
 
+    let paired = load_paired_peers();
+    let matched_peer = paired.iter().find(|p| p.ip.as_deref() == Some(target_ip));
+    let auth_token = matched_peer.and_then(|p| p.auth_token.clone()).unwrap_or_default();
+
     // 1. Send transfer request
     let request_payload = serde_json::json!({
         "sender_id": my_oma_id,
@@ -2486,6 +2477,7 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
         "device_id": my_id,
         "sender_name": my_name,
         "sender_ip": get_local_ip(),
+        "auth_token": auth_token,
         "files": [
             {
                 "name": file_name,
@@ -2511,8 +2503,8 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
     };
     let req_bytes = request_payload.to_string().into_bytes();
     let http_req = format!(
-        "POST /api/p2p/request HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-OmaSend-OmaID: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        addr, my_oma_id, req_bytes.len()
+        "POST /api/p2p/request HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-OmaSend-OmaID: {}\r\nX-OmaSend-Auth-Token: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        addr, my_oma_id, auth_token, req_bytes.len()
     );
     stream.write_all(http_req.as_bytes()).map_err(|e| e.to_string())?;
     stream.write_all(&req_bytes).map_err(|e| e.to_string())?;
@@ -2634,13 +2626,19 @@ fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
     let (my_id, _) = get_or_create_device_id();
     let my_oma_id = get_or_create_oma_id();
     let my_name = get_system_hostname();
+
+    let paired = load_paired_peers();
+    let matched_peer = paired.iter().find(|p| p.ip.as_deref() == Some(target_ip));
+    let auth_token = matched_peer.and_then(|p| p.auth_token.clone()).unwrap_or_default();
+
     let payload = serde_json::json!({
         "sender_id": my_oma_id,
         "oma_id": my_oma_id,
         "device_id": my_id,
         "sender_name": my_name,
         "content_type": "text",
-        "text": text
+        "text": text,
+        "auth_token": auth_token
     });
     let addr = resolve_peer_addr(target_ip);
     let mut stream = match connect_peer_with_timeout(&addr, Duration::from_secs(4)) {
@@ -2655,8 +2653,8 @@ fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
     };
     let req_bytes = payload.to_string().into_bytes();
     let http_req = format!(
-        "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-OmaSend-OmaID: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        addr, my_oma_id, req_bytes.len()
+        "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-OmaSend-OmaID: {}\r\nX-OmaSend-Auth-Token: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        addr, my_oma_id, auth_token, req_bytes.len()
     );
     stream.write_all(http_req.as_bytes()).map_err(|e| e.to_string())?;
     stream.write_all(&req_bytes).map_err(|e| e.to_string())?;
@@ -4140,6 +4138,23 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             return;
         }
 
+        // Verify authentication token if configured for paired peer
+        let provided_token = req.get_header("x-omasend-auth-token")
+            .or_else(|| req_data.get("auth_token").and_then(|v| v.as_str()))
+            .unwrap_or_default();
+
+        let paired = load_paired_peers();
+        let norm_sender = rendezvous::normalize_oma_id(&sender_id);
+        if let Some(peer_record) = paired.iter().find(|p| rendezvous::normalize_oma_id(&p.oma_id) == norm_sender) {
+            if let Some(ref expected_tok) = peer_record.auth_token {
+                if !expected_tok.is_empty() && (provided_token.is_empty() || !constant_time_eq_str(expected_tok, provided_token)) {
+                    let err = serde_json::json!({ "error": "Invalid peer authentication token" });
+                    respond(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
+                    return;
+                }
+            }
+        }
+
         let mut file_names = Vec::new();
         let mut files_info = Vec::new();
         let mut total_size_bytes = 0u64;
@@ -4534,7 +4549,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                     if let Ok(raw_bytes) = base64_decode(b64_data) {
                         if let Ok((verified_ct, w, h)) = validate_image_header(&raw_bytes) {
                             let computed_hash = compute_image_clipboard_hash(&raw_bytes);
-                            if img_hash.map_or(true, |expected| expected == computed_hash) {
+                            if img_hash.is_none_or(|expected| expected == computed_hash) {
                                 set_last_synced_clipboard_hash(&computed_hash);
                                 let _ = stage_clipboard_image(&raw_bytes, &verified_ct);
                                 let _ = set_pc_image_clipboard(&raw_bytes, &verified_ct);
@@ -4863,7 +4878,6 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             }
         }
         respond(&stream, "404 Not Found", "application/json", b"{\"error\":\"Image not found in staging\"}", None, None);
-        return;
     }
     else if req.method == "GET" && req.path.starts_with("/download/") {
         let filename = sanitize_filename(&urlencoding_decode(req.path.trim_start_matches("/download/")));
