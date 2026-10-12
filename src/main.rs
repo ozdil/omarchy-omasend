@@ -4,12 +4,12 @@ pub mod rendezvous;
 
 pub use rendezvous::{
     build_github_anchor_payload, compute_rendezvous_topic, create_stun_binding_request,
-    decrypt_rendezvous_record, derive_rendezvous_key, encrypt_rendezvous_record,
-    format_github_anchor_ref, format_oma_id, generate_raw_oma_id, hkdf_sha256, hmac_sha256,
-    luhn_checksum, luhn_verify, normalize_oma_id, parse_github_anchor_payload, parse_stun_response,
-    publish_local_rendezvous_anchor, query_local_rendezvous_anchor, query_stun_external_addr,
-    query_stun_server, validate_oma_id, EncryptedRendezvousEnvelope, NatTraversedSocket,
-    RendezvousRecord,
+    decrypt_p2p_payload, decrypt_rendezvous_record, derive_p2p_session_key, derive_rendezvous_key,
+    encrypt_p2p_payload, encrypt_rendezvous_record, format_github_anchor_ref, format_oma_id,
+    generate_raw_oma_id, hkdf_sha256, hmac_sha256, luhn_checksum, luhn_verify, normalize_oma_id,
+    parse_github_anchor_payload, parse_stun_response, publish_local_rendezvous_anchor,
+    query_local_rendezvous_anchor, query_stun_external_addr, query_stun_server, validate_oma_id,
+    EncryptedP2PEnvelope, EncryptedRendezvousEnvelope, NatTraversedSocket, RendezvousRecord,
 };
 
 use aes_gcm::{
@@ -1506,7 +1506,7 @@ fn p2p_push_clipboard_silent(target_ip: &str, text: &str) {
     let matched_peer = paired.iter().find(|p| p.is_active() && p.ip.as_deref() == Some(target_ip));
     let auth_token = matched_peer.and_then(|p| p.auth_token.clone()).unwrap_or_default();
 
-    let payload = serde_json::json!({
+    let inner_json = serde_json::json!({
         "sender_id": my_oma_id,
         "oma_id": my_oma_id,
         "device_id": my_id,
@@ -1515,8 +1515,26 @@ fn p2p_push_clipboard_silent(target_ip: &str, text: &str) {
         "text": text,
         "auth_token": auth_token
     });
+
+    let target_oma_id = matched_peer.map(|p| p.oma_id.clone()).unwrap_or_default();
+    let final_payload = if !target_oma_id.is_empty() {
+        if let Ok(env) = encrypt_p2p_payload(&my_oma_id, &target_oma_id, inner_json.to_string().as_bytes()) {
+            serde_json::json!({
+                "encrypted_envelope": env,
+                "oma_id": my_oma_id,
+                "sender_id": my_oma_id,
+                "sender_name": my_name,
+                "auth_token": auth_token
+            })
+        } else {
+            inner_json
+        }
+    } else {
+        inner_json
+    };
+
     let addr = resolve_peer_addr(target_ip);
-    let req_bytes = payload.to_string().into_bytes();
+    let req_bytes = final_payload.to_string().into_bytes();
     let oma_id_hdr = my_oma_id.clone();
     let auth_hdr = auth_token.clone();
     thread::spawn(move || {
@@ -1576,7 +1594,7 @@ pub fn p2p_push_image_clipboard_silent(
         None
     };
 
-    let payload = serde_json::json!({
+    let inner_json = serde_json::json!({
         "sender_id": my_oma_id,
         "oma_id": my_oma_id,
         "device_id": my_id,
@@ -1591,8 +1609,25 @@ pub fn p2p_push_image_clipboard_silent(
         "auth_token": auth_token
     });
 
+    let target_oma_id = matched_peer.map(|p| p.oma_id.clone()).unwrap_or_default();
+    let final_payload = if !target_oma_id.is_empty() {
+        if let Ok(env) = encrypt_p2p_payload(&my_oma_id, &target_oma_id, inner_json.to_string().as_bytes()) {
+            serde_json::json!({
+                "encrypted_envelope": env,
+                "oma_id": my_oma_id,
+                "sender_id": my_oma_id,
+                "sender_name": my_name,
+                "auth_token": auth_token
+            })
+        } else {
+            inner_json
+        }
+    } else {
+        inner_json
+    };
+
     let addr = resolve_peer_addr(target_ip);
-    let req_bytes = payload.to_string().into_bytes();
+    let req_bytes = final_payload.to_string().into_bytes();
     let oma_id_hdr = my_oma_id.clone();
     let auth_hdr = auth_token.clone();
     thread::spawn(move || {
@@ -1699,6 +1734,11 @@ pub fn start_clipboard_sentinel() {
             }
 
             set_last_synced_clipboard_hash(&hash);
+
+            // Sensitive Clipboard Shield: Never broadcast passwords, secret keys, or credentials
+            if military::is_sensitive_clipboard_payload(&text) {
+                continue;
+            }
 
             let target_ips = get_active_paired_peer_ips();
             for target_ip in target_ips {
@@ -2584,6 +2624,24 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
         "total_size_bytes": size_bytes
     });
 
+    let target_oma_id = matched_peer.map(|p| p.oma_id.clone()).unwrap_or_default();
+    let final_payload = if !target_oma_id.is_empty() {
+        if let Ok(env) = encrypt_p2p_payload(&my_oma_id, &target_oma_id, request_payload.to_string().as_bytes()) {
+            serde_json::json!({
+                "encrypted_envelope": env,
+                "oma_id": my_oma_id,
+                "sender_id": my_oma_id,
+                "sender_name": my_name,
+                "sender_ip": get_local_ip(),
+                "auth_token": auth_token
+            })
+        } else {
+            request_payload
+        }
+    } else {
+        request_payload
+    };
+
     let addr = resolve_peer_addr(target_ip);
     let mut stream = match connect_peer_with_timeout(&addr, Duration::from_secs(4)) {
         Ok(s) => s,
@@ -2595,7 +2653,7 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
             return Err(e);
         }
     };
-    let req_bytes = request_payload.to_string().into_bytes();
+    let req_bytes = final_payload.to_string().into_bytes();
     let http_req = format!(
         "POST /api/p2p/request HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-OmaSend-OmaID: {}\r\nX-OmaSend-Auth-Token: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         addr, my_oma_id, auth_token, req_bytes.len()
@@ -4233,6 +4291,19 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             }
         };
 
+        let my_oma_id = get_or_create_oma_id();
+        let mut resolved_req_data = req_data.clone();
+        if let Some(env_val) = req_data.get("encrypted_envelope") {
+            if let Ok(envelope) = serde_json::from_value::<EncryptedP2PEnvelope>(env_val.clone()) {
+                if let Ok(decrypted_bytes) = decrypt_p2p_payload(&my_oma_id, &envelope) {
+                    if let Ok(inner) = serde_json::from_slice::<serde_json::Value>(&decrypted_bytes) {
+                        resolved_req_data = inner;
+                    }
+                }
+            }
+        }
+        let req_data = resolved_req_data;
+
         let sender_id = req_data.get("oma_id")
             .or_else(|| req_data.get("sender_oma_id"))
             .or_else(|| req_data.get("sender_id"))
@@ -4663,6 +4734,21 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                 }
             }
 
+            let my_oma_id = get_or_create_oma_id();
+            let mut resolved_val = val.clone();
+
+            // P2P E2EE Decryption: If payload is wrapped in an EncryptedP2PEnvelope, decrypt it
+            if let Some(env_val) = val.get("encrypted_envelope") {
+                if let Ok(envelope) = serde_json::from_value::<EncryptedP2PEnvelope>(env_val.clone()) {
+                    if let Ok(decrypted_bytes) = decrypt_p2p_payload(&my_oma_id, &envelope) {
+                        if let Ok(inner) = serde_json::from_slice::<serde_json::Value>(&decrypted_bytes) {
+                            resolved_val = inner;
+                        }
+                    }
+                }
+            }
+            let val = resolved_val;
+
             let content_type = val["content_type"].as_str().unwrap_or("text");
 
             // Handle visual clipboard payloads (< 512 KiB Base64 or metadata announcement)
@@ -4703,6 +4789,13 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                 if text.len() <= MAX_IMAGE_CLIP_SIZE {
                     let hash = compute_clipboard_hash(text);
                     set_last_synced_clipboard_hash(&hash);
+
+                    // Sensitive Clipboard Shield: Inbound protection
+                    if military::is_sensitive_clipboard_payload(text) {
+                        respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Sensitive credentials rejected by clipboard shield\"}", None, None);
+                        return;
+                    }
+
                     set_pc_clipboard(text);
                     notify_desktop("OmaSend: Universal Clipboard", &format!("Received clipboard text from {}.", sender_name));
                     play_clipboard_sound();
@@ -7344,5 +7437,74 @@ mod tests {
         }));
         server.join().unwrap();
         assert!(r.starts_with("HTTP/1.1 403"), "Trusted-only sender must be refused: {}", r);
+    }
+
+    #[test]
+    fn test_p2p_clipboard_rejects_sensitive_keys_and_passwords() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        set_visibility("ALL");
+        let valid_raw_oma_id = rendezvous::generate_raw_oma_id();
+        let peer_id = rendezvous::format_oma_id(&valid_raw_oma_id);
+        let paired_peer = confirmed_test_peer(&peer_id, "Paired Peer");
+        let auth_token = paired_peer.auth_token.unwrap_or_default();
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (s, _) = listener.accept().expect("Accept");
+            handle_connection(s, "127.0.0.1", "1234", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+        });
+
+        // Send private key
+        let headers = format!("X-OmaSend-OmaID: {}\r\nX-OmaSend-Auth-Token: {}\r\n", peer_id, auth_token);
+        let r = post_json(addr, "/api/p2p/clipboard", &headers, &serde_json::json!({
+            "oma_id": peer_id, "sender_id": peer_id, "sender_name": "Paired Peer",
+            "content_type": "text", "text": "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQ..."
+        }));
+        server.join().unwrap();
+        assert!(r.starts_with("HTTP/1.1 403"), "Sensitive credentials must be refused: {}", r);
+        assert!(r.contains("clipboard shield"), "Response should explain shield rejection: {}", r);
+    }
+
+    #[test]
+    fn test_p2p_clipboard_accepts_encrypted_envelope() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        set_visibility("ALL");
+        let valid_raw_oma_id = rendezvous::generate_raw_oma_id();
+        let peer_id = rendezvous::format_oma_id(&valid_raw_oma_id);
+        let paired_peer = confirmed_test_peer(&peer_id, "Paired Peer");
+        let auth_token = paired_peer.auth_token.unwrap_or_default();
+        let my_oma_id = get_or_create_oma_id();
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (s, _) = listener.accept().expect("Accept");
+            handle_connection(s, "127.0.0.1", "1234", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+        });
+
+        let secret_msg = "Zero-Knowledge Sovereign P2P Message 42";
+        let inner = serde_json::json!({
+            "oma_id": peer_id,
+            "sender_id": peer_id,
+            "sender_name": "Paired Peer",
+            "content_type": "text",
+            "text": secret_msg
+        });
+
+        // Encrypt with pairwise session key
+        let envelope = encrypt_p2p_payload(&peer_id, &my_oma_id, inner.to_string().as_bytes())
+            .expect("Encrypt P2P payload");
+
+        let headers = format!("X-OmaSend-OmaID: {}\r\nX-OmaSend-Auth-Token: {}\r\n", peer_id, auth_token);
+        let r = post_json(addr, "/api/p2p/clipboard", &headers, &serde_json::json!({
+            "encrypted_envelope": envelope,
+            "oma_id": peer_id,
+            "sender_id": peer_id,
+            "sender_name": "Paired Peer",
+            "auth_token": auth_token
+        }));
+        server.join().unwrap();
+        assert!(r.starts_with("HTTP/1.1 200 OK"), "Encrypted envelope must be accepted with 200 OK: {}", r);
     }
 }

@@ -123,10 +123,87 @@ pub fn verify_file_military_integrity<P: AsRef<Path>>(
     Ok(true)
 }
 
+/// Sensitive Clipboard Shield: Heuristics to detect passwords, private keys,
+/// tokens, recovery phrases, and sensitive clipboard data to prevent accidental leak.
+pub fn is_sensitive_clipboard_payload(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+
+    // 1. Private keys, certificates and secrets
+    if t.contains("BEGIN PRIVATE KEY")
+        || t.contains("BEGIN RSA PRIVATE KEY")
+        || t.contains("BEGIN OPENSSH PRIVATE KEY")
+        || t.contains("BEGIN PGP PRIVATE KEY")
+        || t.contains("BEGIN CERTIFICATE")
+    {
+        return true;
+    }
+
+    // 2. High-entropy API tokens and cloud secrets
+    if t.starts_with("ghp_") || t.starts_with("gho_") || t.starts_with("ghu_") || t.starts_with("ghs_") // GitHub
+        || t.starts_with("glpat-") // GitLab
+        || t.starts_with("sk_live_") || t.starts_with("rk_live_") // Stripe
+        || t.starts_with("AIzaSy") // Google API key
+        || t.starts_with("AKIA") || t.starts_with("ASIA") // AWS Access Key
+        || t.starts_with("xoxb-") || t.starts_with("xoxp-") // Slack token
+        || (t.starts_with("eyJ") && t.contains('.') && t.matches('.').count() == 2) // JWT token
+    {
+        return true;
+    }
+
+    // 3. Multi-word BIP-39 mnemonic phrase detection (12 or 24 words with no punctuation)
+    let words: Vec<&str> = t.split_whitespace().collect();
+    if (words.len() == 12 || words.len() == 24)
+        && words.iter().all(|w| w.chars().all(|c| c.is_ascii_lowercase()))
+    {
+        return true;
+    }
+
+    // 4. Typical high-entropy password/token heuristic (single continuous token, 20-128 chars, mixed casing, digits, specials)
+    if !t.contains(' ') && !t.contains('\n') && !t.contains('/') && !t.contains('.') && t.len() >= 20 && t.len() <= 128 {
+        let has_upper = t.chars().any(|c| c.is_ascii_uppercase());
+        let has_lower = t.chars().any(|c| c.is_ascii_lowercase());
+        let has_digit = t.chars().any(|c| c.is_ascii_digit());
+        let has_special = t.chars().any(|c| "!@#$%^&*()-_=+[]{}|;:,<>?".contains(c));
+        if has_upper && has_lower && has_digit && has_special {
+            return true;
+        }
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn test_sensitive_clipboard_shield() {
+        // Safe strings
+        assert!(!is_sensitive_clipboard_payload("https://github.com/ozdil/omasend"));
+        assert!(!is_sensitive_clipboard_payload("Hello world! Check this text."));
+        assert!(!is_sensitive_clipboard_payload("192.168.1.100"));
+
+        // Sensitive private keys
+        assert!(is_sensitive_clipboard_payload("-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQ..."));
+        assert!(is_sensitive_clipboard_payload("-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNza..."));
+
+        // Sensitive API tokens
+        assert!(is_sensitive_clipboard_payload("ghp_1234567890abcdefghijklmnopqrstuvwxyzAB"));
+        assert!(is_sensitive_clipboard_payload("sk_live_51Abcdefghijklmnop"));
+        assert!(is_sensitive_clipboard_payload("AKIAIOSFODNN7EXAMPLE"));
+        assert!(is_sensitive_clipboard_payload("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozS6-m_sample"));
+
+        // BIP-39 12-word mnemonic phrase
+        let mnemonic = "abandon ability able about above absent absorb abstract absurd abuse access accident";
+        assert!(is_sensitive_clipboard_payload(mnemonic));
+
+        // High entropy generated password
+        assert!(is_sensitive_clipboard_payload("kX9#mP$2vL@8qR*1zT&4wY!7"));
+    }
 
     #[test]
     fn test_zeroize_memory_protection() {

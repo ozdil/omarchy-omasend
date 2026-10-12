@@ -61,13 +61,14 @@ Panel {
   readonly property color hoverFill: bar ? Style.hoverFillFor(bar.foreground, Color.accent) : "transparent"
   readonly property color selectedFill: bar ? Style.selectedFillFor(bar.foreground, Color.accent) : "transparent"
   readonly property string fontFamily: (root.bar && root.bar.fontFamily) ? root.bar.fontFamily : ((typeof Style !== "undefined" && Style.font && Style.font.family) ? Style.font.family : "JetBrainsMono Nerd Font, JetBrains Mono, monospace")
-  readonly property string peersPath: (Quickshell.env("HOME") || "/home/ozdil") + "/.local/state/omarchy/omasend/discovered_peers.json"
-  readonly property string omaidQrFilePath: (Quickshell.env("HOME") || "/home/ozdil") + "/.local/state/omarchy/omasend/omaid_qr.svg"
-  readonly property string clipStagingPath: (Quickshell.env("HOME") || "/home/ozdil") + "/.local/state/omarchy/omasend/clip_staging"
+  readonly property string userHome: Quickshell.env("HOME") || ("/home/" + (Quickshell.env("USER") || "user"))
+  readonly property string peersPath: root.userHome + "/.local/state/omarchy/omasend/discovered_peers.json"
+  readonly property string omaidQrFilePath: root.userHome + "/.local/state/omarchy/omasend/omaid_qr.svg"
+  readonly property string clipStagingPath: root.userHome + "/.local/state/omarchy/omasend/clip_staging"
   readonly property string manifestPath: Qt.resolvedUrl("manifest.json").toString().replace(/^file:\/\//, "")
-  readonly property string manifestFallbackPath: (Quickshell.env("HOME") || "/home/ozdil") + "/.config/omarchy/plugins/ozdil.omasend/manifest.json"
+  readonly property string manifestFallbackPath: root.userHome + "/.config/omarchy/plugins/ozdil.omasend/manifest.json"
 
-  property string pluginVersion: "1.7.2"
+  property string pluginVersion: "1.8.0"
   property string pluginDescription: "AirBridge P2P, E2EE Secure Local & Network File Transfer System"
   property string pluginAuthor: "Ozan Özdil (@ozdil)"
   property string pluginLicense: "MIT"
@@ -151,8 +152,7 @@ Panel {
   }
 
   function resolveEnginePath() {
-    var home = Quickshell.env("HOME") || "/home/ozdil"
-    return home + "/.local/bin/omasend-engine"
+    return root.userHome + "/.local/bin/omasend-engine"
   }
 
   function executeAction(args) {
@@ -284,7 +284,7 @@ Panel {
 
   Process {
     id: omaIdDirectReadProc
-    command: ["cat", (Quickshell.env("HOME") || "/home/ozdil") + "/.local/state/omarchy/omasend/oma_id"]
+    command: ["cat", root.userHome + "/.local/state/omarchy/omasend/oma_id"]
     running: true
     stdout: StdioCollector {
       waitForEnd: true
@@ -670,14 +670,28 @@ Panel {
       }
     }
 
+    property var draggedFiles: []
+    property string blastTargetName: ""
+    property int blastedCount: 0
+
     function triggerDropBlast(drop) {
-      var rawUrl = ""
+      var fileList = []
       if (drop.hasUrls && drop.urls.length > 0) {
-        rawUrl = drop.urls[0].toString()
+        for (var i = 0; i < drop.urls.length; i++) {
+          var u = drop.urls[i].toString().replace(/^file:\/\//, "")
+          try { u = decodeURIComponent(u) } catch(e) {}
+          if (u.trim() !== "") fileList.push(u.trim())
+        }
       } else if (drop.hasText && drop.text) {
-        rawUrl = drop.text
+        var lines = drop.text.split("\n")
+        for (var j = 0; j < lines.length; j++) {
+          var l = lines[j].replace(/^file:\/\//, "").trim()
+          try { l = decodeURIComponent(l) } catch(e) {}
+          if (l !== "") fileList.push(l)
+        }
       }
-      var firstFile = rawUrl.replace(/^file:\/\//, "")
+
+      dropPortal.blastedCount = fileList.length
 
       // Play send whoosh sound via PipeWire
       if (playSendSoundProc.running) playSendSoundProc.running = false
@@ -688,9 +702,13 @@ Panel {
                        ? root.p2pPeers[root.selectedPeerIndex]
                        : (root.p2pPeers && root.p2pPeers.length > 0 ? root.p2pPeers[0] : null)
       var targetIp = targetPeer ? targetPeer.ip : ""
+      dropPortal.blastTargetName = targetPeer ? (targetPeer.name || targetPeer.ip) : "Cihaz Seçilmedi"
 
-      if (targetIp !== "" && firstFile !== "") {
-        root.executeAction(["--send", targetIp, firstFile])
+      if (targetIp !== "" && fileList.length > 0) {
+        // Send all dragged files
+        for (var k = 0; k < fileList.length; k++) {
+          root.executeAction(["--send", targetIp, fileList[k]])
+        }
       }
 
       // Trigger Water Droplet Splash & Rebound Shockwave
@@ -984,21 +1002,24 @@ Panel {
           Text {
             textFormat: Text.PlainText
             text: {
+              if (dropPortal.isBlasting && dropPortal.blastTargetName !== "") {
+                return "→ " + dropPortal.blastTargetName.toUpperCase()
+              }
               if (root.p2pPeers && root.p2pPeers.length > 0) {
                 var p = (root.selectedPeerIndex >= 0 && root.selectedPeerIndex < root.p2pPeers.length)
                         ? root.p2pPeers[root.selectedPeerIndex]
                         : root.p2pPeers[0]
-                return p.name ? p.name.toUpperCase() : "DISCOVERING..."
+                return "HEDEF: " + (p.name ? p.name.toUpperCase() : p.ip)
               }
-              return "DISCOVERING PEERS..."
+              return "EŞLEŞMİŞ CİHAZ ARANIYOR..."
             }
-            color: root.bar ? root.bar.foreground : Color.foreground
+            color: dropPortal.isBlasting ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             font.bold: true
             font.letterSpacing: 0.6
             elide: Text.ElideRight
-            Layout.maximumWidth: 200
+            Layout.maximumWidth: 220
             Layout.alignment: Qt.AlignVCenter
           }
 
@@ -1132,22 +1153,27 @@ Panel {
           Text {
             anchors.horizontalCenter: parent.horizontalCenter
             textFormat: Text.PlainText
-            text: dropPortal.isBlasting ? "" : (dropPortal.proximity > 0.1 ? "󱘖" : "")
-            color: dropPortal.isBlasting ? Qt.rgba(1.0, 1.0, 1.0, 0.95) : Color.accent
+            text: dropPortal.isBlasting ? "󰄲" : (dropPortal.proximity > 0.1 ? "󱘖" : "")
+            color: dropPortal.isBlasting ? Qt.rgba(1.0, 1.0, 1.0, 0.98) : Color.accent
             font.family: root.fontFamily
-            font.pixelSize: Style.font.title + Math.round(dropPortal.proximity * 2)
+            font.pixelSize: Style.font.title + Math.round(dropPortal.proximity * 3)
           }
           Text {
             anchors.horizontalCenter: parent.horizontalCenter
             textFormat: Text.PlainText
-            text: dropPortal.isBlasting ? "SENT!" : ((dropPortal.proximity > 0.1) ? "DROP" : "AIRBRIDGE")
-            color: dropPortal.isBlasting ? Qt.rgba(1.0, 1.0, 1.0, 0.95) : Color.accent
+            text: {
+              if (dropPortal.isBlasting) {
+                return dropPortal.blastedCount > 1 ? (dropPortal.blastedCount + " DOSYA") : "GÖNDERİLDİ"
+              }
+              return (dropPortal.proximity > 0.1) ? "BIRAK" : "AIRBRIDGE"
+            }
+            color: dropPortal.isBlasting ? Qt.rgba(1.0, 1.0, 1.0, 0.98) : Color.accent
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             font.bold: true
             font.letterSpacing: 0.8
             elide: Text.ElideRight
-            width: Math.min(84, impactCrown.width - 4)
+            width: Math.min(92, impactCrown.width - 2)
             horizontalAlignment: Text.AlignHCenter
           }
         }

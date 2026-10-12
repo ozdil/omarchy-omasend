@@ -657,6 +657,86 @@ pub fn decrypt_rendezvous_record(
         .map_err(|e| format!("Record deserialization failed: {}", e))
 }
 
+// ------------------- NOISE/E2EE P2P TRANSPORT TUNNEL -------------------
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct EncryptedP2PEnvelope {
+    pub v: u32,
+    pub sender_oma_id: String,
+    pub nonce: String,
+    pub ciphertext: String,
+    pub timestamp: u64,
+}
+
+/// Derives a pairwise session key between two OmaIDs using symmetric HKDF
+pub fn derive_p2p_session_key(local_oma_id: &str, remote_oma_id: &str) -> [u8; 32] {
+    let norm_local = normalize_oma_id(local_oma_id);
+    let norm_remote = normalize_oma_id(remote_oma_id);
+    // Canonical ordering guarantees both sides derive the exact same pairwise key
+    let (first, second) = if norm_local <= norm_remote {
+        (norm_local, norm_remote)
+    } else {
+        (norm_remote, norm_local)
+    };
+    let mut ikm = Vec::with_capacity(32);
+    ikm.extend_from_slice(first.as_bytes());
+    ikm.extend_from_slice(second.as_bytes());
+    hkdf_sha256(&ikm, b"omasend-p2p-noise-salt-v2", b"omasend-p2p-chacha-aes-tunnel-v2")
+}
+
+/// Encrypts an arbitrary JSON or binary payload for direct P2P transport
+pub fn encrypt_p2p_payload(
+    local_oma_id: &str,
+    remote_oma_id: &str,
+    plaintext: &[u8],
+) -> Result<EncryptedP2PEnvelope, String> {
+    let key = derive_p2p_session_key(local_oma_id, remote_oma_id);
+    let cipher_key = Key::<Aes256Gcm>::from_slice(&key);
+    let cipher = Aes256Gcm::new(cipher_key);
+
+    let mut nonce_bytes = [0u8; 12];
+    getrandom::getrandom(&mut nonce_bytes).map_err(|e| format!("CSPRNG nonce failed: {}", e))?;
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|e| format!("E2EE encryption failed: {}", e))?;
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+    Ok(EncryptedP2PEnvelope {
+        v: 2,
+        sender_oma_id: format_oma_id(local_oma_id),
+        nonce: hex::encode(nonce_bytes),
+        ciphertext: hex::encode(ciphertext),
+        timestamp: now,
+    })
+}
+
+/// Decrypts a received P2P payload envelope using the derived pairwise key
+pub fn decrypt_p2p_payload(
+    local_oma_id: &str,
+    envelope: &EncryptedP2PEnvelope,
+) -> Result<Vec<u8>, String> {
+    let key = derive_p2p_session_key(local_oma_id, &envelope.sender_oma_id);
+    let cipher_key = Key::<Aes256Gcm>::from_slice(&key);
+    let cipher = Aes256Gcm::new(cipher_key);
+
+    let nonce_bytes = hex::decode(&envelope.nonce)
+        .map_err(|e| format!("Invalid nonce hex: {}", e))?;
+    if nonce_bytes.len() != 12 {
+        return Err("Invalid nonce length; expected 12 bytes".to_string());
+    }
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext_bytes = hex::decode(&envelope.ciphertext)
+        .map_err(|e| format!("Invalid ciphertext hex: {}", e))?;
+
+    cipher
+        .decrypt(nonce, ciphertext_bytes.as_ref())
+        .map_err(|e| format!("E2EE decryption failed: {}", e))
+}
+
 // ------------------- STUN PROTOCOL CLIENT (RFC 5389) -------------------
 
 /// Creates a 20-byte STUN Binding Request packet with random 12-byte transaction ID
