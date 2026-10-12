@@ -125,13 +125,12 @@ Panel {
       root.pairStatusError = true
       return
     }
-    root.pairStatusMsg = "Cihaz bağlanıyor..."
+    root.pairStatusMsg = "Eşleştirme kodu oluşturuluyor..."
     root.pairStatusError = false
     var name = String(targetName || "").trim() || ("OmaID-" + clean.slice(0, 4))
-    root.executeAction(["--bind-oma-id", clean, name])
-    root.pairStatusMsg = "Cihaz başarıyla bağlandı ve güvenildi!"
-    root.pairStatusError = false
-    pairTimer.restart()
+    if (pairProc.running) pairProc.running = false
+    pairProc.command = [root.resolveEnginePath(), "--bind-oma-id", clean, name]
+    pairProc.running = true
   }
 
   function scanFromScreen() {
@@ -434,6 +433,30 @@ Panel {
     onExited: function(code) {
       actionProc.running = false
       root.refresh()
+    }
+  }
+
+  Process {
+    id: pairProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        pairProc.running = false
+        var code = ""
+        try {
+          var d = JSON.parse(String(text || "").slice(0, 4096))
+          var c = String(d.pair_code || "")
+          if (/^[0-9]{6}$/.test(c)) code = c
+        } catch (e) {}
+        if (code.length === 6) {
+          root.pairStatusMsg = "Eşleştirme kodu: " + code + " (10 dakika geçerli). Diğer cihazda: omasend-engine --complete-pair <bu cihazın IP adresi> " + root.omaId + " " + code
+          root.pairStatusError = false
+        } else {
+          root.pairStatusMsg = "Eşleştirme başlatılamadı"
+          root.pairStatusError = true
+        }
+        root.refresh()
+      }
     }
   }
 
@@ -2319,6 +2342,7 @@ Panel {
             width: parent.width - Style.space(16)
             wrapMode: Text.WordWrap
             horizontalAlignment: Text.AlignHCenter
+            textFormat: Text.PlainText
             text: root.pairStatusMsg
             color: root.pairStatusError ? "#f7768e" : Color.accent
             font.family: root.fontFamily

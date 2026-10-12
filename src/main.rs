@@ -1481,6 +1481,10 @@ fn get_active_paired_peer_ips() -> Vec<String> {
     let mut ips = Vec::new();
 
     for p in &paired {
+        // Only peers that completed the code-verified handshake receive pushes.
+        if !p.is_active() {
+            continue;
+        }
         if let Some(ref static_ip) = p.ip {
             if !static_ip.is_empty() && !ips.contains(static_ip) {
                 ips.push(static_ip.clone());
@@ -1499,7 +1503,7 @@ fn p2p_push_clipboard_silent(target_ip: &str, text: &str) {
     let my_name = get_system_hostname();
 
     let paired = load_paired_peers();
-    let matched_peer = paired.iter().find(|p| p.ip.as_deref() == Some(target_ip));
+    let matched_peer = paired.iter().find(|p| p.is_active() && p.ip.as_deref() == Some(target_ip));
     let auth_token = matched_peer.and_then(|p| p.auth_token.clone()).unwrap_or_default();
 
     let payload = serde_json::json!({
@@ -1546,7 +1550,7 @@ pub fn p2p_push_image_clipboard_silent(
     let my_name = get_system_hostname();
 
     let paired = load_paired_peers();
-    let matched_peer = paired.iter().find(|p| p.ip.as_deref() == Some(target_ip));
+    let matched_peer = paired.iter().find(|p| p.is_active() && p.ip.as_deref() == Some(target_ip));
     let auth_token = matched_peer.and_then(|p| p.auth_token.clone()).unwrap_or_default();
 
     let image_base64 = if let Some(d) = data {
@@ -2006,8 +2010,14 @@ pub fn add_paired_peer(oma_id: &str, name: &str, ip: Option<&str>) -> Result<ren
     rendezvous::add_paired_peer(oma_id, name, ip, &get_state_dir())
 }
 
-pub fn add_paired_peer_with_token(oma_id: &str, name: &str, ip: Option<&str>, token: Option<&str>) -> Result<rendezvous::PairedPeer, String> {
-    rendezvous::add_paired_peer_with_token(oma_id, name, ip, token, &get_state_dir())
+pub fn begin_local_pairing(oma_id: &str, name: &str, ip_hint: Option<&str>) -> Result<(rendezvous::PairedPeer, String), String> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    rendezvous::begin_local_pairing(oma_id, name, ip_hint, &get_state_dir(), now)
+}
+
+pub fn complete_remote_pairing(oma_id: &str, code: &str, source_ip: IpAddr) -> Result<rendezvous::PairedPeer, rendezvous::PairingError> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    rendezvous::complete_remote_pairing(oma_id, code, source_ip, &get_state_dir(), now)
 }
 
 pub fn constant_time_eq_str(a: &str, b: &str) -> bool {
@@ -2031,6 +2041,16 @@ fn load_trusted_peers() -> Vec<TrustedPeer> {
         }
     }
     Vec::new()
+}
+
+/// Inbound clipboard/transfer requests require a paired record that completed
+/// the code-verified handshake; trusted-only or unconfirmed entries are refused.
+fn is_peer_confirmed(oma_id: &str) -> bool {
+    let norm = rendezvous::normalize_oma_id(oma_id);
+    if norm.len() != 16 {
+        return false;
+    }
+    load_paired_peers().iter().any(|p| p.confirmed && rendezvous::normalize_oma_id(&p.oma_id) == norm)
 }
 
 fn is_peer_trusted(peer_id: &str) -> bool {
@@ -2229,7 +2249,7 @@ fn update_discovered_peer(packet: &P2pBeaconPacket) {
     let is_authenticated_paired = if is_paired {
         let paired = load_paired_peers();
         let norm = rendezvous::normalize_oma_id(&packet.oma_id);
-        paired.iter().any(|p| rendezvous::normalize_oma_id(&p.oma_id) == norm && p.ip.as_deref() == Some(&packet.ip))
+        paired.iter().any(|p| p.is_active() && rendezvous::normalize_oma_id(&p.oma_id) == norm && p.ip.as_deref() == Some(&packet.ip))
     } else {
         false
     };
@@ -2455,6 +2475,80 @@ fn resolve_peer_addr(target_ip: &str) -> String {
     format!("{}:{}", target_ip, PORT)
 }
 
+const MAX_PAIR_RESPONSE_BYTES: u64 = 64 * 1024;
+
+/// Initiator side of code-verified pairing: presents the one-time code issued
+/// on the responder (`--pair-peer <our OmaID>` there) and stores the responder
+/// as a confirmed peer only if it echoes the expected OmaID and a valid token.
+fn p2p_complete_pairing(peer_ip_str: &str, expected_oma_id: &str, code: &str, name: &str) -> Result<rendezvous::PairedPeer, String> {
+    let peer_ip: IpAddr = peer_ip_str.trim().parse().map_err(|_| "Invalid peer IP address".to_string())?;
+    let peer_ip = peer_ip.to_canonical();
+    if !rendezvous::is_local_network_ip(&peer_ip) || peer_ip.is_loopback() {
+        return Err("Peer address must be a private (RFC 1918) or link-local address".to_string());
+    }
+    let expected_norm = rendezvous::normalize_oma_id(expected_oma_id);
+    if !rendezvous::validate_oma_id(&expected_norm) {
+        return Err("Invalid peer OmaID".to_string());
+    }
+    if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("Pairing code must be 6 digits".to_string());
+    }
+
+    let port = get_discovered_peers()
+        .into_iter()
+        .find(|p| p.ip.parse::<IpAddr>().map(|ip| ip.to_canonical() == peer_ip).unwrap_or(false))
+        .map(|p| p.port)
+        .unwrap_or(PORT);
+    let addr = std::net::SocketAddr::new(peer_ip, port).to_string();
+
+    let my_oma_id = get_or_create_oma_id();
+    let payload = serde_json::json!({
+        "oma_id": my_oma_id,
+        "name": get_system_hostname(),
+        "pair_code": code
+    });
+    let body = payload.to_string().into_bytes();
+
+    let mut stream = connect_peer_with_timeout(&addr, Duration::from_millis(3000))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+    let req = format!(
+        "POST /api/p2p/pair HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        addr,
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).map_err(|e| format!("Send failed: {}", e))?;
+    stream.write_all(&body).map_err(|e| format!("Send failed: {}", e))?;
+
+    let mut resp = Vec::new();
+    (&mut stream)
+        .take(MAX_PAIR_RESPONSE_BYTES + 1)
+        .read_to_end(&mut resp)
+        .map_err(|e| format!("Read failed: {}", e))?;
+    if resp.len() as u64 > MAX_PAIR_RESPONSE_BYTES {
+        return Err("Pairing response exceeds size limit".to_string());
+    }
+    let header_end = resp
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| "Malformed pairing response".to_string())?;
+    let status_line = String::from_utf8_lossy(&resp[..header_end]);
+    if !status_line.starts_with("HTTP/1.1 200") {
+        return Err("Pairing rejected by peer (wrong or expired code)".to_string());
+    }
+    let json: serde_json::Value = serde_json::from_slice(&resp[header_end + 4..])
+        .map_err(|_| "Malformed pairing response body".to_string())?;
+    if json["status"].as_str() != Some("PAIRED") {
+        return Err("Pairing rejected by peer".to_string());
+    }
+    let returned_id = json["oma_id"].as_str().unwrap_or_default();
+    if rendezvous::normalize_oma_id(returned_id) != expected_norm {
+        return Err("Responder OmaID does not match the expected peer".to_string());
+    }
+    let token = json["auth_token"].as_str().unwrap_or_default();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    rendezvous::store_completed_pairing(&expected_norm, name, peer_ip, token, &get_state_dir(), now)
+}
+
 fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String> {
     let size_bytes = safe_verify_file(file_path).map_err(|e| format!("Security check failed: {}", e))?;
     let file_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
@@ -2467,7 +2561,7 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
         .map_err(|e| format!("Failed to compute file hashes: {}", e))?;
 
     let paired = load_paired_peers();
-    let matched_peer = paired.iter().find(|p| p.ip.as_deref() == Some(target_ip));
+    let matched_peer = paired.iter().find(|p| p.is_active() && p.ip.as_deref() == Some(target_ip));
     let auth_token = matched_peer.and_then(|p| p.auth_token.clone()).unwrap_or_default();
 
     // 1. Send transfer request
@@ -2628,7 +2722,7 @@ fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
     let my_name = get_system_hostname();
 
     let paired = load_paired_peers();
-    let matched_peer = paired.iter().find(|p| p.ip.as_deref() == Some(target_ip));
+    let matched_peer = paired.iter().find(|p| p.is_active() && p.ip.as_deref() == Some(target_ip));
     let auth_token = matched_peer.and_then(|p| p.auth_token.clone()).unwrap_or_default();
 
     let payload = serde_json::json!({
@@ -4044,31 +4138,49 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         };
 
         if let Ok(req_data) = serde_json::from_slice::<serde_json::Value>(body_slice) {
+            // Remote side may only COMPLETE a pairing the local user started with
+            // `--pair-peer`, by presenting the one-time code shown locally. Body
+            // supplied `ip` and `auth_token` fields are ignored: the address is
+            // the observed TCP source and the token is generated locally.
             let peer_oma_id = req_data.get("oma_id")
                 .or_else(|| req_data.get("sender_id"))
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            let peer_name = req_data["name"].as_str().or_else(|| req_data["sender_name"].as_str()).unwrap_or("Paired Device");
-            let peer_ip = req_data["ip"].as_str().or_else(|| req_data["sender_ip"].as_str());
-            let peer_token = req_data.get("auth_token").and_then(|v| v.as_str());
+            let pair_code = req_data.get("pair_code").and_then(|v| v.as_str()).unwrap_or_default();
 
-            if rendezvous::validate_oma_id(peer_oma_id) {
-                let paired_record = add_paired_peer_with_token(peer_oma_id, peer_name, peer_ip, peer_token);
-                let auth_token = paired_record.ok().and_then(|p| p.auth_token).unwrap_or_default();
-                let my_oma_id = get_or_create_oma_id();
-                let my_name = get_system_hostname();
-                let resp = serde_json::json!({
-                    "status": "PAIRED",
-                    "oma_id": my_oma_id,
-                    "name": my_name,
-                    "auth_token": auth_token
-                });
-                respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
-                return;
-            } else {
-                respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid OmaID\"}", None, None);
+            // WAN tunnel traffic arrives from loopback; refuse it before the
+            // shared rate limiter so internet clients cannot lock out localhost.
+            if client_ip.to_canonical().is_loopback() {
+                respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Pairing not authorized\"}", None, None);
                 return;
             }
+
+            if is_pin_rate_limited(client_ip) {
+                respond(&stream, "429 Too Many Requests", "application/json", b"{\"error\":\"Too many pairing attempts\"}", None, None);
+                return;
+            }
+
+            match complete_remote_pairing(peer_oma_id, pair_code, client_ip) {
+                Ok(paired_record) => {
+                    record_pin_attempt(client_ip, true);
+                    let auth_token = paired_record.auth_token.unwrap_or_default();
+                    let my_oma_id = get_or_create_oma_id();
+                    let my_name = get_system_hostname();
+                    notify_desktop("OmaSend AirBridge", &format!("Device paired: {}", paired_record.name));
+                    let resp = serde_json::json!({
+                        "status": "PAIRED",
+                        "oma_id": my_oma_id,
+                        "name": my_name,
+                        "auth_token": auth_token
+                    });
+                    respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+                }
+                Err(_) => {
+                    record_pin_attempt(client_ip, false);
+                    respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Pairing not authorized\"}", None, None);
+                }
+            }
+            return;
         }
         respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid JSON\"}", None, None);
         return;
@@ -4130,7 +4242,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             .to_string();
         let sender_name = req_data["sender_name"].as_str().unwrap_or("Unknown Omarchy Device").to_string();
         let sender_ip = req_data["sender_ip"].as_str().unwrap_or("").to_string();
-        let is_trusted = is_peer_paired(&sender_id) || is_peer_trusted(&sender_id);
+        let is_trusted = is_peer_confirmed(&sender_id);
 
         if !is_trusted {
             let err = serde_json::json!({ "error": "Peer OmaID is not paired with this device" });
@@ -4146,6 +4258,12 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         let paired = load_paired_peers();
         let norm_sender = rendezvous::normalize_oma_id(&sender_id);
         if let Some(peer_record) = paired.iter().find(|p| rendezvous::normalize_oma_id(&p.oma_id) == norm_sender) {
+            // Records that never completed the code-verified handshake (including
+            // legacy records from earlier versions) are not accepted inbound.
+            if !peer_record.confirmed {
+                respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Peer pairing is not confirmed\"}", None, None);
+                return;
+            }
             if let Some(ref expected_tok) = peer_record.auth_token {
                 if !expected_tok.is_empty() && (provided_token.is_empty() || !constant_time_eq_str(expected_tok, provided_token)) {
                     let err = serde_json::json!({ "error": "Invalid peer authentication token" });
@@ -4517,7 +4635,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                 .or_else(|| req.get_header("x-omasend-omaid"))
                 .unwrap_or_default();
             let sender_name = val["sender_name"].as_str().unwrap_or("Nearby Device");
-            let is_trusted = is_peer_paired(sender_id) || is_peer_trusted(sender_id);
+            let is_trusted = is_peer_confirmed(sender_id);
             if !is_trusted {
                 respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Peer OmaID is not paired\"}", None, None);
                 return;
@@ -4531,6 +4649,12 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             let paired = load_paired_peers();
             let norm_sender = rendezvous::normalize_oma_id(sender_id);
             if let Some(peer_record) = paired.iter().find(|p| rendezvous::normalize_oma_id(&p.oma_id) == norm_sender) {
+                // Records that never completed the code-verified handshake (including
+                // legacy records from earlier versions) are not accepted inbound.
+                if !peer_record.confirmed {
+                    respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Peer pairing is not confirmed\"}", None, None);
+                    return;
+                }
                 if let Some(ref expected_tok) = peer_record.auth_token {
                     if !expected_tok.is_empty() && (provided_token.is_empty() || !constant_time_eq_str(expected_tok, provided_token)) {
                         respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Invalid peer authentication token\"}", None, None);
@@ -5219,10 +5343,17 @@ fn main() {
                 let default_name = format!("OmaID-{}", &norm[..4]);
                 let name = args.get(pos + 2).cloned().unwrap_or(default_name);
                 let ip_arg = args.get(pos + 3).map(|s| s.as_str());
-                match add_paired_peer(&norm, &name, ip_arg) {
-                    Ok(peer) => {
+                match begin_local_pairing(&norm, &name, ip_arg) {
+                    Ok((peer, code)) => {
                         send_immediate_beacon_broadcast();
-                        println!("{{\"status\":\"SUCCESS\",\"oma_id\":\"{}\",\"name\":\"{}\"}}", peer.oma_id, peer.name);
+                        let out = serde_json::json!({
+                            "status": "PENDING",
+                            "oma_id": peer.oma_id,
+                            "name": peer.name,
+                            "pair_code": code,
+                            "expires_in_secs": rendezvous::PAIR_CODE_TTL_SECS
+                        });
+                        println!("{}", out);
                     }
                     Err(e) => {
                         eprintln!("Error pairing OmaID: {}", e);
@@ -5235,6 +5366,29 @@ fn main() {
             }
             return;
         }
+    }
+
+    if let Some(pos) = args.iter().position(|a| a == "--complete-pair") {
+        match (args.get(pos + 1), args.get(pos + 2), args.get(pos + 3)) {
+            (Some(ip), Some(peer_id), Some(code)) => {
+                let name = args.get(pos + 4).cloned().unwrap_or_default();
+                match p2p_complete_pairing(ip, peer_id, code, &name) {
+                    Ok(peer) => {
+                        let out = serde_json::json!({ "status": "PAIRED", "oma_id": peer.oma_id, "name": peer.name });
+                        println!("{}", out);
+                    }
+                    Err(e) => {
+                        eprintln!("Error completing pairing: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            _ => {
+                eprintln!("Usage: omasend-engine --complete-pair <PEER_IP> <PEER_OMAID> <6-DIGIT-CODE> [name]");
+                std::process::exit(2);
+            }
+        }
+        return;
     }
 
     if let Some(pos) = args.iter().position(|a| a == "--trust-peer") {
@@ -5497,6 +5651,13 @@ mod tests {
     use super::*;
 
     static TEST_SYNC_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Creates a peer that completed the code-verified handshake from a LAN source.
+    fn confirmed_test_peer(oma_id: &str, name: &str) -> rendezvous::PairedPeer {
+        let (_, code) = begin_local_pairing(oma_id, name, None).expect("Begin local pairing");
+        let src: IpAddr = "192.168.77.10".parse().unwrap();
+        complete_remote_pairing(oma_id, &code, src).expect("Complete code-verified pairing")
+    }
 
     #[test]
     fn test_secure_file_atomic_write_and_mode_0600() {
@@ -6799,7 +6960,7 @@ mod tests {
         set_visibility("ALL");
         let valid_raw_oma_id = rendezvous::generate_raw_oma_id();
         let valid_peer_oma_id = rendezvous::format_oma_id(&valid_raw_oma_id);
-        let paired_peer = add_paired_peer(&valid_peer_oma_id, "Instant Device", None).expect("Add paired peer");
+        let paired_peer = confirmed_test_peer(&valid_peer_oma_id, "Instant Device");
         let auth_token = paired_peer.auth_token.unwrap_or_default();
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
@@ -6845,7 +7006,7 @@ mod tests {
         set_visibility("ALL");
         let valid_raw_oma_id = rendezvous::generate_raw_oma_id();
         let valid_peer_oma_id = rendezvous::format_oma_id(&valid_raw_oma_id);
-        let paired_peer = add_paired_peer(&valid_peer_oma_id, "Test Device", None).expect("Add paired peer");
+        let paired_peer = confirmed_test_peer(&valid_peer_oma_id, "Test Device");
         let auth_token = paired_peer.auth_token.unwrap_or_default();
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
@@ -6934,7 +7095,7 @@ mod tests {
         set_visibility("ALL");
         let valid_raw_oma_id = rendezvous::generate_raw_oma_id();
         let valid_peer_oma_id = rendezvous::format_oma_id(&valid_raw_oma_id);
-        let paired_peer = add_paired_peer(&valid_peer_oma_id, "Token Test Device", None).expect("Add paired peer");
+        let paired_peer = confirmed_test_peer(&valid_peer_oma_id, "Token Test Device");
         let _auth_token = paired_peer.auth_token.unwrap_or_default();
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
@@ -7090,6 +7251,98 @@ mod tests {
         let total_bytes: u64 = entries.iter().map(|e| e.metadata().map(|m| m.len()).unwrap_or(0)).sum();
         assert!(total_bytes <= MAX_CLIP_STAGING_BYTES, "Total staging bytes must not exceed MAX_CLIP_STAGING_BYTES");
     }
+
+    fn post_json(addr: std::net::SocketAddr, path: &str, extra_headers: &str, body: &serde_json::Value) -> String {
+        let bytes = body.to_string().into_bytes();
+        let mut c = TcpStream::connect(addr).expect("Connect test client");
+        let req = format!(
+            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            path, addr, extra_headers, bytes.len()
+        );
+        c.write_all(req.as_bytes()).unwrap();
+        c.write_all(&bytes).unwrap();
+        let mut resp = String::new();
+        c.read_to_string(&mut resp).unwrap();
+        resp
+    }
+
+    #[test]
+    fn test_p2p_pair_rejects_loopback_tunnel_source_and_legacy_body_fields() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        set_visibility("ALL");
+        let peer_id = rendezvous::format_oma_id(&rendezvous::generate_raw_oma_id());
+        let (pending, code) = begin_local_pairing(&peer_id, "Tunnel Target", None).expect("Begin pairing");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (s, _) = listener.accept().expect("Accept");
+                handle_connection(s, "127.0.0.1", "1234", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+            }
+        });
+
+        // Correct code but loopback source (as forwarded by the WAN tunnel) -> 403
+        let r1 = post_json(addr, "/api/p2p/pair", "", &serde_json::json!({ "oma_id": peer_id, "pair_code": code }));
+        assert!(r1.starts_with("HTTP/1.1 403"), "Loopback pairing must be refused: {}", r1);
+
+        // Old takeover payload without code (attacker ip + token) -> 403
+        let r2 = post_json(addr, "/api/p2p/pair", "", &serde_json::json!({
+            "oma_id": peer_id, "ip": "192.168.1.250",
+            "auth_token": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }));
+        assert!(r2.starts_with("HTTP/1.1 403"), "Codeless pairing must be refused: {}", r2);
+        server.join().unwrap();
+
+        let stored = load_paired_peers().into_iter().find(|p| rendezvous::normalize_oma_id(&p.oma_id) == rendezvous::normalize_oma_id(&peer_id)).expect("Record kept");
+        assert!(!stored.confirmed);
+        assert_eq!(stored.ip, None);
+        assert_eq!(stored.auth_token, pending.auth_token, "Token must not be replaced remotely");
+    }
+
+    #[test]
+    fn test_p2p_clipboard_rejects_unconfirmed_peer_even_with_valid_token() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        set_visibility("ALL");
+        let peer_id = rendezvous::format_oma_id(&rendezvous::generate_raw_oma_id());
+        let unconfirmed = add_paired_peer(&peer_id, "Legacy Device", None).expect("Add unconfirmed peer");
+        let token = unconfirmed.auth_token.unwrap_or_default();
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (s, _) = listener.accept().expect("Accept");
+            handle_connection(s, "127.0.0.1", "1234", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+        });
+        let headers = format!("X-OmaSend-OmaID: {}\r\nX-OmaSend-Auth-Token: {}\r\n", peer_id, token);
+        let r = post_json(addr, "/api/p2p/clipboard", &headers, &serde_json::json!({
+            "oma_id": peer_id, "sender_id": peer_id, "sender_name": "Legacy Device",
+            "content_type": "text", "text": "should be refused"
+        }));
+        server.join().unwrap();
+        assert!(r.starts_with("HTTP/1.1 403"), "Unconfirmed peer must be refused inbound: {}", r);
+    }
+
+    #[test]
+    fn test_p2p_clipboard_rejects_trusted_only_sender_without_pairing() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        set_visibility("ALL");
+        let rogue_id = "trusted-only-device-0001";
+        add_trusted_peer(rogue_id, "Trusted Only", "");
+        assert!(is_peer_trusted(rogue_id));
+        assert!(!is_peer_confirmed(rogue_id));
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (s, _) = listener.accept().expect("Accept");
+            handle_connection(s, "127.0.0.1", "1234", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+        });
+        let r = post_json(addr, "/api/p2p/clipboard", "X-OmaSend-OmaID: trusted-only-device-0001\r\n", &serde_json::json!({
+            "oma_id": rogue_id, "sender_id": rogue_id, "sender_name": "Trusted Only",
+            "content_type": "text", "text": "no token, no pairing"
+        }));
+        server.join().unwrap();
+        assert!(r.starts_with("HTTP/1.1 403"), "Trusted-only sender must be refused: {}", r);
+    }
 }
-
-

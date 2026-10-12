@@ -174,6 +174,16 @@ pub fn get_or_create_oma_id(state_dir: &Path) -> String {
 
 // ------------------- OMAID PAIRED PEERS & TRUST STORE -------------------
 
+/// Lifetime of a locally issued one-time pairing code.
+pub const PAIR_CODE_TTL_SECS: u64 = 600;
+/// Failed remote completion attempts tolerated before a pending code is revoked.
+pub const PAIR_CODE_MAX_FAILURES: u32 = 5;
+const MAX_PEER_NAME_CHARS: usize = 64;
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PairedPeer {
     pub oma_id: String,
@@ -183,6 +193,139 @@ pub struct PairedPeer {
     pub paired_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
+    /// True only after the remote device proved knowledge of the locally issued
+    /// one-time pairing code. Records written by earlier versions deserialize as
+    /// unconfirmed and are never used as clipboard or transfer push targets until
+    /// the user pairs them again.
+    #[serde(default)]
+    pub confirmed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_expires_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub pair_failures: u32,
+}
+
+impl PairedPeer {
+    /// A peer may receive pushed clipboard/transfer data only when it completed
+    /// the code-verified handshake and has a source-verified address.
+    pub fn is_active(&self) -> bool {
+        self.confirmed && self.ip.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
+    }
+}
+
+/// Reasons a remote pairing completion is refused. Callers must map every
+/// variant to the same external response so the paired list cannot be probed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PairingError {
+    NotAuthorized,
+    Storage(String),
+}
+
+/// Accepts only loopback, RFC 1918, RFC 3927 link-local, IPv6 link-local
+/// (fe80::/10) and IPv6 unique-local (fc00::/7) addresses.
+pub fn is_local_network_ip(ip: &IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            let seg0 = v6.segments()[0];
+            v6.is_loopback() || (seg0 & 0xffc0) == 0xfe80 || (seg0 & 0xfe00) == 0xfc00
+        }
+    }
+}
+
+fn parse_local_ip_hint(ip: Option<&str>) -> Option<String> {
+    let raw = ip?.trim();
+    let parsed: IpAddr = raw.parse().ok()?;
+    let canonical = parsed.to_canonical();
+    if is_local_network_ip(&canonical) {
+        Some(canonical.to_string())
+    } else {
+        None
+    }
+}
+
+/// Strips control characters and bounds the display name length.
+pub fn sanitize_peer_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_PEER_NAME_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn random_hex_token() -> Result<String, String> {
+    let mut rand_bytes = [0u8; 32];
+    getrandom::getrandom(&mut rand_bytes).map_err(|e| format!("CSPRNG failure: {}", e))?;
+    Ok(hex::encode(rand_bytes))
+}
+
+/// Uniform 6-digit one-time code (rejection sampling avoids modulo bias).
+fn random_pair_code() -> Result<String, String> {
+    const LIMIT: u32 = 4_294_000_000; // largest multiple of 1_000_000 below u32::MAX
+    loop {
+        let mut b = [0u8; 4];
+        getrandom::getrandom(&mut b).map_err(|e| format!("CSPRNG failure: {}", e))?;
+        let v = u32::from_le_bytes(b);
+        if v < LIMIT {
+            return Ok(format!("{:06}", v % 1_000_000));
+        }
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Exclusive advisory lock serializing every read-modify-write of
+/// paired_peers.json across the daemon threads and CLI processes.
+struct PeersLock {
+    _file: std::fs::File,
+}
+
+fn lock_paired_peers(state_dir: &Path) -> Result<PeersLock, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    std::fs::create_dir_all(state_dir).map_err(|e| format!("State dir unavailable: {}", e))?;
+    let path = state_dir.join(".paired_peers.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .map_err(|e| format!("Failed to open peers lock {:?}: {}", path, e))?;
+    // SAFETY: fd is valid for the lifetime of `file`; the lock is released on drop.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err("Failed to acquire paired peers lock".to_string());
+    }
+    Ok(PeersLock { _file: file })
+}
+
+fn save_paired_peers_locked(peers: Vec<PairedPeer>, state_dir: &Path, _lock: &PeersLock) -> Result<(), String> {
+    let db = PairedPeersDb { peers };
+    let path = state_dir.join("paired_peers.json");
+    let s = serde_json::to_string_pretty(&db).map_err(|e| format!("Serialization failed: {}", e))?;
+    crate::write_secure_file(&path, &s)
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -211,85 +354,194 @@ pub fn is_peer_paired(oma_id: &str, state_dir: &Path) -> bool {
     peers.iter().any(|p| normalize_oma_id(&p.oma_id) == norm)
 }
 
-/// Adds or updates a paired peer in paired_peers.json with 0600 permissions
+/// Registers a peer locally without issuing a pairing code (used by trust and
+/// accepted-transfer flows). Existing records are returned unchanged: their
+/// address, token and confirmation state are never modified here. New records
+/// start unconfirmed and are not push targets until a code-verified handshake.
 pub fn add_paired_peer(
     oma_id: &str,
     name: &str,
     ip: Option<&str>,
     state_dir: &Path,
 ) -> Result<PairedPeer, String> {
-    add_paired_peer_with_token(oma_id, name, ip, None, state_dir)
-}
-
-/// Adds or updates a paired peer with an explicit or generated authentication token
-pub fn add_paired_peer_with_token(
-    oma_id: &str,
-    name: &str,
-    ip: Option<&str>,
-    token: Option<&str>,
-    state_dir: &Path,
-) -> Result<PairedPeer, String> {
     let norm = normalize_oma_id(oma_id);
     if !validate_oma_id(&norm) {
         return Err(format!("Invalid 16-digit Luhn OmaID: '{}'", oma_id));
     }
-    let formatted = format_oma_id(&norm);
+    let lock = lock_paired_peers(state_dir)?;
     let mut peers = load_paired_peers(state_dir);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    if let Some(existing) = peers.iter_mut().find(|p| normalize_oma_id(&p.oma_id) == norm) {
-        if !name.trim().is_empty() {
-            existing.name = name.to_string();
-        }
-        if let Some(ip_str) = ip {
-            if !ip_str.trim().is_empty() {
-                existing.ip = Some(ip_str.to_string());
-            }
-        }
-        if let Some(tok) = token {
-            if !tok.trim().is_empty() {
-                existing.auth_token = Some(tok.to_string());
-            }
-        }
-        let peer_clone = existing.clone();
-        let db = PairedPeersDb { peers };
-        let path = state_dir.join("paired_peers.json");
-        let s = serde_json::to_string_pretty(&db)
-            .map_err(|e| format!("Serialization failed: {}", e))?;
-        crate::write_secure_file(&path, &s)?;
-        Ok(peer_clone)
-    } else {
-        let auth_token = token
-            .filter(|t| !t.trim().is_empty())
-            .map(|t| t.to_string())
-            .unwrap_or_else(|| {
-                let mut rand_bytes = [0u8; 32];
-                let _ = getrandom::getrandom(&mut rand_bytes);
-                hex::encode(rand_bytes)
-            });
-
-        let peer = PairedPeer {
-            oma_id: formatted,
-            name: if name.trim().is_empty() {
-                format!("OmaID-{}", &norm[..4])
-            } else {
-                name.to_string()
-            },
-            ip: ip.filter(|s| !s.trim().is_empty()).map(|s| s.to_string()),
-            paired_at: now,
-            auth_token: Some(auth_token),
-        };
-        peers.push(peer.clone());
-        let db = PairedPeersDb { peers };
-        let path = state_dir.join("paired_peers.json");
-        let s = serde_json::to_string_pretty(&db)
-            .map_err(|e| format!("Serialization failed: {}", e))?;
-        crate::write_secure_file(&path, &s)?;
-        Ok(peer)
+    if let Some(existing) = peers.iter().find(|p| normalize_oma_id(&p.oma_id) == norm) {
+        return Ok(existing.clone());
     }
+    let clean_name = sanitize_peer_name(name);
+    let peer = PairedPeer {
+        oma_id: format_oma_id(&norm),
+        name: if clean_name.is_empty() { format!("OmaID-{}", &norm[..4]) } else { clean_name },
+        ip: parse_local_ip_hint(ip),
+        paired_at: unix_now(),
+        auth_token: Some(random_hex_token()?),
+        confirmed: false,
+        pair_code: None,
+        pair_expires_at: None,
+        pair_failures: 0,
+    };
+    peers.push(peer.clone());
+    save_paired_peers_locked(peers, state_dir, &lock)?;
+    Ok(peer)
+}
+
+/// Local consent step: creates or resets a peer to the unconfirmed state with a
+/// fresh authentication token and a one-time 6-digit pairing code valid for
+/// `PAIR_CODE_TTL_SECS`. The code must be entered on the remote device. An
+/// optional local-network IP hint additionally binds completion to that source.
+pub fn begin_local_pairing(
+    oma_id: &str,
+    name: &str,
+    ip_hint: Option<&str>,
+    state_dir: &Path,
+    now: u64,
+) -> Result<(PairedPeer, String), String> {
+    let norm = normalize_oma_id(oma_id);
+    if !validate_oma_id(&norm) {
+        return Err(format!("Invalid 16-digit Luhn OmaID: '{}'", oma_id));
+    }
+    if ip_hint.map(|s| !s.trim().is_empty()).unwrap_or(false) && parse_local_ip_hint(ip_hint).is_none() {
+        return Err("IP hint must be a loopback, private (RFC 1918) or link-local address".to_string());
+    }
+    let code = random_pair_code()?;
+    let token = random_hex_token()?;
+    let clean_name = sanitize_peer_name(name);
+
+    let lock = lock_paired_peers(state_dir)?;
+    let mut peers = load_paired_peers(state_dir);
+    peers.retain(|p| normalize_oma_id(&p.oma_id) != norm);
+    let peer = PairedPeer {
+        oma_id: format_oma_id(&norm),
+        name: if clean_name.is_empty() { format!("OmaID-{}", &norm[..4]) } else { clean_name },
+        ip: parse_local_ip_hint(ip_hint),
+        paired_at: now,
+        auth_token: Some(token),
+        confirmed: false,
+        pair_code: Some(code.clone()),
+        pair_expires_at: Some(now.saturating_add(PAIR_CODE_TTL_SECS)),
+        pair_failures: 0,
+    };
+    peers.push(peer.clone());
+    save_paired_peers_locked(peers, state_dir, &lock)?;
+    Ok((peer, code))
+}
+
+/// Remote completion of a locally initiated pairing. Succeeds only when the
+/// OmaID has an unexpired pending code, the supplied code matches in constant
+/// time, and (if an IP hint was recorded) the TCP source address matches it.
+/// The stored address is always the observed TCP source, never a body field,
+/// and the locally generated token is never replaced by the remote side.
+pub fn complete_remote_pairing(
+    oma_id: &str,
+    code: &str,
+    source_ip: IpAddr,
+    state_dir: &Path,
+    now: u64,
+) -> Result<PairedPeer, PairingError> {
+    let source = source_ip.to_canonical();
+    // Loopback is refused: the WAN tunnel (cloudflared) forwards internet
+    // clients from 127.0.0.1, and a real LAN peer never connects from loopback.
+    if !is_local_network_ip(&source) || source.is_loopback() {
+        return Err(PairingError::NotAuthorized);
+    }
+    let norm = normalize_oma_id(oma_id);
+    if !validate_oma_id(&norm) || code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(PairingError::NotAuthorized);
+    }
+
+    let lock = lock_paired_peers(state_dir).map_err(PairingError::Storage)?;
+    let mut peers = load_paired_peers(state_dir);
+    let idx = match peers.iter().position(|p| normalize_oma_id(&p.oma_id) == norm) {
+        Some(i) => i,
+        None => return Err(PairingError::NotAuthorized),
+    };
+
+    let outcome = {
+        let peer = &mut peers[idx];
+        let pending = !peer.confirmed
+            && peer.pair_code.is_some()
+            && peer.pair_expires_at.map(|exp| now <= exp).unwrap_or(false);
+        if !pending {
+            Err(PairingError::NotAuthorized)
+        } else {
+            let expected = peer.pair_code.clone().unwrap_or_default();
+            let code_ok = constant_time_eq(expected.as_bytes(), code.as_bytes());
+            let source_ok = peer
+                .ip
+                .as_deref()
+                .and_then(|h| h.parse::<IpAddr>().ok())
+                .map(|h| h.to_canonical() == source)
+                .unwrap_or(true);
+            if code_ok && source_ok {
+                peer.confirmed = true;
+                peer.ip = Some(source.to_string());
+                peer.pair_code = None;
+                peer.pair_expires_at = None;
+                peer.pair_failures = 0;
+                peer.paired_at = now;
+                Ok(peer.clone())
+            } else {
+                peer.pair_failures = peer.pair_failures.saturating_add(1);
+                if peer.pair_failures >= PAIR_CODE_MAX_FAILURES {
+                    peer.pair_code = None;
+                    peer.pair_expires_at = None;
+                }
+                Err(PairingError::NotAuthorized)
+            }
+        }
+    };
+
+    save_paired_peers_locked(peers, state_dir, &lock).map_err(PairingError::Storage)?;
+    outcome
+}
+
+/// Initiator side of a code-verified pairing. Called only after the local user
+/// explicitly ran `--complete-pair <ip> <omaid> <code>` and the responder at
+/// that local-network address accepted the code, echoed the expected OmaID and
+/// returned its token. The record is stored as confirmed with the address the
+/// user chose; any previous record for that OmaID is replaced.
+pub fn store_completed_pairing(
+    peer_oma_id: &str,
+    name: &str,
+    peer_ip: IpAddr,
+    token: &str,
+    state_dir: &Path,
+    now: u64,
+) -> Result<PairedPeer, String> {
+    let norm = normalize_oma_id(peer_oma_id);
+    if !validate_oma_id(&norm) {
+        return Err("Responder returned an invalid OmaID".to_string());
+    }
+    let ip = peer_ip.to_canonical();
+    if !is_local_network_ip(&ip) || ip.is_loopback() {
+        return Err("Peer address must be a private (RFC 1918) or link-local address".to_string());
+    }
+    if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return Err("Responder returned a malformed authentication token".to_string());
+    }
+    let clean_name = sanitize_peer_name(name);
+    let lock = lock_paired_peers(state_dir)?;
+    let mut peers = load_paired_peers(state_dir);
+    peers.retain(|p| normalize_oma_id(&p.oma_id) != norm);
+    let peer = PairedPeer {
+        oma_id: format_oma_id(&norm),
+        name: if clean_name.is_empty() { format!("OmaID-{}", &norm[..4]) } else { clean_name },
+        ip: Some(ip.to_string()),
+        paired_at: now,
+        auth_token: Some(token.to_string()),
+        confirmed: true,
+        pair_code: None,
+        pair_expires_at: None,
+        pair_failures: 0,
+    };
+    peers.push(peer.clone());
+    save_paired_peers_locked(peers, state_dir, &lock)?;
+    Ok(peer)
 }
 
 // ------------------- BLINDED RENDEZVOUS & KDF -------------------
@@ -1036,18 +1288,118 @@ mod tests {
         let meta = fs::symlink_metadata(&peers_file).expect("Stat paired_peers.json");
         assert_eq!(meta.mode() & 0o777, 0o600, "paired_peers.json must have 0600 permissions");
 
-        // Update IP for existing peer
-        let updated = add_paired_peer(&raw_id, "Alice Workstation Updated", Some("10.0.0.99"), &temp_dir).expect("Update paired peer");
-        assert_eq!(updated.name, "Alice Workstation Updated");
-        assert_eq!(updated.ip, Some("10.0.0.99".to_string()));
+        // Existing records are immutable through add_paired_peer (trust flows)
+        let again = add_paired_peer(&raw_id, "Alice Workstation Updated", Some("10.0.0.99"), &temp_dir).expect("Re-add paired peer");
+        assert_eq!(again.name, "Alice Workstation");
+        assert_eq!(again.ip, Some("192.168.1.55".to_string()));
+        assert_eq!(again.auth_token, paired.auth_token);
+        assert!(!again.confirmed, "Records created without code handshake must stay unconfirmed");
+        assert!(!again.is_active());
 
         let loaded = load_paired_peers(&temp_dir);
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].ip, Some("10.0.0.99".to_string()));
+        assert_eq!(loaded[0].ip, Some("192.168.1.55".to_string()));
 
         // Invalid OmaID must fail
         assert!(add_paired_peer("1234-invalid", "Bad", None, &temp_dir).is_err());
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    fn pair_test_dir(tag: &str) -> std::path::PathBuf {
+        let d = env::temp_dir().join(format!("oma_pair_sec_{}_{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn test_remote_pairing_rejects_unknown_peer_and_creates_nothing() {
+        let dir = pair_test_dir("unknown");
+        let raw_id = generate_raw_oma_id();
+        let src: IpAddr = "192.168.1.66".parse().unwrap();
+        assert_eq!(complete_remote_pairing(&raw_id, "123456", src, &dir, 1000), Err(PairingError::NotAuthorized));
+        assert!(load_paired_peers(&dir).is_empty(), "Remote requests must never create peer records");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_remote_pairing_requires_code_and_binds_source_ip() {
+        let dir = pair_test_dir("code");
+        let raw_id = generate_raw_oma_id();
+        let (pending, code) = begin_local_pairing(&raw_id, "Phone", None, &dir, 1000).expect("Begin pairing");
+        assert!(!pending.is_active());
+        assert_eq!(code.len(), 6);
+        let local_token = pending.auth_token.clone();
+
+        let src: IpAddr = "192.168.1.77".parse().unwrap();
+        let wrong = if code == "000000" { "111111" } else { "000000" };
+        assert_eq!(complete_remote_pairing(&raw_id, wrong, src, &dir, 1001), Err(PairingError::NotAuthorized));
+
+        let done = complete_remote_pairing(&raw_id, &code, src, &dir, 1002).expect("Complete pairing");
+        assert!(done.is_active());
+        assert_eq!(done.ip, Some("192.168.1.77".to_string()));
+        assert_eq!(done.auth_token, local_token, "Token must be the locally generated one");
+        assert!(done.pair_code.is_none());
+
+        // Replay of the same code (or any takeover attempt) after completion fails
+        let attacker: IpAddr = "192.168.1.200".parse().unwrap();
+        assert_eq!(complete_remote_pairing(&raw_id, &code, attacker, &dir, 1003), Err(PairingError::NotAuthorized));
+        let stored = load_paired_peers(&dir);
+        assert_eq!(stored[0].ip, Some("192.168.1.77".to_string()));
+        assert_eq!(stored[0].auth_token, local_token);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_remote_pairing_expiry_ip_hint_public_source_and_lockout() {
+        let dir = pair_test_dir("limits");
+        let raw_id = generate_raw_oma_id();
+
+        // Expired code
+        let (_, code) = begin_local_pairing(&raw_id, "Laptop", None, &dir, 1000).unwrap();
+        let src: IpAddr = "10.0.0.5".parse().unwrap();
+        assert!(complete_remote_pairing(&raw_id, &code, src, &dir, 1000 + PAIR_CODE_TTL_SECS + 1).is_err());
+
+        // IP hint binds the source address
+        let (_, code) = begin_local_pairing(&raw_id, "Laptop", Some("10.0.0.5"), &dir, 2000).unwrap();
+        let other: IpAddr = "10.0.0.6".parse().unwrap();
+        assert!(complete_remote_pairing(&raw_id, &code, other, &dir, 2001).is_err());
+        assert!(complete_remote_pairing(&raw_id, &code, src, &dir, 2002).is_ok());
+
+        // Public source addresses are refused
+        let (_, code) = begin_local_pairing(&raw_id, "Laptop", None, &dir, 3000).unwrap();
+        let public: IpAddr = "8.8.8.8".parse().unwrap();
+        assert!(complete_remote_pairing(&raw_id, &code, public, &dir, 3001).is_err());
+
+        // Public IP hints are refused locally
+        assert!(begin_local_pairing(&raw_id, "Laptop", Some("8.8.8.8"), &dir, 3002).is_err());
+
+        // Code is revoked after repeated failures
+        let (_, code) = begin_local_pairing(&raw_id, "Laptop", None, &dir, 4000).unwrap();
+        let wrong = if code == "000000" { "111111" } else { "000000" };
+        for _ in 0..PAIR_CODE_MAX_FAILURES {
+            assert!(complete_remote_pairing(&raw_id, wrong, src, &dir, 4001).is_err());
+        }
+        assert!(complete_remote_pairing(&raw_id, &code, src, &dir, 4002).is_err(), "Code must be revoked after max failures");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_legacy_records_deserialize_unconfirmed() {
+        let legacy = r#"{"peers":[{"oma_id":"1234-5678-9012-3452","name":"Old","ip":"192.168.1.9","paired_at":1,"auth_token":"ab"}]}"#;
+        let db: PairedPeersDb = serde_json::from_str(legacy).unwrap();
+        assert!(!db.peers[0].confirmed);
+        assert!(!db.peers[0].is_active());
+    }
+
+    #[test]
+    fn test_local_network_ip_classification() {
+        for ok in ["127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.0.1", "169.254.1.1", "::1", "fe80::1", "fd00::1", "::ffff:192.168.1.1"] {
+            assert!(is_local_network_ip(&ok.parse().unwrap()), "{} should be local", ok);
+        }
+        for bad in ["8.8.8.8", "100.64.0.1", "2001:4860::8888", "::ffff:8.8.8.8"] {
+            assert!(!is_local_network_ip(&bad.parse().unwrap()), "{} should be rejected", bad);
+        }
     }
 }

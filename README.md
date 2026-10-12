@@ -23,6 +23,7 @@
   - Zero-account, zero-server device pairing using RFC 2104 HMAC-SHA256 Blinded Rendezvous topics and RFC 5869 HKDF-SHA256 symmetric key derivation.
   - Generates verifiable 16-digit device identifiers with Luhn mod 10 checksum validation (`XXXX-XXXX-XXXX-XXXX`).
   - Strict zero-trust connection filter: Unpaired devices are rejected before staging data.
+  - Code-verified pairing: pairing is always started locally (`omasend-engine --pair-peer <OMAID> [name] [ip]` or the panel), which prints a one-time 6-digit code valid for 10 minutes. The remote device presents this code with `omasend-engine --complete-pair <PEER_IP> <PEER_OMAID> <CODE> [name]` (which calls `POST /api/p2p/pair` and verifies that the responder echoes the expected OmaID); loopback sources (including WAN tunnel traffic) are refused; the stored peer address is the observed TCP source (RFC 1918 / link-local / loopback only), the authentication token is generated locally and is never replaced remotely, and the code is revoked after 5 failed attempts. Unknown OmaIDs cannot create or modify peer records, and clipboard data is pushed only to peers that completed this handshake. Peers paired with earlier versions must be paired again.
 - **Universal Multi-Format Clipboard Vault & WebP Micro-Thumbnails:**
   - Real-time bidirectional clipboard sync supporting text and image payloads (PNG, JPEG, WebP).
   - Integrated WebP Micro-Thumbnail Engine: Automatically generates ultra-compact 96x96 WebP thumbnails (3-5 KB) in an isolated sandbox for instant zero-latency preview rendering.
