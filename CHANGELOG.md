@@ -4,6 +4,22 @@ Bu belgede OmaSend masaüstü ve Android uygulamaları için yapılan tüm sür�
 
 ---
 
+## [1.8.1] - 2026-10-14
+
+### Full-Stack Denetim Düzeltmeleri (Masaüstü)
+- **Pano (Wayland/X11):** `wl-copy`/`xclip` arka plan süreçleri yazma sonrası artık öldürülmüyor; pano içeriği kalıcı.
+- **İndirme izleyici:** Mevcut dosyalar için ~61 sn'de bir tekrarlanan bildirim döngüsü giderildi (`known_files` takibi).
+- **Panel performansı:** `--json` durumu STUN/qrencode çağrılarını önbellekten (30 sn) okuyor; panel donmaları giderildi.
+- **P2P güvenliği:** `/api/p2p/decision` üzerinden uzaktan kendi kendini onaylama engellendi (yalnızca loopback veya oturumlu portal).
+- **EVERYONE modu:** Eşleşmemiş cihazlar için onay (Gatekeeper) istemi artık erişilebilir.
+- **Çoklu dosya:** Toplu gönderim tek istek + tek onay ile yapılıyor; sürükle-bırak tüm dosyaları tek seferde gönderiyor.
+- **Görsel pano (Android uyumu):** BLAKE3 ve SHA-256 karma doğrulaması, `image_data_base64`/`sender_ip` alanları, `data:` öneki desteği, path/query tabanlı görsel uç noktası.
+- **Web portal:** Dosya adı kaçışlama (XSS), dosya adı temizleme ve çoğaltılmış ad uyumluluğu düzeltildi.
+- **Panel:** `omasend-engine` yolu çözümleme, 6 haneli eşleştirme kodu girişi.
+- Tüm testler geçiyor (84/84).
+
+---
+
 ## [1.6.4] - 2026-10-02 (Android Build: 43)
 
 ### Masaüstü & Mobil Eşzamanlı Sürüm ve Otomasyon Güncellemesi

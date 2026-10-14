@@ -313,7 +313,6 @@ pub fn run_cmd_write_stdin_bounded(
         match guard.child.try_wait() {
             Ok(Some(status)) => {
                 guard.active = false;
-                reap_process_group(guard.child, guard.pid);
                 return status.success();
             }
             Ok(None) => {

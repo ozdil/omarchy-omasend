@@ -354,6 +354,39 @@ pub fn is_peer_paired(oma_id: &str, state_dir: &Path) -> bool {
     peers.iter().any(|p| normalize_oma_id(&p.oma_id) == norm)
 }
 
+/// Verifies whether an OmaID has completed the code-verified pairing handshake
+pub fn is_peer_confirmed(oma_id: &str, state_dir: &Path) -> bool {
+    let norm = normalize_oma_id(oma_id);
+    if norm.len() != 16 {
+        return false;
+    }
+    load_paired_peers(state_dir)
+        .iter()
+        .any(|p| p.confirmed && normalize_oma_id(&p.oma_id) == norm)
+}
+
+/// Verifies the peer's authentication token in constant time
+pub fn verify_peer_auth_token(oma_id: &str, provided_token: &str, state_dir: &Path) -> bool {
+    let norm = normalize_oma_id(oma_id);
+    if norm.len() != 16 {
+        return false;
+    }
+    let peers = load_paired_peers(state_dir);
+    if let Some(peer) = peers.iter().find(|p| normalize_oma_id(&p.oma_id) == norm) {
+        if !peer.confirmed {
+            return false;
+        }
+        if let Some(ref expected) = peer.auth_token {
+            if !expected.is_empty() {
+                return !provided_token.is_empty()
+                    && constant_time_eq(expected.as_bytes(), provided_token.as_bytes());
+            }
+        }
+        return true;
+    }
+    false
+}
+
 /// Registers a peer locally without issuing a pairing code (used by trust and
 /// accepted-transfer flows). Existing records are returned unchanged: their
 /// address, token and confirmation state are never modified here. New records
@@ -1127,6 +1160,76 @@ pub fn generate_fallback_qr_svg(content: &str) -> String {
         r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {0} {0}" width="{0}" height="{0}"><rect width="{0}" height="{0}" fill="#ffffff" rx="12"/>{1}</svg>"##,
         size, paths
     )
+}
+
+// ------------------- FAST RENDEZVOUS STATUS CACHE -------------------
+
+pub const RENDEZVOUS_CACHE_TTL_SECS: u64 = 30;
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct RendezvousStatus {
+    pub oma_id: String,
+    pub cluster_id: String,
+    pub local_ip: String,
+    pub mode: String,
+    pub stun_addr: Option<String>,
+    pub tailscale_ip: Option<String>,
+    pub updated_at: u64,
+}
+
+pub fn load_rendezvous_status_cache(state_dir: &Path) -> Option<RendezvousStatus> {
+    let cache_path = state_dir.join("rendezvous_status_cache.json");
+    let content = crate::read_secure_file(&cache_path).ok()?;
+    serde_json::from_str::<RendezvousStatus>(&content).ok()
+}
+
+pub fn save_rendezvous_status_cache(state_dir: &Path, status: &RendezvousStatus) {
+    let cache_path = state_dir.join("rendezvous_status_cache.json");
+    if let Ok(json) = serde_json::to_string_pretty(status) {
+        let _ = crate::write_secure_file(&cache_path, &json);
+    }
+}
+
+/// Returns cached RendezvousStatus immediately (<1ms) if `rendezvous_status_cache.json`
+/// exists and is fresher than 30 seconds (with matching `oma_id`, `local_ip`, and `mode`).
+/// If missing or stale, returns immediate local info (preserving any previously cached STUN
+/// or local anchor address) and saves it to avoid blocking `--json` UI polls.
+pub fn get_rendezvous_status_fast(
+    state_dir: &Path,
+    oma_id: &str,
+    local_ip: &str,
+    mode: &str,
+) -> RendezvousStatus {
+    let now = unix_now();
+    let cached_opt = load_rendezvous_status_cache(state_dir);
+
+    if let Some(ref cached) = cached_opt {
+        if now.saturating_sub(cached.updated_at) < RENDEZVOUS_CACHE_TTL_SECS
+            && cached.oma_id == oma_id
+            && cached.local_ip == local_ip
+            && cached.mode == mode
+        {
+            return cached.clone();
+        }
+    }
+
+    let prev_stun = cached_opt
+        .as_ref()
+        .and_then(|c| c.stun_addr.clone())
+        .or_else(|| query_local_rendezvous_anchor(oma_id, state_dir).and_then(|r| r.stun_addr));
+    let prev_ts = cached_opt.as_ref().and_then(|c| c.tailscale_ip.clone());
+
+    let fast_status = RendezvousStatus {
+        oma_id: oma_id.to_string(),
+        cluster_id: compute_rendezvous_topic(oma_id),
+        local_ip: local_ip.to_string(),
+        mode: mode.to_string(),
+        stun_addr: prev_stun,
+        tailscale_ip: prev_ts,
+        updated_at: now,
+    };
+    save_rendezvous_status_cache(state_dir, &fast_status);
+    fast_status
 }
 
 #[cfg(test)]

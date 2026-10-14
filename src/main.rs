@@ -223,6 +223,8 @@ pub struct PendingFileTransfer {
     pub file_names: Vec<String>,
     #[serde(default)]
     pub files: Vec<TransferFileInfo>,
+    #[serde(default)]
+    pub remaining_files: usize,
     pub total_size_bytes: u64,
     pub created_at: u64,
     pub expires_at: u64,
@@ -973,6 +975,7 @@ fn notify_desktop(title: &str, body: &str) {
 fn start_download_dir_watcher(download_dir: &Path) {
     let dir = download_dir.to_path_buf();
     thread::spawn(move || {
+        let mut known_files: std::collections::HashSet<String> = std::collections::HashSet::new();
         // Initial scan: record existing files so we don't send notifications for old files
         if let Ok(entries) = fs::read_dir(&dir) {
             for entry in entries.flatten() {
@@ -980,6 +983,7 @@ fn start_download_dir_watcher(download_dir: &Path) {
                     if ft.is_file() {
                         let fname = entry.file_name().to_string_lossy().to_string();
                         record_notified_file(&fname);
+                        known_files.insert(fname);
                     }
                 }
             }
@@ -990,6 +994,7 @@ fn start_download_dir_watcher(download_dir: &Path) {
         loop {
             thread::sleep(Duration::from_millis(1500));
             if let Ok(entries) = fs::read_dir(&dir) {
+                let mut current_files: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for entry in entries.flatten() {
                     if let Ok(ft) = entry.file_type() {
                         if !ft.is_file() {
@@ -999,7 +1004,10 @@ fn start_download_dir_watcher(download_dir: &Path) {
                         if fname.starts_with('.') || fname.ends_with(".part") || fname.ends_with(".crdownload") {
                             continue;
                         }
-                        if is_recently_notified(&fname) {
+                        current_files.insert(fname.clone());
+                        if known_files.contains(&fname) || is_recently_notified(&fname) {
+                            known_files.insert(fname.clone());
+                            previous_sizes.remove(&fname);
                             continue;
                         }
 
@@ -1007,6 +1015,7 @@ fn start_download_dir_watcher(download_dir: &Path) {
                         if let Some(&prev_size) = previous_sizes.get(&fname) {
                             if prev_size == size && size > 0 {
                                 record_notified_file(&fname);
+                                known_files.insert(fname.clone());
                                 previous_sizes.remove(&fname);
                                 RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
                                 notify_desktop(
@@ -1021,6 +1030,7 @@ fn start_download_dir_watcher(download_dir: &Path) {
                         }
                     }
                 }
+                known_files.retain(|f| current_files.contains(f));
             }
         }
     });
@@ -1034,6 +1044,17 @@ pub const MAX_CLIP_STAGING_FILES: usize = 20; // 20 images max
 
 pub fn compute_image_clipboard_hash(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
+}
+
+pub fn verify_image_clipboard_hash(bytes: &[u8], expected_hash: &str) -> bool {
+    let b3 = blake3::hash(bytes).to_hex().to_string();
+    if b3.eq_ignore_ascii_case(expected_hash) {
+        return true;
+    }
+    let mut sha_hasher = Sha256::new();
+    sha_hasher.update(bytes);
+    let sha_hex = hex::encode(sha_hasher.finalize());
+    sha_hex.eq_ignore_ascii_case(expected_hash)
 }
 
 pub fn base64_encode(data: &[u8]) -> String {
@@ -1062,7 +1083,12 @@ pub fn base64_encode(data: &[u8]) -> String {
 }
 
 pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
-    let clean: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let stripped = if let Some(idx) = input.find(";base64,") {
+        &input[idx + 8..]
+    } else {
+        input
+    };
+    let clean: Vec<u8> = stripped.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     if !clean.len().is_multiple_of(4) {
         return Err("Invalid Base64 length".to_string());
     }
@@ -1594,17 +1620,23 @@ pub fn p2p_push_image_clipboard_silent(
         None
     };
 
+    let local_ip = get_local_ip();
     let inner_json = serde_json::json!({
         "sender_id": my_oma_id,
         "oma_id": my_oma_id,
         "device_id": my_id,
         "sender_name": my_name,
+        "sender_alias": my_name,
+        "sender_ip": local_ip,
         "content_type": content_type,
         "image_hash": hash,
         "image_size": size,
         "image_width": width,
         "image_height": height,
+        "width": width,
+        "height": height,
         "image_base64": image_base64,
+        "image_data_base64": image_base64,
         "thumbnail_base64": thumb_b64,
         "auth_token": auth_token
     });
@@ -1617,6 +1649,7 @@ pub fn p2p_push_image_clipboard_silent(
                 "oma_id": my_oma_id,
                 "sender_id": my_oma_id,
                 "sender_name": my_name,
+                "sender_ip": local_ip,
                 "auth_token": auth_token
             })
         } else {
@@ -1654,8 +1687,8 @@ pub fn p2p_fetch_image_clipboard_and_apply(sender_ip: &str, hash: &str, _content
         let addr = resolve_peer_addr(&ip);
         if let Ok(mut stream) = connect_peer_with_timeout(&addr, Duration::from_secs(5)) {
             let http_req = format!(
-                "GET /api/p2p/clipboard/image/{} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-                h, addr
+                "GET /api/p2p/clipboard/image/{}?hash={} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                h, h, addr
             );
             if stream.write_all(http_req.as_bytes()).is_ok() {
                 let mut resp_bytes = Vec::new();
@@ -1665,8 +1698,7 @@ pub fn p2p_fetch_image_clipboard_and_apply(sender_ip: &str, hash: &str, _content
                         if header_part.starts_with("HTTP/1.1 200") || header_part.starts_with("HTTP/1.0 200") {
                             let body_bytes = &resp_bytes[pos + 4..];
                             if let Ok((verified_ct, _w, _h)) = validate_image_header(body_bytes) {
-                                let computed_hash = compute_image_clipboard_hash(body_bytes);
-                                if computed_hash == h {
+                                if verify_image_clipboard_hash(body_bytes, &h) {
                                     let _ = stage_clipboard_image(body_bytes, &verified_ct);
                                     let _ = set_pc_image_clipboard(body_bytes, &verified_ct);
                                 }
@@ -1866,9 +1898,9 @@ fn get_unique_filepath(dir: &Path, filename: &str) -> PathBuf {
     let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
     for i in 1..1000 {
         let candidate_name = if ext.is_empty() {
-            format!("{} ({})", stem, i)
+            format!("{}_{}", stem, i)
         } else {
-            format!("{} ({}).{}", stem, i, ext)
+            format!("{}_{}.{}", stem, i, ext)
         };
         let candidate_path = dir.join(&candidate_name);
         if !candidate_path.exists() {
@@ -2590,15 +2622,54 @@ fn p2p_complete_pairing(peer_ip_str: &str, expected_oma_id: &str, code: &str, na
 }
 
 fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String> {
-    let size_bytes = safe_verify_file(file_path).map_err(|e| format!("Security check failed: {}", e))?;
-    let file_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    p2p_send_files_to_peer(target_ip, &[file_path.to_path_buf()])
+}
+
+fn p2p_send_files_to_peer(target_ip: &str, file_paths: &[PathBuf]) -> Result<(), String> {
+    if file_paths.is_empty() {
+        return Err("No files specified for transfer".to_string());
+    }
+
+    struct PreparedFile {
+        path: PathBuf,
+        name: String,
+        size_bytes: u64,
+        blake3_hex: String,
+        sha256_hex: String,
+        md5_hex: String,
+    }
+
+    let mut prepared = Vec::with_capacity(file_paths.len());
+    let mut files_json = Vec::with_capacity(file_paths.len());
+    let mut total_size_bytes = 0u64;
+
+    for fp in file_paths {
+        let size_bytes = safe_verify_file(fp).map_err(|e| format!("Security check failed for {:?}: {}", fp, e))?;
+        let file_name = fp.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let (blake3_hex, sha256_hex, md5_hex) = compute_file_military_hashes(fp)
+            .map_err(|e| format!("Failed to compute file hashes: {}", e))?;
+        total_size_bytes = total_size_bytes.saturating_add(size_bytes);
+        files_json.push(serde_json::json!({
+            "name": file_name,
+            "size": size_bytes,
+            "size_bytes": size_bytes,
+            "blake3": blake3_hex,
+            "sha256": sha256_hex,
+            "md5": md5_hex
+        }));
+        prepared.push(PreparedFile {
+            path: fp.clone(),
+            name: file_name,
+            size_bytes,
+            blake3_hex,
+            sha256_hex,
+            md5_hex,
+        });
+    }
 
     let (my_id, _) = get_or_create_device_id();
     let my_oma_id = get_or_create_oma_id();
     let my_name = get_system_hostname();
-
-    let (blake3_hex, sha256_hex, md5_hex) = compute_file_military_hashes(file_path)
-        .map_err(|e| format!("Failed to compute file hashes: {}", e))?;
 
     let paired = load_paired_peers();
     let matched_peer = paired.iter().find(|p| p.is_active() && p.ip.as_deref() == Some(target_ip));
@@ -2610,18 +2681,11 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
         "oma_id": my_oma_id,
         "device_id": my_id,
         "sender_name": my_name,
+        "sender_alias": my_name,
         "sender_ip": get_local_ip(),
         "auth_token": auth_token,
-        "files": [
-            {
-                "name": file_name,
-                "size_bytes": size_bytes,
-                "blake3": blake3_hex,
-                "sha256": sha256_hex,
-                "md5": md5_hex
-            }
-        ],
-        "total_size_bytes": size_bytes
+        "files": files_json,
+        "total_size_bytes": total_size_bytes
     });
 
     let target_oma_id = matched_peer.map(|p| p.oma_id.clone()).unwrap_or_default();
@@ -2632,6 +2696,7 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
                 "oma_id": my_oma_id,
                 "sender_id": my_oma_id,
                 "sender_name": my_name,
+                "sender_alias": my_name,
                 "sender_ip": get_local_ip(),
                 "auth_token": auth_token
             })
@@ -2675,42 +2740,45 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
         return Err(format!("Peer rejected request: {}", err));
     }
     let token = val["token"].as_str().ok_or_else(|| "Peer did not return a transfer token".to_string())?.to_string();
+    let initial_status = val["status"].as_str().unwrap_or("PENDING");
 
-    println!("Transfer request sent to {}! Waiting for user to Accept...", target_ip);
-    notify_desktop("OmaSend AirBridge", &format!("Transfer request sent to {}. Waiting for consent...", target_ip));
+    let mut accepted = initial_status == "ACCEPTED";
+    if !accepted {
+        println!("Transfer request sent to {}! Waiting for user to Accept...", target_ip);
+        notify_desktop("OmaSend AirBridge", &format!("Transfer request sent to {}. Waiting for consent...", target_ip));
 
-    // 2. Poll for decision (monotonic deadline of 30 seconds)
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    let mut accepted = false;
+        // 2. Poll for decision (monotonic deadline of 30 seconds)
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
 
-    while std::time::Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(600));
-        let mut poll_stream = match connect_peer_with_timeout(&addr, Duration::from_secs(4)) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let poll_req = format!(
-            "GET /api/p2p/decision?token={} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-            token, addr
-        );
-        let _ = poll_stream.write_all(poll_req.as_bytes());
-        let mut poll_resp = String::new();
-        let _ = poll_stream.read_to_string(&mut poll_resp);
-        if let Some(idx) = poll_resp.find("\r\n\r\n") {
-            let poll_body = &poll_resp[idx + 4..];
-            if let Ok(p_val) = serde_json::from_str::<serde_json::Value>(poll_body) {
-                match p_val["status"].as_str() {
-                    Some("ACCEPTED") => {
-                        accepted = true;
-                        break;
+        while std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(600));
+            let mut poll_stream = match connect_peer_with_timeout(&addr, Duration::from_secs(4)) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let poll_req = format!(
+                "GET /api/p2p/decision?token={} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                token, addr
+            );
+            let _ = poll_stream.write_all(poll_req.as_bytes());
+            let mut poll_resp = String::new();
+            let _ = poll_stream.read_to_string(&mut poll_resp);
+            if let Some(idx) = poll_resp.find("\r\n\r\n") {
+                let poll_body = &poll_resp[idx + 4..];
+                if let Ok(p_val) = serde_json::from_str::<serde_json::Value>(poll_body) {
+                    match p_val["status"].as_str() {
+                        Some("ACCEPTED") => {
+                            accepted = true;
+                            break;
+                        }
+                        Some("REJECTED") => {
+                            return Err("Transfer was declined by the recipient.".to_string());
+                        }
+                        Some("EXPIRED") => {
+                            return Err("Transfer request timed out.".to_string());
+                        }
+                        _ => {} // Still pending
                     }
-                    Some("REJECTED") => {
-                        return Err("Transfer was declined by the recipient.".to_string());
-                    }
-                    Some("EXPIRED") => {
-                        return Err("Transfer request timed out.".to_string());
-                    }
-                    _ => {} // Still pending
                 }
             }
         }
@@ -2720,34 +2788,39 @@ fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String
         return Err("Transfer timed out waiting for recipient approval.".to_string());
     }
 
-    println!("Peer accepted! Streaming file '{}' ({} bytes, sha256: {})...", file_name, size_bytes, sha256_hex);
+    // 3. Upload each file in the batch via 128 KiB streaming chunks
+    for pf in &prepared {
+        println!("Peer accepted! Streaming file '{}' ({} bytes, sha256: {})...", pf.name, pf.size_bytes, pf.sha256_hex);
+        let mut upload_stream = connect_peer_with_timeout(&addr, Duration::from_secs(6))
+            .map_err(|e| format!("Failed to connect to peer for upload: {}", e))?;
+        let encoded_filename = urlencoding_encode(&pf.name);
+        let upload_header = format!(
+            "POST /api/p2p/upload?token={}&filename={}&blake3={}&sha256={}&md5={} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/octet-stream\r\nX-File-BLAKE3: {}\r\nX-File-SHA256: {}\r\nX-File-MD5: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            token, encoded_filename, pf.blake3_hex, pf.sha256_hex, pf.md5_hex, addr, pf.blake3_hex, pf.sha256_hex, pf.md5_hex, pf.size_bytes
+        );
+        upload_stream.write_all(upload_header.as_bytes()).map_err(|e| e.to_string())?;
 
-    // 3. Upload file via 128 KiB streaming chunks
-    let mut upload_stream = connect_peer_with_timeout(&addr, Duration::from_secs(6))
-        .map_err(|e| format!("Failed to connect to peer for upload: {}", e))?;
-    let encoded_filename = urlencoding_encode(&file_name);
-    let upload_header = format!(
-        "POST /api/p2p/upload?token={}&filename={}&sha256={}&md5={} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/octet-stream\r\nX-File-SHA256: {}\r\nX-File-MD5: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        token, encoded_filename, sha256_hex, md5_hex, addr, sha256_hex, md5_hex, size_bytes
-    );
-    upload_stream.write_all(upload_header.as_bytes()).map_err(|e| e.to_string())?;
-
-    let mut file = fs::File::open(file_path).map_err(|e| format!("Failed to open file for upload: {}", e))?;
-    let mut chunk_buf = [0u8; 131072]; // 128 KiB chunk aligned with IEEE 802.11 A-MPDU
-    loop {
-        let n = file.read(&mut chunk_buf).map_err(|e| format!("Failed to read file chunk: {}", e))?;
-        if n == 0 {
-            break;
+        let mut file = fs::File::open(&pf.path).map_err(|e| format!("Failed to open file for upload: {}", e))?;
+        let mut chunk_buf = [0u8; 131072]; // 128 KiB chunk aligned with IEEE 802.11 A-MPDU
+        loop {
+            let n = file.read(&mut chunk_buf).map_err(|e| format!("Failed to read file chunk: {}", e))?;
+            if n == 0 {
+                break;
+            }
+            upload_stream.write_all(&chunk_buf[..n]).map_err(|e| format!("Failed to send chunk to peer: {}", e))?;
         }
-        upload_stream.write_all(&chunk_buf[..n]).map_err(|e| format!("Failed to send chunk to peer: {}", e))?;
-    }
-    upload_stream.flush().map_err(|e| format!("Failed to flush upload stream: {}", e))?;
+        upload_stream.flush().map_err(|e| format!("Failed to flush upload stream: {}", e))?;
 
-    let mut final_resp = String::new();
-    let _ = upload_stream.read_to_string(&mut final_resp);
+        let mut final_resp = String::new();
+        let _ = upload_stream.read_to_string(&mut final_resp);
+    }
 
     println!("Transfer successfully completed to {}!", target_ip);
-    notify_desktop("OmaSend AirBridge", &format!("'{}' successfully sent to {}.", file_name, target_ip));
+    if prepared.len() == 1 {
+        notify_desktop("OmaSend AirBridge", &format!("'{}' successfully sent to {}.", prepared[0].name, target_ip));
+    } else {
+        notify_desktop("OmaSend AirBridge", &format!("{} files successfully sent to {}.", prepared.len(), target_ip));
+    }
     Ok(())
 }
 
@@ -4395,6 +4468,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             sender_name: sender_name.clone(),
             sender_ip,
             file_names: file_names.clone(),
+            remaining_files: files_info.len().max(1),
             files: files_info,
             total_size_bytes,
             created_at: now,
@@ -6491,6 +6565,7 @@ mod tests {
             sender_ip: "192.168.1.50".to_string(),
             file_names: vec!["approved_file.pdf".to_string()],
             files: vec![approved_info],
+            remaining_files: 1,
             total_size_bytes: 1024,
             created_at: 100,
             expires_at: 500,

@@ -68,7 +68,7 @@ Panel {
   readonly property string manifestPath: Qt.resolvedUrl("manifest.json").toString().replace(/^file:\/\//, "")
   readonly property string manifestFallbackPath: root.userHome + "/.config/omarchy/plugins/ozdil.omasend/manifest.json"
 
-  property string pluginVersion: "1.8.0"
+  property string pluginVersion: "1.8.1"
   property string pluginDescription: "AirBridge P2P, E2EE Secure Local & Network File Transfer System"
   property string pluginAuthor: "Ozan Özdil (@ozdil)"
   property string pluginLicense: "MIT"
@@ -589,6 +589,9 @@ Panel {
           var dist = Math.abs(dx)
           var raw = Math.max(0.0, Math.min(1.0, 1.0 - (dist / (iconDropArea.width / 2))))
           dropPortal.proximity = Math.max(dropPortal.proximity, 0.5 * (1.0 - Math.cos(raw * Math.PI)))
+          dropPortal.dragOffsetX = Math.max(-45.0, Math.min(45.0, dx * 0.22))
+          dropPortal.fluidStretch = 1.0 + (dropPortal.proximity * 0.25)
+          dropPortal.fluidMorphAngle = (dx / (iconDropArea.width / 2)) * 14.0
         }
       }
 
@@ -647,6 +650,34 @@ Panel {
     property bool isBlasting: false
     property real blastProgress: 0.0
 
+    // Caelestia Shell Spring & Fluid Dynamic Offsets
+    property real dragOffsetX: 0.0
+    property real dragOffsetY: 0.0
+    property real fluidMorphAngle: 0.0
+    property real fluidStretch: 1.0
+
+    Behavior on dragOffsetX {
+      NumberAnimation {
+        duration: 250
+        easing.type: Easing.BezierSpline
+        easing.bezierCurve: [0.38, 1.21, 0.22, 1, 1, 1] // Caelestia expressiveDefaultSpatial
+      }
+    }
+    Behavior on dragOffsetY {
+      NumberAnimation {
+        duration: 250
+        easing.type: Easing.BezierSpline
+        easing.bezierCurve: [0.38, 1.21, 0.22, 1, 1, 1] // Caelestia expressiveDefaultSpatial
+      }
+    }
+    Behavior on fluidStretch {
+      NumberAnimation {
+        duration: 350
+        easing.type: Easing.BezierSpline
+        easing.bezierCurve: [0.42, 1.67, 0.21, 0.9, 1, 1] // Caelestia expressiveFastSpatial (spring rebound)
+      }
+    }
+
     // Exact button center relative to dropPortal (Fully Reactive with TransformWatcher)
     readonly property real originX: {
       buttonWatcher.transform
@@ -666,6 +697,10 @@ Panel {
         if (!portalDropArea.containsDrag && !iconDropArea.containsDrag && !dropPortal.isBlasting) {
           dropPortal.active = false
           dropPortal.proximity = 0.0
+          dropPortal.dragOffsetX = 0.0
+          dropPortal.dragOffsetY = 0.0
+          dropPortal.fluidStretch = 1.0
+          dropPortal.fluidMorphAngle = 0.0
         }
       }
     }
@@ -773,6 +808,10 @@ Panel {
           dropPortal.isBlasting = false
           dropPortal.blastProgress = 0.0
           dropPortal.proximity = 0.0
+          dropPortal.dragOffsetX = 0.0
+          dropPortal.dragOffsetY = 0.0
+          dropPortal.fluidStretch = 1.0
+          dropPortal.fluidMorphAngle = 0.0
           dropPortal.active = false
         }
       }
@@ -802,6 +841,10 @@ Panel {
           var maxDist = 600.0
           var raw = Math.max(0.0, Math.min(1.0, 1.0 - (dist / maxDist)))
           dropPortal.proximity = 0.5 * (1.0 - Math.cos(raw * Math.PI))
+          dropPortal.dragOffsetX = Math.max(-55.0, Math.min(55.0, dx * 0.16))
+          dropPortal.dragOffsetY = Math.max(-40.0, Math.min(40.0, dy * 0.14))
+          dropPortal.fluidStretch = 1.0 + (dropPortal.proximity * 0.32)
+          dropPortal.fluidMorphAngle = Math.max(-20.0, Math.min(20.0, (dx / 300.0) * 18.0))
         }
       }
 
@@ -820,17 +863,26 @@ Panel {
 
     Item {
       id: auraContainer
-      x: Math.round(dropPortal.originX - width / 2)
-      y: Math.round(dropPortal.originY - height / 2)
+      x: Math.round(dropPortal.originX - width / 2 + dropPortal.dragOffsetX)
+      y: Math.round(dropPortal.originY - height / 2 + dropPortal.dragOffsetY)
       width: 600
       height: 600
       layer.enabled: true
       opacity: ((dropPortal.active && dropPortal.proximity > 0.01) || dropPortal.isBlasting) ? 1.0 : 0.0
+      scale: dropPortal.isBlasting ? (1.0 + dropPortal.blastProgress * 0.12) : Math.max(0.85, Math.min(1.15, dropPortal.fluidStretch))
+      rotation: dropPortal.fluidMorphAngle
+
       Behavior on opacity {
-        NumberAnimation { duration: 120; easing.type: Easing.OutQuad }
+        NumberAnimation { duration: 140; easing.type: Easing.OutQuad }
+      }
+      Behavior on scale {
+        NumberAnimation { duration: 120; easing.type: Easing.OutBack }
+      }
+      Behavior on rotation {
+        NumberAnimation { duration: 110; easing.type: Easing.OutQuad }
       }
 
-      // Layer 5: Liquid Water Surface Radial Refraction Gradient (Center 80% -> Outer 0%)
+      // Layer 5: Liquid Water Surface Radial Refraction & Chromatic Glow
       Canvas {
         id: radialGradientCanvas
         anchors.centerIn: parent
@@ -849,10 +901,12 @@ Panel {
           var cy = height / 2
           var r = (80 + dropPortal.proximity * 440) / 2
 
+          // Caelestia Dual-Stop Chromatic Gradient (Accent Cyan to Electric Purple/Blue)
           var grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, r)
-          grad.addColorStop(0.0, Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.80 * (0.35 + dropPortal.proximity * 0.65)))
-          grad.addColorStop(0.28, Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.48 * dropPortal.proximity))
-          grad.addColorStop(0.65, Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.16 * dropPortal.proximity))
+          grad.addColorStop(0.0, Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.85 * (0.35 + dropPortal.proximity * 0.65)))
+          grad.addColorStop(0.24, Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.52 * dropPortal.proximity))
+          grad.addColorStop(0.55, Qt.rgba(0.48, 0.64, 0.98, 0.28 * dropPortal.proximity)) // Caelestia soft violet refraction
+          grad.addColorStop(0.82, Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.08 * dropPortal.proximity))
           grad.addColorStop(1.0, Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.00))
 
           ctx.fillStyle = grad
@@ -866,23 +920,24 @@ Panel {
           function onProximityChanged() { radialGradientCanvas.requestPaint() }
           function onIsBlastingChanged() { radialGradientCanvas.requestPaint() }
           function onBlastProgressChanged() { radialGradientCanvas.requestPaint() }
+          function onFluidStretchChanged() { radialGradientCanvas.requestPaint() }
         }
       }
 
-      // Layer 4: Ambient Liquid Pool Glow (80px -> 480px)
+      // Layer 4: Ambient Liquid Pool Glow with Spring Elasticity
       Rectangle {
         id: ambientGlow
         anchors.centerIn: parent
-        width: 80 + (dropPortal.proximity * 400) + (dropPortal.isBlasting ? dropPortal.blastProgress * 120 : 0)
-        height: width
-        radius: width / 2
+        width: (80 + (dropPortal.proximity * 410) + (dropPortal.isBlasting ? dropPortal.blastProgress * 140 : 0)) * (1.0 + (dropPortal.fluidStretch - 1.0) * 0.4)
+        height: (80 + (dropPortal.proximity * 390) + (dropPortal.isBlasting ? dropPortal.blastProgress * 140 : 0)) / (1.0 + (dropPortal.fluidStretch - 1.0) * 0.3)
+        radius: Math.min(width, height) / 2
         layer.enabled: true
-        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, dropPortal.isBlasting ? 0.35 : (0.04 + dropPortal.proximity * 0.24))
-        border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, dropPortal.isBlasting ? 0.75 : (0.08 + dropPortal.proximity * 0.48))
-        border.width: 1.0
+        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, dropPortal.isBlasting ? 0.38 : (0.05 + dropPortal.proximity * 0.26))
+        border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, dropPortal.isBlasting ? 0.85 : (0.10 + dropPortal.proximity * 0.52))
+        border.width: 1.2
 
-        Behavior on width { NumberAnimation { duration: 60; easing.type: Easing.OutQuad } }
-        Behavior on height { NumberAnimation { duration: 60; easing.type: Easing.OutQuad } }
+        Behavior on width { NumberAnimation { duration: 80; easing.type: Easing.OutBack } }
+        Behavior on height { NumberAnimation { duration: 80; easing.type: Easing.OutBack } }
         Behavior on color { ColorAnimation { duration: 80 } }
       }
 
@@ -890,20 +945,20 @@ Panel {
       Rectangle {
         id: portalWave4
         anchors.centerIn: parent
-        width: 260 + dropPortal.proximity * 300
+        width: (260 + dropPortal.proximity * 300) * (1.0 + (dropPortal.fluidStretch - 1.0) * 0.2)
         height: width
         radius: width / 2
         layer.enabled: true
-        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.01)
-        border.color: Color.accent
-        border.width: Math.max(0.8, 1.4 * (1.0 - scale * 0.5))
+        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.015)
+        border.color: Qt.rgba(0.48, 0.64, 0.98, 0.75) // Caelestia pastel rim
+        border.width: Math.max(0.8, 1.5 * (1.0 - scale * 0.5))
 
         SequentialAnimation on opacity {
           running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
           loops: Animation.Infinite
           PauseAnimation { duration: 1200 }
-          NumberAnimation { from: 0.0; to: 0.35 + dropPortal.proximity * 0.30; duration: 550; easing.type: Easing.OutQuad }
-          NumberAnimation { from: 0.35 + dropPortal.proximity * 0.30; to: 0.0; duration: 1150; easing.type: Easing.InQuad }
+          NumberAnimation { from: 0.0; to: 0.38 + dropPortal.proximity * 0.32; duration: 550; easing.type: Easing.OutQuad }
+          NumberAnimation { from: 0.38 + dropPortal.proximity * 0.32; to: 0.0; duration: 1150; easing.type: Easing.InQuad }
         }
 
         SequentialAnimation on scale {
@@ -922,7 +977,7 @@ Panel {
         height: width
         radius: width / 2
         layer.enabled: true
-        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.02)
+        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.025)
         border.color: Color.accent
         border.width: Math.max(1.0, 1.8 * (1.0 - scale * 0.4))
 
@@ -930,8 +985,8 @@ Panel {
           running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
           loops: Animation.Infinite
           PauseAnimation { duration: 800 }
-          NumberAnimation { from: 0.0; to: 0.48 + dropPortal.proximity * 0.32; duration: 500; easing.type: Easing.OutQuad }
-          NumberAnimation { from: 0.48 + dropPortal.proximity * 0.32; to: 0.0; duration: 1100; easing.type: Easing.InQuad }
+          NumberAnimation { from: 0.0; to: 0.52 + dropPortal.proximity * 0.34; duration: 500; easing.type: Easing.OutQuad }
+          NumberAnimation { from: 0.52 + dropPortal.proximity * 0.34; to: 0.0; duration: 1100; easing.type: Easing.InQuad }
         }
 
         SequentialAnimation on scale {
@@ -942,39 +997,39 @@ Panel {
         }
       }
 
-      // Layer 6: Floating Frosted Glass Capsule (Dynamic Island Peer Badge)
+      // Layer 6: Floating Frosted Glass Capsule (Caelestia Dynamic Morphing Island)
       Item {
         id: floatingDeviceCapsule
         z: 30
         anchors.horizontalCenter: parent.horizontalCenter
         y: (root.bar && (root.bar.position === "bottom" || root.bar.edge === "bottom"))
-           ? (parent.height / 2 - 110 - (dropPortal.proximity * 25))
-           : (parent.height / 2 + 80 + (dropPortal.proximity * 25))
+           ? (parent.height / 2 - 118 - (dropPortal.proximity * 30))
+           : (parent.height / 2 + 86 + (dropPortal.proximity * 30))
 
-        width: Math.min(360, capsuleRow.implicitWidth + 28)
-        height: 32
+        width: Math.min(380, capsuleRow.implicitWidth + 32)
+        height: 34
         opacity: (dropPortal.active && dropPortal.proximity > 0.03) || dropPortal.isBlasting ? 1.0 : 0.0
-        scale: opacity > 0 ? (0.92 + dropPortal.proximity * 0.08) : 0.85
+        scale: opacity > 0 ? (0.94 + dropPortal.proximity * 0.08) : 0.85
 
         Behavior on opacity { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
         Behavior on scale   { NumberAnimation { duration: 180; easing.type: Easing.OutBack } }
-        Behavior on y       { NumberAnimation { duration: 100; easing.type: Easing.OutQuad } }
+        Behavior on y       { NumberAnimation { duration: 110; easing.type: Easing.OutQuad } }
 
-        // Frosted Dark Glass Surface
+        // Caelestia Frosted Glass Pill with Specular Neon Glow
         Rectangle {
           anchors.fill: parent
           radius: height / 2
-          color: Qt.rgba(0.06, 0.07, 0.10, 0.88)
-          border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.50)
-          border.width: 1.0
+          color: Qt.rgba(0.05, 0.06, 0.09, 0.92)
+          border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.65)
+          border.width: 1.2
 
-          // Subtle Inner Specular Rim
+          // Specular Top-Light Glass Reflection
           Rectangle {
             anchors.fill: parent
             anchors.margins: 1
             radius: parent.radius - 1
             color: "transparent"
-            border.color: Qt.rgba(1.0, 1.0, 1.0, 0.10)
+            border.color: Qt.rgba(1.0, 1.0, 1.0, 0.16)
             border.width: 1.0
           }
         }
@@ -1107,8 +1162,8 @@ Panel {
         id: flareBeam
         anchors.centerIn: parent
         z: 15
-        width: 36 + (dropPortal.isBlasting ? dropPortal.blastProgress * 400 : dropPortal.proximity * 340)
-        height: 2 + (dropPortal.isBlasting ? 4 : dropPortal.proximity * 2.0)
+        width: 36 + (dropPortal.isBlasting ? dropPortal.blastProgress * 420 : dropPortal.proximity * 360)
+        height: 2 + (dropPortal.isBlasting ? 5 : dropPortal.proximity * 2.4)
         radius: 1
         color: Qt.rgba(1.0, 1.0, 1.0, 0.95)
         opacity: dropPortal.isBlasting ? (1.0 - dropPortal.blastProgress) : (dropPortal.proximity * 0.9)
@@ -1129,22 +1184,22 @@ Panel {
         border.width: Math.max(1.0, 5.0 * (1.0 - dropPortal.blastProgress))
       }
 
-      // Layer 0: Droplet Impact Crown & Target Reticle
+      // Layer 0: Droplet Impact Crown & Target Reticle with Caelestia Spring Pop
       Rectangle {
         id: impactCrown
         anchors.centerIn: parent
         z: 20
-        width: 48 + dropPortal.proximity * 18
+        width: 50 + dropPortal.proximity * 20
         height: width
         radius: width / 2
-        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, dropPortal.isBlasting ? 0.70 : (0.20 + dropPortal.proximity * 0.35))
-        border.color: dropPortal.isBlasting ? Qt.rgba(1.0, 1.0, 1.0, 0.95) : Color.accent
-        border.width: (dropPortal.active || dropPortal.isBlasting) ? (1.5 + dropPortal.proximity * 1.5) : 1.5
-        scale: (1.0 + dropPortal.proximity * 0.35)
+        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, dropPortal.isBlasting ? 0.75 : (0.22 + dropPortal.proximity * 0.38))
+        border.color: dropPortal.isBlasting ? Qt.rgba(1.0, 1.0, 1.0, 0.98) : Color.accent
+        border.width: (dropPortal.active || dropPortal.isBlasting) ? (1.5 + dropPortal.proximity * 1.8) : 1.5
+        scale: (1.0 + dropPortal.proximity * 0.38)
 
-        Behavior on width { NumberAnimation { duration: 60; easing.type: Easing.OutQuad } }
-        Behavior on height { NumberAnimation { duration: 60; easing.type: Easing.OutQuad } }
-        Behavior on scale { NumberAnimation { duration: 60; easing.type: Easing.OutBack } }
+        Behavior on width { NumberAnimation { duration: 70; easing.type: Easing.OutBack } }
+        Behavior on height { NumberAnimation { duration: 70; easing.type: Easing.OutBack } }
+        Behavior on scale { NumberAnimation { duration: 70; easing.type: Easing.OutBack } }
         Behavior on color { ColorAnimation { duration: 80 } }
 
         Column {
@@ -1173,7 +1228,7 @@ Panel {
             font.bold: true
             font.letterSpacing: 0.8
             elide: Text.ElideRight
-            width: Math.min(92, impactCrown.width - 2)
+            width: Math.min(96, impactCrown.width - 2)
             horizontalAlignment: Text.AlignHCenter
           }
         }
