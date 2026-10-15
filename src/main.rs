@@ -1736,12 +1736,8 @@ fn get_active_paired_peer_ips() -> Vec<String> {
         }
     }
 
-    // Also include active same-owner devices (Anonymous Numbered OmaID model)
-    for dp in get_discovered_peers() {
-        if dp.is_same_owner && dp.last_seen_secs > 0 && !dp.ip.is_empty() && !ips.contains(&dp.ip) {
-            ips.push(dp.ip);
-        }
-    }
+    // V2-SEC-02 interim fix: same-owner status comes from unauthenticated UDP beacons and can be
+    // spoofed, so discovered "same-owner" devices no longer receive automatic clipboard pushes.
     ips
 }
 
@@ -4916,10 +4912,11 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         let token = hex::encode(token_bytes);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
-        // Anonymous Numbered OmaID Model: Same OmaID owner -> auto-accept ("ACCEPTED").
-        // Different OmaID user (even if paired or EVERYONE visibility) -> Gatekeeper user approval ("PENDING").
-        let initial_status = if is_same_owner { "ACCEPTED" } else { "PENDING" };
-        let initial_expiry = if is_same_owner { now.saturating_add(600) } else { now.saturating_add(30) };
+        // V2-SEC-01 interim fix: OmaID is broadcast in plaintext and cannot prove ownership,
+        // so a claimed same-owner OmaID no longer bypasses user approval. Every transfer is PENDING
+        // until per-device key authentication replaces OmaID string comparison.
+        let initial_status = "PENDING";
+        let initial_expiry = now.saturating_add(30);
 
         let transfer = PendingFileTransfer {
             token: token.clone(),
@@ -4937,17 +4934,10 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         save_pending_transfer(&transfer);
 
         let size_mb = (total_size_bytes as f64) / 1024.0 / 1024.0;
-        if is_same_owner {
-            notify_desktop(
-                "OmaSend AirBridge",
-                &format!("Auto-receiving {} file(s) ({:.1} MB) from own device '{}'.", file_names.len(), size_mb, sender_name),
-            );
-        } else {
-            notify_desktop(
-                "OmaSend AirBridge: Transfer Request",
-                &format!("'{}' wants to send {} file(s) ({:.1} MB).\nOpen OmaSend panel to Accept or Decline.", sender_name, file_names.len(), size_mb),
-            );
-        }
+        notify_desktop(
+            "OmaSend AirBridge: Transfer Request",
+            &format!("'{}' wants to send {} file(s) ({:.1} MB).\nOpen OmaSend panel to Accept or Decline.", sender_name, file_names.len(), size_mb),
+        );
 
         let resp = serde_json::json!({
             "status": initial_status,
@@ -5274,9 +5264,11 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                 .unwrap_or("Nearby Device");
 
             let norm_sender = rendezvous::normalize_oma_id(sender_id);
-            let is_same_owner = !norm_sender.is_empty() && constant_time_eq_str(&norm_sender, &my_norm);
+            // V2-SEC-01 interim fix: a claimed same-owner OmaID is not proof of ownership.
+            // Clipboard writes require a confirmed pairing (and its auth token) for every sender.
+            let _claims_same_owner = !norm_sender.is_empty() && constant_time_eq_str(&norm_sender, &my_norm);
 
-            if !is_same_owner {
+            {
                 let is_trusted = is_peer_confirmed(sender_id);
                 if !is_trusted {
                     respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Peer OmaID is not paired\"}", None, None);
@@ -8185,9 +8177,10 @@ mod tests {
     }
 
     #[test]
-    fn test_same_owner_oma_id_zero_click_auto_accept() {
+    fn test_claimed_same_owner_oma_id_requires_approval_and_pairing() {
         let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        // Even in KNOWN mode, a device sharing our own OmaID is automatically accepted without pairing or token
+        // V2-SEC-01: OmaID is public (broadcast in beacons), so claiming our own OmaID must NOT
+        // auto-accept transfers or authorize clipboard writes.
         set_visibility("KNOWN");
         let my_oma_id = get_or_create_oma_id();
 
@@ -8200,7 +8193,7 @@ mod tests {
             }
         });
 
-        // 1. Same-owner file transfer request -> auto-accepted ("ACCEPTED") with zero-click consent
+        // 1. Claimed same-owner file transfer request -> still needs user approval ("PENDING")
         let req_headers = format!("X-OmaSend-OmaID: {}\r\n", my_oma_id);
         let resp_transfer = post_json(addr, "/api/p2p/request", &req_headers, &serde_json::json!({
             "oma_id": my_oma_id,
@@ -8209,10 +8202,10 @@ mod tests {
             "files": [{"name": "notes.txt", "size_bytes": 128}]
         }));
         assert!(resp_transfer.starts_with("HTTP/1.1 200 OK"), "Same-owner transfer must return 200 OK: {}", resp_transfer);
-        assert!(resp_transfer.contains("\"status\":\"ACCEPTED\""), "Same-owner transfer must auto-accept: {}", resp_transfer);
+        assert!(resp_transfer.contains("\"status\":\"PENDING\""), "Claimed same-owner transfer must not auto-accept: {}", resp_transfer);
         assert!(resp_transfer.contains("\"is_same_owner\":true"), "Same-owner flag must be true: {}", resp_transfer);
 
-        // 2. Same-owner clipboard sync -> accepted immediately without pairing record or auth token
+        // 2. Claimed same-owner clipboard write without a confirmed pairing -> rejected
         let resp_clip = post_json(addr, "/api/p2p/clipboard", &req_headers, &serde_json::json!({
             "oma_id": my_oma_id,
             "sender_id": my_oma_id,
@@ -8220,7 +8213,7 @@ mod tests {
             "content_type": "text",
             "text": "Anonymous Numbered OmaID Zero-Click Same-Owner Clipboard Sync"
         }));
-        assert!(resp_clip.starts_with("HTTP/1.1 200 OK"), "Same-owner clipboard must return 200 OK: {}", resp_clip);
+        assert!(resp_clip.starts_with("HTTP/1.1 403"), "Claimed same-owner clipboard without pairing must be rejected: {}", resp_clip);
 
         server.join().unwrap();
     }
