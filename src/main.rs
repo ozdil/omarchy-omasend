@@ -1611,11 +1611,7 @@ pub fn is_transfer_cancelled() -> bool {
 }
 
 pub fn save_transfer_progress(direction: &str, filename: &str, bytes: u64, total: u64) {
-    let pct = if total > 0 {
-        ((bytes.saturating_mul(100)) / total).min(100)
-    } else {
-        100
-    };
+    let pct = bytes.saturating_mul(100).checked_div(total).map_or(100, |p| p.min(100));
     let val = serde_json::json!({
         "active": true,
         "direction": direction,
@@ -2989,6 +2985,17 @@ fn p2p_pair_v2(uri: &str) -> Result<devicekey::TrustedKey, String> {
     };
     trust_store().upsert(key.clone())?;
     Ok(key)
+}
+
+/// Target for `--send auto`: the most recently seen QR-paired own device ("ip:port").
+fn auto_send_target() -> Option<String> {
+    let mut keys: Vec<_> = trust_store()
+        .load()
+        .into_iter()
+        .filter(|k| k.own_device && !k.ip.is_empty())
+        .collect();
+    keys.sort_by_key(|k| std::cmp::Reverse(k.last_seen));
+    keys.first().map(|k| format!("{}:{}", k.ip, if k.port > 0 { k.port } else { PORT }))
 }
 
 /// Creates a pairing offer, renders its QR code to PNG and returns the JSON the panel/CLI shows.
@@ -6497,20 +6504,20 @@ fn main() {
         let (target, file_path_str) = match (target_arg, second_arg) {
             (Some(t), Some(f)) if t != "auto" => (t.clone(), f.clone()),
             (Some(f_or_auto), None) => {
-                let peers = get_discovered_peers();
-                if let Some(first_peer) = peers.iter().find(|p| p.is_same_owner).or_else(|| peers.first()) {
-                    (first_peer.ip.clone(), f_or_auto.clone())
+                // "auto" must never pick a peer from unauthenticated beacons (a spoofed
+                // "same owner" beacon would receive the file); only QR-paired own devices.
+                if let Some(t) = auto_send_target() {
+                    (t, f_or_auto.clone())
                 } else {
-                    eprintln!("Error: No active peers discovered for automatic send");
+                    eprintln!("Error: No QR-paired own device available for automatic send (pair with: --pair-offer --own)");
                     return;
                 }
             }
             (Some(t), Some(f)) if t == "auto" => {
-                let peers = get_discovered_peers();
-                if let Some(first_peer) = peers.iter().find(|p| p.is_same_owner).or_else(|| peers.first()) {
-                    (first_peer.ip.clone(), f.clone())
+                if let Some(t) = auto_send_target() {
+                    (t, f.clone())
                 } else {
-                    eprintln!("Error: No active peers discovered for automatic send");
+                    eprintln!("Error: No QR-paired own device available for automatic send (pair with: --pair-offer --own)");
                     return;
                 }
             }
