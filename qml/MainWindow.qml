@@ -39,7 +39,7 @@ Rectangle {
     property int refreshNonce: 0
 
     property string pluginVersion: "1.9.1"
-    property string pluginDescription: "OmaSend Zero-Click OmaID & AirBridge P2P Dosya Aktarım Sistemi"
+    property string pluginDescription: "OmaSend OmaID & AirBridge P2P Dosya Aktarım Sistemi"
     property string pluginAuthor: "Ozan Özdil (@ozdil)"
     property string pluginLicense: "MIT"
 
@@ -722,7 +722,7 @@ Rectangle {
                     spacing: 18
 
                     Text {
-                        text: "󰌆 Kimlik: 16-Haneli Luhn OmaID (Zero-Click)"
+                        text: "󰌆 Kimlik: 16-Haneli Luhn OmaID"
                         font.family: Theme.fontFamily
                         font.pixelSize: 10
                         color: Theme.textMuted
@@ -897,7 +897,7 @@ Rectangle {
                         Text {
                             Layout.fillWidth: true
                             wrapMode: Text.WordWrap
-                            text: "Android uygulamasında bu QR kodu okutarak telefonunuzu aynı OmaID kimliğine geçirebilir ve sıfır izinle (Zero-Click) anında dosya/pano paylaşabilirsiniz."
+                            text: "Android uygulamasında bu QR kodu okutarak telefonunuzu aynı OmaID kimliğine geçirebilirsiniz. Cihazlarınız 'Kendi Cihazlarım' altında görünür; gelen her transfer onayınızı bekler."
                             font.family: Theme.fontFamily
                             font.pixelSize: 10
                             color: Theme.textMuted

@@ -975,7 +975,7 @@ Panel {
           text: {
             if (root.dropBlasting) return root.t("drop_transfer_started")
             var p = root.resolveActiveDropPeer()
-            return (p && p.is_same_owner) ? root.t("drop_own_zero_click") : "OMASEND AIRBRIDGE"
+            return "OMASEND AIRBRIDGE"
           }
           color: Color.accent
           font.family: root.fontFamily
@@ -1995,7 +1995,7 @@ Panel {
           width: parent.width
           textFormat: Text.PlainText
           text: row.peer
-                ? (root.formatPeerIdentity(row.peer) + " · " + (row.isOwnDevice ? root.t("zero_click_linked") : root.t("approval_send")))
+                ? (root.formatPeerIdentity(row.peer) + " · " + root.t("approval_send"))
                 : ""
           color: row.isOwnDevice ? root.foreground : Qt.darker(root.foreground, 1.5)
           font.family: root.fontFamily

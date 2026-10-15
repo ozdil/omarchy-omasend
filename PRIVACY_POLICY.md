@@ -1,12 +1,14 @@
 # Privacy Policy for OmaSend
 
-**Last Updated**: September 9, 2026
+**Last Updated**: October 15, 2026
 
 ## 1. Overview
 
 OmaSend ("the Application") is an open-source, peer-to-peer file transfer and clipboard synchronization application developed by Ozan Ozdil for Linux and Android devices. 
 
-Your privacy is paramount. OmaSend is architected from the ground up on a **Zero-Knowledge, Zero-Cloud, and Local-Only** operational model.
+Your privacy is paramount. OmaSend follows a **Zero-Cloud, Local-First** operational model: the developer operates no servers that receive your files or clipboard contents.
+
+**Transport security notice:** Local network (LAN/P2P) transfers are integrity-checked but are not yet end-to-end encrypted or cryptographically authenticated. Anyone on the same network may be able to observe this traffic. Use OmaSend on networks you trust.
 
 ---
 

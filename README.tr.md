@@ -1,43 +1,46 @@
-# OmaSend - Omarchy Linux İçin Sıfır Bilgili AirBridge ve E2EE Aktarım Merkezi
+# OmaSend - Omarchy Linux İçin Eşler Arası AirBridge ve Pano Senkronu
 
 [![Omarchy Onaylı Eklenti](https://img.shields.io/badge/Omarchy-Verified_Plugin-22c55e?style=for-the-badge&logo=omarchy)](https://github.com/ozdil)
-[![Sürüm v1.8.6](https://img.shields.io/badge/S%C3%BCr%C3%BCm-v1.8.6-38BDF8?style=for-the-badge&logo=rust)](https://github.com/ozdil/omarchy-omasend/releases)
+[![Sürüm v1.9.1](https://img.shields.io/badge/S%C3%BCr%C3%BCm-v1.9.1-38BDF8?style=for-the-badge&logo=rust)](https://github.com/ozdil/omarchy-omasend/releases)
 [![Kahve Ismarla](https://img.shields.io/badge/Buy_Me_A_Coffee-Geli%C5%9Ftiriciye_Destek-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/ozdil)
 [![Lisans: MIT](https://img.shields.io/badge/Lisans-MIT-blue?style=for-the-badge)](LICENSE)
 
 ![OmaSend Önizleme](preview.png)
 
-> **Omarchy Linux, Android ve Modern Web Tarayıcıları arasında cihazlar arası egemen dosya aktarımı, Anonim Numaralı Kimlik (Sıfır Kayıt OmaID) ile Zero-Click Kendi Cihazlarım ağı, şifreli pano kasası ve Sıfır Bilgili AES-256-GCM uçtan uca şifrelemeli küresel WAN portalı.**
+> **Omarchy Linux, Android ve modern web tarayıcıları arasında doğrudan eşler arası dosya aktarımı ve pano senkronu; anonim numaralı kimlik (OmaID), hesap ve bulut sunucusu yok.**
+
+> [!IMPORTANT]
+> **Güvenlik durumu (v1.9.1):** Yerel ağ aktarımlarında boyut ve (gönderildiğinde) sağlama toplamı doğrulanır, ancak trafik **henüz uçtan uca şifreli veya kriptografik olarak kimliği doğrulanmış değildir**. OmaSend'i güvendiğiniz ağlarda kullanın. Gelen her transfer onayınızı bekler, pano senkronu yalnızca açıkça eşleştirilmiş cihazlarla çalışır. Cihaz başına anahtarlar, QR ile eşleşme ve kimliği doğrulanmış şifreleme yol haritasındadır.
 
 - **Geliştirici:** Ozan Özdil (ozdil)  
 - **Lisans:** MIT  
 - **Eklenti Kimliği:** `ozdil.omasend`  
-- **Sürüm:** `1.8.6`  
+- **Sürüm:** `1.9.1`  
 - **Varsayılan Yazı Tipi:** `JetBrainsMono Nerd Font`
 
 ---
 
 ## Öne Çıkan Yetenekler
 
-- **Anonim Numaralı Kimlik (Sıfır Kayıt OmaID) ve Zero-Click Kendi Cihazlarım Ağı:**
+- **Anonim Numaralı Kimlik (Sıfır Kayıt OmaID) ve Kendi Cihazlarım:**
   - Kayıt, e-posta, kullanıcı adı veya kişisel veri gerektirmeyen ücretsiz ve açık kaynaklı 16 haneli Luhn mod-10 numaralı kimlik (`XXXX-XXXX-XXXX-XXXX`).
-  - Bilgisayarınıza ve Android telefonunuza aynı 16 haneli OmaID'yi girdiğinizde (`--set-oma-id <OMAID>` veya arayüz üzerinden), cihazlar birbirini **Kendi Cihazlarım (Zero-Click)** olarak tanır; PIN veya onay beklemeden anında dosya ve pano paylaşır.
-  - RFC 2104 HMAC-SHA256 Kör Randevu (Blinded Rendezvous) konuları, RFC 5869 HKDF-SHA256 simetrik anahtar türetimi, sabit zamanlı (constant-time) kimlik doğrulaması ve tekrar oynatma (replay) korumalı sıfır bilgi kanıtı (`compute_same_owner_zk_proof` / `verify_same_owner_zk_proof`) kullanır.
-  - Farklı OmaID taşıyan cihazlar misafir/harici kullanıcı olarak sınıflandırılır ve manuel Gatekeeper onayı (`KABUL ET` / `REDDET`) veya tek seferlik kod doğrulaması gerektirir.
+  - Bilgisayarınıza ve Android telefonunuza aynı 16 haneli OmaID'yi girdiğinizde (`--set-oma-id <OMAID>` veya arayüz üzerinden) cihazlar arayüzde **Kendi Cihazlarım** altında gruplanır.
+  - OmaID bir sır değil, bir tanımlayıcıdır: yerel ağda görülebilir. Bu yüzden tek başına güven sağlamaz. Gelen her transfer Gatekeeper onayından (`KABUL ET` / `REDDET`) geçer, pano senkronu kod doğrulamalı eşleşme gerektirir. Kendi cihazlarınız arasında onaysız aktarım, cihaz başına kriptografik anahtarlar geldiğinde geri dönecektir.
 - **Evrensel Çok Formatlı Pano Kasası ve WebP Mikro Önizleme Motoru:**
   - Metin ve görsel verilerini (PNG, JPEG, WebP) masaüstü ile mobil arasında çift yönlü ve anlık senkronize eder.
   - Dahili WebP Mikro Önizleme Motoru: Kopyalanan görseller için izole sandbox içinde otomatik olarak 96x96 piksel ultra hafif önizlemeler (~3-5 KB) üretir; büyük dosyalar indirilmeden sıfır gecikmeli görsel sunumu sağlar.
   - Kompakt Pano Kasası Arayüzü: Tek tıklamayla panoya kopyalama, çift tıklamayla tam ekran önizleme ve `~/Pictures/OmaStudio_Exports/` dizinine anında aktarım.
   - Güvenli İzolasyon: `~/.local/state/omarchy/omasend/clip_staging/` altında atomik 0600 dosya izinleri ve 50 MiB LRU temizleme sınırı.
 - **Omarchy AirBridge P2P ve Samuray Ses Efektleri:**
-  - Sıfır Tıklamalı Anında Aktarım: Kendi cihazlarınız veya güvenilir eşlerden gelen transferler manuel onay beklemeden doğrudan diske 0600 izinleriyle akıtılır.
+  - Akışlı Aktarım: Onaylanan transferler 0600 izinleri, disk alanı ayırma ve boyut/sağlama toplamı doğrulamasıyla doğrudan diske akıtılır.
   - Otantik Samuray Ses Efektleri: Dosya gönderiminde (*"OMAKASE!"* + Katana) ve dosya alım/kabulünde (*"ONEGAI SHIMASU!"* + Katana) yüksek netlikli sesli geri bildirim.
   - Donanım hızlandırmalı Wayland LayerShell manyetik sürükle-bırak (Drop HUD) kapsülü ve dairesel sonar radar görselleştirmesi.
   - Sıfır Yapılandırmalı Keşif: Yerel ağdaki Omarchy Linux masaüstü ve Android cihazları UDP işaretçileri (53317 portu) ile otomatik keşfeder.
   - 3 Kademeli Görünürlük Kontrolü: Kapalı (Off), Yalnızca Tanınanlar (Known - Varsayılan) ve Herkes (Everyone - 10 dakikalık geçici keşif).
-- **Sıfır Bilgili Uçtan Uca Şifreleme (E2EE):**
-  - Donanım hızlandırmalı AES-256-GCM şifreleme ve BLAKE3 kriptografik bütünlük sağlama toplamı.
-  - Oturum anahtarı URL'nin karma (`#key=...`) bölümünde taşınır; HTTP istek başlıklarına veya sunucu kayıtlarına asla ulaşmaz (RFC 3986).
+- **Bütünlük ve Şifreleme:**
+  - Yüklenen dosyanın boyutu onaylanan istekle eşleşmek zorundadır; BLAKE3 / SHA-256 / MD5 sağlama toplamları gönderici sağladığında doğrulanır (masaüstü motoru sağlar, Android uygulaması henüz sağlamaz).
+  - Web portalı: oturum anahtarı URL'nin karma (`#key=...`) bölümünde taşınır ve HTTP isteklerine eklenmez (RFC 3986).
+  - Henüz yok: yerel ağ/P2P trafiği için uçtan uca şifreleme ve kriptografik eş kimlik doğrulaması (yukarıdaki güvenlik durumu notuna bakın).
 - **Çoklu Platform Ekosistemi:**
   - **Linux Masaüstü Eklentisi:** Yerel Quickshell QML widget'ı ve sertleştirilmiş Rust arka plan motoru (`omasend-engine`).
   - **Android Yerel Uygulaması:** Kotlin ve Jetpack Compose ile sıfır GMS bağımlılıklı CameraX QR/Barkod vizörü ve dokunsal titreşim desteği ([ozdil/omasend-android](https://github.com/ozdil/omasend-android)).
@@ -96,7 +99,7 @@ omarchy-restart-shell
 
 ## Güvenlik ve Gizlilik Politikası
 
-OmaSend katı bir **Sıfır Güven (Zero-Trust) ve Sıfır Bilgi (Zero-Knowledge)** mimarisiyle çalışır. Telemetri toplamaz, kullanıcıları izlemez veya merkezi aracılar üzerinden veri aktarmaz. Tüm iletişimler doğrudan uçtan uca şifrelenir veya yerel ağda noktadan noktaya (P2P) yürütülür.
+OmaSend telemetri toplamaz, kullanıcıları izlemez ve verileri merkezi sunucularda saklamaz. Dosyalar ve pano içeriği doğrudan cihazlarınız arasında gider. Yerel ağ/P2P trafiği şu an uçtan uca şifreli veya kriptografik olarak kimliği doğrulanmış değildir; güvendiğiniz ağlarda kullanın. Gelen her transfer onayınızı bekler. Güvenlik sorunlarını GitHub üzerinden bildirebilirsiniz.
 
 Detaylı güvenlik ilkeleri için [PRIVACY_POLICY.md](PRIVACY_POLICY.md) ve [CONTRIBUTING.md](CONTRIBUTING.md) belgelerini inceleyin.
 
