@@ -18,8 +18,16 @@ fi
 [[ -d "$ANDROID_NDK_HOME" ]] || { echo "Android NDK not found (set ANDROID_NDK_HOME)" >&2; exit 1; }
 
 cd "$CORE_DIR"
-cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -P 26 \
-  -o "$APP_DIR/app/src/main/jniLibs" build --release --lib
+cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -P 26 build --release --lib
+
+# Copy only our library (cargo-ndk's -o would also copy dependency cdylibs such as libiroh-*.so).
+declare -A TRIPLE=([arm64-v8a]=aarch64-linux-android [armeabi-v7a]=armv7-linux-androideabi [x86_64]=x86_64-linux-android)
+for abi in "${!TRIPLE[@]}"; do
+  out="$APP_DIR/app/src/main/jniLibs/$abi"
+  mkdir -p "$out"
+  rm -f "$out"/*.so
+  cp "target/${TRIPLE[$abi]}/release/libomasend_core.so" "$out/"
+done
 
 # Bindings are generated from an unstripped host build (release builds strip UniFFI metadata).
 cargo build --lib
