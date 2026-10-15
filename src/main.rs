@@ -4907,6 +4907,14 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             }
         }
 
+        // V2-FUNC-01: there is a single pending-transfer slot. Never overwrite a live request or an
+        // accepted transfer that is still uploading; the new sender must retry once it finishes/expires.
+        if get_pending_transfer().is_some_and(|p| p.status == "PENDING" || p.status == "ACCEPTED") {
+            let err = serde_json::json!({ "error": "Another transfer is in progress. Please retry shortly." });
+            respond(&stream, "409 Conflict", "application/json", err.to_string().as_bytes(), None, Some(&[("Retry-After", "30")]));
+            return;
+        }
+
         let mut token_bytes = [0u8; 16];
         let _ = getrandom::getrandom(&mut token_bytes);
         let token = hex::encode(token_bytes);
@@ -5048,6 +5056,14 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         if content_length > MAX_P2P_UPLOAD_SIZE {
             respond(&stream, "413 Payload Too Large", "application/json", b"{\"error\":\"Payload exceeds 10 GiB limit\"}", None, None);
             return;
+        }
+
+        // V2-SEC-06: the upload must match the size the user approved in the transfer request.
+        if let Some(ref info) = matching_info {
+            if content_length as u64 != info.size_bytes {
+                respond(&stream, "413 Payload Too Large", "application/json", b"{\"error\":\"Upload size does not match the approved transfer request\"}", None, None);
+                return;
+            }
         }
 
         let upload_secs = (content_length as u64 / (512 * 1024)).clamp(30, MAX_UPLOAD_DURATION_SECS);
@@ -6679,6 +6695,7 @@ mod tests {
     #[test]
     fn test_p2p_request_and_clipboard_require_paired_oma_id() {
         let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        clear_pending_transfer();
         set_visibility("KNOWN");
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
@@ -8181,6 +8198,7 @@ mod tests {
         let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         // V2-SEC-01: OmaID is public (broadcast in beacons), so claiming our own OmaID must NOT
         // auto-accept transfers or authorize clipboard writes.
+        clear_pending_transfer();
         set_visibility("KNOWN");
         let my_oma_id = get_or_create_oma_id();
 
@@ -8221,6 +8239,7 @@ mod tests {
     #[test]
     fn test_different_owner_pending_gatekeeper_and_oma_id_resolution() {
         let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        clear_pending_transfer();
         set_visibility("ALL");
 
         let foreign_raw = rendezvous::generate_raw_oma_id();
@@ -8291,5 +8310,90 @@ mod tests {
         assert!(!is_sound_enabled());
         set_sound_enabled(true);
         assert!(is_sound_enabled());
+    }
+
+    #[test]
+    fn test_v2_func01_second_request_does_not_overwrite_pending_transfer() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        clear_pending_transfer();
+        set_visibility("ALL");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (s, _) = listener.accept().expect("Accept client");
+                handle_connection(s, "127.0.0.1", "1234", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+            }
+        });
+
+        let first = rendezvous::format_oma_id(&rendezvous::generate_raw_oma_id());
+        let second = rendezvous::format_oma_id(&rendezvous::generate_raw_oma_id());
+        let r1 = post_json(addr, "/api/p2p/request", &format!("X-OmaSend-OmaID: {}\r\n", first), &serde_json::json!({
+            "oma_id": first, "sender_id": first, "sender_name": "First",
+            "files": [{"name": "a.txt", "size_bytes": 10}]
+        }));
+        let r2 = post_json(addr, "/api/p2p/request", &format!("X-OmaSend-OmaID: {}\r\n", second), &serde_json::json!({
+            "oma_id": second, "sender_id": second, "sender_name": "Second",
+            "files": [{"name": "b.txt", "size_bytes": 10}]
+        }));
+        server.join().unwrap();
+
+        assert!(r1.contains("\"status\":\"PENDING\""), "First request must be pending: {}", r1);
+        assert!(r2.starts_with("HTTP/1.1 409"), "Second request must not overwrite the live one: {}", r2);
+        let pending = get_pending_transfer().expect("First pending transfer must survive");
+        assert_eq!(pending.sender_name, "First");
+        clear_pending_transfer();
+    }
+
+    #[test]
+    fn test_v2_sec06_upload_size_must_match_approved_size() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        clear_pending_transfer();
+        set_visibility("ALL");
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let token = "v2sec06token00000000000000000000".to_string();
+        save_pending_transfer(&PendingFileTransfer {
+            token: token.clone(),
+            sender_id: "tester".to_string(),
+            sender_name: "Tester".to_string(),
+            sender_ip: "127.0.0.1".to_string(),
+            file_names: vec!["small.txt".to_string()],
+            remaining_files: 1,
+            files: vec![TransferFileInfo {
+                name: "small.txt".to_string(),
+                size_bytes: 4,
+                blake3: None,
+                sha256: None,
+                md5: None,
+            }],
+            total_size_bytes: 4,
+            created_at: now,
+            expires_at: now + 60,
+            status: "ACCEPTED".to_string(),
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (s, _) = listener.accept().expect("Accept client");
+            handle_connection(s, "127.0.0.1", "1234", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+        });
+
+        let body = b"this body is much larger than four bytes";
+        let mut c = TcpStream::connect(addr).expect("Connect test client");
+        let req = format!(
+            "POST /api/p2p/upload?token={}&filename=small.txt HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            token, addr, body.len()
+        );
+        c.write_all(req.as_bytes()).unwrap();
+        c.write_all(body).unwrap();
+        let mut resp = String::new();
+        c.read_to_string(&mut resp).unwrap();
+        server.join().unwrap();
+
+        assert!(resp.starts_with("HTTP/1.1 413"), "Oversized upload must be rejected: {}", resp);
+        clear_pending_transfer();
     }
 }
