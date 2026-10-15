@@ -1,4 +1,5 @@
 mod subproc;
+pub mod devicekey;
 pub mod military;
 pub mod rendezvous;
 
@@ -232,6 +233,9 @@ pub struct PendingFileTransfer {
     pub created_at: u64,
     pub expires_at: u64,
     pub status: String, // "PENDING", "ACCEPTED", "REJECTED"
+    /// v2: public key of the authenticated sender; uploads must be signed by the same key.
+    #[serde(default)]
+    pub sender_pk: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1738,6 +1742,12 @@ fn get_active_paired_peer_ips() -> Vec<String> {
 
     // V2-SEC-02 interim fix: same-owner status comes from unauthenticated UDP beacons and can be
     // spoofed, so discovered "same-owner" devices no longer receive automatic clipboard pushes.
+    // Phase 1: devices paired with a verified key (QR pairing) do, at the IP of their last signed request.
+    for k in trust_store().load() {
+        if !k.ip.is_empty() && !ips.contains(&k.ip) {
+            ips.push(k.ip);
+        }
+    }
     ips
 }
 
@@ -1798,8 +1808,10 @@ fn p2p_push_clipboard_silent(target_ip: &str, text: &str) {
     thread::spawn(move || {
         if let Ok(mut stream) = connect_peer_with_timeout(&addr, Duration::from_millis(1500)) {
             let http_req = format!(
-                "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-OmaSend-OmaID: {}\r\nX-OmaSend-Auth-Token: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                addr, oma_id_hdr, auth_hdr, req_bytes.len()
+                "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-OmaSend-OmaID: {}\r\nX-OmaSend-Auth-Token: {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                addr, oma_id_hdr, auth_hdr,
+                v2_auth_lines("POST", "/api/p2p/clipboard", &devicekey::body_tag_json(&req_bytes)),
+                req_bytes.len()
             );
             let _ = stream.write_all(http_req.as_bytes());
             let _ = stream.write_all(&req_bytes);
@@ -1916,8 +1928,10 @@ pub fn p2p_push_image_clipboard_silent(
     thread::spawn(move || {
         if let Ok(mut stream) = connect_peer_with_timeout(&addr, Duration::from_millis(2500)) {
             let http_req = format!(
-                "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-OmaSend-OmaID: {}\r\nX-OmaSend-Auth-Token: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                addr, oma_id_hdr, auth_hdr, req_bytes.len()
+                "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-OmaSend-OmaID: {}\r\nX-OmaSend-Auth-Token: {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                addr, oma_id_hdr, auth_hdr,
+                v2_auth_lines("POST", "/api/p2p/clipboard", &devicekey::body_tag_json(&req_bytes)),
+                req_bytes.len()
             );
             let _ = stream.write_all(http_req.as_bytes());
             let _ = stream.write_all(&req_bytes);
@@ -1937,9 +1951,10 @@ pub fn p2p_fetch_image_clipboard_and_apply(sender_ip: &str, hash: &str, _content
     thread::spawn(move || {
         let addr = resolve_peer_addr(&ip);
         if let Ok(mut stream) = connect_peer_with_timeout(&addr, Duration::from_secs(5)) {
+            let pq = format!("/api/p2p/clipboard/image?hash={}", h);
             let http_req = format!(
-                "GET /api/p2p/clipboard/image?hash={} HTTP/1.1\r\nHost: {}\r\nX-OmaSend-OmaID: {}\r\nConnection: close\r\n\r\n",
-                h, addr, my_oma_id
+                "GET {} HTTP/1.1\r\nHost: {}\r\nX-OmaSend-OmaID: {}\r\n{}Connection: close\r\n\r\n",
+                pq, addr, my_oma_id, v2_auth_lines("GET", &pq, &devicekey::body_tag_json(b""))
             );
             if stream.write_all(http_req.as_bytes()).is_ok() {
                 let max_resp_bytes = (MAX_IMAGE_CLIP_SIZE + 65536) as u64;
@@ -2347,6 +2362,50 @@ pub fn begin_local_pairing(oma_id: &str, name: &str, ip_hint: Option<&str>) -> R
 pub fn complete_remote_pairing(oma_id: &str, code: &str, source_ip: IpAddr) -> Result<rendezvous::PairedPeer, rendezvous::PairingError> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     rendezvous::complete_remote_pairing(oma_id, code, source_ip, &get_state_dir(), now)
+}
+
+// ------------------- PHASE 1: DEVICE KEYS (devicekey.rs) -------------------
+
+fn device_identity() -> &'static devicekey::DeviceIdentity {
+    static ID: std::sync::OnceLock<devicekey::DeviceIdentity> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        devicekey::load_or_create_identity(&get_state_dir()).unwrap_or_else(|_| {
+            let mut seed = [0u8; 32];
+            let _ = getrandom::getrandom(&mut seed);
+            devicekey::DeviceIdentity::from_seed(seed)
+        })
+    })
+}
+
+fn trust_store() -> devicekey::TrustStore {
+    devicekey::TrustStore::new(&get_state_dir())
+}
+
+/// Signature header lines for an outgoing request (each ends with CRLF).
+fn v2_auth_lines(method: &str, path_and_query: &str, body_tag: &str) -> String {
+    devicekey::auth_header_lines(device_identity(), method, path_and_query, body_tag)
+}
+
+/// Verifies v2 signature headers. A signature from a key we never paired with is treated
+/// like an unsigned legacy request (legacy rules then apply); a bad signature, stale
+/// timestamp or replay from a known key is rejected.
+fn v2_verify(req: &HttpRequest, body_tag: &str, client_ip: &str) -> devicekey::AuthResult {
+    let pq = if req.query.is_empty() { req.path.clone() } else { format!("{}?{}", req.path, req.query) };
+    let h = devicekey::SignedHeaders {
+        pk: req.get_header("x-omasend-pk"),
+        ts: req.get_header("x-omasend-ts"),
+        nonce: req.get_header("x-omasend-nonce"),
+        sig: req.get_header("x-omasend-sig"),
+    };
+    let store = trust_store();
+    match devicekey::verify_request(&store, &h, &req.method, &pq, body_tag) {
+        devicekey::AuthResult::Rejected("Unknown device key") => devicekey::AuthResult::Absent,
+        devicekey::AuthResult::Trusted(k) => {
+            store.touch(&k.pk, client_ip);
+            devicekey::AuthResult::Trusted(k)
+        }
+        other => other,
+    }
 }
 
 pub fn constant_time_eq_str(a: &str, b: &str) -> bool {
@@ -2879,6 +2938,91 @@ fn resolve_peer_addr(target_ip_or_omaid: &str) -> String {
 
 const MAX_PAIR_RESPONSE_BYTES: u64 = 64 * 1024;
 
+/// Phase 1 initiator: scan/paste an `omasend://pair?...` link shown by the other device.
+/// The responder's key is pinned from the link, so a LAN attacker cannot impersonate it.
+fn p2p_pair_v2(uri: &str) -> Result<devicekey::TrustedKey, String> {
+    let offer = devicekey::parse_pair_uri(uri)?;
+    let _: IpAddr = offer.host.trim().parse().map_err(|_| "Invalid host in pairing link".to_string())?;
+    let body = devicekey::build_pair_request(device_identity(), &offer, &get_system_hostname())
+        .to_string()
+        .into_bytes();
+    let addr = format!("{}:{}", offer.host, offer.port);
+    let mut stream = connect_peer_with_timeout(&addr, Duration::from_secs(4))?;
+    let head = format!(
+        "POST /api/v2/pair HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        addr,
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
+    stream.write_all(&body).map_err(|e| e.to_string())?;
+    let mut resp = Vec::new();
+    (&mut stream)
+        .take(MAX_PAIR_RESPONSE_BYTES + 1)
+        .read_to_end(&mut resp)
+        .map_err(|e| format!("Read failed: {}", e))?;
+    if resp.len() as u64 > MAX_PAIR_RESPONSE_BYTES {
+        return Err("Pairing response exceeds size limit".to_string());
+    }
+    let header_end = resp
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| "Malformed pairing response".to_string())?;
+    let status_line = String::from_utf8_lossy(&resp[..header_end]).to_string();
+    let json: serde_json::Value = serde_json::from_slice(&resp[header_end + 4..])
+        .map_err(|_| "Malformed pairing response body".to_string())?;
+    if !status_line.starts_with("HTTP/1.1 200") {
+        return Err(json["error"].as_str().unwrap_or("Pairing rejected by peer").to_string());
+    }
+    devicekey::verify_pair_response(device_identity(), &offer, &json)?;
+    let vk = devicekey::decode_pk(&offer.pk).ok_or("Invalid responder key")?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let name = json["name"].as_str().filter(|n| !n.is_empty()).unwrap_or(&offer.name).chars().take(64).collect();
+    let key = devicekey::TrustedKey {
+        pk: offer.pk.clone(),
+        device_id: devicekey::device_id_for_pk(vk.as_bytes()),
+        name,
+        ip: offer.host.clone(),
+        port: offer.port,
+        own_device: offer.own_device,
+        added_at: now,
+        last_seen: now,
+    };
+    trust_store().upsert(key.clone())?;
+    Ok(key)
+}
+
+/// Creates a pairing offer, renders its QR code to PNG and returns the JSON the panel/CLI shows.
+fn create_pair_offer_json(own_device: bool) -> serde_json::Value {
+    let uri = devicekey::create_pair_offer(
+        device_identity(),
+        &get_state_dir(),
+        &get_system_hostname(),
+        &get_local_ip(),
+        PORT,
+        own_device,
+    );
+    let png = get_state_dir().join("pair_offer_qr.png");
+    let png_str = png.to_string_lossy().to_string();
+    let _ = fs::remove_file(&png);
+    let _ = run_cmd_bounded(
+        "/usr/bin/qrencode",
+        &["-o", &png_str, "-t", "PNG", "-s", "8", "-m", "2", "--", &uri],
+        &[],
+        Instant::now() + Duration::from_secs(2),
+        1024,
+    );
+    if png.exists() {
+        let _ = fs::set_permissions(&png, fs::Permissions::from_mode(0o600));
+    }
+    serde_json::json!({
+        "uri": uri,
+        "qr_png": if png.exists() { png_str } else { String::new() },
+        "device_id": device_identity().device_id(),
+        "own_device": own_device,
+        "expires_in_secs": devicekey::PAIR_OFFER_TTL_SECS,
+    })
+}
+
 /// Initiator side of code-verified pairing: presents the one-time code issued
 /// on the responder (`--pair-peer <our OmaID>` there) and stores the responder
 /// as a confirmed peer only if it echoes the expected OmaID and a valid token.
@@ -3115,8 +3259,10 @@ fn p2p_send_files_to_peer(target_ip_or_omaid: &str, file_paths: &[PathBuf]) -> R
     };
     let req_bytes = final_payload.to_string().into_bytes();
     let http_req = format!(
-        "POST /api/p2p/request HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-OmaSend-OmaID: {}\r\nX-OmaSend-Auth-Token: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        addr, my_oma_id, auth_token, req_bytes.len()
+        "POST /api/p2p/request HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-OmaSend-OmaID: {}\r\nX-OmaSend-Auth-Token: {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        addr, my_oma_id, auth_token,
+        v2_auth_lines("POST", "/api/p2p/request", &devicekey::body_tag_json(&req_bytes)),
+        req_bytes.len()
     );
     stream.write_all(http_req.as_bytes()).map_err(|e| e.to_string())?;
     stream.write_all(&req_bytes).map_err(|e| e.to_string())?;
@@ -3199,9 +3345,15 @@ fn p2p_send_files_to_peer(target_ip_or_omaid: &str, file_paths: &[PathBuf]) -> R
         let mut upload_stream = connect_peer_with_timeout(&addr, Duration::from_secs(6))
             .map_err(|e| format!("Failed to connect to peer for upload: {}", e))?;
         let encoded_filename = urlencoding_encode(&pf.name);
+        let upload_pq = format!(
+            "/api/p2p/upload?token={}&filename={}&blake3={}&sha256={}&md5={}",
+            token, encoded_filename, pf.blake3_hex, pf.sha256_hex, pf.md5_hex
+        );
         let upload_header = format!(
-            "POST /api/p2p/upload?token={}&filename={}&blake3={}&sha256={}&md5={} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/octet-stream\r\nX-File-BLAKE3: {}\r\nX-File-SHA256: {}\r\nX-File-MD5: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            token, encoded_filename, pf.blake3_hex, pf.sha256_hex, pf.md5_hex, addr, pf.blake3_hex, pf.sha256_hex, pf.md5_hex, pf.size_bytes
+            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/octet-stream\r\nX-File-BLAKE3: {}\r\nX-File-SHA256: {}\r\nX-File-MD5: {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            upload_pq, addr, pf.blake3_hex, pf.sha256_hex, pf.md5_hex,
+            v2_auth_lines("POST", &upload_pq, &devicekey::body_tag_stream(pf.size_bytes as usize)),
+            pf.size_bytes
         );
         upload_stream.write_all(upload_header.as_bytes()).map_err(|e| e.to_string())?;
 
@@ -3300,8 +3452,10 @@ fn p2p_sync_clipboard_to_peer(target_ip_or_omaid: &str) -> Result<(), String> {
     };
     let req_bytes = payload.to_string().into_bytes();
     let http_req = format!(
-        "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-OmaSend-OmaID: {}\r\nX-OmaSend-Auth-Token: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        addr, my_oma_id, auth_token, req_bytes.len()
+        "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-OmaSend-OmaID: {}\r\nX-OmaSend-Auth-Token: {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        addr, my_oma_id, auth_token,
+        v2_auth_lines("POST", "/api/p2p/clipboard", &devicekey::body_tag_json(&req_bytes)),
+        req_bytes.len()
     );
     stream.write_all(http_req.as_bytes()).map_err(|e| e.to_string())?;
     stream.write_all(&req_bytes).map_err(|e| e.to_string())?;
@@ -4691,6 +4845,46 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         return;
     }
 
+    if req.method == "POST" && req.path == "/api/v2/pair" {
+        if content_length > MAX_CONTROL_BODY {
+            respond(&stream, "413 Payload Too Large", "application/json", b"{\"error\":\"Request payload exceeds limit\"}", None, None);
+            return;
+        }
+        let body_deadline = Instant::now() + Duration::from_secs(DEFAULT_BODY_TIMEOUT_SECS);
+        let body = match read_http_body(&mut stream, content_length, &initial_body, body_deadline, false, MAX_CONTROL_BODY) {
+            Some(b) => b,
+            None => return,
+        };
+        let val: serde_json::Value = match body.as_slice().and_then(|b| serde_json::from_slice(b).ok()) {
+            Some(v) => v,
+            None => {
+                respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid JSON\"}", None, None);
+                return;
+            }
+        };
+        let peer_ip = client_ip.to_canonical().to_string();
+        match devicekey::accept_pair_request(device_identity(), &get_state_dir(), &get_system_hostname(), &val, &peer_ip) {
+            Ok((resp, key)) => {
+                let label = format!("{} ({})", key.name, key.device_id);
+                let own = key.own_device;
+                if trust_store().upsert(key).is_err() {
+                    respond(&stream, "500 Internal Server Error", "application/json", b"{\"error\":\"Failed to store device key\"}", None, None);
+                    return;
+                }
+                notify_desktop(
+                    "OmaSend: Device paired",
+                    &format!("{} is now paired{}.", label, if own { " as one of your devices" } else { "" }),
+                );
+                respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+            }
+            Err(e) => {
+                let err = serde_json::json!({ "error": e });
+                respond(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
+            }
+        }
+        return;
+    }
+
     if req.method == "POST" && req.path == "/api/p2p/pair" {
         let (vis, _) = get_visibility();
         if vis == "OFF" {
@@ -4814,6 +5008,15 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                 return;
             }
         };
+        let v2_key = match v2_verify(&req, &devicekey::body_tag_json(body_slice), &client_ip.to_canonical().to_string()) {
+            devicekey::AuthResult::Trusted(k) => Some(k),
+            devicekey::AuthResult::Absent => None,
+            devicekey::AuthResult::Rejected(why) => {
+                let err = serde_json::json!({ "error": format!("Signature rejected: {}", why) });
+                respond(&stream, "401 Unauthorized", "application/json", err.to_string().as_bytes(), None, None);
+                return;
+            }
+        };
 
         let my_oma_id = get_or_create_oma_id();
         let my_norm = rendezvous::normalize_oma_id(&my_oma_id);
@@ -4923,8 +5126,15 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         // V2-SEC-01 interim fix: OmaID is broadcast in plaintext and cannot prove ownership,
         // so a claimed same-owner OmaID no longer bypasses user approval. Every transfer is PENDING
         // until per-device key authentication replaces OmaID string comparison.
-        let initial_status = "PENDING";
-        let initial_expiry = now.saturating_add(30);
+        // Phase 1: a cryptographically verified key that the user paired as "own device"
+        // may auto-accept; everything else waits for approval.
+        let auto_accept = v2_key.as_ref().is_some_and(|k| k.own_device);
+        let initial_status = if auto_accept { "ACCEPTED" } else { "PENDING" };
+        let initial_expiry = if auto_accept { now.saturating_add(600) } else { now.saturating_add(30) };
+        let sender_name = match v2_key.as_ref() {
+            Some(k) => k.name.clone(),
+            None => sender_name,
+        };
 
         let transfer = PendingFileTransfer {
             token: token.clone(),
@@ -4938,18 +5148,27 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             created_at: now,
             expires_at: initial_expiry,
             status: initial_status.to_string(),
+            sender_pk: v2_key.as_ref().map(|k| k.pk.clone()),
         };
         save_pending_transfer(&transfer);
 
         let size_mb = (total_size_bytes as f64) / 1024.0 / 1024.0;
-        notify_desktop(
-            "OmaSend AirBridge: Transfer Request",
-            &format!("'{}' wants to send {} file(s) ({:.1} MB).\nOpen OmaSend panel to Accept or Decline.", sender_name, file_names.len(), size_mb),
-        );
+        if auto_accept {
+            notify_desktop(
+                "OmaSend AirBridge",
+                &format!("Receiving {} file(s) ({:.1} MB) from your device '{}' (verified key).", file_names.len(), size_mb, sender_name),
+            );
+        } else {
+            notify_desktop(
+                "OmaSend AirBridge: Transfer Request",
+                &format!("'{}' wants to send {} file(s) ({:.1} MB).\nOpen OmaSend panel to Accept or Decline.", sender_name, file_names.len(), size_mb),
+            );
+        }
 
         let resp = serde_json::json!({
             "status": initial_status,
-            "is_trusted": is_trusted,
+            "is_trusted": is_trusted || v2_key.is_some(),
+            "verified_device": v2_key.is_some(),
             "is_same_owner": is_same_owner,
             "token": token
         });
@@ -5056,6 +5275,17 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         if content_length > MAX_P2P_UPLOAD_SIZE {
             respond(&stream, "413 Payload Too Large", "application/json", b"{\"error\":\"Payload exceeds 10 GiB limit\"}", None, None);
             return;
+        }
+
+        if let Some(ref expected_pk) = pending.sender_pk {
+            let ok = matches!(
+                v2_verify(&req, &devicekey::body_tag_stream(content_length), &client_ip.to_canonical().to_string()),
+                devicekey::AuthResult::Trusted(ref k) if &k.pk == expected_pk
+            );
+            if !ok {
+                respond(&stream, "401 Unauthorized", "application/json", b"{\"error\":\"Upload must be signed by the device that requested the transfer\"}", None, None);
+                return;
+            }
         }
 
         // V2-SEC-06: the upload must match the size the user approved in the transfer request.
@@ -5249,6 +5479,15 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                 return;
             }
         };
+        let v2_key = match v2_verify(&req, &devicekey::body_tag_json(body_slice), &client_ip.to_canonical().to_string()) {
+            devicekey::AuthResult::Trusted(k) => Some(k),
+            devicekey::AuthResult::Absent => None,
+            devicekey::AuthResult::Rejected(why) => {
+                let err = serde_json::json!({ "error": format!("Signature rejected: {}", why) });
+                respond(&stream, "401 Unauthorized", "application/json", err.to_string().as_bytes(), None, None);
+                return;
+            }
+        };
         if let Ok(raw_val) = serde_json::from_slice::<serde_json::Value>(body_slice) {
             let my_oma_id = get_or_create_oma_id();
             let my_norm = rendezvous::normalize_oma_id(&my_oma_id);
@@ -5284,7 +5523,8 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             // Clipboard writes require a confirmed pairing (and its auth token) for every sender.
             let _claims_same_owner = !norm_sender.is_empty() && constant_time_eq_str(&norm_sender, &my_norm);
 
-            {
+            // Phase 1: a valid signature from a paired device key authorizes on its own.
+            if v2_key.is_none() {
                 let is_trusted = is_peer_confirmed(sender_id);
                 if !is_trusted {
                     respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Peer OmaID is not paired\"}", None, None);
@@ -5909,6 +6149,73 @@ fn main() {
     if args.iter().any(|a| a == "--test-notification") {
         notify_desktop("OmaSend", "Masaustu bildirim sistemi aktif ve calisiyor.");
         println!("Test bildirimi gonderildi.");
+        return;
+    }
+
+    // ---- Phase 1: device keys & QR pairing ----
+    if args.iter().any(|a| a == "--device-id") {
+        println!("{}", device_identity().device_id());
+        return;
+    }
+    if args.iter().any(|a| a == "--pair-offer") {
+        let own = args.iter().any(|a| a == "--own");
+        let out = create_pair_offer_json(own);
+        if args.iter().any(|a| a == "--json") {
+            println!("{}", out);
+        } else {
+            let uri = out["uri"].as_str().unwrap_or_default().to_string();
+            let _ = Command::new("/usr/bin/qrencode").args(["-t", "ANSIUTF8", "--", &uri]).status();
+            println!("Scan this QR code with OmaSend on the other device (valid for {} minutes, single use).", devicekey::PAIR_OFFER_TTL_SECS / 60);
+            println!("Or paste on another Omarchy desktop:  omasend-engine --pair-with '{}'", uri);
+            println!("This device: {}{}", device_identity().device_id(), if own { "  (new device will be trusted as YOUR device)" } else { "" });
+        }
+        return;
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--pair-with") {
+        let Some(uri) = args.get(pos + 1) else {
+            eprintln!("Usage: --pair-with 'omasend://pair?...'");
+            std::process::exit(2);
+        };
+        match p2p_pair_v2(uri) {
+            Ok(k) => {
+                println!("Paired with {} ({}){}", k.name, k.device_id, if k.own_device { " as one of your devices" } else { "" });
+                notify_desktop("OmaSend: Device paired", &format!("{} ({})", k.name, k.device_id));
+            }
+            Err(e) => {
+                eprintln!("Pairing failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if args.iter().any(|a| a == "--devices") {
+        let list: Vec<serde_json::Value> = trust_store()
+            .load()
+            .into_iter()
+            .map(|k| serde_json::json!({
+                "device_id": k.device_id, "name": k.name, "ip": k.ip,
+                "own_device": k.own_device, "added_at": k.added_at, "last_seen": k.last_seen
+            }))
+            .collect();
+        println!("{}", serde_json::json!({ "me": device_identity().device_id(), "devices": list }));
+        return;
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--unpair") {
+        let Some(id) = args.get(pos + 1) else {
+            eprintln!("Usage: --unpair <device-id>");
+            std::process::exit(2);
+        };
+        match trust_store().remove(id) {
+            Ok(true) => println!("Removed {}", id),
+            Ok(false) => {
+                eprintln!("No paired device {}", id);
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Failed: {}", e);
+                std::process::exit(1);
+            }
+        }
         return;
     }
 
@@ -7163,6 +7470,7 @@ mod tests {
             created_at: 100,
             expires_at: 500,
             status: "ACCEPTED".to_string(),
+            sender_pk: None,
         };
 
         // File listed in approved files
@@ -8312,6 +8620,81 @@ mod tests {
         assert!(is_sound_enabled());
     }
 
+    fn raw_http(addr: std::net::SocketAddr, head: &str, body: &[u8]) -> String {
+        let mut c = TcpStream::connect(addr).expect("Connect test client");
+        c.write_all(head.as_bytes()).unwrap();
+        c.write_all(body).unwrap();
+        let mut resp = String::new();
+        c.read_to_string(&mut resp).unwrap();
+        resp
+    }
+
+    #[test]
+    fn test_phase1_qr_pairing_and_signed_requests_end_to_end() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        clear_pending_transfer();
+        set_visibility("ALL");
+
+        // The "phone" is a separate identity; this process plays the desktop (responder).
+        let mut seed = [0u8; 32];
+        getrandom::getrandom(&mut seed).unwrap();
+        let phone = devicekey::DeviceIdentity::from_seed(seed);
+        let _ = trust_store().remove(&phone.public_b64());
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for _ in 0..5 {
+                let (s, _) = listener.accept().expect("Accept client");
+                handle_connection(s, "127.0.0.1", "1234", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+            }
+        });
+
+        // 1. Pair via QR offer marked "own device".
+        let offer_json = create_pair_offer_json(true);
+        let offer = devicekey::parse_pair_uri(offer_json["uri"].as_str().unwrap()).unwrap();
+        let pair_body = devicekey::build_pair_request(&phone, &offer, "Test Phone").to_string();
+        let r = post_json(addr, "/api/v2/pair", "", &serde_json::from_str(&pair_body).unwrap());
+        assert!(r.starts_with("HTTP/1.1 200"), "pairing must succeed: {}", r);
+        let resp_json: serde_json::Value = serde_json::from_str(r.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        devicekey::verify_pair_response(&phone, &offer, &resp_json).expect("desktop signature must verify");
+
+        // 2. Signed transfer request from the verified own device is auto-accepted.
+        let oma = rendezvous::format_oma_id(&rendezvous::generate_raw_oma_id());
+        let body = serde_json::json!({
+            "oma_id": oma, "sender_id": oma, "sender_name": "Spoofable name",
+            "files": [{"name": "photo.jpg", "size_bytes": 3}]
+        }).to_string().into_bytes();
+        let sig = devicekey::auth_header_lines(&phone, "POST", "/api/p2p/request", &devicekey::body_tag_json(&body));
+        let head = format!("POST /api/p2p/request HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n", sig, body.len());
+        let r = raw_http(addr, &head, &body);
+        assert!(r.contains("\"status\":\"ACCEPTED\""), "verified own device must auto-accept: {}", r);
+        assert!(r.contains("\"verified_device\":true"), "{}", r);
+        let token = serde_json::from_str::<serde_json::Value>(r.split("\r\n\r\n").nth(1).unwrap()).unwrap()["token"].as_str().unwrap().to_string();
+
+        // 3. Upload of that transfer by a different (unsigned) client is rejected.
+        let pq = format!("/api/p2p/upload?token={}&filename=photo.jpg", token);
+        let r = raw_http(addr, &format!("POST {} HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nConnection: close\r\n\r\n", pq), b"abc");
+        assert!(r.starts_with("HTTP/1.1 401"), "unsigned upload of a verified transfer must fail: {}", r);
+
+        // 4. Tampered body (signature over different bytes) is rejected.
+        let sig = devicekey::auth_header_lines(&phone, "POST", "/api/p2p/clipboard", &devicekey::body_tag_json(b"{}"));
+        let evil = br#"{"content_type":"text","text":"evil"}"#;
+        let head = format!("POST /api/p2p/clipboard HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n", sig, evil.len());
+        let r = raw_http(addr, &head, evil);
+        assert!(r.starts_with("HTTP/1.1 401"), "tampered signed request must fail: {}", r);
+
+        // 5. Signed upload from the paired phone succeeds.
+        let sig = devicekey::auth_header_lines(&phone, "POST", &pq, &devicekey::body_tag_stream(3));
+        let r = raw_http(addr, &format!("POST {} HTTP/1.1\r\nHost: x\r\n{}Content-Length: 3\r\nConnection: close\r\n\r\n", pq, sig), b"abc");
+        assert!(r.starts_with("HTTP/1.1 200"), "signed upload must succeed: {}", r);
+
+        server.join().unwrap();
+        clear_pending_transfer();
+        let _ = trust_store().remove(&phone.public_b64());
+        let _ = fs::remove_file(get_download_dir().join("photo.jpg"));
+    }
+
     #[test]
     fn test_v2_func01_second_request_does_not_overwrite_pending_transfer() {
         let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
@@ -8372,6 +8755,7 @@ mod tests {
             created_at: now,
             expires_at: now + 60,
             status: "ACCEPTED".to_string(),
+            sender_pk: None,
         });
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
