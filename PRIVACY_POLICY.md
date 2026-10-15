@@ -19,33 +19,37 @@ OmaSend does not collect, harvest, store, transmit, or monetize any personal inf
 The Application does not include any third-party advertising SDKs, tracking pixels, analytics frameworks (such as Google Analytics or Firebase), crash-reporting services, or profiling tools.
 
 ### 2.3 Peer-to-Peer Transmission
-All file transfers and clipboard synchronization events happen directly and exclusively between devices located on the same Local Area Network (LAN):
-- Devices discover each other using local UDP broadcast beacons on port `53317`.
-- Data streams directly between peer devices over local HTTP/TCP sockets on port `53317`.
-- No transmission ever passes through an external server, proxy, relay, or cloud storage bucket operated by the developer or any third party.
+All file transfers and clipboard synchronization events happen directly between peer devices:
+- Devices discover each other on Local Area Networks (LAN) using UDP broadcast/multicast beacons on port `53317`.
+- Data streams directly between peer devices over HTTP/TCP sockets on port `53317` (or optional user-initiated Cloudflare WAN tunnels / STUN endpoint discovery when WAN mode is enabled).
+- No user files or clipboard contents are stored on any central cloud storage bucket operated by the developer.
 
 ---
 
 ## 3. Permissions Used by the Application
 
-OmaSend requests only the strictly minimum Android system permissions necessary to operate on local networks:
+OmaSend requests only the strictly minimum Android system permissions necessary to operate:
 
 - **INTERNET (`android.permission.INTERNET`)**:
-  Used solely to bind local TCP/HTTP sockets and exchange files directly with nearby peers over your local Wi-Fi or Ethernet connection. The application makes no outbound calls to external internet servers.
+  Used to bind TCP/HTTP sockets, exchange files and clipboard payloads with authorized peers over Wi-Fi/Ethernet, and perform optional STUN/WAN endpoint resolution when cross-subnet connectivity is active.
 - **ACCESS_NETWORK_STATE & ACCESS_WIFI_STATE (`android.permission.ACCESS_NETWORK_STATE`, `android.permission.ACCESS_WIFI_STATE`)**:
-  Used to detect local network connectivity and determine the device's local IP address.
+  Used to detect network connectivity and determine the device's local IP address.
 - **CHANGE_WIFI_MULTICAST_STATE (`android.permission.CHANGE_WIFI_MULTICAST_STATE`)**:
   Used to enable UDP multicast packet reception required for automatic discovery of nearby peers.
-- **FOREGROUND_SERVICE & FOREGROUND_SERVICE_CONNECTED_DEVICE (`android.permission.FOREGROUND_SERVICE`, `android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE`)**:
-  Used to maintain continuous local peer availability and complete file transfers without interruption when the app is in the background.
+- **FOREGROUND_SERVICE & FOREGROUND_SERVICE_DATA_SYNC (`android.permission.FOREGROUND_SERVICE`, `android.permission.FOREGROUND_SERVICE_DATA_SYNC`)**:
+  Used to maintain peer availability and complete active file transfers without interruption when the app is in the background.
 - **POST_NOTIFICATIONS (`android.permission.POST_NOTIFICATIONS`)**:
   Used on Android 13+ to display the foreground service status and real-time file transfer progress in the system notification drawer.
+- **VIBRATE (`android.permission.VIBRATE`)**:
+  Used to provide tactile haptic feedback during peer discovery and file transfer completion.
+- **CAMERA (`android.permission.CAMERA`)**:
+  Used solely when the user explicitly opens the QR code scanner to pair or sync an OmaID.
 
 ---
 
 ## 4. Third-Party Services
 
-OmaSend does not integrate with or share data with any third-party services, advertising networks, or data brokers.
+OmaSend does not integrate with advertising networks, analytics SDKs, or data brokers.
 
 ---
 
@@ -58,9 +62,9 @@ The Application does not address anyone under the age of 13. We do not knowingly
 ## 6. Security Architecture
 
 In adherence to Omarchy Linux security standards:
-- The Android companion client and server communicate using explicit, bounded I/O buffers to prevent buffer overrun attacks.
-- File writes on Android are restricted to the public `Download/OmaSend` directory or explicit user-selected folders.
-- Clipboard synchronizations are executed directly in-memory and are never written to persistent disk storage or shared outside the active session.
+- The Android companion client and Linux server communicate using explicit, bounded I/O buffers to prevent buffer overrun and memory exhaustion attacks.
+- File writes on Android are restricted to the `Download/OmaSend` directory via MediaStore or explicit user-selected folders.
+- Clipboard history and staged images are stored strictly inside user-private local state directories (`0700` directory / `0600` file permissions on Linux; `MODE_PRIVATE` internal storage on Android) and are excluded from cloud backups.
 
 ---
 

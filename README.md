@@ -1,37 +1,38 @@
 # OmaSend - Zero-Knowledge AirBridge and E2EE Transfer for Omarchy Linux
 
 [![Omarchy Verified Plugin](https://img.shields.io/badge/Omarchy-Verified_Plugin-22c55e?style=for-the-badge&logo=omarchy)](https://github.com/ozdil)
-[![Release v1.8.0](https://img.shields.io/badge/Release-v1.8.0-38BDF8?style=for-the-badge&logo=rust)](https://github.com/ozdil/omarchy-omasend/releases)
+[![Release v1.8.6](https://img.shields.io/badge/Release-v1.8.6-38BDF8?style=for-the-badge&logo=rust)](https://github.com/ozdil/omarchy-omasend/releases)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy_Me_A_Coffee-Support_Development-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/ozdil)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](LICENSE)
 
 ![omasend Preview](preview.png)
 
-> **Cross-device sovereign file transfer, encrypted clipboard vault, 16-digit Luhn OmaID pairing, and global WAN portal with Zero-Knowledge AES-256-GCM encryption for Omarchy Linux, Android, and Modern Web Browsers.**
+> **Cross-device sovereign file transfer, Anonymous Numbered Identity (Zero-Log OmaID) with Zero-Click My Devices mesh, encrypted clipboard vault, and global WAN portal with Zero-Knowledge AES-256-GCM encryption for Omarchy Linux, Android, and Modern Web Browsers.**
 
 - **Author:** Ozan Özdil (ozdil)  
 - **License:** MIT  
 - **Plugin ID:** `ozdil.omasend`  
-- **Version:** `1.8.0`  
+- **Version:** `1.8.6`  
 - **Default Font:** `JetBrainsMono Nerd Font`
 
 ---
 
 ## Key Features
 
-- **16-Digit Luhn Mod 10 OmaID Pairing & Blinded Rendezvous:**
-  - Zero-account, zero-server device pairing using RFC 2104 HMAC-SHA256 Blinded Rendezvous topics and RFC 5869 HKDF-SHA256 symmetric key derivation.
-  - Generates verifiable 16-digit device identifiers with Luhn mod 10 checksum validation (`XXXX-XXXX-XXXX-XXXX`).
-  - Strict zero-trust connection filter: Unpaired devices are rejected before staging data.
-  - Code-verified pairing: pairing is always started locally (`omasend-engine --pair-peer <OMAID> [name] [ip]` or the panel), which prints a one-time 6-digit code valid for 10 minutes. The remote device presents this code with `omasend-engine --complete-pair <PEER_IP> <PEER_OMAID> <CODE> [name]` (which calls `POST /api/p2p/pair` and verifies that the responder echoes the expected OmaID); loopback sources (including WAN tunnel traffic) are refused; the stored peer address is the observed TCP source (RFC 1918 / link-local / loopback only), the authentication token is generated locally and is never replaced remotely, and the code is revoked after 5 failed attempts. Unknown OmaIDs cannot create or modify peer records, and clipboard data is pushed only to peers that completed this handshake. Peers paired with earlier versions must be paired again.
+- **Anonymous Numbered Identity (Zero-Log OmaID) & Zero-Click My Devices Mesh:**
+  - Free and open-source 16-digit Luhn mod-10 numbered account identity (`XXXX-XXXX-XXXX-XXXX`) requiring zero registration, email, username, or personal data.
+  - Enter the same 16-digit OmaID across your PC and Android phone (`--set-oma-id <OMAID>` or via UI) to form an instant **My Devices (Zero-Click)** trust mesh without manual PIN prompts or per-transfer approval friction.
+  - Uses RFC 2104 HMAC-SHA256 Blinded Rendezvous topics, RFC 5869 HKDF-SHA256 symmetric key derivation, constant-time identity verification, and replay-resistant zero-knowledge proofs (`compute_same_owner_zk_proof` / `verify_same_owner_zk_proof`).
+  - Devices with a different OmaID are classified as external/guest peers and require explicit Gatekeeper approval (`ACCEPT` / `REJECT`) or code-verified pairing.
 - **Universal Multi-Format Clipboard Vault & WebP Micro-Thumbnails:**
   - Real-time bidirectional clipboard sync supporting text and image payloads (PNG, JPEG, WebP).
   - Integrated WebP Micro-Thumbnail Engine: Automatically generates ultra-compact 96x96 WebP thumbnails (3-5 KB) in an isolated sandbox for instant zero-latency preview rendering.
   - Compact Clipboard Vault UI: One-click copy, double-click lightbox modal preview, and instant export to `~/Pictures/OmaStudio_Exports/`.
   - Strict local staging isolation in `~/.local/state/omarchy/omasend/clip_staging/` with atomic mode 0600 file permissions and 50 MiB LRU eviction cap.
-- **Omarchy AirBridge P2P (PC-to-PC, Android, and Web Direct Transfer):**
-  - Instant Zero-Click Transfer: Transfers from paired/trusted devices are auto-accepted instantly without manual prompt friction, streaming directly to disk with mode 0600 security.
-  - Hardware-accelerated radial sonar radar visualization expanding from the bar icon center.
+- **Omarchy AirBridge P2P & Authentic Samurai Audio Feedback:**
+  - Instant Zero-Click Transfer: Transfers between same-owner OmaID devices or trusted peers stream directly to disk with mode 0600 security.
+  - Authentic Samurai Soundscape: Integrated high-clarity vocal + katana audio feedback on send (*"OMAKASE!"*) and receive/accept (*"ONEGAI SHIMASU!"*).
+  - Hardware-accelerated Wayland LayerShell magnetic drop dock and radial sonar visualization expanding from the bar icon center.
   - Zero-Config Discovery: Automatically discovers neighboring Omarchy Linux desktops and Android devices on the same local network using UDP beacons (port 53317).
   - 3-Tier Visibility Control: Off, Known (Trusted Peers Only - Default), and Everyone (10 Minutes Temporary Discovery).
 - **Zero-Knowledge End-to-End Encryption (E2EE):**

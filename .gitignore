@@ -8,3 +8,4 @@ omasend-engine
 android/local.properties
 android/**/build/
 
+REPORT.md

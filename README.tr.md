@@ -1,36 +1,38 @@
 # OmaSend - Omarchy Linux İçin Sıfır Bilgili AirBridge ve E2EE Aktarım Merkezi
 
 [![Omarchy Onaylı Eklenti](https://img.shields.io/badge/Omarchy-Verified_Plugin-22c55e?style=for-the-badge&logo=omarchy)](https://github.com/ozdil)
-[![Sürüm v1.7.1](https://img.shields.io/badge/S%C3%BCr%C3%BCm-v1.7.1-38BDF8?style=for-the-badge&logo=rust)](https://github.com/ozdil/omarchy-omasend/releases)
+[![Sürüm v1.8.6](https://img.shields.io/badge/S%C3%BCr%C3%BCm-v1.8.6-38BDF8?style=for-the-badge&logo=rust)](https://github.com/ozdil/omarchy-omasend/releases)
 [![Kahve Ismarla](https://img.shields.io/badge/Buy_Me_A_Coffee-Geli%C5%9Ftiriciye_Destek-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/ozdil)
 [![Lisans: MIT](https://img.shields.io/badge/Lisans-MIT-blue?style=for-the-badge)](LICENSE)
 
 ![OmaSend Önizleme](preview.png)
 
-> **Omarchy Linux, Android ve Modern Web Tarayıcıları arasında cihazlar arası egemen dosya aktarımı, şifreli pano kasası, 16 haneli Luhn OmaID eşleşmesi ve Sıfır Bilgili AES-256-GCM uçtan uca şifrelemeli küresel WAN portalı.**
+> **Omarchy Linux, Android ve Modern Web Tarayıcıları arasında cihazlar arası egemen dosya aktarımı, Anonim Numaralı Kimlik (Sıfır Kayıt OmaID) ile Zero-Click Kendi Cihazlarım ağı, şifreli pano kasası ve Sıfır Bilgili AES-256-GCM uçtan uca şifrelemeli küresel WAN portalı.**
 
 - **Geliştirici:** Ozan Özdil (ozdil)  
 - **Lisans:** MIT  
 - **Eklenti Kimliği:** `ozdil.omasend`  
-- **Sürüm:** `1.7.1`  
+- **Sürüm:** `1.8.6`  
 - **Varsayılan Yazı Tipi:** `JetBrainsMono Nerd Font`
 
 ---
 
 ## Öne Çıkan Yetenekler
 
-- **16 Haneli Luhn Mod 10 OmaID Eşleşmesi ve Kör Randevu (Blinded Rendezvous):**
-  - Sıfır hesap, sıfır merkezi sunucu: RFC 2104 HMAC-SHA256 Blinded Rendezvous konuları ve RFC 5869 HKDF-SHA256 simetrik anahtar türetimi ile güvenli eşleşme.
-  - Luhn mod 10 sağlama toplamı doğrulamalı 16 haneli P2P cihaz kimlikleri (`XXXX-XXXX-XXXX-XXXX`).
-  - Katı sıfır güven (Zero-Trust) filtresi: Eşleşmemiş veya yetkisiz cihazlardan gelen istekler bellek veya diske yazılmadan HTTP 403 ile engellenir.
+- **Anonim Numaralı Kimlik (Sıfır Kayıt OmaID) ve Zero-Click Kendi Cihazlarım Ağı:**
+  - Kayıt, e-posta, kullanıcı adı veya kişisel veri gerektirmeyen ücretsiz ve açık kaynaklı 16 haneli Luhn mod-10 numaralı kimlik (`XXXX-XXXX-XXXX-XXXX`).
+  - Bilgisayarınıza ve Android telefonunuza aynı 16 haneli OmaID'yi girdiğinizde (`--set-oma-id <OMAID>` veya arayüz üzerinden), cihazlar birbirini **Kendi Cihazlarım (Zero-Click)** olarak tanır; PIN veya onay beklemeden anında dosya ve pano paylaşır.
+  - RFC 2104 HMAC-SHA256 Kör Randevu (Blinded Rendezvous) konuları, RFC 5869 HKDF-SHA256 simetrik anahtar türetimi, sabit zamanlı (constant-time) kimlik doğrulaması ve tekrar oynatma (replay) korumalı sıfır bilgi kanıtı (`compute_same_owner_zk_proof` / `verify_same_owner_zk_proof`) kullanır.
+  - Farklı OmaID taşıyan cihazlar misafir/harici kullanıcı olarak sınıflandırılır ve manuel Gatekeeper onayı (`KABUL ET` / `REDDET`) veya tek seferlik kod doğrulaması gerektirir.
 - **Evrensel Çok Formatlı Pano Kasası ve WebP Mikro Önizleme Motoru:**
   - Metin ve görsel verilerini (PNG, JPEG, WebP) masaüstü ile mobil arasında çift yönlü ve anlık senkronize eder.
   - Dahili WebP Mikro Önizleme Motoru: Kopyalanan görseller için izole sandbox içinde otomatik olarak 96x96 piksel ultra hafif önizlemeler (~3-5 KB) üretir; büyük dosyalar indirilmeden sıfır gecikmeli görsel sunumu sağlar.
   - Kompakt Pano Kasası Arayüzü: Tek tıklamayla panoya kopyalama, çift tıklamayla tam ekran önizleme ve `~/Pictures/OmaStudio_Exports/` dizinine anında aktarım.
   - Güvenli İzolasyon: `~/.local/state/omarchy/omasend/clip_staging/` altında atomik 0600 dosya izinleri ve 50 MiB LRU temizleme sınırı.
-- **Omarchy AirBridge P2P (Masaüstü, Android ve Web Doğrudan Aktarım):**
-  - Sıfır Tıklamalı Anında Aktarım: Eşleşmiş ve güvenilir cihazlardan gelen transferler manuel onay beklemeden, doğrudan diske 0600 izinleriyle akıtılır.
-  - Donanım hızlandırmalı dairesel sonar radar görselleştirmesi.
+- **Omarchy AirBridge P2P ve Samuray Ses Efektleri:**
+  - Sıfır Tıklamalı Anında Aktarım: Kendi cihazlarınız veya güvenilir eşlerden gelen transferler manuel onay beklemeden doğrudan diske 0600 izinleriyle akıtılır.
+  - Otantik Samuray Ses Efektleri: Dosya gönderiminde (*"OMAKASE!"* + Katana) ve dosya alım/kabulünde (*"ONEGAI SHIMASU!"* + Katana) yüksek netlikli sesli geri bildirim.
+  - Donanım hızlandırmalı Wayland LayerShell manyetik sürükle-bırak (Drop HUD) kapsülü ve dairesel sonar radar görselleştirmesi.
   - Sıfır Yapılandırmalı Keşif: Yerel ağdaki Omarchy Linux masaüstü ve Android cihazları UDP işaretçileri (53317 portu) ile otomatik keşfeder.
   - 3 Kademeli Görünürlük Kontrolü: Kapalı (Off), Yalnızca Tanınanlar (Known - Varsayılan) ve Herkes (Everyone - 10 dakikalık geçici keşif).
 - **Sıfır Bilgili Uçtan Uca Şifreleme (E2EE):**

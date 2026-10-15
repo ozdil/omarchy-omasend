@@ -4,6 +4,24 @@ Bu belgede OmaSend masaüstü ve Android uygulamaları için yapılan tüm sür�
 
 ---
 
+## [1.8.6] - 2026-10-15 (Android Build: 57)
+
+### Anonim Numaralı Kimlik (Sıfır Kayıt OmaID) & Zero-Click Kendi Cihazlarım Ağı
+- **Anonim Numaralı Kimlik (Zero-Log Numbered Identity):**
+  - `OmaID` (16 haneli Luhn mod-10: `XXXX-XXXX-XXXX-XXXX`) kullanıcı/sahip seviyesinde anonim numaralı kimliğe dönüştürüldü; fiziksel cihaz kimliği (`DeviceID`) ayrıştırıldı.
+  - Aynı OmaID'yi taşıyan PC ve Android cihazlar birbirini otomatik olarak **Kendi Cihazlarım (Zero-Click)** olarak tanır; PIN, QR veya onay istemeden anında dosya ve pano aktarır.
+  - Farklı OmaID taşıyan cihazlar misafir/harici olarak sınıflandırılır ve Gatekeeper onayı (`PENDING`) ile yönetilir.
+- **Kriptografik ve RAM Güvenliği Sertleştirmeleri:**
+  - `zeroize` ile `hmac_sha256`, `hkdf_sha256`, `derive_p2p_session_key` ve AES-256-GCM kayıt şifreleme/çözme adımlarında tüm ara anahtar materyalleri RAM'den temizlendi.
+  - Sabit zamanlı (`constant_time_eq` / `MessageDigest.isEqual`) OmaID doğrulaması ve zaman damgalı tekrar oynatma (replay) korumalı sıfır bilgi kanıtı (`compute_same_owner_zk_proof` / `verify_same_owner_zk_proof`) eklendi.
+  - `qrencode` çağrılarında `--` bayrak sonlandırıcısı ve `0600` dosya izni zorlaması uygulandı.
+- **Bütünleşik Quickshell Arayüzü & Samuray Ses Efektleri:**
+  - Masaüstü `Panel.qml` resmi Omarchy UI bileşenleriyle yeniden inşa edildi; Wayland LayerShell tabanlı manyetik `dropPortal` (60 FPS dalga yayılımı) entegre edildi.
+  - Gönderme (*"OMAKASE!"* + Katana) ve Alma/Kabul Etme (*"ONEGAI SHIMASU!"* + Katana) ses efektleri masaüstü ve Android'de devreye alındı.
+- Tüm masaüstü birim testleri (`87/87`) ve Android birim testleri sıfır hata ile doğrulandı.
+
+---
+
 ## [1.8.1] - 2026-10-14
 
 ### Full-Stack Denetim Düzeltmeleri (Masaüstü)
