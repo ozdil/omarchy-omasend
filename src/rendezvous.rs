@@ -7,10 +7,11 @@ use sha2::{Digest, Sha256};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use zeroize::Zeroize;
 
 // ------------------- CRYPTOGRAPHIC PRIMITIVES (HMAC & HKDF) -------------------
 
-/// Standard RFC 2104 HMAC-SHA256 implementation
+/// Standard RFC 2104 HMAC-SHA256 implementation with automatic RAM zeroization
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut k_padded = [0u8; 64];
     if key.len() > 64 {
@@ -28,29 +29,35 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
         ipad[i] ^= k_padded[i];
         opad[i] ^= k_padded[i];
     }
+    k_padded.zeroize();
 
     let mut inner_hasher = Sha256::new();
     inner_hasher.update(ipad);
     inner_hasher.update(data);
     let inner_hash = inner_hasher.finalize();
+    ipad.zeroize();
 
     let mut outer_hasher = Sha256::new();
     outer_hasher.update(opad);
     outer_hasher.update(inner_hash);
     let outer_hash = outer_hasher.finalize();
+    opad.zeroize();
 
     let mut out = [0u8; 32];
     out.copy_from_slice(&outer_hash);
     out
 }
 
-/// Standard RFC 5869 HKDF-SHA256 extraction & expansion for 32-byte key derivation
+/// Standard RFC 5869 HKDF-SHA256 extraction & expansion for 32-byte key derivation with RAM zeroization
 pub fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8]) -> [u8; 32] {
-    let prk = hmac_sha256(salt, ikm);
+    let mut prk = hmac_sha256(salt, ikm);
     let mut info_with_counter = Vec::with_capacity(info.len() + 1);
     info_with_counter.extend_from_slice(info);
     info_with_counter.push(0x01);
-    hmac_sha256(&prk, &info_with_counter)
+    let out = hmac_sha256(&prk, &info_with_counter);
+    prk.zeroize();
+    info_with_counter.zeroize();
+    out
 }
 
 // ------------------- OMAID (16 DIGIT LUHN MOD 10 IDENTIFIER) -------------------
@@ -633,20 +640,25 @@ pub fn encrypt_rendezvous_record(
     oma_id: &str,
     record: &RendezvousRecord,
 ) -> Result<EncryptedRendezvousEnvelope, String> {
-    let key = derive_rendezvous_key(oma_id);
+    let mut key = derive_rendezvous_key(oma_id);
     let cipher_key = Key::<Aes256Gcm>::from_slice(&key);
     let cipher = Aes256Gcm::new(cipher_key);
+    key.zeroize();
 
     let mut nonce_bytes = [0u8; 12];
     getrandom::getrandom(&mut nonce_bytes).map_err(|e| format!("Random nonce failed: {}", e))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let plaintext = serde_json::to_vec(record)
+    let mut plaintext = serde_json::to_vec(record)
         .map_err(|e| format!("Record serialization failed: {}", e))?;
 
     let ciphertext = cipher
         .encrypt(nonce, plaintext.as_ref())
-        .map_err(|e| format!("AES-256-GCM encryption failed: {}", e))?;
+        .map_err(|e| {
+            plaintext.zeroize();
+            format!("AES-256-GCM encryption failed: {}", e)
+        })?;
+    plaintext.zeroize();
 
     let topic = compute_rendezvous_topic(oma_id);
 
@@ -664,13 +676,14 @@ pub fn decrypt_rendezvous_record(
     envelope: &EncryptedRendezvousEnvelope,
 ) -> Result<RendezvousRecord, String> {
     let expected_topic = compute_rendezvous_topic(oma_id);
-    if envelope.topic != expected_topic {
+    if !constant_time_eq(envelope.topic.as_bytes(), expected_topic.as_bytes()) {
         return Err("Rendezvous topic mismatch for specified OmaID".to_string());
     }
 
-    let key = derive_rendezvous_key(oma_id);
+    let mut key = derive_rendezvous_key(oma_id);
     let cipher_key = Key::<Aes256Gcm>::from_slice(&key);
     let cipher = Aes256Gcm::new(cipher_key);
+    key.zeroize();
 
     let nonce_bytes = hex::decode(&envelope.nonce)
         .map_err(|e| format!("Invalid nonce hex: {}", e))?;
@@ -682,12 +695,14 @@ pub fn decrypt_rendezvous_record(
     let ciphertext_bytes = hex::decode(&envelope.ciphertext)
         .map_err(|e| format!("Invalid ciphertext hex: {}", e))?;
 
-    let plaintext = cipher
+    let mut plaintext = cipher
         .decrypt(nonce, ciphertext_bytes.as_ref())
         .map_err(|e| format!("AES-256-GCM decryption failed: {}", e))?;
 
-    serde_json::from_slice(&plaintext)
-        .map_err(|e| format!("Record deserialization failed: {}", e))
+    let res = serde_json::from_slice(&plaintext)
+        .map_err(|e| format!("Record deserialization failed: {}", e));
+    plaintext.zeroize();
+    res
 }
 
 // ------------------- NOISE/E2EE P2P TRANSPORT TUNNEL -------------------
@@ -703,18 +718,60 @@ pub struct EncryptedP2PEnvelope {
 
 /// Derives a pairwise session key between two OmaIDs using symmetric HKDF
 pub fn derive_p2p_session_key(local_oma_id: &str, remote_oma_id: &str) -> [u8; 32] {
-    let norm_local = normalize_oma_id(local_oma_id);
-    let norm_remote = normalize_oma_id(remote_oma_id);
+    let mut norm_local = normalize_oma_id(local_oma_id);
+    let mut norm_remote = normalize_oma_id(remote_oma_id);
     // Canonical ordering guarantees both sides derive the exact same pairwise key
-    let (first, second) = if norm_local <= norm_remote {
-        (norm_local, norm_remote)
-    } else {
-        (norm_remote, norm_local)
-    };
     let mut ikm = Vec::with_capacity(32);
-    ikm.extend_from_slice(first.as_bytes());
-    ikm.extend_from_slice(second.as_bytes());
-    hkdf_sha256(&ikm, b"omasend-p2p-noise-salt-v2", b"omasend-p2p-chacha-aes-tunnel-v2")
+    if norm_local <= norm_remote {
+        ikm.extend_from_slice(norm_local.as_bytes());
+        ikm.extend_from_slice(norm_remote.as_bytes());
+    } else {
+        ikm.extend_from_slice(norm_remote.as_bytes());
+        ikm.extend_from_slice(norm_local.as_bytes());
+    }
+    let out = hkdf_sha256(&ikm, b"omasend-p2p-noise-salt-v2", b"omasend-p2p-chacha-aes-tunnel-v2");
+    ikm.zeroize();
+    norm_local.zeroize();
+    norm_remote.zeroize();
+    out
+}
+
+/// Derives a cryptographic Zero-Knowledge Same-Owner Proof (HMAC-SHA256) so two devices
+/// sharing the same Anonymous Numbered OmaID can verify ownership without relying solely on
+/// plaintext header strings, and with constant-time verification.
+pub fn compute_same_owner_zk_proof(oma_id: &str, device_id: &str, timestamp_bucket: u64) -> String {
+    let mut norm = normalize_oma_id(oma_id);
+    let mut master_key = hkdf_sha256(
+        norm.as_bytes(),
+        b"omasend-zk-same-owner-salt-v1",
+        b"omasend-zk-same-owner-auth-key-v1",
+    );
+    norm.zeroize();
+    let msg = format!("omasend-zk-v1:{}:{}", device_id.trim(), timestamp_bucket);
+    let tag = hmac_sha256(&master_key, msg.as_bytes());
+    master_key.zeroize();
+    hex::encode(tag)
+}
+
+/// Verifies a Zero-Knowledge Same-Owner Proof across the current and adjacent 60-second time buckets
+/// in constant time (`constant_time_eq`) to prevent timing side-channels and replay attacks.
+pub fn verify_same_owner_zk_proof(
+    local_oma_id: &str,
+    sender_device_id: &str,
+    provided_proof_hex: &str,
+    now_secs: u64,
+) -> bool {
+    if provided_proof_hex.len() != 64 || sender_device_id.trim().is_empty() {
+        return false;
+    }
+    let bucket = now_secs / 60;
+    for b in [bucket.saturating_sub(1), bucket, bucket.saturating_add(1)] {
+        let expected = compute_same_owner_zk_proof(local_oma_id, sender_device_id, b);
+        if constant_time_eq(expected.as_bytes(), provided_proof_hex.as_bytes()) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Encrypts an arbitrary JSON or binary payload for direct P2P transport
@@ -723,9 +780,10 @@ pub fn encrypt_p2p_payload(
     remote_oma_id: &str,
     plaintext: &[u8],
 ) -> Result<EncryptedP2PEnvelope, String> {
-    let key = derive_p2p_session_key(local_oma_id, remote_oma_id);
+    let mut key = derive_p2p_session_key(local_oma_id, remote_oma_id);
     let cipher_key = Key::<Aes256Gcm>::from_slice(&key);
     let cipher = Aes256Gcm::new(cipher_key);
+    key.zeroize();
 
     let mut nonce_bytes = [0u8; 12];
     getrandom::getrandom(&mut nonce_bytes).map_err(|e| format!("CSPRNG nonce failed: {}", e))?;
@@ -751,9 +809,10 @@ pub fn decrypt_p2p_payload(
     local_oma_id: &str,
     envelope: &EncryptedP2PEnvelope,
 ) -> Result<Vec<u8>, String> {
-    let key = derive_p2p_session_key(local_oma_id, &envelope.sender_oma_id);
+    let mut key = derive_p2p_session_key(local_oma_id, &envelope.sender_oma_id);
     let cipher_key = Key::<Aes256Gcm>::from_slice(&key);
     let cipher = Aes256Gcm::new(cipher_key);
+    key.zeroize();
 
     let nonce_bytes = hex::decode(&envelope.nonce)
         .map_err(|e| format!("Invalid nonce hex: {}", e))?;
@@ -1584,5 +1643,30 @@ mod tests {
         for bad in ["8.8.8.8", "100.64.0.1", "2001:4860::8888", "::ffff:8.8.8.8"] {
             assert!(!is_local_network_ip(&bad.parse().unwrap()), "{} should be rejected", bad);
         }
+    }
+
+    #[test]
+    fn test_same_owner_zk_proof_verification_and_replay_resistance() {
+        let oma_id = generate_raw_oma_id();
+        let formatted_oma_id = format_oma_id(&oma_id);
+        let device_id = "pc-linux-a1b2c3d4";
+        let now_secs = 1_760_000_120u64;
+        let bucket = now_secs / 60;
+
+        let proof = compute_same_owner_zk_proof(&formatted_oma_id, device_id, bucket);
+        assert_eq!(proof.len(), 64);
+
+        // Exact bucket and +/- 1 adjacent bucket must verify
+        assert!(verify_same_owner_zk_proof(&oma_id, device_id, &proof, now_secs));
+        assert!(verify_same_owner_zk_proof(&formatted_oma_id, device_id, &proof, now_secs + 55));
+        assert!(verify_same_owner_zk_proof(&formatted_oma_id, device_id, &proof, now_secs - 55));
+
+        // Expired replay (> 2 buckets away) must fail
+        assert!(!verify_same_owner_zk_proof(&oma_id, device_id, &proof, now_secs + 180));
+
+        // Different OmaID or different device_id must fail
+        let other_oma_id = generate_raw_oma_id();
+        assert!(!verify_same_owner_zk_proof(&other_oma_id, device_id, &proof, now_secs));
+        assert!(!verify_same_owner_zk_proof(&oma_id, "different-device-id", &proof, now_secs));
     }
 }

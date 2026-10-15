@@ -48,6 +48,7 @@ static GLOBAL_ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 static PEER_CONNECTION_TRACKER: Mutex<Option<HashMap<IpAddr, usize>>> = Mutex::new(None);
 static RECENTLY_NOTIFIED_FILES: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
 static LAST_SYNCED_CLIPBOARD_HASH: Mutex<Option<String>> = Mutex::new(None);
+static STATE_FILE_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn get_last_synced_clipboard_hash() -> Option<String> {
     LAST_SYNCED_CLIPBOARD_HASH.lock().ok().and_then(|guard| guard.clone())
@@ -153,6 +154,8 @@ pub struct DiscoveredPeer {
     pub transport: String, // "LAN"
     pub fingerprint: String,
     pub is_trusted: bool,
+    #[serde(default)]
+    pub is_same_owner: bool,
     pub last_seen_secs: u64,
 }
 
@@ -273,12 +276,18 @@ pub struct ServerState {
     pub p2p_visibility_remaining_secs: u64,
     pub p2p_discovered_peers: Vec<DiscoveredPeer>,
     pub p2p_pending_transfer: Option<PendingFileTransfer>,
+    #[serde(default)]
+    pub p2p_transfer_progress: Option<serde_json::Value>,
     pub clipboard_vault: Vec<ClipboardItem>,
     // OmaID, Blinded Rendezvous & WAN Discovery
     pub oma_id: String,
     pub wan_mode: String,
     pub cluster_id: String,
     pub stun_addr: Option<String>,
+    #[serde(default)]
+    pub sound_enabled: bool,
+    #[serde(default)]
+    pub firewall_status: String,
 }
 
 fn get_local_ip() -> String {
@@ -310,16 +319,30 @@ fn get_current_uid() -> u32 {
 }
 
 fn get_state_dir() -> PathBuf {
-    let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let dir = Path::new(&home).join(".local/state/omarchy/omasend");
+    #[cfg(test)]
+    let dir = {
+        std::env::temp_dir().join(format!("omasend_test_state_{}", std::process::id()))
+    };
+    #[cfg(not(test))]
+    let dir = {
+        let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        Path::new(&home).join(".local/state/omarchy/omasend")
+    };
     let _ = fs::create_dir_all(&dir);
     let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
     dir
 }
 
 fn get_download_dir() -> PathBuf {
-    let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let dir = Path::new(&home).join("Downloads/omasend");
+    #[cfg(test)]
+    let dir = {
+        std::env::temp_dir().join(format!("omasend_test_downloads_{}", std::process::id()))
+    };
+    #[cfg(not(test))]
+    let dir = {
+        let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        Path::new(&home).join("Downloads/omasend")
+    };
     let _ = fs::create_dir_all(&dir);
     let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
     dir
@@ -383,7 +406,26 @@ fn read_secure_file(path: &Path) -> Result<String, String> {
         ));
     }
 
-    fs::read_to_string(path).map_err(|e| format!("Failed to read {:?}: {}", path, e))
+    const MAX_SECURE_FILE_BYTES: u64 = 1024 * 1024; // 1 MiB ceiling for state/config files
+    if meta.len() > MAX_SECURE_FILE_BYTES {
+        return Err(format!(
+            "Security violation: {:?} exceeds maximum allowed size ({} bytes)",
+            path, MAX_SECURE_FILE_BYTES
+        ));
+    }
+
+    let file = fs::File::open(path).map_err(|e| format!("Failed to open {:?}: {}", path, e))?;
+    let mut buf = Vec::with_capacity((meta.len() as usize).min(65536));
+    file.take(MAX_SECURE_FILE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("Failed to read {:?}: {}", path, e))?;
+    if buf.len() as u64 > MAX_SECURE_FILE_BYTES {
+        return Err(format!(
+            "Security violation: {:?} grew beyond maximum size during read",
+            path
+        ));
+    }
+    String::from_utf8(buf).map_err(|e| format!("Invalid UTF-8 in {:?}: {}", path, e))
 }
 
 pub fn safe_verify_file(path: &Path) -> Result<u64, String> {
@@ -428,10 +470,11 @@ pub fn compute_file_military_hashes(path: &Path) -> Result<(String, String, Stri
     Ok((blake3_hex, sha256_hex, md5_hex))
 }
 
-/// Reads any normal file safely:
+/// Reads any normal file safely with a strict 100 MiB upper bound:
 /// - Rejects untrusted symlinks
 /// - Must be regular file
 /// - Must be owned by the current running user
+/// - Enforces bounded read via take(MAX + 1)
 pub fn safe_read_file(path: &Path) -> Result<Vec<u8>, String> {
     let meta = fs::symlink_metadata(path).map_err(|e| format!("Failed to stat {:?}: {}", path, e))?;
     if meta.file_type().is_symlink() {
@@ -449,7 +492,25 @@ pub fn safe_read_file(path: &Path) -> Result<Vec<u8>, String> {
             current_uid
         ));
     }
-    fs::read(path).map_err(|e| format!("Failed to read {:?}: {}", path, e))
+    let max_bytes = MAX_BODY_SIZE as u64;
+    if meta.len() > max_bytes {
+        return Err(format!(
+            "Security violation: {:?} exceeds maximum safe read ceiling ({} bytes)",
+            path, max_bytes
+        ));
+    }
+    let file = fs::File::open(path).map_err(|e| format!("Failed to open {:?}: {}", path, e))?;
+    let mut buf = Vec::with_capacity((meta.len() as usize).min(1024 * 1024));
+    file.take(max_bytes + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("Failed to read {:?}: {}", path, e))?;
+    if buf.len() as u64 > max_bytes {
+        return Err(format!(
+            "Security violation: {:?} grew beyond maximum size during read",
+            path
+        ));
+    }
+    Ok(buf)
 }
 
 /// Atomically writes a secure file with mode 0600:
@@ -577,7 +638,7 @@ pub fn generate_new_oma_id() -> String {
 
 fn get_active_mode() -> String {
     let mode_file = get_state_dir().join("mode.txt");
-    if let Ok(m) = fs::read_to_string(&mode_file) {
+    if let Ok(m) = read_secure_file(&mode_file) {
         let trimmed = m.trim().to_uppercase();
         if trimmed == "WAN" {
             return "WAN".to_string();
@@ -820,11 +881,16 @@ pub fn update_oma_id_qr() -> (String, String) {
     // Generate SVG via qrencode
     let svg_ok = run_cmd_bounded(
         "/usr/bin/qrencode",
-        &["-o", &svg_path, "-t", "SVG", &qr_content],
+        &["-o", &svg_path, "-t", "SVG", "--", &qr_content],
         &[],
         deadline,
         1024,
     ).is_some();
+
+    if svg_file.exists() {
+        #[cfg(unix)]
+        let _ = fs::set_permissions(&svg_file, fs::Permissions::from_mode(0o600));
+    }
 
     // Fallback internal SVG generator if qrencode fails or is absent
     if !svg_ok || !svg_file.exists() {
@@ -841,11 +907,16 @@ pub fn update_oma_id_qr() -> (String, String) {
     let deadline_png = Instant::now() + Duration::from_secs(2);
     let _ = run_cmd_bounded(
         "/usr/bin/qrencode",
-        &["-o", &png_path, "-t", "PNG", "-s", "8", "-m", "2", &qr_content],
+        &["-o", &png_path, "-t", "PNG", "-s", "8", "-m", "2", "--", &qr_content],
         &[],
         deadline_png,
         1024,
     );
+
+    if png_file.exists() {
+        #[cfg(unix)]
+        let _ = fs::set_permissions(&png_file, fs::Permissions::from_mode(0o600));
+    }
 
     let _ = write_secure_file(&last_content_file, &qr_content);
     (svg_path, png_path)
@@ -878,11 +949,15 @@ fn update_all_qr() {
         let deadline = Instant::now() + Duration::from_secs(2);
         let _ = run_cmd_bounded(
             "/usr/bin/qrencode",
-            &["-o", &qr_path, "-t", "SVG", &full_url],
+            &["-o", &qr_path, "-t", "SVG", "--", &full_url],
             &[],
             deadline,
             1024,
         );
+        if qr_file.exists() {
+            #[cfg(unix)]
+            let _ = fs::set_permissions(&qr_file, fs::Permissions::from_mode(0o600));
+        }
         let _ = write_secure_file(&last_qr_file, &full_url);
     }
 
@@ -1484,7 +1559,96 @@ pub fn get_clipboard_vault_items() -> Vec<ClipboardItem> {
 }
 
 
+pub fn is_sound_enabled() -> bool {
+    let f = get_state_dir().join("sound_enabled.txt");
+    if let Ok(content) = read_secure_file(&f) {
+        let trimmed = content.trim().to_lowercase();
+        return trimmed != "false" && trimmed != "0" && trimmed != "off";
+    }
+    true
+}
+
+pub fn set_sound_enabled(enabled: bool) {
+    let f = get_state_dir().join("sound_enabled.txt");
+    let _ = write_secure_file(&f, if enabled { "true" } else { "false" });
+}
+
+pub fn check_firewall_status() -> String {
+    let deadline = Instant::now() + Duration::from_millis(250);
+    if Path::new("/usr/bin/ufw").exists() {
+        if let Some(out) = run_cmd_bounded("/usr/bin/ufw", &["status"], &[], deadline, 4096) {
+            let s = String::from_utf8_lossy(&out);
+            if s.contains("Status: active") {
+                if s.contains("53317") {
+                    return "UFW_ALLOWED_53317".to_string();
+                } else {
+                    return "UFW_ACTIVE_CHECK_53317 (sudo ufw allow 53317/tcp && sudo ufw allow 53317/udp)".to_string();
+                }
+            }
+        }
+    }
+    "OK".to_string()
+}
+
+pub fn request_transfer_cancel() {
+    let flag = get_state_dir().join("cancel_transfer.flag");
+    let _ = write_secure_file(&flag, "1");
+    clear_pending_transfer();
+    clear_transfer_progress();
+}
+
+pub fn clear_transfer_cancel() {
+    let flag = get_state_dir().join("cancel_transfer.flag");
+    let _ = fs::remove_file(flag);
+}
+
+pub fn is_transfer_cancelled() -> bool {
+    get_state_dir().join("cancel_transfer.flag").exists()
+}
+
+pub fn save_transfer_progress(direction: &str, filename: &str, bytes: u64, total: u64) {
+    let pct = if total > 0 {
+        ((bytes.saturating_mul(100)) / total).min(100)
+    } else {
+        100
+    };
+    let val = serde_json::json!({
+        "active": true,
+        "direction": direction,
+        "filename": filename,
+        "file_name": filename,
+        "bytes_transferred": bytes,
+        "total_bytes": total,
+        "percent": pct,
+        "updated_at": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    });
+    let path = get_state_dir().join("transfer_progress.json");
+    let _ = write_secure_file(&path, &val.to_string());
+}
+
+pub fn clear_transfer_progress() {
+    let path = get_state_dir().join("transfer_progress.json");
+    let _ = fs::remove_file(path);
+}
+
+pub fn get_transfer_progress() -> Option<serde_json::Value> {
+    let path = get_state_dir().join("transfer_progress.json");
+    if let Ok(content) = read_secure_file(&path) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            let updated = val["updated_at"].as_u64().unwrap_or(0);
+            if now.saturating_sub(updated) <= 15 {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
 fn play_clipboard_sound() {
+    if !is_sound_enabled() {
+        return;
+    }
     thread::spawn(|| {
         let env_store = get_desktop_gui_envs();
         let envs: Vec<(&str, &str)> = env_store.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -1497,6 +1661,60 @@ fn play_clipboard_sound() {
         for (bin, args) in sound_candidates {
             if Path::new(bin).exists() && run_cmd_bounded(bin, args, &envs, deadline, 1024).is_some() {
                 break;
+            }
+        }
+    });
+}
+
+fn resolve_omasend_asset_wav(filename: &str) -> Option<PathBuf> {
+    let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let mut candidates = vec![
+        PathBuf::from(&home).join(".config/omarchy/plugins/ozdil.omasend/assets").join(filename),
+        PathBuf::from(&home).join(".local/share/omarchy/plugins/ozdil.omasend/assets").join(filename),
+        PathBuf::from("/usr/share/omarchy/plugins/ozdil.omasend/assets").join(filename),
+        PathBuf::from(&home).join("Projects/omarchy/omarchy-omasend/assets").join(filename),
+    ];
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.insert(0, dir.join("assets").join(filename));
+        }
+    }
+    candidates.into_iter().find(|p| p.exists())
+}
+
+fn play_samurai_send_sound() {
+    if !is_sound_enabled() {
+        return;
+    }
+    thread::spawn(|| {
+        if let Some(wav) = resolve_omasend_asset_wav("send_whoosh.wav").or_else(|| resolve_omasend_asset_wav("send.wav")) {
+            let wav_str = wav.to_string_lossy().to_string();
+            let env_store = get_desktop_gui_envs();
+            let envs: Vec<(&str, &str)> = env_store.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let deadline = Instant::now() + Duration::from_millis(5000);
+            for bin in ["/usr/bin/pw-play", "/usr/bin/paplay"] {
+                if Path::new(bin).exists() && run_cmd_bounded(bin, &[wav_str.as_str()], &envs, deadline, 1024).is_some() {
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn play_samurai_receive_sound() {
+    if !is_sound_enabled() {
+        return;
+    }
+    thread::spawn(|| {
+        if let Some(wav) = resolve_omasend_asset_wav("receive_whoosh.wav").or_else(|| resolve_omasend_asset_wav("receive.wav")) {
+            let wav_str = wav.to_string_lossy().to_string();
+            let env_store = get_desktop_gui_envs();
+            let envs: Vec<(&str, &str)> = env_store.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let deadline = Instant::now() + Duration::from_millis(5000);
+            for bin in ["/usr/bin/pw-play", "/usr/bin/paplay"] {
+                if Path::new(bin).exists() && run_cmd_bounded(bin, &[wav_str.as_str()], &envs, deadline, 1024).is_some() {
+                    break;
+                }
             }
         }
     });
@@ -1515,6 +1733,13 @@ fn get_active_paired_peer_ips() -> Vec<String> {
             if !static_ip.is_empty() && !ips.contains(static_ip) {
                 ips.push(static_ip.clone());
             }
+        }
+    }
+
+    // Also include active same-owner devices (Anonymous Numbered OmaID model)
+    for dp in get_discovered_peers() {
+        if dp.is_same_owner && dp.last_seen_secs > 0 && !dp.ip.is_empty() && !ips.contains(&dp.ip) {
+            ips.push(dp.ip);
         }
     }
     ips
@@ -1542,14 +1767,25 @@ fn p2p_push_clipboard_silent(target_ip: &str, text: &str) {
         "auth_token": auth_token
     });
 
-    let target_oma_id = matched_peer.map(|p| p.oma_id.clone()).unwrap_or_default();
+    let target_oma_id = matched_peer
+        .map(|p| p.oma_id.clone())
+        .or_else(|| {
+            get_discovered_peers()
+                .into_iter()
+                .find(|dp| dp.ip == target_ip && !dp.oma_id.is_empty())
+                .map(|dp| dp.oma_id)
+        })
+        .unwrap_or_default();
     let final_payload = if !target_oma_id.is_empty() {
         if let Ok(env) = encrypt_p2p_payload(&my_oma_id, &target_oma_id, inner_json.to_string().as_bytes()) {
             serde_json::json!({
                 "encrypted_envelope": env,
                 "oma_id": my_oma_id,
                 "sender_id": my_oma_id,
+                "device_id": my_id,
                 "sender_name": my_name,
+                "content_type": "text",
+                "text": text,
                 "auth_token": auth_token
             })
         } else {
@@ -1572,7 +1808,7 @@ fn p2p_push_clipboard_silent(target_ip: &str, text: &str) {
             let _ = stream.write_all(http_req.as_bytes());
             let _ = stream.write_all(&req_bytes);
             let mut resp = Vec::new();
-            let _ = stream.read_to_end(&mut resp);
+            let _ = (&mut stream).take(64 * 1024).read_to_end(&mut resp);
         }
     });
 }
@@ -1641,15 +1877,33 @@ pub fn p2p_push_image_clipboard_silent(
         "auth_token": auth_token
     });
 
-    let target_oma_id = matched_peer.map(|p| p.oma_id.clone()).unwrap_or_default();
+    let target_oma_id = matched_peer
+        .map(|p| p.oma_id.clone())
+        .or_else(|| {
+            get_discovered_peers()
+                .into_iter()
+                .find(|dp| dp.ip == target_ip && !dp.oma_id.is_empty())
+                .map(|dp| dp.oma_id)
+        })
+        .unwrap_or_default();
     let final_payload = if !target_oma_id.is_empty() {
         if let Ok(env) = encrypt_p2p_payload(&my_oma_id, &target_oma_id, inner_json.to_string().as_bytes()) {
             serde_json::json!({
                 "encrypted_envelope": env,
                 "oma_id": my_oma_id,
                 "sender_id": my_oma_id,
+                "device_id": my_id,
                 "sender_name": my_name,
+                "sender_alias": my_name,
                 "sender_ip": local_ip,
+                "content_type": "image",
+                "image_hash": hash,
+                "image_size": size,
+                "width": width,
+                "height": height,
+                "image_base64": image_base64,
+                "image_data_base64": image_base64,
+                "thumbnail_base64": thumb_b64,
                 "auth_token": auth_token
             })
         } else {
@@ -1672,7 +1926,7 @@ pub fn p2p_push_image_clipboard_silent(
             let _ = stream.write_all(http_req.as_bytes());
             let _ = stream.write_all(&req_bytes);
             let mut resp = Vec::new();
-            let _ = stream.read_to_end(&mut resp);
+            let _ = (&mut stream).take(64 * 1024).read_to_end(&mut resp);
         }
     });
 }
@@ -1683,16 +1937,23 @@ pub fn p2p_fetch_image_clipboard_and_apply(sender_ip: &str, hash: &str, _content
     }
     let ip = sender_ip.to_string();
     let h = hash.to_string();
+    let my_oma_id = get_or_create_oma_id();
     thread::spawn(move || {
         let addr = resolve_peer_addr(&ip);
         if let Ok(mut stream) = connect_peer_with_timeout(&addr, Duration::from_secs(5)) {
             let http_req = format!(
-                "GET /api/p2p/clipboard/image/{}?hash={} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-                h, h, addr
+                "GET /api/p2p/clipboard/image?hash={} HTTP/1.1\r\nHost: {}\r\nX-OmaSend-OmaID: {}\r\nConnection: close\r\n\r\n",
+                h, addr, my_oma_id
             );
             if stream.write_all(http_req.as_bytes()).is_ok() {
+                let max_resp_bytes = (MAX_IMAGE_CLIP_SIZE + 65536) as u64;
                 let mut resp_bytes = Vec::new();
-                if stream.read_to_end(&mut resp_bytes).is_ok() {
+                if (&mut stream)
+                    .take(max_resp_bytes + 1)
+                    .read_to_end(&mut resp_bytes)
+                    .is_ok()
+                    && (resp_bytes.len() as u64) <= max_resp_bytes
+                {
                     if let Some(pos) = resp_bytes.windows(4).position(|w| w == b"\r\n\r\n") {
                         let header_part = String::from_utf8_lossy(&resp_bytes[..pos]);
                         if header_part.starts_with("HTTP/1.1 200") || header_part.starts_with("HTTP/1.0 200") {
@@ -2150,7 +2411,38 @@ fn add_trusted_peer(id: &str, name: &str, fingerprint: &str) {
     }
 }
 
+struct StateFileGuard<'a> {
+    _mutex_guard: Option<std::sync::MutexGuard<'a, ()>>,
+    _flock_file: Option<fs::File>,
+}
+
+fn lock_state_files() -> StateFileGuard<'static> {
+    use std::os::unix::io::AsRawFd;
+    let mutex_guard = STATE_FILE_LOCK.lock().ok();
+    let state_dir = get_state_dir();
+    let _ = fs::create_dir_all(&state_dir);
+    let lock_path = state_dir.join(".state_files.lock");
+    let flock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&lock_path)
+        .ok();
+    if let Some(ref f) = flock_file {
+        unsafe {
+            let _ = libc::flock(f.as_raw_fd(), libc::LOCK_EX);
+        }
+    }
+    StateFileGuard {
+        _mutex_guard: mutex_guard,
+        _flock_file: flock_file,
+    }
+}
+
 fn get_pending_transfer() -> Option<PendingFileTransfer> {
+    let _guard = lock_state_files();
     let path = get_state_dir().join("pending_transfer.json");
     if let Ok(content) = read_secure_file(&path) {
         if let Ok(t) = serde_json::from_str::<PendingFileTransfer>(&content) {
@@ -2164,6 +2456,7 @@ fn get_pending_transfer() -> Option<PendingFileTransfer> {
 }
 
 fn save_pending_transfer(t: &PendingFileTransfer) {
+    let _guard = lock_state_files();
     let path = get_state_dir().join("pending_transfer.json");
     if let Ok(s) = serde_json::to_string(t) {
         let _ = write_secure_file(&path, &s);
@@ -2171,11 +2464,12 @@ fn save_pending_transfer(t: &PendingFileTransfer) {
 }
 
 fn clear_pending_transfer() {
+    let _guard = lock_state_files();
     let path = get_state_dir().join("pending_transfer.json");
     let _ = fs::remove_file(path);
 }
 
-fn get_discovered_peers() -> Vec<DiscoveredPeer> {
+fn get_discovered_peers_unlocked() -> Vec<DiscoveredPeer> {
     let (vis, _) = get_visibility();
     if vis == "OFF" {
         return Vec::new();
@@ -2190,7 +2484,7 @@ fn get_discovered_peers() -> Vec<DiscoveredPeer> {
     let path = get_state_dir().join("discovered_peers.json");
     if let Ok(content) = read_secure_file(&path) {
         if let Ok(loaded) = serde_json::from_str::<Vec<DiscoveredPeer>>(&content) {
-            // Prune peers older than 15s and filter out self device / self OmaID
+            // Prune peers older than 15s and filter out ONLY the exact same physical device (my_id)
             peers = loaded
                 .into_iter()
                 .filter(|p| {
@@ -2200,9 +2494,6 @@ fn get_discovered_peers() -> Vec<DiscoveredPeer> {
                     if p.id == my_id {
                         return false;
                     }
-                    if !p.oma_id.is_empty() && rendezvous::normalize_oma_id(&p.oma_id) == my_norm {
-                        return false;
-                    }
                     true
                 })
                 .collect();
@@ -2210,44 +2501,20 @@ fn get_discovered_peers() -> Vec<DiscoveredPeer> {
     }
 
     for p in &mut peers {
-        p.is_trusted = is_peer_paired(&p.oma_id) || is_peer_trusted(&p.id);
+        let peer_norm = rendezvous::normalize_oma_id(&p.oma_id);
+        let same_owner = !peer_norm.is_empty() && peer_norm == my_norm;
+        p.is_same_owner = same_owner;
+        p.is_trusted = same_owner || is_peer_paired(&p.oma_id) || is_peer_trusted(&p.id);
         p.transport = "LAN".to_string();
     }
 
-    if vis == "KNOWN" {
-        peers.retain(|p| p.is_trusted || is_local_subnet_or_private_ip(&p.ip));
-    }
+    peers.retain(|p| rendezvous::validate_oma_id(&p.oma_id));
 
-    // Include paired OmaID peers that are currently offline so they remain visible in Paired Devices
-    let paired = load_paired_peers();
-    for p in paired {
-        let p_norm = rendezvous::normalize_oma_id(&p.oma_id);
-        if p_norm.is_empty() || p_norm == my_norm {
-            continue;
-        }
-        let exists = peers.iter().any(|dp| {
-            (!dp.oma_id.is_empty() && rendezvous::normalize_oma_id(&dp.oma_id) == p_norm)
-                || dp.id == p.oma_id
-        });
-        if !exists {
-            peers.push(DiscoveredPeer {
-                id: format!("paired_{}", p_norm),
-                oma_id: p.oma_id.clone(),
-                name: p.name.clone(),
-                ip: p.ip.clone().unwrap_or_default(),
-                port: 53317,
-                transport: "OMAID".to_string(),
-                fingerprint: p.oma_id.clone(),
-                is_trusted: true,
-                last_seen_secs: 0, // Standby / Offline indicator
-            });
-        }
-    }
-
-    // Sort: Online trusted first, then standby trusted, then alphabetical
+    // Sort: Same-owner first, then online trusted, then alphabetical
     peers.sort_by(|a, b| {
-        b.is_trusted
-            .cmp(&a.is_trusted)
+        b.is_same_owner
+            .cmp(&a.is_same_owner)
+            .then_with(|| b.is_trusted.cmp(&a.is_trusted))
             .then_with(|| (b.last_seen_secs > 0).cmp(&(a.last_seen_secs > 0)))
             .then_with(|| a.name.cmp(&b.name))
     });
@@ -2255,54 +2522,40 @@ fn get_discovered_peers() -> Vec<DiscoveredPeer> {
     peers
 }
 
-fn save_discovered_peers(peers: &[DiscoveredPeer]) {
+fn save_discovered_peers_unlocked(peers: &[DiscoveredPeer]) {
     let path = get_state_dir().join("discovered_peers.json");
     if let Ok(s) = serde_json::to_string(peers) {
         let _ = write_secure_file(&path, &s);
     }
 }
 
-fn is_local_subnet_or_private_ip(ip: &str) -> bool {
-    if ip.starts_with("192.168.") || ip.starts_with("10.") || ip == "127.0.0.1" || ip == "::1" || ip.starts_with("169.254.") {
-        return true;
-    }
-    // Carrier-Grade NAT & Tailscale: 100.64.0.0/10 (100.64.0.0 - 100.127.255.255)
-    if ip.starts_with("100.") {
-        if let Some(second) = ip.split('.').nth(1) {
-            if let Ok(num) = second.parse::<u8>() {
-                if (64..=127).contains(&num) {
-                    return true;
-                }
-            }
-        }
-    }
-    if ip.starts_with("172.") {
-        if let Some(second) = ip.split('.').nth(1) {
-            if let Ok(num) = second.parse::<u8>() {
-                if (16..=31).contains(&num) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+fn get_discovered_peers() -> Vec<DiscoveredPeer> {
+    let _guard = lock_state_files();
+    get_discovered_peers_unlocked()
+}
+
+fn save_discovered_peers(peers: &[DiscoveredPeer]) {
+    let _guard = lock_state_files();
+    save_discovered_peers_unlocked(peers);
 }
 
 fn update_discovered_peer(packet: &P2pBeaconPacket) {
+    let _guard = lock_state_files();
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let (my_id, _) = get_or_create_device_id();
     let my_oma_id = get_or_create_oma_id();
-    if packet.id == my_id || (!packet.oma_id.is_empty() && rendezvous::normalize_oma_id(&packet.oma_id) == rendezvous::normalize_oma_id(&my_oma_id)) {
+    // Only ignore if the packet comes from the exact same physical device
+    if packet.id == my_id {
         return;
     }
 
     // Instant offline handling when remote peer turns discovery OFF
     if packet.mode == "OFF" || packet.mode == "STOP" {
-        let mut peers = get_discovered_peers();
+        let mut peers = get_discovered_peers_unlocked();
         let initial_len = peers.len();
-        peers.retain(|p| p.id != packet.id && p.ip != packet.ip && (p.oma_id.is_empty() || p.oma_id != packet.oma_id));
+        peers.retain(|p| p.id != packet.id && p.ip != packet.ip);
         if peers.len() != initial_len {
-            save_discovered_peers(&peers);
+            save_discovered_peers_unlocked(&peers);
         }
         return;
     }
@@ -2311,23 +2564,28 @@ fn update_discovered_peer(packet: &P2pBeaconPacket) {
     if vis == "OFF" {
         return;
     }
-    let is_local_net = is_local_subnet_or_private_ip(&packet.ip);
-    let is_paired = !packet.oma_id.is_empty() && is_peer_paired(&packet.oma_id);
-    if vis == "KNOWN" && !is_paired && !is_local_net && packet.mode != "EVERYONE" {
+
+    let my_norm = rendezvous::normalize_oma_id(&my_oma_id);
+    let packet_norm = rendezvous::normalize_oma_id(&packet.oma_id);
+    if !rendezvous::validate_oma_id(&packet_norm) {
         return;
     }
+    let is_same_owner = packet_norm == my_norm;
+    let is_paired = is_peer_paired(&packet.oma_id);
 
-    // Verify if beacon IP matches the established authenticated paired peer IP
-    let is_authenticated_paired = if is_paired {
+    // Verify if beacon IP matches the established authenticated paired peer IP, or if it belongs to same owner
+    let is_authenticated_paired = if is_same_owner {
+        true
+    } else if is_paired {
         let paired = load_paired_peers();
-        let norm = rendezvous::normalize_oma_id(&packet.oma_id);
-        paired.iter().any(|p| p.is_active() && rendezvous::normalize_oma_id(&p.oma_id) == norm && p.ip.as_deref() == Some(&packet.ip))
+        paired.iter().any(|p| p.is_active() && rendezvous::normalize_oma_id(&p.oma_id) == packet_norm && p.ip.as_deref() == Some(&packet.ip))
     } else {
         false
     };
 
-    let mut peers = get_discovered_peers();
-    if let Some(existing) = peers.iter_mut().find(|p| (!packet.oma_id.is_empty() && p.oma_id == packet.oma_id) || p.id == packet.id) {
+    let mut peers = get_discovered_peers_unlocked();
+    if let Some(existing) = peers.iter_mut().find(|p| p.id == packet.id) {
+        existing.id = packet.id.clone();
         existing.oma_id = packet.oma_id.clone();
         existing.name = packet.name.clone();
         existing.ip = packet.ip.clone();
@@ -2335,6 +2593,7 @@ fn update_discovered_peer(packet: &P2pBeaconPacket) {
         existing.transport = "LAN".to_string();
         existing.fingerprint = packet.fp.clone();
         existing.is_trusted = is_authenticated_paired;
+        existing.is_same_owner = is_same_owner;
         existing.last_seen_secs = now;
     } else {
         peers.push(DiscoveredPeer {
@@ -2346,10 +2605,11 @@ fn update_discovered_peer(packet: &P2pBeaconPacket) {
             transport: "LAN".to_string(),
             fingerprint: packet.fp.clone(),
             is_trusted: is_authenticated_paired,
+            is_same_owner,
             last_seen_secs: now,
         });
     }
-    save_discovered_peers(&peers);
+    save_discovered_peers_unlocked(&peers);
 }
 
 pub fn get_all_broadcast_addresses() -> Vec<Ipv4Addr> {
@@ -2461,6 +2721,7 @@ pub fn send_p2p_beacon_burst(burst_count: usize) {
 }
 
 pub fn prune_expired_discovered_peers() -> usize {
+    let _guard = lock_state_files();
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let path = get_state_dir().join("discovered_peers.json");
     if let Ok(content) = read_secure_file(&path) {
@@ -2468,7 +2729,7 @@ pub fn prune_expired_discovered_peers() -> usize {
             let initial_len = peers.len();
             let remaining: Vec<DiscoveredPeer> = peers.into_iter().filter(|p| now.saturating_sub(p.last_seen_secs) <= 15).collect();
             if remaining.len() != initial_len {
-                save_discovered_peers(&remaining);
+                save_discovered_peers_unlocked(&remaining);
                 return initial_len - remaining.len();
             }
         }
@@ -2538,13 +2799,86 @@ fn connect_peer_with_timeout(addr_str: &str, timeout: Duration) -> Result<TcpStr
     ))
 }
 
-fn resolve_peer_addr(target_ip: &str) -> String {
+/// Resolves a target string (either an IP address or a 16-digit Luhn OmaID) into `(ip, port, optional_oma_id)`.
+pub fn resolve_target_ip_or_omaid(target_ip_or_omaid: &str) -> Result<(String, u16, Option<String>), String> {
+    let trimmed = target_ip_or_omaid.trim();
+    if trimmed.is_empty() {
+        return Err("Empty target specified".to_string());
+    }
+
+    let norm = rendezvous::normalize_oma_id(trimmed);
+    let is_oma_id = norm.len() == 16 && rendezvous::validate_oma_id(&norm);
+
+    if is_oma_id {
+        let formatted_id = rendezvous::format_oma_id(&norm);
+        // 1. Check active discovered peers
+        for peer in get_discovered_peers() {
+            if rendezvous::normalize_oma_id(&peer.oma_id) == norm && !peer.ip.is_empty() {
+                return Ok((peer.ip, peer.port, Some(formatted_id)));
+            }
+        }
+        // 2. Check paired peers
+        for peer in load_paired_peers() {
+            if rendezvous::normalize_oma_id(&peer.oma_id) == norm {
+                if let Some(ip) = peer.ip {
+                    if !ip.is_empty() {
+                        return Ok((ip, PORT, Some(formatted_id)));
+                    }
+                }
+            }
+        }
+        // 3. Check local blinded rendezvous anchor
+        if let Some(rec) = query_local_rendezvous_anchor(&norm, &get_state_dir()) {
+            if !rec.local_ip.is_empty() {
+                let port = if rec.local_port > 0 { rec.local_port } else { PORT };
+                return Ok((rec.local_ip, port, Some(formatted_id)));
+            }
+        }
+        return Err(format!("Could not resolve IP address for OmaID {}", formatted_id));
+    }
+
+    // Target is an IP or host(:port)
+    if let Some((host, port_str)) = trimmed.rsplit_once(':') {
+        if !host.contains(':') {
+            if let Ok(p) = port_str.parse::<u16>() {
+                let known_oma = get_discovered_peers()
+                    .into_iter()
+                    .find(|dp| dp.ip == host && !dp.oma_id.is_empty())
+                    .map(|dp| dp.oma_id)
+                    .or_else(|| {
+                        load_paired_peers()
+                            .into_iter()
+                            .find(|pp| pp.ip.as_deref() == Some(host))
+                            .map(|pp| pp.oma_id)
+                    });
+                return Ok((host.to_string(), p, known_oma));
+            }
+        }
+    }
+
     for peer in get_discovered_peers() {
-        if peer.ip == target_ip {
+        if peer.ip == trimmed {
+            let oma_opt = if !peer.oma_id.is_empty() { Some(peer.oma_id) } else { None };
+            return Ok((peer.ip, peer.port, oma_opt));
+        }
+    }
+    let known_oma = load_paired_peers()
+        .into_iter()
+        .find(|pp| pp.ip.as_deref() == Some(trimmed))
+        .map(|pp| pp.oma_id);
+    Ok((trimmed.to_string(), PORT, known_oma))
+}
+
+fn resolve_peer_addr(target_ip_or_omaid: &str) -> String {
+    if let Ok((ip, port, _)) = resolve_target_ip_or_omaid(target_ip_or_omaid) {
+        return format!("{}:{}", ip, port);
+    }
+    for peer in get_discovered_peers() {
+        if peer.ip == target_ip_or_omaid {
             return format!("{}:{}", peer.ip, peer.port);
         }
     }
-    format!("{}:{}", target_ip, PORT)
+    format!("{}:{}", target_ip_or_omaid, PORT)
 }
 
 const MAX_PAIR_RESPONSE_BYTES: u64 = 64 * 1024;
@@ -2621,14 +2955,33 @@ fn p2p_complete_pairing(peer_ip_str: &str, expected_oma_id: &str, code: &str, na
     rendezvous::store_completed_pairing(&expected_norm, name, peer_ip, token, &get_state_dir(), now)
 }
 
-fn p2p_send_file_to_peer(target_ip: &str, file_path: &Path) -> Result<(), String> {
-    p2p_send_files_to_peer(target_ip, &[file_path.to_path_buf()])
+fn p2p_send_file_to_peer(target_ip_or_omaid: &str, file_path: &Path) -> Result<(), String> {
+    p2p_send_files_to_peer(target_ip_or_omaid, &[file_path.to_path_buf()])
 }
 
-fn p2p_send_files_to_peer(target_ip: &str, file_paths: &[PathBuf]) -> Result<(), String> {
+fn p2p_send_files_to_peer(target_ip_or_omaid: &str, file_paths: &[PathBuf]) -> Result<(), String> {
     if file_paths.is_empty() {
         return Err("No files specified for transfer".to_string());
     }
+
+    clear_transfer_cancel();
+    struct ProgressAndTarCleanup {
+        temp_files: Vec<PathBuf>,
+    }
+    impl Drop for ProgressAndTarCleanup {
+        fn drop(&mut self) {
+            clear_transfer_progress();
+            for p in &self.temp_files {
+                let _ = fs::remove_file(p);
+            }
+        }
+    }
+    let mut cleanup_guard = ProgressAndTarCleanup {
+        temp_files: Vec::new(),
+    };
+
+    let (resolved_ip, resolved_port, resolved_oma_id) = resolve_target_ip_or_omaid(target_ip_or_omaid)?;
+    let target_ip = resolved_ip.as_str();
 
     struct PreparedFile {
         path: PathBuf,
@@ -2644,9 +2997,47 @@ fn p2p_send_files_to_peer(target_ip: &str, file_paths: &[PathBuf]) -> Result<(),
     let mut total_size_bytes = 0u64;
 
     for fp in file_paths {
-        let size_bytes = safe_verify_file(fp).map_err(|e| format!("Security check failed for {:?}: {}", fp, e))?;
-        let file_name = fp.file_name().unwrap_or_default().to_string_lossy().to_string();
-        let (blake3_hex, sha256_hex, md5_hex) = compute_file_military_hashes(fp)
+        let meta = fs::symlink_metadata(fp).map_err(|e| format!("Failed to stat {:?}: {}", fp, e))?;
+        if meta.file_type().is_symlink() {
+            return Err(format!("Security violation: {:?} is a symlink", fp));
+        }
+        let current_uid = get_current_uid();
+        if meta.uid() != current_uid {
+            return Err(format!("Security violation: {:?} is not owned by current user", fp));
+        }
+
+        let effective_path = if meta.file_type().is_dir() {
+            let dir_name = fp
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|s| !s.is_empty() && !s.starts_with('.'))
+                .ok_or_else(|| format!("Invalid directory name: {:?}", fp))?;
+            let parent_dir = fp.parent().unwrap_or_else(|| Path::new("."));
+            let parent_str = parent_dir.to_str().ok_or_else(|| "Invalid parent path UTF-8".to_string())?;
+            let safe_base = sanitize_filename(dir_name);
+            let tar_path = get_state_dir().join(format!("{}.tar", safe_base));
+            let _ = fs::remove_file(&tar_path);
+            let tar_str = tar_path.to_str().ok_or_else(|| "Invalid tar path UTF-8".to_string())?;
+            let deadline = Instant::now() + Duration::from_secs(120);
+            let _ = run_cmd_bounded(
+                "/usr/bin/tar",
+                &["--no-acls", "--no-xattrs", "-cf", tar_str, "-C", parent_str, "--", dir_name],
+                &[],
+                deadline,
+                4096,
+            )
+            .ok_or_else(|| format!("Failed to archive directory {:?}", fp))?;
+            let _ = fs::set_permissions(&tar_path, fs::Permissions::from_mode(0o600));
+            cleanup_guard.temp_files.push(tar_path.clone());
+            tar_path
+        } else {
+            fp.clone()
+        };
+
+        let size_bytes = safe_verify_file(&effective_path)
+            .map_err(|e| format!("Security check failed for {:?}: {}", effective_path, e))?;
+        let file_name = effective_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let (blake3_hex, sha256_hex, md5_hex) = compute_file_military_hashes(&effective_path)
             .map_err(|e| format!("Failed to compute file hashes: {}", e))?;
         total_size_bytes = total_size_bytes.saturating_add(size_bytes);
         files_json.push(serde_json::json!({
@@ -2658,7 +3049,7 @@ fn p2p_send_files_to_peer(target_ip: &str, file_paths: &[PathBuf]) -> Result<(),
             "md5": md5_hex
         }));
         prepared.push(PreparedFile {
-            path: fp.clone(),
+            path: effective_path,
             name: file_name,
             size_bytes,
             blake3_hex,
@@ -2672,7 +3063,10 @@ fn p2p_send_files_to_peer(target_ip: &str, file_paths: &[PathBuf]) -> Result<(),
     let my_name = get_system_hostname();
 
     let paired = load_paired_peers();
-    let matched_peer = paired.iter().find(|p| p.is_active() && p.ip.as_deref() == Some(target_ip));
+    let matched_peer = paired.iter().find(|p| {
+        (p.is_active() && p.ip.as_deref() == Some(target_ip))
+            || resolved_oma_id.as_deref().map(|ro| rendezvous::normalize_oma_id(&p.oma_id) == rendezvous::normalize_oma_id(ro)).unwrap_or(false)
+    });
     let auth_token = matched_peer.and_then(|p| p.auth_token.clone()).unwrap_or_default();
 
     // 1. Send transfer request
@@ -2688,17 +3082,22 @@ fn p2p_send_files_to_peer(target_ip: &str, file_paths: &[PathBuf]) -> Result<(),
         "total_size_bytes": total_size_bytes
     });
 
-    let target_oma_id = matched_peer.map(|p| p.oma_id.clone()).unwrap_or_default();
+    let target_oma_id = resolved_oma_id
+        .or_else(|| matched_peer.map(|p| p.oma_id.clone()))
+        .unwrap_or_default();
     let final_payload = if !target_oma_id.is_empty() {
         if let Ok(env) = encrypt_p2p_payload(&my_oma_id, &target_oma_id, request_payload.to_string().as_bytes()) {
             serde_json::json!({
                 "encrypted_envelope": env,
                 "oma_id": my_oma_id,
                 "sender_id": my_oma_id,
+                "device_id": my_id,
                 "sender_name": my_name,
                 "sender_alias": my_name,
                 "sender_ip": get_local_ip(),
-                "auth_token": auth_token
+                "auth_token": auth_token,
+                "files": files_json,
+                "total_size_bytes": total_size_bytes
             })
         } else {
             request_payload
@@ -2707,7 +3106,7 @@ fn p2p_send_files_to_peer(target_ip: &str, file_paths: &[PathBuf]) -> Result<(),
         request_payload
     };
 
-    let addr = resolve_peer_addr(target_ip);
+    let addr = format!("{}:{}", target_ip, resolved_port);
     let mut stream = match connect_peer_with_timeout(&addr, Duration::from_secs(4)) {
         Ok(s) => s,
         Err(e) => {
@@ -2727,7 +3126,7 @@ fn p2p_send_files_to_peer(target_ip: &str, file_paths: &[PathBuf]) -> Result<(),
     stream.write_all(&req_bytes).map_err(|e| e.to_string())?;
 
     let mut response = String::new();
-    stream.read_to_string(&mut response).map_err(|e| e.to_string())?;
+    (&mut stream).take(64 * 1024).read_to_string(&mut response).map_err(|e| e.to_string())?;
 
     let body_str = if let Some(idx) = response.find("\r\n\r\n") {
         &response[idx + 4..]
@@ -2751,6 +3150,10 @@ fn p2p_send_files_to_peer(target_ip: &str, file_paths: &[PathBuf]) -> Result<(),
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
 
         while std::time::Instant::now() < deadline {
+            if is_transfer_cancelled() {
+                clear_transfer_cancel();
+                return Err("Transfer cancelled by user.".to_string());
+            }
             thread::sleep(Duration::from_millis(600));
             let mut poll_stream = match connect_peer_with_timeout(&addr, Duration::from_secs(4)) {
                 Ok(s) => s,
@@ -2762,7 +3165,7 @@ fn p2p_send_files_to_peer(target_ip: &str, file_paths: &[PathBuf]) -> Result<(),
             );
             let _ = poll_stream.write_all(poll_req.as_bytes());
             let mut poll_resp = String::new();
-            let _ = poll_stream.read_to_string(&mut poll_resp);
+            let _ = (&mut poll_stream).take(64 * 1024).read_to_string(&mut poll_resp);
             if let Some(idx) = poll_resp.find("\r\n\r\n") {
                 let poll_body = &poll_resp[idx + 4..];
                 if let Ok(p_val) = serde_json::from_str::<serde_json::Value>(poll_body) {
@@ -2789,7 +3192,13 @@ fn p2p_send_files_to_peer(target_ip: &str, file_paths: &[PathBuf]) -> Result<(),
     }
 
     // 3. Upload each file in the batch via 128 KiB streaming chunks
+    let mut cumulative_sent = 0u64;
     for pf in &prepared {
+        if is_transfer_cancelled() {
+            clear_transfer_cancel();
+            return Err("Transfer cancelled by user.".to_string());
+        }
+        save_transfer_progress("send", &pf.name, cumulative_sent, total_size_bytes);
         println!("Peer accepted! Streaming file '{}' ({} bytes, sha256: {})...", pf.name, pf.size_bytes, pf.sha256_hex);
         let mut upload_stream = connect_peer_with_timeout(&addr, Duration::from_secs(6))
             .map_err(|e| format!("Failed to connect to peer for upload: {}", e))?;
@@ -2802,17 +3211,28 @@ fn p2p_send_files_to_peer(target_ip: &str, file_paths: &[PathBuf]) -> Result<(),
 
         let mut file = fs::File::open(&pf.path).map_err(|e| format!("Failed to open file for upload: {}", e))?;
         let mut chunk_buf = [0u8; 131072]; // 128 KiB chunk aligned with IEEE 802.11 A-MPDU
+        let mut last_progress_tick = Instant::now();
         loop {
+            if is_transfer_cancelled() {
+                clear_transfer_cancel();
+                return Err("Transfer cancelled by user.".to_string());
+            }
             let n = file.read(&mut chunk_buf).map_err(|e| format!("Failed to read file chunk: {}", e))?;
             if n == 0 {
                 break;
             }
             upload_stream.write_all(&chunk_buf[..n]).map_err(|e| format!("Failed to send chunk to peer: {}", e))?;
+            cumulative_sent = cumulative_sent.saturating_add(n as u64);
+            if last_progress_tick.elapsed() >= Duration::from_millis(250) {
+                save_transfer_progress("send", &pf.name, cumulative_sent, total_size_bytes);
+                last_progress_tick = Instant::now();
+            }
         }
+        save_transfer_progress("send", &pf.name, cumulative_sent, total_size_bytes);
         upload_stream.flush().map_err(|e| format!("Failed to flush upload stream: {}", e))?;
 
         let mut final_resp = String::new();
-        let _ = upload_stream.read_to_string(&mut final_resp);
+        let _ = (&mut upload_stream).take(64 * 1024).read_to_string(&mut final_resp);
     }
 
     println!("Transfer successfully completed to {}!", target_ip);
@@ -2824,7 +3244,10 @@ fn p2p_send_files_to_peer(target_ip: &str, file_paths: &[PathBuf]) -> Result<(),
     Ok(())
 }
 
-fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
+fn p2p_sync_clipboard_to_peer(target_ip_or_omaid: &str) -> Result<(), String> {
+    let (resolved_ip, resolved_port, resolved_oma_id) = resolve_target_ip_or_omaid(target_ip_or_omaid)?;
+    let target_ip = resolved_ip.as_str();
+
     if let Some((img_bytes, ct, w, h)) = get_pc_image_clipboard() {
         let hash = compute_image_clipboard_hash(&img_bytes);
         let _ = stage_clipboard_image(&img_bytes, &ct);
@@ -2853,7 +3276,10 @@ fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
     let my_name = get_system_hostname();
 
     let paired = load_paired_peers();
-    let matched_peer = paired.iter().find(|p| p.is_active() && p.ip.as_deref() == Some(target_ip));
+    let matched_peer = paired.iter().find(|p| {
+        (p.is_active() && p.ip.as_deref() == Some(target_ip))
+            || resolved_oma_id.as_deref().map(|ro| rendezvous::normalize_oma_id(&p.oma_id) == rendezvous::normalize_oma_id(ro)).unwrap_or(false)
+    });
     let auth_token = matched_peer.and_then(|p| p.auth_token.clone()).unwrap_or_default();
 
     let payload = serde_json::json!({
@@ -2865,7 +3291,7 @@ fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
         "text": text,
         "auth_token": auth_token
     });
-    let addr = resolve_peer_addr(target_ip);
+    let addr = format!("{}:{}", target_ip, resolved_port);
     let mut stream = match connect_peer_with_timeout(&addr, Duration::from_secs(4)) {
         Ok(s) => s,
         Err(e) => {
@@ -2884,7 +3310,7 @@ fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
     stream.write_all(http_req.as_bytes()).map_err(|e| e.to_string())?;
     stream.write_all(&req_bytes).map_err(|e| e.to_string())?;
     let mut resp = String::new();
-    let _ = stream.read_to_string(&mut resp);
+    let _ = (&mut stream).take(64 * 1024).read_to_string(&mut resp);
     println!("Clipboard successfully synced to {}", target_ip);
     notify_desktop("OmaSend AirBridge", &format!("Clipboard successfully synced to {}.", target_ip));
     Ok(())
@@ -2893,16 +3319,17 @@ fn p2p_sync_clipboard_to_peer(target_ip: &str) -> Result<(), String> {
 // ------------------- HTTP ENGINE -------------------
 
 pub const MAX_HEADER_SIZE: usize = 65536; // 64 KiB header limit
-pub const MAX_BODY_SIZE: usize = 100 * 1024 * 1024; // 100 MiB strict plain upload ceiling
+pub const MAX_BODY_SIZE: usize = 100 * 1024 * 1024; // 100 MiB strict plain web upload ceiling
+pub const MAX_P2P_UPLOAD_SIZE: usize = 10 * 1024 * 1024 * 1024; // 10 GiB P2P streaming upload ceiling
 pub const MAX_ENCRYPTED_UPLOAD_SIZE: usize = 25 * 1024 * 1024; // 25 MiB encrypted upload ceiling
 pub const MAX_CLIPBOARD_BODY: usize = 10 * 1024 * 1024; // 10 MiB clipboard limit
 pub const MAX_CONTROL_BODY: usize = 65536; // 64 KiB JSON metadata limit
 pub const IN_MEMORY_BODY_LIMIT: usize = 1024 * 1024; // 1 MiB in-memory cap
-pub const MAX_AGGREGATE_STAGING_BYTES: u64 = 200 * 1024 * 1024; // 200 MiB aggregate disk staging cap
+pub const MAX_AGGREGATE_STAGING_BYTES: u64 = 20 * 1024 * 1024 * 1024; // 20 GiB aggregate disk staging cap
 pub const MAX_CONCURRENT_ENCRYPTED_UPLOADS: u32 = 2; // Max 2 concurrent encrypted uploads
 pub const HEADER_READ_TIMEOUT_SECS: u64 = 15; // 15s max header timeout
 pub const DEFAULT_BODY_TIMEOUT_SECS: u64 = 30; // 30s body timeout for small requests
-pub const MAX_UPLOAD_DURATION_SECS: u64 = 120; // 120s max duration for 100 MiB uploads
+pub const MAX_UPLOAD_DURATION_SECS: u64 = 3600; // 1 hour max duration for large P2P uploads
 
 // Atomic aggregate staging capacity accounting to eliminate disk space check races
 static CURRENT_STAGED_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -2918,10 +3345,10 @@ impl StagingReservationGuard {
         let _lock = STAGING_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let current = CURRENT_STAGED_BYTES.load(Ordering::SeqCst);
         if current.saturating_add(needed_bytes) > MAX_AGGREGATE_STAGING_BYTES {
-            return Err("Aggregate staging capacity exceeded (200 MiB limit)");
+            return Err("Aggregate staging capacity exceeded");
         }
         if let Some(avail) = get_available_disk_space(ddir) {
-            let required_space = current.saturating_add(needed_bytes).saturating_add(25 * 1024 * 1024);
+            let required_space = needed_bytes.saturating_add(25 * 1024 * 1024);
             if required_space > avail {
                 return Err("Insufficient disk space for staging reservation");
             }
@@ -3249,7 +3676,7 @@ pub fn read_http_headers<S: TimeoutStream>(
                     let v = line[col + 1..].trim();
                     if k == "content-length" {
                         content_length = v.parse::<usize>().unwrap_or(0);
-                        if content_length > MAX_BODY_SIZE {
+                        if content_length > MAX_P2P_UPLOAD_SIZE {
                             return None; // Immediate ceiling rejection
                         }
                     }
@@ -3281,7 +3708,7 @@ pub fn read_http_headers<S: TimeoutStream>(
                                 let v = line[col + 1..].trim();
                                 if k == "content-length" {
                                     content_length = v.parse::<usize>().unwrap_or(0);
-                                    if content_length > MAX_BODY_SIZE {
+                                    if content_length > MAX_P2P_UPLOAD_SIZE {
                                         return None;
                                     }
                                 }
@@ -3385,6 +3812,7 @@ pub fn read_http_body<S: TimeoutStream>(
             return None; // Staging not permitted for this endpoint
         }
 
+        clear_transfer_cancel();
         let ddir = get_download_dir();
         let _ = fs::create_dir_all(&ddir);
         let _ = fs::set_permissions(&ddir, fs::Permissions::from_mode(0o700));
@@ -3424,16 +3852,25 @@ pub fn read_http_body<S: TimeoutStream>(
         let mut remaining = content_length.saturating_sub(copy_len);
         let mut total_written = copy_len as u64;
         let mut stream_chunk = [0u8; 131072]; // 128 KiB streaming chunk aligned with IEEE 802.11 A-MPDU
+        let mut last_progress_tick = Instant::now();
 
         while remaining > 0 {
+            if is_transfer_cancelled() {
+                clear_transfer_cancel();
+                clear_transfer_progress();
+                let _ = fs::remove_file(&stage_path);
+                return None;
+            }
             let to_read = remaining.min(stream_chunk.len());
             match read_stream_chunk_with_deadline(stream, &mut stream_chunk[..to_read], deadline) {
                 Ok(0) => {
+                    clear_transfer_progress();
                     let _ = fs::remove_file(&stage_path);
                     return None;
                 }
                 Ok(n) => {
                     if stage_file.write_all(&stream_chunk[..n]).is_err() {
+                        clear_transfer_progress();
                         let _ = fs::remove_file(&stage_path);
                         return None;
                     }
@@ -3442,13 +3879,19 @@ pub fn read_http_body<S: TimeoutStream>(
                     md5_ctx.consume(&stream_chunk[..n]);
                     total_written = total_written.saturating_add(n as u64);
                     remaining = remaining.saturating_sub(n);
+                    if last_progress_tick.elapsed() >= Duration::from_millis(250) {
+                        save_transfer_progress("receive", "Incoming Transfer", total_written, content_length as u64);
+                        last_progress_tick = Instant::now();
+                    }
                 }
                 Err(_) => {
+                    clear_transfer_progress();
                     let _ = fs::remove_file(&stage_path);
                     return None;
                 }
             }
         }
+        clear_transfer_progress();
 
         if stage_file.flush().is_err() {
             let _ = fs::remove_file(&stage_path);
@@ -3742,44 +4185,52 @@ pub fn stream_file_zero_copy(
 
 // ------------------- WEB PAGES -------------------
 
+const OMARCHY_INLINE_LOGO_SVG: &str = r##"<span class="omarchy-plane-icon" style="font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 20px; color: #00cbb8; line-height: 1;"></span>"##;
+
 fn render_login_page() -> String {
-    r#"<!DOCTYPE html>
+    format!(
+        r#"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-<title>OmaSend • PIN Verification</title>
+<title>OmaSend | PIN Verification</title>
 <style>
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background: #070a0e; color: #dbe4ee; display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; }
-.card { background: #0e141d; border: 1px solid #1a2332; border-radius: 0; padding: 36px 24px; width: 100%; max-width: 380px; text-align: center; box-shadow: 0 12px 40px rgba(0,0,0,0.6); }
-.icon { font-size: 44px; margin-bottom: 14px; }
-h1 { font-size: 20px; font-weight: 700; color: #dbe4ee; margin-bottom: 6px; }
-p { font-size: 13px; color: #8899a6; margin-bottom: 24px; line-height: 1.5; }
-.pin-input { width: 100%; font-size: 32px; letter-spacing: 12px; text-align: center; background: #070a0e; border: 2px solid #00cbb8; color: #00eed9; border-radius: 0; padding: 12px; margin-bottom: 20px; font-family: monospace; outline: none; transition: border-color 0.2s; }
-.pin-input:focus { border-color: #00eed9; box-shadow: 0 0 16px rgba(0,203,184,0.3); }
-button { width: 100%; background: #00cbb8; color: #070a0e; border: none; padding: 14px; font-size: 15px; font-weight: 700; border-radius: 0; cursor: pointer; transition: opacity 0.2s; }
-button:active { opacity: 0.85; }
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+body {{ font-family: "JetBrainsMono Nerd Font", "JetBrains Mono", monospace; background: #0d1117; color: #dbe4ee; display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; }}
+.card {{ background: #161b22; border: 1px solid #30363d; border-radius: 0; padding: 36px 24px; width: 100%; max-width: 390px; text-align: center; box-shadow: 0 12px 40px rgba(0,0,0,0.65); }}
+.logo-wrap {{ display: flex; align-items: center; justify-content: center; margin-bottom: 18px; color: #00cbb8; }}
+.omarchy-logo {{ height: 22px; width: auto; display: block; }}
+.tag {{ display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: #00cbb8; border: 1px solid #00cbb8; background: rgba(0, 203, 184, 0.1); padding: 3px 8px; margin-bottom: 12px; }}
+h1 {{ font-size: 18px; font-weight: 700; color: #dbe4ee; margin-bottom: 8px; letter-spacing: 0.5px; }}
+p {{ font-size: 12px; color: #8b949e; margin-bottom: 24px; line-height: 1.6; }}
+.pin-input {{ width: 100%; font-size: 28px; letter-spacing: 10px; text-align: center; background: #0d1117; border: 1px solid #00cbb8; color: #00eed9; border-radius: 0; padding: 12px; margin-bottom: 20px; font-family: "JetBrainsMono Nerd Font", "JetBrains Mono", monospace; outline: none; transition: border-color 0.2s; }}
+.pin-input:focus {{ border-color: #00eed9; box-shadow: 0 0 12px rgba(0,203,184,0.25); }}
+button {{ width: 100%; background: #00cbb8; color: #0d1117; border: none; padding: 13px; font-size: 13px; font-weight: 700; font-family: "JetBrainsMono Nerd Font", "JetBrains Mono", monospace; letter-spacing: 0.5px; border-radius: 0; cursor: pointer; text-transform: uppercase; transition: opacity 0.2s; }}
+button:active {{ opacity: 0.85; }}
 </style>
 </head>
 <body>
 <div class="card">
-<div class="icon" style="font-size: 24px; font-weight: bold; color: #00cbb8; margin-bottom: 12px;">[SECURE]</div>
-<h1>OmaSend AirBridge</h1>
-<p>Enter the 4-digit security PIN displayed on your PC screen.</p>
+<div class="logo-wrap">{}</div>
+<div class="tag">ZERO-TRUST GATEWAY</div>
+<h1>OMASEND AIRBRIDGE</h1>
+<p>Enter the 4-digit security PIN displayed on your Omarchy desktop panel.</p>
 <form method="GET" action="/">
-<input type="number" name="pin" class="pin-input" placeholder="••••" required autofocus pattern="[0-9]*" inputmode="numeric">
-<button type="submit">Verify & Connect</button>
+<input type="number" name="pin" class="pin-input" placeholder="----" required autofocus pattern="[0-9]*" inputmode="numeric">
+<button type="submit">Verify &amp; Connect</button>
 </form>
 </div>
 </body>
-</html>"#.to_string()
+</html>"#,
+        OMARCHY_INLINE_LOGO_SVG
+    )
 }
 
 fn render_web_app(active_endpoint: &str, shared_files: &[FileInfo]) -> String {
     let mut files_html = String::new();
     if shared_files.is_empty() {
-        files_html.push_str("<div class='empty'>No files shared from PC.<br><small style='color:#667788;'>Add files to ~/Downloads/omasend/shared.</small></div>");
+        files_html.push_str("<div class='empty'>No files shared from PC.<br><small style='color:#6e7681;'>Add files to ~/Downloads/omasend/shared.</small></div>");
     } else {
         for f in shared_files {
             files_html.push_str(&format!(
@@ -3798,39 +4249,42 @@ fn render_web_app(active_endpoint: &str, shared_files: &[FileInfo]) -> String {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-<title>OmaSend • AirBridge E2EE</title>
+<title>OmaSend | AirBridge E2EE</title>
 <style>
 * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background: #070a0e; color: #dbe4ee; padding: 16px; max-width: 560px; margin: 0 auto; }}
-.header {{ display: flex; align-items: center; justify-content: space-between; padding-bottom: 14px; border-bottom: 1px solid #1a2332; margin-bottom: 16px; }}
-.brand {{ font-size: 19px; font-weight: 700; color: #00cbb8; display: flex; align-items: center; gap: 8px; }}
+body {{ font-family: "JetBrainsMono Nerd Font", "JetBrains Mono", monospace; background: #0d1117; color: #dbe4ee; padding: 18px; max-width: 600px; margin: 0 auto; }}
+.header {{ display: flex; align-items: center; justify-content: space-between; padding-bottom: 14px; border-bottom: 1px solid #30363d; margin-bottom: 18px; gap: 12px; flex-wrap: wrap; }}
+.brand {{ font-size: 15px; font-weight: 700; color: #00cbb8; display: flex; align-items: center; gap: 10px; letter-spacing: 0.5px; }}
+.omarchy-logo {{ height: 18px; width: auto; display: block; color: #00cbb8; }}
+.brand-sep {{ color: #30363d; font-weight: 400; }}
+.brand-title {{ color: #dbe4ee; font-weight: 700; }}
 .badges {{ display: flex; gap: 6px; flex-wrap: wrap; }}
-.badge {{ font-size: 11px; background: rgba(0, 203, 184, 0.15); border: 1px solid #00cbb8; color: #00cbb8; padding: 4px 8px; border-radius: 0; font-weight: bold; }}
-.badge-e2ee {{ font-size: 11px; background: rgba(39, 201, 63, 0.15); border: 1px solid #27c93f; color: #27c93f; padding: 4px 8px; border-radius: 0; font-weight: bold; display: flex; align-items: center; gap: 4px; }}
-.card {{ background: #0e141d; border: 1px solid #1a2332; border-radius: 0; padding: 18px; margin-bottom: 16px; }}
-.card-title {{ font-size: 12px; font-weight: 700; letter-spacing: 1px; color: #8899a6; text-transform: uppercase; margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between; }}
-.drop-zone {{ border: 2px dashed #00cbb8; border-radius: 0; padding: 36px 16px; text-align: center; cursor: pointer; background: rgba(0, 203, 184, 0.03); transition: all 0.2s; }}
-.drop-zone:hover {{ background: rgba(0, 203, 184, 0.08); border-color: #00eed9; }}
-.drop-icon {{ font-size: 36px; margin-bottom: 8px; }}
-.file-item {{ display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: #131b26; border-radius: 0; margin-bottom: 8px; border: 1px solid #1a2536; }}
-.file-name {{ font-size: 14px; font-weight: 500; word-break: break-all; color: #dbe4ee; }}
-.file-size {{ font-size: 12px; color: #8899a6; margin-top: 2px; }}
-.btn-sm {{ background: #00cbb8; color: #070a0e; border: none; padding: 6px 14px; border-radius: 0; font-size: 12px; font-weight: 700; cursor: pointer; }}
-textarea {{ width: 100%; height: 84px; background: #070a0e; border: 1px solid #1a2332; border-radius: 0; color: #dbe4ee; padding: 12px; font-size: 13px; margin-bottom: 10px; resize: vertical; outline: none; }}
+.badge {{ font-size: 11px; background: rgba(0, 203, 184, 0.12); border: 1px solid #00cbb8; color: #00cbb8; padding: 4px 8px; border-radius: 0; font-weight: 700; }}
+.badge-e2ee {{ font-size: 11px; background: rgba(39, 201, 63, 0.12); border: 1px solid #27c93f; color: #27c93f; padding: 4px 8px; border-radius: 0; font-weight: 700; display: flex; align-items: center; gap: 4px; }}
+.card {{ background: #161b22; border: 1px solid #30363d; border-radius: 0; padding: 18px; margin-bottom: 16px; }}
+.card-title {{ font-size: 12px; font-weight: 700; letter-spacing: 0.8px; color: #8b949e; text-transform: uppercase; margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between; }}
+.drop-zone {{ border: 1px dashed #00cbb8; border-radius: 0; padding: 32px 16px; text-align: center; cursor: pointer; background: #0d1117; transition: all 0.2s; }}
+.drop-zone:hover {{ background: rgba(0, 203, 184, 0.06); border-color: #00eed9; }}
+.drop-icon {{ font-size: 18px; font-weight: 700; color: #00cbb8; margin-bottom: 8px; letter-spacing: 1px; }}
+.file-item {{ display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: #0d1117; border-radius: 0; margin-bottom: 8px; border: 1px solid #30363d; }}
+.file-name {{ font-size: 13px; font-weight: 600; word-break: break-all; color: #dbe4ee; }}
+.file-size {{ font-size: 11px; color: #8b949e; margin-top: 2px; }}
+.btn-sm {{ background: #00cbb8; color: #0d1117; border: none; padding: 6px 14px; border-radius: 0; font-size: 11px; font-weight: 700; font-family: "JetBrainsMono Nerd Font", "JetBrains Mono", monospace; cursor: pointer; text-transform: uppercase; }}
+textarea {{ width: 100%; height: 84px; background: #0d1117; border: 1px solid #30363d; border-radius: 0; color: #dbe4ee; padding: 12px; font-size: 12px; font-family: "JetBrainsMono Nerd Font", "JetBrains Mono", monospace; margin-bottom: 10px; resize: vertical; outline: none; }}
 textarea:focus {{ border-color: #00cbb8; }}
-button.main-btn {{ width: 100%; background: #00cbb8; color: #070a0e; border: none; padding: 12px; font-size: 14px; font-weight: 700; border-radius: 0; cursor: pointer; }}
-.clipboard-box {{ background: #070a0e; border: 1px solid #1a2332; padding: 12px; border-radius: 0; font-size: 13px; max-height: 110px; overflow-y: auto; margin-bottom: 10px; color: #00eed9; font-family: monospace; white-space: pre-wrap; }}
-.empty {{ font-size: 13px; color: #8899a6; text-align: center; padding: 16px; line-height: 1.6; }}
-#progress-bar {{ display: none; width: 100%; height: 8px; background: #1a2332; border-radius: 0; overflow: hidden; margin-top: 14px; }}
+button.main-btn {{ width: 100%; background: #00cbb8; color: #0d1117; border: none; padding: 12px; font-size: 12px; font-weight: 700; font-family: "JetBrainsMono Nerd Font", "JetBrains Mono", monospace; letter-spacing: 0.5px; border-radius: 0; cursor: pointer; text-transform: uppercase; }}
+.clipboard-box {{ background: #0d1117; border: 1px solid #30363d; padding: 12px; border-radius: 0; font-size: 12px; max-height: 110px; overflow-y: auto; margin-bottom: 10px; color: #00eed9; font-family: "JetBrainsMono Nerd Font", "JetBrains Mono", monospace; white-space: pre-wrap; }}
+.empty {{ font-size: 12px; color: #8b949e; text-align: center; padding: 16px; line-height: 1.6; }}
+#progress-bar {{ display: none; width: 100%; height: 8px; background: #0d1117; border: 1px solid #30363d; border-radius: 0; overflow: hidden; margin-top: 14px; }}
 #progress-fill {{ width: 0%; height: 100%; background: #00cbb8; transition: width 0.2s; }}
 #status-msg {{ font-size: 12px; font-weight: 600; color: #00cbb8; margin-top: 10px; text-align: center; }}
 </style>
 </head>
 <body>
 <div class="header">
-<div class="brand">OmaSend AirBridge</div>
+<div class="brand">{}<span class="brand-sep">/</span><span class="brand-title">OMASEND AIRBRIDGE</span></div>
 <div class="badges">
-  <div class="badge">CONNECTED: {}</div>
+  <div class="badge">NODE: {}</div>
   <div id="e2ee-badge" class="badge-e2ee">E2EE ACTIVE</div>
 </div>
 </div>
@@ -3841,9 +4295,9 @@ button.main-btn {{ width: 100%; background: #00cbb8; color: #070a0e; border: non
   <span style="color:#27c93f; font-size:11px;">AES-256-GCM Encrypted</span>
 </div>
 <div class="drop-zone" onclick="document.getElementById('file-input').click()">
-<div class="drop-icon" style="font-size: 20px; font-weight: bold; color: #00cbb8; margin-bottom: 6px;">[+]</div>
-<div style="font-size: 15px; font-weight: 700;">Choose Photos, Videos or Files</div>
-<div style="font-size: 12px; color: #8899a6; margin-top: 4px;">or tap / drag & drop here</div>
+<div class="drop-icon">[UPLOAD]</div>
+<div style="font-size: 14px; font-weight: 700;">Select Photos, Videos or Archives</div>
+<div style="font-size: 11px; color: #8b949e; margin-top: 4px;">Tap or drag &amp; drop files here</div>
 <input type="file" id="file-input" style="display: none;" onchange="uploadFiles(this.files)" multiple>
 </div>
 <div id="progress-bar"><div id="progress-fill"></div></div>
@@ -3853,7 +4307,7 @@ button.main-btn {{ width: 100%; background: #00cbb8; color: #070a0e; border: non
 <div class="card">
 <div class="card-title">
   <span>PC Clipboard</span>
-  <button onclick="fetchClipboard()" class="btn-sm" style="padding:3px 8px; font-size:11px;">Refresh</button>
+  <button onclick="fetchClipboard()" class="btn-sm" style="padding:3px 8px; font-size:10px;">Refresh</button>
 </div>
 <div class="clipboard-box" id="pc-clip">Loading clipboard...</div>
 <button class="main-btn" onclick="copyPcClipboard()">Copy to Device</button>
@@ -4115,6 +4569,7 @@ window.addEventListener('load', async function() {{
 </script>
 </body>
 </html>"#,
+        OMARCHY_INLINE_LOGO_SVG,
         active_endpoint,
         files_html
     )
@@ -4365,6 +4820,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         };
 
         let my_oma_id = get_or_create_oma_id();
+        let my_norm = rendezvous::normalize_oma_id(&my_oma_id);
         let mut resolved_req_data = req_data.clone();
         if let Some(env_val) = req_data.get("encrypted_envelope") {
             if let Ok(envelope) = serde_json::from_value::<EncryptedP2PEnvelope>(env_val.clone()) {
@@ -4386,36 +4842,37 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             .to_string();
         let sender_name = req_data["sender_name"].as_str().unwrap_or("Unknown Omarchy Device").to_string();
         let sender_ip = req_data["sender_ip"].as_str().unwrap_or("").to_string();
-        let is_trusted = is_peer_confirmed(&sender_id);
 
-        if !is_trusted {
-            let err = serde_json::json!({ "error": "Peer OmaID is not paired with this device" });
+        let norm_sender = rendezvous::normalize_oma_id(&sender_id);
+        let is_valid_sender_omaid = rendezvous::validate_oma_id(&norm_sender);
+        let is_same_owner = is_valid_sender_omaid && constant_time_eq_str(&norm_sender, &my_norm);
+
+        if !is_valid_sender_omaid {
+            let err = serde_json::json!({ "error": "Valid 16-digit OmaID required to send files" });
             respond(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
             return;
         }
 
-        // Verify authentication token if configured for paired peer
-        let provided_token = req.get_header("x-omasend-auth-token")
-            .or_else(|| req_data.get("auth_token").and_then(|v| v.as_str()))
-            .unwrap_or_default();
-
-        let paired = load_paired_peers();
-        let norm_sender = rendezvous::normalize_oma_id(&sender_id);
-        if let Some(peer_record) = paired.iter().find(|p| rendezvous::normalize_oma_id(&p.oma_id) == norm_sender) {
-            // Records that never completed the code-verified handshake (including
-            // legacy records from earlier versions) are not accepted inbound.
-            if !peer_record.confirmed {
-                respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Peer pairing is not confirmed\"}", None, None);
-                return;
-            }
-            if let Some(ref expected_tok) = peer_record.auth_token {
-                if !expected_tok.is_empty() && (provided_token.is_empty() || !constant_time_eq_str(expected_tok, provided_token)) {
-                    let err = serde_json::json!({ "error": "Invalid peer authentication token" });
-                    respond(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
-                    return;
+        if !is_same_owner {
+            // Foreign OmaID: if paired and confirmed with an auth_token, require valid token
+            let paired = load_paired_peers();
+            if let Some(peer_record) = paired.iter().find(|p| rendezvous::normalize_oma_id(&p.oma_id) == norm_sender) {
+                if peer_record.confirmed {
+                    let provided_token = req.get_header("x-omasend-auth-token")
+                        .or_else(|| req_data.get("auth_token").and_then(|v| v.as_str()))
+                        .unwrap_or_default();
+                    if let Some(ref expected_tok) = peer_record.auth_token {
+                        if !expected_tok.is_empty() && (provided_token.is_empty() || !constant_time_eq_str(expected_tok, provided_token)) {
+                            let err = serde_json::json!({ "error": "Invalid peer authentication token" });
+                            respond(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
+                            return;
+                        }
+                    }
                 }
             }
         }
+
+        let is_trusted = is_same_owner;
 
         let mut file_names = Vec::new();
         let mut files_info = Vec::new();
@@ -4459,8 +4916,10 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         let token = hex::encode(token_bytes);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
-        let initial_status = if is_trusted { "ACCEPTED" } else { "PENDING" };
-        let initial_expiry = if is_trusted { now.saturating_add(600) } else { now.saturating_add(30) };
+        // Anonymous Numbered OmaID Model: Same OmaID owner -> auto-accept ("ACCEPTED").
+        // Different OmaID user (even if paired or EVERYONE visibility) -> Gatekeeper user approval ("PENDING").
+        let initial_status = if is_same_owner { "ACCEPTED" } else { "PENDING" };
+        let initial_expiry = if is_same_owner { now.saturating_add(600) } else { now.saturating_add(30) };
 
         let transfer = PendingFileTransfer {
             token: token.clone(),
@@ -4478,10 +4937,10 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         save_pending_transfer(&transfer);
 
         let size_mb = (total_size_bytes as f64) / 1024.0 / 1024.0;
-        if is_trusted {
+        if is_same_owner {
             notify_desktop(
                 "OmaSend AirBridge",
-                &format!("Auto-receiving {} file(s) ({:.1} MB) from trusted device '{}'.", file_names.len(), size_mb, sender_name),
+                &format!("Auto-receiving {} file(s) ({:.1} MB) from own device '{}'.", file_names.len(), size_mb, sender_name),
             );
         } else {
             notify_desktop(
@@ -4492,6 +4951,8 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
 
         let resp = serde_json::json!({
             "status": initial_status,
+            "is_trusted": is_trusted,
+            "is_same_owner": is_same_owner,
             "token": token
         });
         respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
@@ -4516,6 +4977,11 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             respond(&stream, "404 Not Found", "application/json", b"{\"status\":\"NOT_FOUND\"}", None, None);
             return;
         } else if req.method == "POST" {
+            // Security Gate: Only local user or authenticated web portal session can approve/reject a transfer
+            if !client_ip.to_canonical().is_loopback() && !authorized {
+                respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Only local user can approve or reject transfers\"}", None, None);
+                return;
+            }
             if content_length > MAX_CONTROL_BODY {
                 respond(&stream, "413 Payload Too Large", "application/json", b"{\"error\":\"Request payload exceeds limit\"}", None, None);
                 return;
@@ -4579,7 +5045,9 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             return;
         }
 
-        let mut pending = pending_opt.unwrap();
+        let Some(mut pending) = pending_opt else {
+            return;
+        };
         let matching_info = pending.files.iter().find(|f| f.name == clean_filename).cloned();
         let is_in_pending = matching_info.is_some() || pending.file_names.iter().any(|n| n == &clean_filename);
         if !is_in_pending {
@@ -4587,14 +5055,14 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             return;
         }
 
-        if content_length > MAX_BODY_SIZE {
-            respond(&stream, "413 Payload Too Large", "application/json", b"{\"error\":\"Payload exceeds 100 MiB limit\"}", None, None);
+        if content_length > MAX_P2P_UPLOAD_SIZE {
+            respond(&stream, "413 Payload Too Large", "application/json", b"{\"error\":\"Payload exceeds 10 GiB limit\"}", None, None);
             return;
         }
 
         let upload_secs = (content_length as u64 / (512 * 1024)).clamp(30, MAX_UPLOAD_DURATION_SECS);
         let body_deadline = Instant::now() + Duration::from_secs(upload_secs);
-        let body = match read_http_body(&mut stream, content_length, &initial_body, body_deadline, true, MAX_BODY_SIZE) {
+        let body = match read_http_body(&mut stream, content_length, &initial_body, body_deadline, true, MAX_P2P_UPLOAD_SIZE) {
             Some(b) => b,
             None => return,
         };
@@ -4672,6 +5140,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             }
             let final_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
             record_notified_file(&final_name);
+            play_samurai_receive_sound();
             notify_desktop(
                 "OmaSend: AirBridge Transfer Complete",
                 &format!("'{}' ({} bytes) verified [SHA256: {}] and saved to Downloads/omasend.", final_name, payload_len, &computed_sha256[..8])
@@ -4691,13 +5160,15 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         }
     }
 
-    if req.method == "GET" && req.path.starts_with("/api/p2p/clipboard/image/") {
+    if req.method == "GET" && (req.path == "/api/p2p/clipboard/image" || req.path.starts_with("/api/p2p/clipboard/image/")) {
         let (vis, _) = get_visibility();
         if vis == "OFF" {
             respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Visibility is Off\"}", None, None);
             return;
         }
-        let raw_hash = req.path.trim_start_matches("/api/p2p/clipboard/image/").trim();
+        let raw_hash = req.get_param("hash").unwrap_or_else(|| {
+            req.path.trim_start_matches("/api/p2p/clipboard/image/").trim().to_string()
+        });
         let clean_hash: String = raw_hash.chars().take(64).filter(|c| c.is_ascii_hexdigit()).collect();
         if clean_hash.len() != 64 {
             respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid image hash\"}", None, None);
@@ -4747,7 +5218,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         return;
     }
 
-    if req.method == "POST" && req.path == "/api/p2p/clipboard" {
+    if req.method == "POST" && (req.path == "/api/p2p/clipboard" || req.path == "/api/p2p/clip-image") {
         let (vis, _) = get_visibility();
         if vis == "OFF" {
             respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Visibility is Off\"}", None, None);
@@ -4772,47 +5243,13 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                 return;
             }
         };
-        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(body_slice) {
-            let sender_id = val.get("oma_id")
-                .or_else(|| val.get("sender_oma_id"))
-                .or_else(|| val.get("sender_id"))
-                .and_then(|v| v.as_str())
-                .or_else(|| req.get_header("x-omasend-omaid"))
-                .unwrap_or_default();
-            let sender_name = val["sender_name"].as_str().unwrap_or("Nearby Device");
-            let is_trusted = is_peer_confirmed(sender_id);
-            if !is_trusted {
-                respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Peer OmaID is not paired\"}", None, None);
-                return;
-            }
-
-            // Verify authentication token if configured for paired peer
-            let provided_token = req.get_header("x-omasend-auth-token")
-                .or_else(|| val.get("auth_token").and_then(|v| v.as_str()))
-                .unwrap_or_default();
-
-            let paired = load_paired_peers();
-            let norm_sender = rendezvous::normalize_oma_id(sender_id);
-            if let Some(peer_record) = paired.iter().find(|p| rendezvous::normalize_oma_id(&p.oma_id) == norm_sender) {
-                // Records that never completed the code-verified handshake (including
-                // legacy records from earlier versions) are not accepted inbound.
-                if !peer_record.confirmed {
-                    respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Peer pairing is not confirmed\"}", None, None);
-                    return;
-                }
-                if let Some(ref expected_tok) = peer_record.auth_token {
-                    if !expected_tok.is_empty() && (provided_token.is_empty() || !constant_time_eq_str(expected_tok, provided_token)) {
-                        respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Invalid peer authentication token\"}", None, None);
-                        return;
-                    }
-                }
-            }
-
+        if let Ok(raw_val) = serde_json::from_slice::<serde_json::Value>(body_slice) {
             let my_oma_id = get_or_create_oma_id();
-            let mut resolved_val = val.clone();
+            let my_norm = rendezvous::normalize_oma_id(&my_oma_id);
+            let mut resolved_val = raw_val.clone();
 
             // P2P E2EE Decryption: If payload is wrapped in an EncryptedP2PEnvelope, decrypt it
-            if let Some(env_val) = val.get("encrypted_envelope") {
+            if let Some(env_val) = raw_val.get("encrypted_envelope") {
                 if let Ok(envelope) = serde_json::from_value::<EncryptedP2PEnvelope>(env_val.clone()) {
                     if let Ok(decrypted_bytes) = decrypt_p2p_payload(&my_oma_id, &envelope) {
                         if let Ok(inner) = serde_json::from_slice::<serde_json::Value>(&decrypted_bytes) {
@@ -4823,13 +5260,63 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             }
             let val = resolved_val;
 
-            let content_type = val["content_type"].as_str().unwrap_or("text");
+            let sender_id = val.get("oma_id")
+                .or_else(|| val.get("sender_oma_id"))
+                .or_else(|| val.get("sender_id"))
+                .and_then(|v| v.as_str())
+                .or_else(|| raw_val.get("oma_id").and_then(|v| v.as_str()))
+                .or_else(|| raw_val.get("sender_id").and_then(|v| v.as_str()))
+                .or_else(|| req.get_header("x-omasend-omaid"))
+                .unwrap_or_default();
+            let sender_name = val["sender_name"]
+                .as_str()
+                .or_else(|| raw_val["sender_name"].as_str())
+                .unwrap_or("Nearby Device");
+
+            let norm_sender = rendezvous::normalize_oma_id(sender_id);
+            let is_same_owner = !norm_sender.is_empty() && constant_time_eq_str(&norm_sender, &my_norm);
+
+            if !is_same_owner {
+                let is_trusted = is_peer_confirmed(sender_id);
+                if !is_trusted {
+                    respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Peer OmaID is not paired\"}", None, None);
+                    return;
+                }
+
+                // Verify authentication token if configured for paired peer
+                let provided_token = req.get_header("x-omasend-auth-token")
+                    .or_else(|| val.get("auth_token").and_then(|v| v.as_str()))
+                    .or_else(|| raw_val.get("auth_token").and_then(|v| v.as_str()))
+                    .unwrap_or_default();
+
+                let paired = load_paired_peers();
+                if let Some(peer_record) = paired.iter().find(|p| rendezvous::normalize_oma_id(&p.oma_id) == norm_sender) {
+                    if !peer_record.confirmed {
+                        respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Peer pairing is not confirmed\"}", None, None);
+                        return;
+                    }
+                    if let Some(ref expected_tok) = peer_record.auth_token {
+                        if !expected_tok.is_empty() && (provided_token.is_empty() || !constant_time_eq_str(expected_tok, provided_token)) {
+                            respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Invalid peer authentication token\"}", None, None);
+                            return;
+                        }
+                    }
+                }
+            }
+
+            let content_type = val["content_type"]
+                .as_str()
+                .unwrap_or_else(|| if req.path == "/api/p2p/clip-image" { "image_png" } else { "text" });
 
             // Handle visual clipboard payloads (< 512 KiB Base64 or metadata announcement)
-            if content_type.starts_with("image_") || val.get("image_hash").is_some() {
+            if content_type.starts_with("image") || val.get("image_hash").is_some() || req.path == "/api/p2p/clip-image" {
                 let img_hash = val["image_hash"].as_str();
+                let b64_opt = val["image_base64"]
+                    .as_str()
+                    .or_else(|| val["image_data_base64"].as_str())
+                    .or_else(|| val["data"].as_str());
 
-                if let Some(b64_data) = val["image_base64"].as_str() {
+                if let Some(b64_data) = b64_opt {
                     if let Ok(raw_bytes) = base64_decode(b64_data) {
                         if let Ok((verified_ct, w, h)) = validate_image_header(&raw_bytes) {
                             let computed_hash = compute_image_clipboard_hash(&raw_bytes);
@@ -4847,9 +5334,13 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                 } else if let Some(hash) = img_hash {
                     if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
                         set_last_synced_clipboard_hash(hash);
-                        let peer_ip = val["sender_ip"].as_str().unwrap_or("");
-                        if !peer_ip.is_empty() {
-                            p2p_fetch_image_clipboard_and_apply(peer_ip, hash, content_type);
+                        let peer_ip_str = val["sender_ip"]
+                            .as_str()
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| client_ip.to_canonical().to_string());
+                        if !peer_ip_str.is_empty() {
+                            p2p_fetch_image_clipboard_and_apply(&peer_ip_str, hash, content_type);
                         }
                         notify_desktop("OmaSend: Image Clipboard", &format!("Received image reference from {}.", sender_name));
                         play_clipboard_sound();
@@ -5305,9 +5796,33 @@ fn urlencoding_decode(input: &str) -> String {
 // ------------------- SERVER DAEMON -------------------
 
 fn run_server() {
-    // Enforce military-grade defense: anti-forensics memory protection
+    // Enforce military-grade defense: anti-forensics memory protection + Landlock LSM
     military::enable_anti_forensics();
     let state_dir = get_state_dir();
+    let download_dir = get_download_dir();
+    let shared_dir = get_shared_dir();
+    let home_dir = env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/tmp"));
+    let _ = military::enable_landlock_sandbox(
+        &[
+            Path::new("/usr"),
+            Path::new("/bin"),
+            Path::new("/lib"),
+            Path::new("/lib64"),
+            Path::new("/etc"),
+            Path::new("/proc"),
+            Path::new("/dev"),
+            Path::new("/run"),
+            &home_dir,
+        ],
+        &[
+            &state_dir,
+            &download_dir,
+            &shared_dir,
+            Path::new("/tmp"),
+            Path::new("/dev"),
+            Path::new("/run"),
+        ],
+    );
 
     let pid_file = state_dir.join("engine.pid");
     if let Ok(old_pid_str) = read_secure_file(&pid_file) {
@@ -5389,6 +5904,36 @@ fn main() {
         return;
     }
 
+    if args.iter().any(|a| a == "--cancel-transfer") {
+        request_transfer_cancel();
+        clear_transfer_progress();
+        clear_pending_transfer();
+        notify_desktop("OmaSend AirBridge", "Aktif transfer iptal edildi.");
+        println!("Transfer cancelled");
+        return;
+    }
+
+    if args.iter().any(|a| a == "--toggle-sound") {
+        let next = !is_sound_enabled();
+        set_sound_enabled(next);
+        println!("{}", if next { "ON" } else { "OFF" });
+        return;
+    }
+
+    if let Some(pos) = args.iter().position(|a| a == "--set-sound") {
+        if let Some(val) = args.get(pos + 1) {
+            let en = !matches!(val.trim().to_lowercase().as_str(), "off" | "0" | "false");
+            set_sound_enabled(en);
+            println!("{}", if en { "ON" } else { "OFF" });
+            return;
+        }
+    }
+
+    if args.iter().any(|a| a == "--firewall-status") {
+        println!("{}", check_firewall_status());
+        return;
+    }
+
     if args.iter().any(|a| a == "--oma-id-qr") {
         let (svg_path, png_path) = update_oma_id_qr();
         println!("SVG: {}\nPNG: {}", svg_path, png_path);
@@ -5409,8 +5954,34 @@ fn main() {
 
     if args.iter().any(|a| a == "--new-oma-id") {
         let oma_id = generate_new_oma_id();
+        let _ = update_oma_id_qr();
+        send_p2p_beacon_burst(2);
         println!("{}", oma_id);
         return;
+    }
+
+    if let Some(pos) = args.iter().position(|a| a == "--set-oma-id") {
+        if let Some(candidate) = args.get(pos + 1) {
+            if validate_oma_id(candidate) {
+                let formatted = format_oma_id(candidate);
+                let state_dir = get_state_dir();
+                let oma_id_file = state_dir.join("oma_id");
+                if let Err(e) = write_secure_file(&oma_id_file, &formatted) {
+                    eprintln!("Error writing oma_id: {}", e);
+                    std::process::exit(1);
+                }
+                let _ = update_oma_id_qr();
+                send_p2p_beacon_burst(2);
+                println!("{}", formatted);
+            } else {
+                eprintln!("INVALID OmaID: {}", candidate);
+                std::process::exit(1);
+            }
+            return;
+        } else {
+            eprintln!("Usage: omasend-engine --set-oma-id <XXXX-XXXX-XXXX-XXXX>");
+            std::process::exit(2);
+        }
     }
 
     if let Some(pos) = args.iter().position(|a| a == "--validate-oma-id") {
@@ -5575,6 +6146,7 @@ fn main() {
                     save_pending_transfer(&pending);
                     let _ = add_paired_peer(&pending.sender_id, &pending.sender_name, Some(&pending.sender_ip));
                     add_trusted_peer(&pending.sender_id, &pending.sender_name, "");
+                    play_samurai_receive_sound();
                     notify_desktop("OmaSend AirBridge", "Transfer accepted. Receiving files...");
                     println!("Transfer accepted");
                     return;
@@ -5601,7 +6173,9 @@ fn main() {
         }
     }
 
-    if let Some(pos) = args.iter().position(|a| a == "--send-p2p" || a == "--send") {
+    if let Some(pos) = args.iter().position(|a| {
+        a == "--send-p2p" || a == "--send" || a == "--send-to-omaid" || a == "--send-file"
+    }) {
         let target_arg = args.get(pos + 1);
         let second_arg = args.get(pos + 2);
 
@@ -5609,7 +6183,7 @@ fn main() {
             (Some(t), Some(f)) if t != "auto" => (t.clone(), f.clone()),
             (Some(f_or_auto), None) => {
                 let peers = get_discovered_peers();
-                if let Some(first_peer) = peers.first() {
+                if let Some(first_peer) = peers.iter().find(|p| p.is_same_owner).or_else(|| peers.first()) {
                     (first_peer.ip.clone(), f_or_auto.clone())
                 } else {
                     eprintln!("Error: No active peers discovered for automatic send");
@@ -5618,7 +6192,7 @@ fn main() {
             }
             (Some(t), Some(f)) if t == "auto" => {
                 let peers = get_discovered_peers();
-                if let Some(first_peer) = peers.first() {
+                if let Some(first_peer) = peers.iter().find(|p| p.is_same_owner).or_else(|| peers.first()) {
                     (first_peer.ip.clone(), f.clone())
                 } else {
                     eprintln!("Error: No active peers discovered for automatic send");
@@ -5626,7 +6200,7 @@ fn main() {
                 }
             }
             _ => {
-                eprintln!("Usage: omasend-engine --send [peer_ip|auto] <file_path>");
+                eprintln!("Usage: omasend-engine --send [peer_ip|oma_id|auto] <file_path>");
                 return;
             }
         };
@@ -5634,7 +6208,10 @@ fn main() {
         let path = Path::new(&file_path_str);
         match p2p_send_file_to_peer(&target, path) {
             Ok(()) => println!("File sent successfully to {}", target),
-            Err(e) => eprintln!("Error sending file: {}", e),
+            Err(e) => {
+                eprintln!("Error sending file: {}", e);
+                std::process::exit(1);
+            }
         }
         return;
     }
@@ -5653,6 +6230,7 @@ fn main() {
             ) {
                 let chosen = String::from_utf8_lossy(&out).trim().to_string();
                 if !chosen.is_empty() {
+                    play_samurai_send_sound();
                     let path = Path::new(&chosen);
                     match p2p_send_file_to_peer(target, path) {
                         Ok(()) => println!("File successfully sent to {}", target),
@@ -5794,11 +6372,14 @@ fn main() {
             p2p_visibility_remaining_secs: rem,
             p2p_discovered_peers: get_discovered_peers(),
             p2p_pending_transfer: get_pending_transfer(),
+            p2p_transfer_progress: get_transfer_progress(),
             clipboard_vault: get_clipboard_vault_items(),
             oma_id,
             wan_mode,
             cluster_id,
             stun_addr,
+            sound_enabled: is_sound_enabled(),
+            firewall_status: check_firewall_status(),
         };
         if let Ok(s) = serde_json::to_string_pretty(&state) {
             println!("{}", s);
@@ -5925,6 +6506,7 @@ mod tests {
 
     #[test]
     fn test_visibility_modes() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         set_visibility("OFF");
         let (vis_off, _) = get_visibility();
         assert_eq!(vis_off, "OFF");
@@ -5942,6 +6524,7 @@ mod tests {
 
     #[test]
     fn test_trusted_peers_db_enforces_0600() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let peer_id = format!("test_peer_{}", std::process::id());
         add_trusted_peer(&peer_id, "Test Laptop", "abcdef1234567890");
         assert!(is_peer_trusted(&peer_id));
@@ -6381,36 +6964,37 @@ mod tests {
         let ddir = get_download_dir();
         let _ = fs::create_dir_all(&ddir);
 
-        // Reset staged bytes to baseline
-        CURRENT_STAGED_BYTES.store(0, Ordering::SeqCst);
+        // Pre-fill baseline near MAX_AGGREGATE_STAGING_BYTES leaving 200 MiB headroom
+        let base = MAX_AGGREGATE_STAGING_BYTES - 200 * 1024 * 1024;
+        CURRENT_STAGED_BYTES.store(base, Ordering::SeqCst);
 
         // Reserve 100 MiB
         let guard1 = StagingReservationGuard::try_reserve(100 * 1024 * 1024, &ddir);
         assert!(guard1.is_ok(), "First 100 MiB reservation should succeed");
-        assert_eq!(CURRENT_STAGED_BYTES.load(Ordering::SeqCst), 100 * 1024 * 1024);
+        assert_eq!(CURRENT_STAGED_BYTES.load(Ordering::SeqCst), base + 100 * 1024 * 1024);
 
-        // Reserve another 100 MiB (total 200 MiB = MAX_AGGREGATE_STAGING_BYTES)
+        // Reserve another 100 MiB (total = MAX_AGGREGATE_STAGING_BYTES)
         let guard2 = StagingReservationGuard::try_reserve(100 * 1024 * 1024, &ddir);
         assert!(guard2.is_ok(), "Second 100 MiB reservation reaching aggregate cap should succeed");
-        assert_eq!(CURRENT_STAGED_BYTES.load(Ordering::SeqCst), 200 * 1024 * 1024);
+        assert_eq!(CURRENT_STAGED_BYTES.load(Ordering::SeqCst), MAX_AGGREGATE_STAGING_BYTES);
 
         // Third reservation exceeding cap must fail
         let guard3 = StagingReservationGuard::try_reserve(1024, &ddir);
-        assert!(guard3.is_err(), "Reservation exceeding 200 MiB aggregate cap must be rejected");
+        assert!(guard3.is_err(), "Reservation exceeding aggregate cap must be rejected");
 
         // Drop first guard
         drop(guard1);
-        assert_eq!(CURRENT_STAGED_BYTES.load(Ordering::SeqCst), 100 * 1024 * 1024);
+        assert_eq!(CURRENT_STAGED_BYTES.load(Ordering::SeqCst), base + 100 * 1024 * 1024);
 
         // Now a 50 MiB reservation should succeed
         let guard4 = StagingReservationGuard::try_reserve(50 * 1024 * 1024, &ddir);
         assert!(guard4.is_ok(), "Reservation under remaining cap should succeed");
-        assert_eq!(CURRENT_STAGED_BYTES.load(Ordering::SeqCst), 150 * 1024 * 1024);
+        assert_eq!(CURRENT_STAGED_BYTES.load(Ordering::SeqCst), base + 150 * 1024 * 1024);
 
         // Cleanup
         drop(guard2);
         drop(guard4);
-        assert_eq!(CURRENT_STAGED_BYTES.load(Ordering::SeqCst), 0);
+        CURRENT_STAGED_BYTES.store(0, Ordering::SeqCst);
     }
 
     #[test]
@@ -6612,7 +7196,19 @@ mod tests {
 
         // Landlock sandbox gracefully falls back or succeeds
         let tmp = std::env::temp_dir();
-        let _ = enable_landlock_sandbox(&[&tmp], &[&tmp]);
+        let _ = enable_landlock_sandbox(
+            &[
+                &tmp,
+                Path::new("/usr"),
+                Path::new("/bin"),
+                Path::new("/lib"),
+                Path::new("/lib64"),
+                Path::new("/etc"),
+                Path::new("/proc"),
+                Path::new("/dev"),
+            ],
+            &[&tmp],
+        );
     }
 
     #[test]
@@ -6738,11 +7334,14 @@ mod tests {
             p2p_visibility_remaining_secs: 0,
             p2p_discovered_peers: vec![],
             p2p_pending_transfer: None,
+            p2p_transfer_progress: None,
             clipboard_vault: vec![],
             oma_id: oma_id.clone(),
             wan_mode: "LAN".to_string(),
             cluster_id: topic.clone(),
             stun_addr: Some("198.51.100.1:53317".to_string()),
+            sound_enabled: true,
+            firewall_status: "OK".to_string(),
         };
 
         let json = serde_json::to_string(&state).expect("Serialize ServerState");
@@ -6891,6 +7490,7 @@ mod tests {
                 transport: "LAN".to_string(),
                 fingerprint: "fp1".to_string(),
                 is_trusted: false,
+                is_same_owner: false,
                 last_seen_secs: now,
             },
             DiscoveredPeer {
@@ -6902,6 +7502,7 @@ mod tests {
                 transport: "LAN".to_string(),
                 fingerprint: "fp2".to_string(),
                 is_trusted: false,
+                is_same_owner: false,
                 last_seen_secs: now - 30, // 30 seconds old -> expired
             },
         ];
@@ -7581,5 +8182,121 @@ mod tests {
         }));
         server.join().unwrap();
         assert!(r.starts_with("HTTP/1.1 200 OK"), "Encrypted envelope must be accepted with 200 OK: {}", r);
+    }
+
+    #[test]
+    fn test_same_owner_oma_id_zero_click_auto_accept() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        // Even in KNOWN mode, a device sharing our own OmaID is automatically accepted without pairing or token
+        set_visibility("KNOWN");
+        let my_oma_id = get_or_create_oma_id();
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (s, _) = listener.accept().expect("Accept same-owner client");
+                handle_connection(s, "127.0.0.1", "1234", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+            }
+        });
+
+        // 1. Same-owner file transfer request -> auto-accepted ("ACCEPTED") with zero-click consent
+        let req_headers = format!("X-OmaSend-OmaID: {}\r\n", my_oma_id);
+        let resp_transfer = post_json(addr, "/api/p2p/request", &req_headers, &serde_json::json!({
+            "oma_id": my_oma_id,
+            "sender_id": my_oma_id,
+            "sender_name": "My Other Omarchy Laptop",
+            "files": [{"name": "notes.txt", "size_bytes": 128}]
+        }));
+        assert!(resp_transfer.starts_with("HTTP/1.1 200 OK"), "Same-owner transfer must return 200 OK: {}", resp_transfer);
+        assert!(resp_transfer.contains("\"status\":\"ACCEPTED\""), "Same-owner transfer must auto-accept: {}", resp_transfer);
+        assert!(resp_transfer.contains("\"is_same_owner\":true"), "Same-owner flag must be true: {}", resp_transfer);
+
+        // 2. Same-owner clipboard sync -> accepted immediately without pairing record or auth token
+        let resp_clip = post_json(addr, "/api/p2p/clipboard", &req_headers, &serde_json::json!({
+            "oma_id": my_oma_id,
+            "sender_id": my_oma_id,
+            "sender_name": "My Other Omarchy Laptop",
+            "content_type": "text",
+            "text": "Anonymous Numbered OmaID Zero-Click Same-Owner Clipboard Sync"
+        }));
+        assert!(resp_clip.starts_with("HTTP/1.1 200 OK"), "Same-owner clipboard must return 200 OK: {}", resp_clip);
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn test_different_owner_pending_gatekeeper_and_oma_id_resolution() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        set_visibility("ALL");
+
+        let foreign_raw = rendezvous::generate_raw_oma_id();
+        let foreign_oma_id = rendezvous::format_oma_id(&foreign_raw);
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (s, _) = listener.accept().expect("Accept foreign OmaID client");
+            handle_connection(s, "127.0.0.1", "1234", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+        });
+
+        // Different OmaID user sending file in ALL/EVERYONE visibility -> Gatekeeper records as PENDING
+        let headers = format!("X-OmaSend-OmaID: {}\r\n", foreign_oma_id);
+        let resp = post_json(addr, "/api/p2p/request", &headers, &serde_json::json!({
+            "oma_id": foreign_oma_id,
+            "sender_id": foreign_oma_id,
+            "sender_name": "Colleague Workstation",
+            "files": [{"name": "report.pdf", "size_bytes": 4096}]
+        }));
+        server.join().unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "Foreign OmaID in ALL visibility must return 200 OK with PENDING: {}", resp);
+        assert!(resp.contains("\"status\":\"PENDING\""), "Foreign OmaID must enter Gatekeeper PENDING state: {}", resp);
+        assert!(resp.contains("\"is_same_owner\":false"), "Foreign OmaID must have is_same_owner=false: {}", resp);
+
+        // Verify resolve_target_ip_or_omaid resolves discovered peer by 16-digit OmaID
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let peers = vec![DiscoveredPeer {
+            id: "dev_colleague_01".to_string(),
+            oma_id: foreign_oma_id.clone(),
+            name: "Colleague Workstation".to_string(),
+            ip: "192.168.1.88".to_string(),
+            port: 53317,
+            transport: "LAN".to_string(),
+            fingerprint: "fp_colleague".to_string(),
+            is_trusted: false,
+            is_same_owner: false,
+            last_seen_secs: now,
+        }];
+        save_discovered_peers(&peers);
+
+        let (resolved_ip, resolved_port, resolved_oma) = resolve_target_ip_or_omaid(&foreign_oma_id)
+            .expect("Resolve target by 16-digit OmaID");
+        assert_eq!(resolved_ip, "192.168.1.88");
+        assert_eq!(resolved_port, 53317);
+        assert_eq!(resolved_oma.as_deref(), Some(foreign_oma_id.as_str()));
+    }
+
+    #[test]
+    fn test_transfer_cancel_progress_and_sound_settings() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        clear_transfer_cancel();
+        assert!(!is_transfer_cancelled());
+        request_transfer_cancel();
+        assert!(is_transfer_cancelled());
+        clear_transfer_cancel();
+        assert!(!is_transfer_cancelled());
+
+        save_transfer_progress("receive", "archive.tar", 512, 1024);
+        let prog = get_transfer_progress().expect("Progress should be present");
+        assert_eq!(prog["direction"].as_str(), Some("receive"));
+        assert_eq!(prog["file_name"].as_str(), Some("archive.tar"));
+        assert_eq!(prog["percent"].as_u64(), Some(50));
+        clear_transfer_progress();
+        assert!(get_transfer_progress().is_none());
+
+        set_sound_enabled(false);
+        assert!(!is_sound_enabled());
+        set_sound_enabled(true);
+        assert!(is_sound_enabled());
     }
 }

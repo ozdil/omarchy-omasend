@@ -151,11 +151,15 @@ pub fn enable_landlock_sandbox(
 
         let ruleset_fd = ruleset_fd as i32;
 
-        let read_access = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
+        let read_access = LANDLOCK_ACCESS_FS_READ_FILE
+            | LANDLOCK_ACCESS_FS_READ_DIR
+            | LANDLOCK_ACCESS_FS_EXECUTE;
         let mut write_access = read_access
             | LANDLOCK_ACCESS_FS_WRITE_FILE
             | LANDLOCK_ACCESS_FS_MAKE_REG
-            | LANDLOCK_ACCESS_FS_REMOVE_FILE;
+            | LANDLOCK_ACCESS_FS_REMOVE_FILE
+            | LANDLOCK_ACCESS_FS_MAKE_DIR
+            | LANDLOCK_ACCESS_FS_REMOVE_DIR;
 
         if abi >= 2 {
             write_access |= LANDLOCK_ACCESS_FS_REFER;
@@ -239,6 +243,18 @@ mod tests {
     fn test_landlock_sandbox_fallback_or_success() {
         let temp_dir = std::env::temp_dir();
         // Should either succeed or return false cleanly without crashing
-        let _ = enable_landlock_sandbox(&[&temp_dir], &[&temp_dir]);
+        let _ = enable_landlock_sandbox(
+            &[
+                &temp_dir,
+                Path::new("/usr"),
+                Path::new("/bin"),
+                Path::new("/lib"),
+                Path::new("/lib64"),
+                Path::new("/etc"),
+                Path::new("/proc"),
+                Path::new("/dev"),
+            ],
+            &[&temp_dir],
+        );
     }
 }
