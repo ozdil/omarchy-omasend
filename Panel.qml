@@ -1,11 +1,13 @@
 import QtQuick
 import QtQuick.Layouts
 import QtQuick.Controls
+import QtQuick.Shapes
 import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
 import qs.Commons
 import qs.Ui
+import "OmaI18n.js" as OmaI18n
 
 Panel {
   id: root
@@ -16,6 +18,19 @@ Panel {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
+  // --- Automatic Multi-Language (i18n) Detection from Device Locale ---
+  readonly property string rawSystemLocale: Quickshell.env("LC_ALL")
+    || Quickshell.env("LC_MESSAGES")
+    || Quickshell.env("LANG")
+    || Qt.locale().name
+    || "en"
+  readonly property string systemLang: OmaI18n.detectLang(root.rawSystemLocale, Qt.locale().name)
+
+  function t(key) {
+    return OmaI18n.tr(root.systemLang, key)
+  }
+
+  // --- Core Engine & Network State ---
   property string localIp: "127.0.0.1"
   property int port: 53317
   property string pin: "----"
@@ -32,46 +47,101 @@ Panel {
   property var sharedFiles: []
   property int refreshNonce: 0
 
-  // AirBridge P2P (Strict OmaID) properties
+  // --- Anonim OmaID (Zero-Knowledge Account ID) & Device ID State ---
   property string p2pVisibility: "KNOWN"
   property int p2pVisibilityRemainingSecs: 0
   property var p2pPeers: []
   property var p2pPendingTransfer: null
-  property bool showAboutModal: false
-  property bool showOmaIdQrModal: false
-  property bool showOmaIdPairModal: false
+  property var p2pTransferProgress: null
+  property bool soundEnabled: true
+  property string firewallStatus: "OK"
 
-  // 16-Digit OmaID & Profile State
   property string omaId: ""
+  property string deviceId: ""
+  property string hostname: "Omarchy-PC"
   property string omaidQrPath: ""
   property bool omaIdRevealed: true
   property bool omaIdCopiedFeedback: false
 
-  // OmaID Pairing & Scan State
-  property string pairInputOmaId: ""
-  property string pairInputName: ""
-  property string pairStatusMsg: ""
-  property bool pairStatusError: false
+  // --- Two-Mode Selector: "own" (Kendi OmaID) vs "foreign" (Yabancı OmaID) ---
+  property string targetScope: "own"
+  property bool showSyncSection: false
+  property bool showQrSection: false
+  property bool showAboutSection: false
 
-  // Selected peer for cursor navigation
+  property string syncInputOmaId: ""
+  property string syncStatusMsg: ""
+  property bool syncStatusError: false
+
+  property string directTargetInput: ""
+  property string directStatusMsg: ""
+  property bool directStatusError: false
+
+  // --- Drop HUD State (Strictly Native Wayland DropArea) ---
+  property bool dropActive: false
+  property bool dropBlasting: false
+  property real dropProximity: 0.0
+  property real blastProgress: 0.0
+  property string blastTargetName: ""
+  property int blastedCount: 0
+
+  // --- Keyboard & Mouse Cursor Model (Official Omarchy Network Panel Standard) ---
   property int selectedPeerIndex: 0
   property bool cursorActive: false
-  property string focusedPeerIp: ""
+  property string focusSection: "peers"
 
+  readonly property color foreground: bar ? bar.foreground : Color.foreground
+  readonly property color urgent: bar ? bar.urgent : Color.urgent
+  readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property color hoverFill: bar ? Style.hoverFillFor(bar.foreground, Color.accent) : "transparent"
   readonly property color selectedFill: bar ? Style.selectedFillFor(bar.foreground, Color.accent) : "transparent"
-  readonly property string fontFamily: (root.bar && root.bar.fontFamily) ? root.bar.fontFamily : ((typeof Style !== "undefined" && Style.font && Style.font.family) ? Style.font.family : "JetBrainsMono Nerd Font, JetBrains Mono, monospace")
+  readonly property string fontFamily: (root.bar && root.bar.fontFamily)
+    ? root.bar.fontFamily
+    : ((typeof Style !== "undefined" && Style.font && Style.font.family)
+      ? Style.font.family
+      : "JetBrainsMono Nerd Font, JetBrains Mono, monospace")
+
   readonly property string userHome: Quickshell.env("HOME") || ("/home/" + (Quickshell.env("USER") || "user"))
   readonly property string peersPath: root.userHome + "/.local/state/omarchy/omasend/discovered_peers.json"
   readonly property string omaidQrFilePath: root.userHome + "/.local/state/omarchy/omasend/omaid_qr.svg"
-  readonly property string clipStagingPath: root.userHome + "/.local/state/omarchy/omasend/clip_staging"
   readonly property string manifestPath: Qt.resolvedUrl("manifest.json").toString().replace(/^file:\/\//, "")
   readonly property string manifestFallbackPath: root.userHome + "/.config/omarchy/plugins/ozdil.omasend/manifest.json"
 
-  property string pluginVersion: "1.8.1"
-  property string pluginDescription: "AirBridge P2P, E2EE Secure Local & Network File Transfer System"
+  property string pluginVersion: "1.9.1"
+  property string pluginDescription: "Anonim OmaID (Zero-Knowledge Identity) & AirBridge P2P Dosya Aktarım Sistemi"
   property string pluginAuthor: "Ozan Özdil (@ozdil)"
   property string pluginLicense: "MIT"
+
+  // --- Peer Separation: Own Devices (Same OmaID -> Zero-Click) vs Foreign OmaID Devices ---
+  readonly property var ownPeers: {
+    if (root.p2pVisibility === "OFF" || !root.p2pPeers) return []
+    var myClean = String(root.omaId || "").replace(/[^0-9]/g, "")
+    var out = []
+    for (var i = 0; i < root.p2pPeers.length; i++) {
+      var p = root.p2pPeers[i]
+      if (!p) continue
+      var pClean = String(p.oma_id || "").replace(/[^0-9]/g, "")
+      if (pClean.length !== 16) continue
+      var sameOwner = Boolean(p.is_same_owner) || (myClean.length === 16 && pClean === myClean)
+      if (sameOwner) out.push(p)
+    }
+    return out
+  }
+
+  readonly property var otherPeers: {
+    if (root.p2pVisibility === "OFF" || !root.p2pPeers) return []
+    var myClean = String(root.omaId || "").replace(/[^0-9]/g, "")
+    var out = []
+    for (var i = 0; i < root.p2pPeers.length; i++) {
+      var p = root.p2pPeers[i]
+      if (!p) continue
+      var pClean = String(p.oma_id || "").replace(/[^0-9]/g, "")
+      if (pClean.length !== 16) continue
+      var sameOwner = Boolean(p.is_same_owner) || (myClean.length === 16 && pClean === myClean)
+      if (!sameOwner) out.push(p)
+    }
+    return out
+  }
 
   function loadManifest(rawJson) {
     try {
@@ -81,22 +151,34 @@ Panel {
       if (parsed.description) root.pluginDescription = parsed.description
       if (parsed.author) root.pluginAuthor = parsed.author
       if (parsed.license) root.pluginLicense = parsed.license
-    } catch(e) {}
+    } catch (e) {}
   }
 
   function formatOmaId(id, revealed) {
     if (!id || String(id).trim() === "") return "---- ---- ---- ----"
     var clean = String(id).replace(/[^0-9]/g, "")
     if (!revealed) {
-      if (clean.length >= 16) {
-        return "••••-••••-••••-" + clean.slice(12, 16)
-      }
+      if (clean.length >= 16) return "••••-••••-••••-" + clean.slice(12, 16)
       return "••••-••••-••••-••••"
     }
     if (clean.length === 16) {
       return clean.slice(0, 4) + "-" + clean.slice(4, 8) + "-" + clean.slice(8, 12) + "-" + clean.slice(12, 16)
     }
     return clean
+  }
+
+  function formatShortDeviceId(devId) {
+    if (!devId || String(devId).trim() === "") return "----"
+    var clean = String(devId).trim().toUpperCase()
+    if (clean.length > 8) return clean.slice(0, 4) + "-" + clean.slice(4, 8)
+    return clean
+  }
+
+  function formatPeerIdentity(peer) {
+    if (!peer) return ""
+    var oma = root.formatOmaId(peer.oma_id || "", true)
+    var dev = root.formatShortDeviceId(peer.id || "")
+    return oma + " / " + dev
   }
 
   function formatInputOmaId(val) {
@@ -109,39 +191,92 @@ Panel {
     return parts.join("-")
   }
 
+  function isValidLuhnOmaId(val) {
+    var clean = String(val || "").replace(/[^0-9]/g, "")
+    if (clean.length !== 16) return false
+    var sum = 0
+    for (var i = 0; i < 16; i++) {
+      var d = parseInt(clean.charAt(15 - i), 10)
+      if (isNaN(d)) return false
+      if (i % 2 === 1) {
+        d *= 2
+        if (d > 9) d -= 9
+      }
+      sum += d
+    }
+    return (sum % 10) === 0
+  }
+
   function loadDiscoveredPeers(content) {
     try {
       if (!content || String(content).trim() === "") return
       var parsed = JSON.parse(content)
-      if (Array.isArray(parsed)) {
-        root.p2pPeers = parsed
-      }
-    } catch(e) {}
+      if (Array.isArray(parsed)) root.p2pPeers = parsed
+    } catch (e) {}
   }
 
-  function bindOmaId(targetId, targetName) {
-    var clean = String(targetId || "").replace(/[^0-9]/g, "")
+  function syncOwnOmaId(candidateId) {
+    var clean = String(candidateId || "").replace(/[^0-9]/g, "")
     if (clean.length !== 16) {
-      root.pairStatusMsg = "Geçersiz OmaID (16 haneli rakam olmalı)"
-      root.pairStatusError = true
+      root.syncStatusMsg = root.t("err_omaid_16_digits")
+      root.syncStatusError = true
       return
     }
-    root.pairStatusMsg = "Eşleştirme kodu oluşturuluyor..."
-    root.pairStatusError = false
-    var name = String(targetName || "").trim() || ("OmaID-" + clean.slice(0, 4))
-    if (pairProc.running) pairProc.running = false
-    pairProc.command = [root.resolveEnginePath(), "--bind-oma-id", clean, name]
-    pairProc.running = true
+    if (!root.isValidLuhnOmaId(clean)) {
+      root.syncStatusMsg = root.t("err_omaid_luhn")
+      root.syncStatusError = true
+      return
+    }
+    var formatted = root.formatOmaId(clean, true)
+    root.syncStatusMsg = root.t("msg_syncing_id")
+    root.syncStatusError = false
+    if (setOwnOmaIdProc.running) setOwnOmaIdProc.running = false
+    setOwnOmaIdProc.targetFormattedId = formatted
+    setOwnOmaIdProc.command = [root.resolveEnginePath(), "--set-oma-id", formatted]
+    setOwnOmaIdProc.running = true
   }
 
-  function scanFromScreen() {
-    root.pairStatusMsg = "Ekran taranıyor..."
-    root.pairStatusError = false
+  function generateNewOwnOmaId() {
+    root.syncStatusMsg = root.t("msg_generating_new_id")
+    root.syncStatusError = false
+    if (newOwnOmaIdProc.running) newOwnOmaIdProc.running = false
+    newOwnOmaIdProc.running = true
+  }
+
+  function sendToDirectTarget(targetStr) {
+    var trimmed = String(targetStr || "").trim()
+    if (trimmed === "") {
+      root.directStatusMsg = root.t("msg_enter_foreign_omaid")
+      root.directStatusError = true
+      return
+    }
+    var digitsOnly = trimmed.replace(/[^0-9]/g, "")
+    if (digitsOnly.length !== 16 || !root.isValidLuhnOmaId(digitsOnly)) {
+      root.directStatusMsg = root.t("err_omaid_16_digits")
+      root.directStatusError = true
+      return
+    }
+    var formatted = root.formatOmaId(digitsOnly, true)
+    root.directStatusMsg = root.t("msg_opening_file_picker") + " (" + formatted + ")..."
+    root.directStatusError = false
+    root.sendFileTo(formatted)
+  }
+
+  function scanFromScreen(forSync) {
+    if (forSync) {
+      root.syncStatusMsg = root.t("msg_scanning_screen_qr")
+      root.syncStatusError = false
+    } else {
+      root.directStatusMsg = root.t("msg_scanning_screen_qr")
+      root.directStatusError = false
+    }
+    screenScanProc.forSync = Boolean(forSync)
     if (screenScanProc.running) screenScanProc.running = false
     screenScanProc.running = true
   }
 
-  function pasteOmaIdFromClipboard() {
+  function pasteOmaIdFromClipboard(targetMode) {
+    pasteProc.targetMode = targetMode || "direct"
     if (pasteProc.running) pasteProc.running = false
     pasteProc.running = true
   }
@@ -156,48 +291,78 @@ Panel {
   }
 
   function executeAction(args) {
-    if (actionProc.running) {
-      actionProc.running = false
-    }
+    if (actionProc.running) actionProc.running = false
     actionProc.command = [root.resolveEnginePath()].concat(args)
     actionProc.running = true
   }
 
   function refresh() {
-    if (!serverProc.running) {
-      serverProc.running = true
-    }
-    if (omaIdDirectReadProc.running) {
-      omaIdDirectReadProc.running = false
-    }
+    if (!serverProc.running) serverProc.running = true
+    if (omaIdDirectReadProc.running) omaIdDirectReadProc.running = false
     omaIdDirectReadProc.running = true
-    if (scanProc.running) {
-      scanProc.running = false
-    }
+    if (scanProc.running) scanProc.running = false
     scanProc.running = true
   }
 
   function setP2pVisibility(mode) {
-    root.p2pVisibility = mode
-    if (mode === "EVERYONE") {
-      root.p2pVisibilityRemainingSecs = 600
-    } else {
-      root.p2pVisibilityRemainingSecs = 0
-    }
-    if (mode === "OFF") {
-      root.p2pPeers = []
-    }
-    root.executeAction(["--set-visibility", mode])
+    var m = (mode === "OFF") ? "OFF" : "KNOWN"
+    root.p2pVisibility = m
+    if (m === "OFF") root.p2pPeers = []
+    root.executeAction(["--set-visibility", m])
   }
 
-  function toggleVisibility() {
+  function togglePower() {
     if (root.p2pVisibility === "OFF") {
       root.setP2pVisibility("KNOWN")
-    } else if (root.p2pVisibility === "KNOWN") {
-      root.setP2pVisibility("EVERYONE")
     } else {
       root.setP2pVisibility("OFF")
     }
+  }
+
+  function resolveActiveDropPeer() {
+    if (root.ownPeers && root.ownPeers.length > 0) return root.ownPeers[0]
+    if (root.p2pPeers && root.selectedPeerIndex >= 0 && root.selectedPeerIndex < root.p2pPeers.length) {
+      return root.p2pPeers[root.selectedPeerIndex]
+    }
+    if (root.p2pPeers && root.p2pPeers.length > 0) return root.p2pPeers[0]
+    return null
+  }
+
+  function handleDroppedData(drop) {
+    var fileList = []
+    if (drop.hasUrls && drop.urls.length > 0) {
+      for (var i = 0; i < drop.urls.length; i++) {
+        var u = drop.urls[i].toString().replace(/^file:\/\//, "")
+        try { u = decodeURIComponent(u) } catch (e) {}
+        if (u.trim() !== "") fileList.push(u.trim())
+      }
+    } else if (drop.hasText && drop.text) {
+      var lines = drop.text.split("\n")
+      for (var j = 0; j < lines.length; j++) {
+        var l = lines[j].replace(/^file:\/\//, "").trim()
+        try { l = decodeURIComponent(l) } catch (e) {}
+        if (l !== "") fileList.push(l)
+      }
+    }
+
+    root.blastedCount = fileList.length
+    if (root.soundEnabled) {
+      if (playSendSoundProc.running) playSendSoundProc.running = false
+      playSendSoundProc.running = true
+    }
+
+    var targetPeer = root.resolveActiveDropPeer()
+    var targetAddr = targetPeer ? (targetPeer.ip || targetPeer.oma_id) : ""
+    root.blastTargetName = targetPeer ? (targetPeer.name || targetPeer.ip) : root.t("waiting_for_device")
+
+    if (targetAddr !== "" && fileList.length > 0) {
+      for (var k = 0; k < fileList.length; k++) {
+        root.executeAction(["--send", targetAddr, fileList[k]])
+      }
+    }
+
+    root.dropBlasting = true
+    blastAnim.restart()
   }
 
   function moveCursor(dy) {
@@ -206,23 +371,21 @@ Panel {
       selectedPeerIndex = 0
       return
     }
-    var len = root.p2pPeers ? root.p2pPeers.length : 0
-    if (len === 0) return
-    var next = selectedPeerIndex + dy
-    if (next < 0) next = 0
-    if (next >= len) next = len - 1
-    selectedPeerIndex = next
+    var total = root.ownPeers.length + root.otherPeers.length
+    if (total === 0) return
+    selectedPeerIndex = Math.max(0, Math.min(total - 1, selectedPeerIndex + dy))
   }
 
   function activateSelected() {
-    if (root.p2pPendingTransfer) {
+    if (root.p2pPendingTransfer && root.p2pPendingTransfer.status === "PENDING") {
       root.acceptTransfer(root.p2pPendingTransfer.token)
       return
     }
-    if (root.p2pPeers && root.p2pPeers.length > selectedPeerIndex) {
-      var peer = root.p2pPeers[selectedPeerIndex]
-      if (peer && peer.ip) {
-        root.sendFileTo(peer.ip)
+    var all = root.ownPeers.concat(root.otherPeers)
+    if (all.length > selectedPeerIndex && selectedPeerIndex >= 0) {
+      var peer = all[selectedPeerIndex]
+      if (peer && (peer.ip || peer.oma_id)) {
+        root.sendFileTo(peer.ip || peer.oma_id)
       }
     }
   }
@@ -231,33 +394,29 @@ Panel {
     if (root.opened) {
       selectedPeerIndex = 0
       cursorActive = false
+      if (panelFlick) panelFlick.contentY = 0
       root.forceScan()
       root.refresh()
+      Qt.callLater(function() { keyCatcher.forceActiveFocus() })
     }
   }
 
-  function acceptTransfer(token) {
-    root.executeAction(["--accept-transfer", token])
+  function acceptTransfer(token) { root.executeAction(["--accept-transfer", token]) }
+  function rejectTransfer(token) { root.executeAction(["--reject-transfer", token]) }
+  function cancelTransfer() {
+    root.p2pTransferProgress = null
+    root.executeAction(["--cancel-transfer"])
   }
-
-  function rejectTransfer(token) {
-    root.executeAction(["--reject-transfer", token])
+  function toggleSound() {
+    root.soundEnabled = !root.soundEnabled
+    root.executeAction(["--toggle-sound"])
   }
+  function syncClipboardTo(ipOrOmaId) { root.executeAction(["--sync-clipboard", ipOrOmaId]) }
 
-  function syncClipboardTo(ip) {
-    root.executeAction(["--sync-clipboard", ip])
-  }
-
-  function sendFileTo(ip) {
+  function sendFileTo(ipOrOmaId) {
     if (sendDialogProc.running) sendDialogProc.running = false
-    sendDialogProc.command = [root.resolveEnginePath(), "--send-dialog", ip]
+    sendDialogProc.command = [root.resolveEnginePath(), "--send-dialog", ipOrOmaId]
     sendDialogProc.running = true
-  }
-
-  function copyPortalUrl() {
-    if (copyProc.running) copyProc.running = false
-    copyProc.command = ["wl-copy", root.activeUrl ? root.activeUrl : ("http://" + root.localIp + ":" + root.port)]
-    copyProc.running = true
   }
 
   function copyText(text) {
@@ -282,6 +441,7 @@ Panel {
     function sendFile(ip: string): void { root.sendFileTo(ip) }
   }
 
+  // --- Background Processes ---
   Process {
     id: omaIdDirectReadProc
     command: ["cat", root.userHome + "/.local/state/omarchy/omasend/oma_id"]
@@ -291,14 +451,61 @@ Panel {
       onStreamFinished: {
         omaIdDirectReadProc.running = false
         var val = String(text || "").trim()
+        if (val.length >= 16) root.omaId = val
+      }
+    }
+  }
+
+  Process {
+    id: setOwnOmaIdProc
+    property string targetFormattedId: ""
+    onExited: function(code) {
+      setOwnOmaIdProc.running = false
+      if (code === 0) {
+        root.omaId = setOwnOmaIdProc.targetFormattedId
+        root.syncStatusMsg = root.t("msg_id_synced") + setOwnOmaIdProc.targetFormattedId
+        root.syncStatusError = false
+        root.refresh()
+        syncCloseTimer.restart()
+      } else {
+        root.syncStatusMsg = root.t("msg_id_save_failed")
+        root.syncStatusError = true
+      }
+    }
+  }
+
+  Process {
+    id: newOwnOmaIdProc
+    command: [root.resolveEnginePath(), "--new-oma-id"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        newOwnOmaIdProc.running = false
+        var val = String(text || "").trim()
         if (val.length >= 16) {
           root.omaId = val
+          root.syncInputOmaId = root.formatInputOmaId(val)
+          root.syncStatusMsg = root.t("msg_new_id_generated") + root.formatOmaId(val, true)
+          root.syncStatusError = false
+          root.forceScan()
+          root.refresh()
         }
       }
     }
   }
 
-  // Persistent background HTTP daemon
+  Timer {
+    id: syncCloseTimer
+    interval: 1200
+    repeat: false
+    onTriggered: {
+      if (!root.syncStatusError) {
+        root.showSyncSection = false
+        root.syncStatusMsg = ""
+      }
+    }
+  }
+
   Process {
     id: serverProc
     command: [root.resolveEnginePath(), "--serve"]
@@ -317,9 +524,7 @@ Panel {
   Process {
     id: scanProc
     command: [root.resolveEnginePath(), "--json"]
-    onExited: function(code) {
-      scanProc.running = false
-    }
+    onExited: function(code) { scanProc.running = false }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -342,13 +547,19 @@ Panel {
           root.totalReceived = Number(d.total_received) || 0
           root.recentFiles = d.recent_files || []
           root.sharedFiles = d.shared_files || []
-          root.p2pVisibility = String(d.p2p_visibility || "KNOWN")
+          var rawVis = String(d.p2p_visibility || "KNOWN")
+          root.p2pVisibility = (rawVis === "OFF") ? "OFF" : "KNOWN"
           root.p2pVisibilityRemainingSecs = Number(d.p2p_visibility_remaining_secs) || 0
           root.p2pPeers = d.p2p_discovered_peers || []
           root.p2pPendingTransfer = d.p2p_pending_transfer || null
-          root.omaId = String(d.oma_id || d.p2p_device_id || "")
+          root.p2pTransferProgress = d.p2p_transfer_progress || null
+          if (d.sound_enabled !== undefined) root.soundEnabled = Boolean(d.sound_enabled)
+          root.firewallStatus = String(d.firewall_status || "OK")
+          root.deviceId = String(d.p2p_device_id || "")
+          root.hostname = String(d.p2p_hostname || "Omarchy-PC")
+          root.omaId = String(d.oma_id || "")
           root.refreshNonce++
-        } catch(e) {}
+        } catch (e) {}
       }
     }
   }
@@ -357,46 +568,38 @@ Panel {
     id: omaIdCopyTimer
     interval: 1800
     repeat: false
-    onTriggered: {
-      root.omaIdCopiedFeedback = false
-    }
-  }
-
-  Timer {
-    id: pairTimer
-    interval: 1800
-    repeat: false
-    onTriggered: {
-      if (!root.pairStatusError) {
-        root.showOmaIdPairModal = false
-        root.pairInputOmaId = ""
-        root.pairInputName = ""
-        root.pairStatusMsg = ""
-      }
-    }
+    onTriggered: root.omaIdCopiedFeedback = false
   }
 
   Process {
     id: screenScanProc
+    property bool forSync: false
     command: ["bash", "-c", "rm -f /tmp/oma_qr_scan.png && /usr/bin/grim /tmp/oma_qr_scan.png 2>/dev/null && (/usr/bin/zbarimg -q --raw /tmp/oma_qr_scan.png 2>/dev/null || true) && rm -f /tmp/oma_qr_scan.png"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         screenScanProc.running = false
         var raw = String(text || "").trim()
-        if (raw.length > 0) {
-          var clean = raw.replace(/[^0-9]/g, "")
-          if (clean.length >= 16) {
-            root.pairInputOmaId = root.formatInputOmaId(clean.slice(0, 16))
-            root.pairStatusMsg = "QR Kod okundu: " + root.pairInputOmaId
-            root.pairStatusError = false
+        var clean = raw.replace(/[^0-9]/g, "")
+        if (clean.length >= 16) {
+          var formatted = root.formatInputOmaId(clean.slice(0, 16))
+          if (screenScanProc.forSync) {
+            root.syncInputOmaId = formatted
+            root.syncStatusMsg = root.t("msg_qr_read") + formatted
+            root.syncStatusError = false
           } else {
-            root.pairStatusMsg = "QR Kod içeriğinde 16 haneli OmaID bulunamadı"
-            root.pairStatusError = true
+            root.directTargetInput = formatted
+            root.directStatusMsg = root.t("msg_qr_read") + formatted
+            root.directStatusError = false
           }
         } else {
-          root.pairStatusMsg = "Ekrandan taranabilir QR kod bulunamadı"
-          root.pairStatusError = true
+          if (screenScanProc.forSync) {
+            root.syncStatusMsg = root.t("msg_qr_not_found")
+            root.syncStatusError = true
+          } else {
+            root.directStatusMsg = root.t("msg_qr_not_found")
+            root.directStatusError = true
+          }
         }
       }
     }
@@ -404,25 +607,33 @@ Panel {
 
   Process {
     id: pasteProc
+    property string targetMode: "direct"
     command: ["wl-paste", "--no-newline"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         pasteProc.running = false
         var raw = String(text || "").trim()
-        if (raw.length > 0) {
-          var clean = raw.replace(/[^0-9]/g, "")
+        if (raw.length === 0) return
+        var clean = raw.replace(/[^0-9]/g, "")
+        if (pasteProc.targetMode === "sync") {
           if (clean.length >= 16) {
-            root.pairInputOmaId = root.formatInputOmaId(clean.slice(0, 16))
-            root.pairStatusMsg = "Panodan OmaID aktarıldı: " + root.pairInputOmaId
-            root.pairStatusError = false
+            root.syncInputOmaId = root.formatInputOmaId(clean.slice(0, 16))
+            root.syncStatusMsg = root.t("msg_clipboard_pasted")
+            root.syncStatusError = false
           } else {
-            root.pairStatusMsg = "Panodaki metin 16 haneli OmaID formatında değil"
-            root.pairStatusError = true
+            root.syncStatusMsg = root.t("msg_clipboard_no_omaid")
+            root.syncStatusError = true
           }
         } else {
-          root.pairStatusMsg = "Pano boş"
-          root.pairStatusError = true
+          if (clean.length >= 16) {
+            root.directTargetInput = root.formatInputOmaId(clean.slice(0, 16))
+            root.directStatusMsg = ""
+            root.directStatusError = false
+          } else {
+            root.directStatusMsg = root.t("msg_clipboard_no_omaid")
+            root.directStatusError = true
+          }
         }
       }
     }
@@ -437,33 +648,10 @@ Panel {
   }
 
   Process {
-    id: pairProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        pairProc.running = false
-        var code = ""
-        try {
-          var d = JSON.parse(String(text || "").slice(0, 4096))
-          var c = String(d.pair_code || "")
-          if (/^[0-9]{6}$/.test(c)) code = c
-        } catch (e) {}
-        if (code.length === 6) {
-          root.pairStatusMsg = "Eşleştirme kodu: " + code + " (10 dakika geçerli). Diğer cihazda: omasend-engine --complete-pair <bu cihazın IP adresi> " + root.omaId + " " + code
-          root.pairStatusError = false
-        } else {
-          root.pairStatusMsg = "Eşleştirme başlatılamadı"
-          root.pairStatusError = true
-        }
-        root.refresh()
-      }
-    }
-  }
-
-  Process {
     id: sendDialogProc
     onExited: function(code) {
       sendDialogProc.running = false
+      root.directStatusMsg = ""
       root.refresh()
     }
   }
@@ -472,7 +660,7 @@ Panel {
   Process { id: folderProc }
   Process {
     id: playSendSoundProc
-    command: ["pw-play", Qt.resolvedUrl("assets/send_whoosh.wav").toString().replace(/^file:\/\//, "")]
+    command: ["pw-play", Qt.resolvedUrl("assets/send.wav").toString().replace(/^file:\/\//, "")]
   }
 
   FileView {
@@ -493,9 +681,7 @@ Panel {
     atomicWrites: true
     printErrors: false
     onLoaded: root.loadManifest(text())
-    onLoadFailed: {
-      manifestFallbackWatcher.reload()
-    }
+    onLoadFailed: manifestFallbackWatcher.reload()
     onFileChanged: reload()
   }
 
@@ -511,7 +697,7 @@ Panel {
 
   Timer {
     id: refreshTimer
-    interval: 800
+    interval: 1000
     running: root.opened
     repeat: true
     onTriggered: root.refresh()
@@ -523,12 +709,8 @@ Panel {
     running: true
     repeat: true
     onTriggered: {
-      if (!serverProc.running) {
-        serverProc.running = true
-      }
-      if (root.opened) {
-        root.refresh()
-      }
+      if (!serverProc.running) serverProc.running = true
+      if (root.opened) root.refresh()
     }
   }
 
@@ -544,698 +726,298 @@ Panel {
     if (watchdogTimer.running) watchdogTimer.running = false
   }
 
-  // Transform Watcher for strictly reactive coordinate tracking across bar re-layouts
-  TransformWatcher {
-    id: buttonWatcher
-    a: button && button.QsWindow.window ? button.QsWindow.window.contentItem : null
-    b: button
-  }
-
+  // =========================================================================
+  // 1. BAR BUTTON & PROXIMITY WAYLAND DROP SENSOR
+  // =========================================================================
   BarIconButton {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: ""
-    active: (dropPortal.active && dropPortal.proximity > 0.01) || dropPortal.isBlasting
+    text: root.dropBlasting ? "󰄬" : ""
+    active: root.dropActive || root.dropBlasting
     useActiveColor: false
-    foreground: ((dropPortal.active && dropPortal.proximity > 0.01) || dropPortal.isBlasting) ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
-    tooltipText: "OmaSend AirBridge (" + root.p2pVisibility + ")"
+    foreground: (root.dropActive || root.dropBlasting) ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
+    tooltipText: "OmaSend (" + root.formatOmaId(root.omaId, true) + " / " + root.formatShortDeviceId(root.deviceId) + ")"
     onPressed: function(b) {
-      root.toggle()
+      if (b === Qt.RightButton) root.forceScan()
+      else root.toggle()
     }
 
     DropArea {
       id: iconDropArea
       anchors.centerIn: parent
-      width: Math.min(560, root.bar ? root.bar.width : 560)
+      width: Math.min(320, root.bar ? root.bar.width : 320)
       height: parent.height
       keys: ["text/uri-list", "text/plain", "application/x-kde-urilist"]
 
       onEntered: function(drag) {
         if (drag.hasUrls || drag.hasText) {
-          dragRetentionTimer.stop()
-          dropPortal.active = true
-          dropPortal.proximity = Math.max(dropPortal.proximity, 0.02)
+          dropHandoffTimer.stop()
+          root.dropActive = true
           drag.acceptProposedAction()
+          var dist = Math.abs(drag.x - (iconDropArea.width / 2))
+          var raw = Math.max(0.35, Math.min(1.0, 1.0 - (dist / (iconDropArea.width / 2))))
+          root.dropProximity = 0.5 * (1.0 - Math.cos(raw * Math.PI))
         }
       }
 
       onPositionChanged: function(drag) {
         if (drag.hasUrls || drag.hasText) {
-          dragRetentionTimer.stop()
-          dropPortal.active = true
+          dropHandoffTimer.stop()
+          root.dropActive = true
           drag.acceptProposedAction()
-          var dx = drag.x - (iconDropArea.width / 2)
-          var dist = Math.abs(dx)
-          var raw = Math.max(0.0, Math.min(1.0, 1.0 - (dist / (iconDropArea.width / 2))))
-          dropPortal.proximity = Math.max(dropPortal.proximity, 0.5 * (1.0 - Math.cos(raw * Math.PI)))
-          dropPortal.dragOffsetX = Math.max(-45.0, Math.min(45.0, dx * 0.22))
-          dropPortal.fluidStretch = 1.0 + (dropPortal.proximity * 0.25)
-          dropPortal.fluidMorphAngle = (dx / (iconDropArea.width / 2)) * 14.0
+          var dist = Math.abs(drag.x - (iconDropArea.width / 2))
+          var raw = Math.max(0.35, Math.min(1.0, 1.0 - (dist / (iconDropArea.width / 2))))
+          root.dropProximity = Math.max(root.dropProximity, 0.5 * (1.0 - Math.cos(raw * Math.PI)))
         }
       }
 
       onExited: {
-        dragRetentionTimer.restart()
+        dropHandoffTimer.restart()
       }
 
       onDropped: function(drop) {
-        dragRetentionTimer.stop()
+        dropHandoffTimer.stop()
         if (drop.hasUrls || drop.hasText) {
           drop.acceptProposedAction()
-          dropPortal.triggerDropBlast(drop)
+          root.handleDroppedData(drop)
         }
       }
     }
   }
 
-  // Anchored Drop Portal & Fluid Water Droplet Ripple Engine
-  PopupWindow {
-    id: dropPortal
-    anchor {
-      id: dropPortalAnchor
-      window: button ? button.QsWindow.window : null
-      adjustment: PopupAdjustment.Slide
-      edges: Edges.Top | Edges.Left
-      gravity: Edges.Bottom | Edges.Right
-      rect.width: 1
-      rect.height: 1
+  Behavior on dropProximity {
+    NumberAnimation { duration: 140; easing.type: Easing.OutCubic }
+  }
 
-      onAnchoring: {
-        if (!button || !root.bar) return
-        var target = button
-        var popupWidth = dropPortal.implicitWidth
-        var popupHeight = dropPortal.implicitHeight
-        var localX = target.width / 2 - popupWidth / 2
-        var isBottom = (root.bar.position === "bottom" || root.bar.edge === "bottom")
-        var localY = isBottom ? -popupHeight : target.height
-
-        var win = target.QsWindow.window
-        if (!win) return
-
-        var point = win.contentItem.mapFromItem(target, localX, localY)
-        point.x = Math.max(0, Math.min(point.x, win.width - popupWidth))
-
-        dropPortalAnchor.rect.x = Math.round(point.x)
-        dropPortalAnchor.rect.y = Math.round(point.y)
+  Timer {
+    id: dropHandoffTimer
+    interval: 160
+    repeat: false
+    onTriggered: {
+      if (!iconDropArea.containsDrag && !hudDropArea.containsDrag && !root.dropBlasting) {
+        root.dropActive = false
+        root.dropProximity = 0.0
       }
     }
-    implicitWidth: 600
-    implicitHeight: 600
-    visible: (dropPortal.active && dropPortal.proximity > 0.01) || dropPortal.isBlasting
-    color: "transparent"
+  }
 
-    property bool active: false
-    property real proximity: 0.0
-    property bool isBlasting: false
-    property real blastProgress: 0.0
-
-    // Caelestia Shell Spring & Fluid Dynamic Offsets
-    property real dragOffsetX: 0.0
-    property real dragOffsetY: 0.0
-    property real fluidMorphAngle: 0.0
-    property real fluidStretch: 1.0
-
-    Behavior on dragOffsetX {
-      NumberAnimation {
-        duration: 250
-        easing.type: Easing.BezierSpline
-        easing.bezierCurve: [0.38, 1.21, 0.22, 1, 1, 1] // Caelestia expressiveDefaultSpatial
+  Timer {
+    id: dropSafetyWatchdog
+    interval: 350
+    repeat: true
+    running: root.dropActive && !root.dropBlasting
+    onTriggered: {
+      if (!iconDropArea.containsDrag && !hudDropArea.containsDrag) {
+        root.dropActive = false
+        root.dropProximity = 0.0
       }
     }
-    Behavior on dragOffsetY {
-      NumberAnimation {
-        duration: 250
-        easing.type: Easing.BezierSpline
-        easing.bezierCurve: [0.38, 1.21, 0.22, 1, 1, 1] // Caelestia expressiveDefaultSpatial
+  }
+
+  SequentialAnimation {
+    id: blastAnim
+    running: false
+    NumberAnimation {
+      target: root
+      property: "blastProgress"
+      from: 0.0
+      to: 1.0
+      duration: 520
+      easing.type: Easing.OutCubic
+    }
+    ScriptAction {
+      script: {
+        root.dropBlasting = false
+        root.blastProgress = 0.0
+        root.dropActive = false
+        root.dropProximity = 0.0
       }
     }
-    Behavior on fluidStretch {
-      NumberAnimation {
-        duration: 350
-        easing.type: Easing.BezierSpline
-        easing.bezierCurve: [0.42, 1.67, 0.21, 0.9, 1, 1] // Caelestia expressiveFastSpatial (spring rebound)
-      }
-    }
+  }
 
-    // Exact button center relative to dropPortal (Fully Reactive with TransformWatcher)
-    readonly property real originX: {
-      buttonWatcher.transform
-      if (!button || !button.QsWindow.window) return dropPortal.width / 2
-      var win = button.QsWindow.window
-      var btnCenterInWin = win.contentItem.mapFromItem(button, button.width / 2, 0)
-      return Math.round(btnCenterInWin.x - dropPortalAnchor.rect.x)
-    }
-    readonly property real originY: (root.bar && (root.bar.position === "bottom" || root.bar.edge === "bottom")) ? dropPortal.height : 0
-
-    // 350ms Drag Dropout Buffer Timer (Ensures strictly drag-only activation)
-    Timer {
-      id: dragRetentionTimer
-      interval: 350
-      repeat: false
-      onTriggered: {
-        if (!portalDropArea.containsDrag && !iconDropArea.containsDrag && !dropPortal.isBlasting) {
-          dropPortal.active = false
-          dropPortal.proximity = 0.0
-          dropPortal.dragOffsetX = 0.0
-          dropPortal.dragOffsetY = 0.0
-          dropPortal.fluidStretch = 1.0
-          dropPortal.fluidMorphAngle = 0.0
-        }
-      }
-    }
-
-    property var draggedFiles: []
-    property string blastTargetName: ""
-    property int blastedCount: 0
-
-    function triggerDropBlast(drop) {
-      var fileList = []
-      if (drop.hasUrls && drop.urls.length > 0) {
-        for (var i = 0; i < drop.urls.length; i++) {
-          var u = drop.urls[i].toString().replace(/^file:\/\//, "")
-          try { u = decodeURIComponent(u) } catch(e) {}
-          if (u.trim() !== "") fileList.push(u.trim())
-        }
-      } else if (drop.hasText && drop.text) {
-        var lines = drop.text.split("\n")
-        for (var j = 0; j < lines.length; j++) {
-          var l = lines[j].replace(/^file:\/\//, "").trim()
-          try { l = decodeURIComponent(l) } catch(e) {}
-          if (l !== "") fileList.push(l)
-        }
-      }
-
-      dropPortal.blastedCount = fileList.length
-
-      // Play send whoosh sound via PipeWire
-      if (playSendSoundProc.running) playSendSoundProc.running = false
-      playSendSoundProc.running = true
-
-      // Target peer identification
-      var targetPeer = (root.p2pPeers && root.selectedPeerIndex >= 0 && root.selectedPeerIndex < root.p2pPeers.length)
-                       ? root.p2pPeers[root.selectedPeerIndex]
-                       : (root.p2pPeers && root.p2pPeers.length > 0 ? root.p2pPeers[0] : null)
-      var targetIp = targetPeer ? targetPeer.ip : ""
-      dropPortal.blastTargetName = targetPeer ? (targetPeer.name || targetPeer.ip) : "Cihaz Seçilmedi"
-
-      if (targetIp !== "" && fileList.length > 0) {
-        // Send all dragged files
-        for (var k = 0; k < fileList.length; k++) {
-          root.executeAction(["--send", targetIp, fileList[k]])
-        }
-      }
-
-      // Trigger Water Droplet Splash & Rebound Shockwave
-      dropPortal.isBlasting = true
-      blastAnim.restart()
-    }
-
-    // Water Droplet Impact & Crown Splash Animation Sequence
-    SequentialAnimation {
-      id: blastAnim
-      running: false
-      ParallelAnimation {
-        NumberAnimation {
-          target: dropPortal
-          property: "blastProgress"
-          from: 0.0
-          to: 1.0
-          duration: 460
-          easing.type: Easing.OutCubic
-        }
-        NumberAnimation {
-          target: impactCrown
-          property: "scale"
-          from: 0.0
-          to: 1.65
-          duration: 220
-          easing.type: Easing.OutBack
-        }
-        NumberAnimation {
-          target: flareBeam
-          property: "opacity"
-          from: 0.0
-          to: 1.0
-          duration: 120
-          easing.type: Easing.OutQuad
-        }
-      }
-      ParallelAnimation {
-        NumberAnimation {
-          target: impactCrown
-          property: "scale"
-          to: 1.0
-          duration: 240
-          easing.type: Easing.OutElastic
-        }
-        NumberAnimation {
-          target: flareBeam
-          property: "opacity"
-          to: 0.0
-          duration: 240
-          easing.type: Easing.InQuad
-        }
-        NumberAnimation {
-          target: dropPortal
-          property: "proximity"
-          to: 0.0
-          duration: 240
-        }
-      }
-      ScriptAction {
-        script: {
-          dropPortal.isBlasting = false
-          dropPortal.blastProgress = 0.0
-          dropPortal.proximity = 0.0
-          dropPortal.dragOffsetX = 0.0
-          dropPortal.dragOffsetY = 0.0
-          dropPortal.fluidStretch = 1.0
-          dropPortal.fluidMorphAngle = 0.0
-          dropPortal.active = false
-        }
-      }
-    }
+  // =========================================================================
+  // 2. BAR-INTEGRATED MAGNETIC DROP HUD (`PopupCard`)
+  // =========================================================================
+  PopupCard {
+    id: dropHud
+    anchorItem: button
+    owner: root
+    bar: root.bar
+    triggerMode: "hover"
+    open: (root.dropActive || root.dropBlasting) && !root.opened
+    borderColor: (root.dropProximity > 0.72 || root.dropBlasting) ? Color.accent : Color.popups.border
+    contentWidth: dropHud.fittedContentWidth(Style.space(276))
+    contentHeight: dropHud.fittedContentHeight(Style.space(68))
 
     DropArea {
-      id: portalDropArea
+      id: hudDropArea
       anchors.fill: parent
       keys: ["text/uri-list", "text/plain", "application/x-kde-urilist"]
 
       onEntered: function(drag) {
         if (drag.hasUrls || drag.hasText) {
-          dragRetentionTimer.stop()
-          dropPortal.active = true
+          dropHandoffTimer.stop()
+          root.dropActive = true
+          root.dropProximity = 1.0
           drag.acceptProposedAction()
         }
       }
 
       onPositionChanged: function(drag) {
         if (drag.hasUrls || drag.hasText) {
-          dragRetentionTimer.stop()
-          dropPortal.active = true
+          dropHandoffTimer.stop()
+          root.dropActive = true
+          root.dropProximity = 1.0
           drag.acceptProposedAction()
-          var dx = drag.x - dropPortal.originX
-          var dy = drag.y - dropPortal.originY
-          var dist = Math.sqrt(dx * dx + dy * dy)
-          var maxDist = 600.0
-          var raw = Math.max(0.0, Math.min(1.0, 1.0 - (dist / maxDist)))
-          dropPortal.proximity = 0.5 * (1.0 - Math.cos(raw * Math.PI))
-          dropPortal.dragOffsetX = Math.max(-55.0, Math.min(55.0, dx * 0.16))
-          dropPortal.dragOffsetY = Math.max(-40.0, Math.min(40.0, dy * 0.14))
-          dropPortal.fluidStretch = 1.0 + (dropPortal.proximity * 0.32)
-          dropPortal.fluidMorphAngle = Math.max(-20.0, Math.min(20.0, (dx / 300.0) * 18.0))
         }
       }
 
       onExited: {
-        dragRetentionTimer.restart()
+        dropHandoffTimer.restart()
       }
 
       onDropped: function(drop) {
-        dragRetentionTimer.stop()
+        dropHandoffTimer.stop()
         if (drop.hasUrls || drop.hasText) {
           drop.acceptProposedAction()
-          dropPortal.triggerDropBlast(drop)
+          root.handleDroppedData(drop)
         }
       }
     }
 
-    Item {
-      id: auraContainer
-      x: Math.round(dropPortal.originX - width / 2 + dropPortal.dragOffsetX)
-      y: Math.round(dropPortal.originY - height / 2 + dropPortal.dragOffsetY)
-      width: 600
-      height: 600
-      layer.enabled: true
-      opacity: ((dropPortal.active && dropPortal.proximity > 0.01) || dropPortal.isBlasting) ? 1.0 : 0.0
-      scale: dropPortal.isBlasting ? (1.0 + dropPortal.blastProgress * 0.12) : Math.max(0.85, Math.min(1.15, dropPortal.fluidStretch))
-      rotation: dropPortal.fluidMorphAngle
+    RowLayout {
+      anchors.fill: parent
+      spacing: Style.space(12)
 
-      Behavior on opacity {
-        NumberAnimation { duration: 140; easing.type: Easing.OutQuad }
-      }
-      Behavior on scale {
-        NumberAnimation { duration: 120; easing.type: Easing.OutBack }
-      }
-      Behavior on rotation {
-        NumberAnimation { duration: 110; easing.type: Easing.OutQuad }
-      }
-
-      // Layer 5: Liquid Water Surface Radial Refraction & Chromatic Glow
-      Canvas {
-        id: radialGradientCanvas
-        anchors.centerIn: parent
-        width: 580
-        height: 580
-        antialiasing: true
-        layer.enabled: true
-        renderTarget: Canvas.FramebufferObject
-
-        onPaint: {
-          var ctx = getContext("2d")
-          ctx.reset()
-          if (dropPortal.proximity <= 0.005 && !dropPortal.isBlasting) return
-
-          var cx = width / 2
-          var cy = height / 2
-          var r = (80 + dropPortal.proximity * 440) / 2
-
-          // Caelestia Dual-Stop Chromatic Gradient (Accent Cyan to Electric Purple/Blue)
-          var grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, r)
-          grad.addColorStop(0.0, Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.85 * (0.35 + dropPortal.proximity * 0.65)))
-          grad.addColorStop(0.24, Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.52 * dropPortal.proximity))
-          grad.addColorStop(0.55, Qt.rgba(0.48, 0.64, 0.98, 0.28 * dropPortal.proximity)) // Caelestia soft violet refraction
-          grad.addColorStop(0.82, Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.08 * dropPortal.proximity))
-          grad.addColorStop(1.0, Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.00))
-
-          ctx.fillStyle = grad
-          ctx.beginPath()
-          ctx.arc(cx, cy, r, 0, 2 * Math.PI, false)
-          ctx.fill()
-        }
-
-        Connections {
-          target: dropPortal
-          function onProximityChanged() { radialGradientCanvas.requestPaint() }
-          function onIsBlastingChanged() { radialGradientCanvas.requestPaint() }
-          function onBlastProgressChanged() { radialGradientCanvas.requestPaint() }
-          function onFluidStretchChanged() { radialGradientCanvas.requestPaint() }
-        }
-      }
-
-      // Layer 4: Ambient Liquid Pool Glow with Spring Elasticity
-      Rectangle {
-        id: ambientGlow
-        anchors.centerIn: parent
-        width: (80 + (dropPortal.proximity * 410) + (dropPortal.isBlasting ? dropPortal.blastProgress * 140 : 0)) * (1.0 + (dropPortal.fluidStretch - 1.0) * 0.4)
-        height: (80 + (dropPortal.proximity * 390) + (dropPortal.isBlasting ? dropPortal.blastProgress * 140 : 0)) / (1.0 + (dropPortal.fluidStretch - 1.0) * 0.3)
-        radius: Math.min(width, height) / 2
-        layer.enabled: true
-        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, dropPortal.isBlasting ? 0.38 : (0.05 + dropPortal.proximity * 0.26))
-        border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, dropPortal.isBlasting ? 0.85 : (0.10 + dropPortal.proximity * 0.52))
-        border.width: 1.2
-
-        Behavior on width { NumberAnimation { duration: 80; easing.type: Easing.OutBack } }
-        Behavior on height { NumberAnimation { duration: 80; easing.type: Easing.OutBack } }
-        Behavior on color { ColorAnimation { duration: 80 } }
-      }
-
-      // Wave 4: Outermost Propagating Ripple (Phase Offset: 1200ms)
-      Rectangle {
-        id: portalWave4
-        anchors.centerIn: parent
-        width: (260 + dropPortal.proximity * 300) * (1.0 + (dropPortal.fluidStretch - 1.0) * 0.2)
-        height: width
-        radius: width / 2
-        layer.enabled: true
-        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.015)
-        border.color: Qt.rgba(0.48, 0.64, 0.98, 0.75) // Caelestia pastel rim
-        border.width: Math.max(0.8, 1.5 * (1.0 - scale * 0.5))
-
-        SequentialAnimation on opacity {
-          running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
-          loops: Animation.Infinite
-          PauseAnimation { duration: 1200 }
-          NumberAnimation { from: 0.0; to: 0.38 + dropPortal.proximity * 0.32; duration: 550; easing.type: Easing.OutQuad }
-          NumberAnimation { from: 0.38 + dropPortal.proximity * 0.32; to: 0.0; duration: 1150; easing.type: Easing.InQuad }
-        }
-
-        SequentialAnimation on scale {
-          running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
-          loops: Animation.Infinite
-          PauseAnimation { duration: 1200 }
-          NumberAnimation { from: 0.0; to: 1.0; duration: 1700; easing.type: Easing.OutCubic }
-        }
-      }
-
-      // Wave 3: Outer Propagating Ripple (Phase Offset: 800ms)
-      Rectangle {
-        id: portalWave3
-        anchors.centerIn: parent
-        width: 200 + dropPortal.proximity * 280
-        height: width
-        radius: width / 2
-        layer.enabled: true
-        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.025)
-        border.color: Color.accent
-        border.width: Math.max(1.0, 1.8 * (1.0 - scale * 0.4))
-
-        SequentialAnimation on opacity {
-          running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
-          loops: Animation.Infinite
-          PauseAnimation { duration: 800 }
-          NumberAnimation { from: 0.0; to: 0.52 + dropPortal.proximity * 0.34; duration: 500; easing.type: Easing.OutQuad }
-          NumberAnimation { from: 0.52 + dropPortal.proximity * 0.34; to: 0.0; duration: 1100; easing.type: Easing.InQuad }
-        }
-
-        SequentialAnimation on scale {
-          running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
-          loops: Animation.Infinite
-          PauseAnimation { duration: 800 }
-          NumberAnimation { from: 0.0; to: 1.0; duration: 1600; easing.type: Easing.OutCubic }
-        }
-      }
-
-      // Layer 6: Floating Frosted Glass Capsule (Caelestia Dynamic Morphing Island)
       Item {
-        id: floatingDeviceCapsule
-        z: 30
-        anchors.horizontalCenter: parent.horizontalCenter
-        y: (root.bar && (root.bar.position === "bottom" || root.bar.edge === "bottom"))
-           ? (parent.height / 2 - 118 - (dropPortal.proximity * 30))
-           : (parent.height / 2 + 86 + (dropPortal.proximity * 30))
+        Layout.preferredWidth: Style.space(44)
+        Layout.preferredHeight: Style.space(44)
+        Layout.alignment: Qt.AlignVCenter
 
-        width: Math.min(380, capsuleRow.implicitWidth + 32)
-        height: 34
-        opacity: (dropPortal.active && dropPortal.proximity > 0.03) || dropPortal.isBlasting ? 1.0 : 0.0
-        scale: opacity > 0 ? (0.94 + dropPortal.proximity * 0.08) : 0.85
-
-        Behavior on opacity { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
-        Behavior on scale   { NumberAnimation { duration: 180; easing.type: Easing.OutBack } }
-        Behavior on y       { NumberAnimation { duration: 110; easing.type: Easing.OutQuad } }
-
-        // Caelestia Frosted Glass Pill with Specular Neon Glow
-        Rectangle {
+        Shape {
           anchors.fill: parent
-          radius: height / 2
-          color: Qt.rgba(0.05, 0.06, 0.09, 0.92)
-          border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.65)
-          border.width: 1.2
+          preferredRendererType: Shape.CurveRenderer
 
-          // Specular Top-Light Glass Reflection
-          Rectangle {
-            anchors.fill: parent
-            anchors.margins: 1
-            radius: parent.radius - 1
-            color: "transparent"
-            border.color: Qt.rgba(1.0, 1.0, 1.0, 0.16)
-            border.width: 1.0
+          ShapePath {
+            strokeWidth: Style.space(3)
+            strokeColor: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.14)
+            fillColor: "transparent"
+            capStyle: ShapePath.RoundCap
+            PathAngleArc {
+              centerX: Style.space(22)
+              centerY: Style.space(22)
+              radiusX: Style.space(19)
+              radiusY: Style.space(19)
+              startAngle: 0
+              sweepAngle: 360
+            }
+          }
+
+          ShapePath {
+            strokeWidth: Style.space(7)
+            strokeColor: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.18 * root.dropProximity)
+            fillColor: "transparent"
+            capStyle: ShapePath.RoundCap
+            PathAngleArc {
+              centerX: Style.space(22)
+              centerY: Style.space(22)
+              radiusX: Style.space(19)
+              radiusY: Style.space(19)
+              startAngle: -90
+              sweepAngle: 360 * (root.dropBlasting ? 1.0 : Math.min(1.0, 0.25 + root.dropProximity * 0.75))
+            }
+          }
+
+          ShapePath {
+            strokeWidth: Style.space(3)
+            strokeColor: Color.accent
+            fillColor: "transparent"
+            capStyle: ShapePath.RoundCap
+            PathAngleArc {
+              centerX: Style.space(22)
+              centerY: Style.space(22)
+              radiusX: Style.space(19)
+              radiusY: Style.space(19)
+              startAngle: -90
+              sweepAngle: 360 * (root.dropBlasting ? 1.0 : Math.min(1.0, 0.25 + root.dropProximity * 0.75))
+            }
           }
         }
 
-        RowLayout {
-          id: capsuleRow
+        BorderSurface {
           anchors.centerIn: parent
-          spacing: 8
+          implicitWidth: Style.space(30)
+          implicitHeight: Style.space(30)
+          radius: Style.space(15)
+          color: Style.selectedFillFor(root.foreground, Color.accent)
+          borderSpec: Border.none()
 
-          // Device Icon (JetBrainsMono Nerd Font)
           Text {
+            anchors.centerIn: parent
             textFormat: Text.PlainText
-            text: {
-              var peer = (root.p2pPeers && root.p2pPeers.length > root.selectedPeerIndex) ? root.p2pPeers[root.selectedPeerIndex] : null
-              var isMobile = peer && peer.is_mobile
-              return isMobile ? "󰏲" : "󰌢"
-            }
+            text: root.dropBlasting ? "󰄬" : ""
             color: Color.accent
             font.family: root.fontFamily
-            font.pixelSize: Style.font.base
-            Layout.alignment: Qt.AlignVCenter
-          }
-
-          // Target Peer Name
-          Text {
-            textFormat: Text.PlainText
-            text: {
-              if (dropPortal.isBlasting && dropPortal.blastTargetName !== "") {
-                return "→ " + dropPortal.blastTargetName.toUpperCase()
-              }
-              if (root.p2pPeers && root.p2pPeers.length > 0) {
-                var p = (root.selectedPeerIndex >= 0 && root.selectedPeerIndex < root.p2pPeers.length)
-                        ? root.p2pPeers[root.selectedPeerIndex]
-                        : root.p2pPeers[0]
-                return "HEDEF: " + (p.name ? p.name.toUpperCase() : p.ip)
-              }
-              return "EŞLEŞMİŞ CİHAZ ARANIYOR..."
-            }
-            color: dropPortal.isBlasting ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            font.bold: true
-            font.letterSpacing: 0.6
-            elide: Text.ElideRight
-            Layout.maximumWidth: 220
-            Layout.alignment: Qt.AlignVCenter
-          }
-
-          // Connection Mode Badge
-          Rectangle {
-            implicitWidth: modeBadgeText.implicitWidth + 10
-            implicitHeight: 18
-            radius: 4
-            color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.18)
-            border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.40)
-            border.width: 0.8
-            Layout.alignment: Qt.AlignVCenter
-
-            Text {
-              id: modeBadgeText
-              anchors.centerIn: parent
-              textFormat: Text.PlainText
-              text: root.activeMode === "LAN" ? "P2P" : root.activeMode
-              color: Color.accent
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.micro
-              font.bold: true
-              font.letterSpacing: 0.5
-            }
+            font.pixelSize: Style.font.body
           }
         }
       }
 
-      // Wave 2: Mid Propagating Ripple (Phase Offset: 400ms)
-      Rectangle {
-        id: portalWave2
-        anchors.centerIn: parent
-        width: 130 + dropPortal.proximity * 220
-        height: width
-        radius: width / 2
-        layer.enabled: true
-        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.03)
-        border.color: Color.accent
-        border.width: Math.max(1.0, 2.0 * (1.0 - scale * 0.4))
+      ColumnLayout {
+        Layout.fillWidth: true
+        Layout.alignment: Qt.AlignVCenter
+        spacing: Style.space(2)
 
-        SequentialAnimation on opacity {
-          running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
-          loops: Animation.Infinite
-          PauseAnimation { duration: 400 }
-          NumberAnimation { from: 0.0; to: 0.58 + dropPortal.proximity * 0.32; duration: 450; easing.type: Easing.OutQuad }
-          NumberAnimation { from: 0.58 + dropPortal.proximity * 0.32; to: 0.0; duration: 1050; easing.type: Easing.InQuad }
-        }
-
-        SequentialAnimation on scale {
-          running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
-          loops: Animation.Infinite
-          PauseAnimation { duration: 400 }
-          NumberAnimation { from: 0.0; to: 1.0; duration: 1500; easing.type: Easing.OutCubic }
-        }
-      }
-
-      // Wave 1: Inner Wavefront Birth (Phase Offset: 0ms)
-      Rectangle {
-        id: portalWave1
-        anchors.centerIn: parent
-        width: 70 + dropPortal.proximity * 140
-        height: width
-        radius: width / 2
-        layer.enabled: true
-        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.04)
-        border.color: Color.accent
-        border.width: Math.max(1.2, 2.4 * (1.0 - scale * 0.35))
-
-        SequentialAnimation on opacity {
-          running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
-          loops: Animation.Infinite
-          NumberAnimation { from: 0.0; to: 0.75 + dropPortal.proximity * 0.25; duration: 350; easing.type: Easing.OutQuad }
-          NumberAnimation { from: 0.75 + dropPortal.proximity * 0.25; to: 0.0; duration: 900; easing.type: Easing.InQuad }
-        }
-
-        SequentialAnimation on scale {
-          running: dropPortal.active && dropPortal.proximity > 0.02 && !dropPortal.isBlasting
-          loops: Animation.Infinite
-          NumberAnimation { from: 0.0; to: 1.0; duration: 1250; easing.type: Easing.OutCubic }
-        }
-      }
-
-      // Anamorphic Optical Flare Halo Streak
-      Rectangle {
-        id: flareBeam
-        anchors.centerIn: parent
-        z: 15
-        width: 36 + (dropPortal.isBlasting ? dropPortal.blastProgress * 420 : dropPortal.proximity * 360)
-        height: 2 + (dropPortal.isBlasting ? 5 : dropPortal.proximity * 2.4)
-        radius: 1
-        color: Qt.rgba(1.0, 1.0, 1.0, 0.95)
-        opacity: dropPortal.isBlasting ? (1.0 - dropPortal.blastProgress) : (dropPortal.proximity * 0.9)
-        Behavior on width { NumberAnimation { duration: 60; easing.type: Easing.OutQuad } }
-        Behavior on opacity { NumberAnimation { duration: 80 } }
-      }
-
-      // High-Energy Splash Shockwave (onDropped: 0 -> 600px with Easing.OutCubic)
-      Rectangle {
-        id: shockRipple
-        anchors.centerIn: parent
-        visible: dropPortal.isBlasting
-        width: 30 + (dropPortal.blastProgress * 570)
-        height: width
-        radius: width / 2
-        color: "transparent"
-        border.color: Qt.rgba(1.0, 1.0, 1.0, (1.0 - dropPortal.blastProgress) * 0.95)
-        border.width: Math.max(1.0, 5.0 * (1.0 - dropPortal.blastProgress))
-      }
-
-      // Layer 0: Droplet Impact Crown & Target Reticle with Caelestia Spring Pop
-      Rectangle {
-        id: impactCrown
-        anchors.centerIn: parent
-        z: 20
-        width: 50 + dropPortal.proximity * 20
-        height: width
-        radius: width / 2
-        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, dropPortal.isBlasting ? 0.75 : (0.22 + dropPortal.proximity * 0.38))
-        border.color: dropPortal.isBlasting ? Qt.rgba(1.0, 1.0, 1.0, 0.98) : Color.accent
-        border.width: (dropPortal.active || dropPortal.isBlasting) ? (1.5 + dropPortal.proximity * 1.8) : 1.5
-        scale: (1.0 + dropPortal.proximity * 0.38)
-
-        Behavior on width { NumberAnimation { duration: 70; easing.type: Easing.OutBack } }
-        Behavior on height { NumberAnimation { duration: 70; easing.type: Easing.OutBack } }
-        Behavior on scale { NumberAnimation { duration: 70; easing.type: Easing.OutBack } }
-        Behavior on color { ColorAnimation { duration: 80 } }
-
-        Column {
-          anchors.centerIn: parent
-          spacing: 1
-          Text {
-            anchors.horizontalCenter: parent.horizontalCenter
-            textFormat: Text.PlainText
-            text: dropPortal.isBlasting ? "󰄲" : (dropPortal.proximity > 0.1 ? "󱘖" : "")
-            color: dropPortal.isBlasting ? Qt.rgba(1.0, 1.0, 1.0, 0.98) : Color.accent
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.title + Math.round(dropPortal.proximity * 3)
+        Text {
+          Layout.fillWidth: true
+          textFormat: Text.PlainText
+          text: {
+            if (root.dropBlasting) return root.t("drop_transfer_started")
+            var p = root.resolveActiveDropPeer()
+            return (p && p.is_same_owner) ? root.t("drop_own_zero_click") : "OMASEND AIRBRIDGE"
           }
-          Text {
-            anchors.horizontalCenter: parent.horizontalCenter
-            textFormat: Text.PlainText
-            text: {
-              if (dropPortal.isBlasting) {
-                return dropPortal.blastedCount > 1 ? (dropPortal.blastedCount + " DOSYA") : "GÖNDERİLDİ"
-              }
-              return (dropPortal.proximity > 0.1) ? "BIRAK" : "AIRBRIDGE"
-            }
-            color: dropPortal.isBlasting ? Qt.rgba(1.0, 1.0, 1.0, 0.98) : Color.accent
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            font.bold: true
-            font.letterSpacing: 0.8
-            elide: Text.ElideRight
-            width: Math.min(96, impactCrown.width - 2)
-            horizontalAlignment: Text.AlignHCenter
+          color: Color.accent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          font.bold: true
+          font.letterSpacing: 1.0
+          elide: Text.ElideRight
+        }
+
+        Text {
+          Layout.fillWidth: true
+          textFormat: Text.PlainText
+          text: {
+            if (root.dropBlasting && root.blastTargetName !== "") return root.blastTargetName
+            var p = root.resolveActiveDropPeer()
+            return p ? (p.name + " (" + root.formatShortDeviceId(p.id) + ")") : root.t("waiting_for_device")
           }
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          font.bold: true
+          elide: Text.ElideRight
+        }
+
+        Text {
+          Layout.fillWidth: true
+          textFormat: Text.PlainText
+          text: root.dropBlasting
+                ? (root.blastedCount + " " + root.t("sending_files"))
+                : root.t("drop_here_hint")
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
         }
       }
     }
   }
 
+  // =========================================================================
+  // 3. MAIN KEYBOARD PANEL (100% Omarchy Network Panel Style — Ultra Clean)
+  // =========================================================================
   KeyboardPanel {
     id: panel
     anchorItem: button
@@ -1244,447 +1026,279 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(380))
-    contentHeight: panel.fittedContentHeight(
-      (root.showAboutModal || root.showOmaIdQrModal || root.showOmaIdPairModal) ?
-        Math.max(panelColumn.implicitHeight, (root.showOmaIdPairModal ? (pairCol.implicitHeight + Style.space(40)) : (root.showOmaIdQrModal ? (qrCol.implicitHeight + Style.space(40)) : (aboutCol.implicitHeight + Style.space(40))))) :
-        panelColumn.implicitHeight
-    )
+    contentHeight: panel.fittedContentHeight(column.implicitHeight + stickyFooter.implicitHeight + Style.space(12), Style.space(580))
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      onMoveRequested: function(dx, dy) {
+        if (dy !== 0) root.moveCursor(dy)
+      }
+      onActivateRequested: root.activateSelected()
       onCloseRequested: {
-        if (root.showOmaIdPairModal) {
-          root.showOmaIdPairModal = false
-          root.pairStatusMsg = ""
-        } else if (root.showOmaIdQrModal) {
-          root.showOmaIdQrModal = false
-        } else if (root.showAboutModal) {
-          root.showAboutModal = false
+        if (root.showSyncSection || root.showQrSection || root.showAboutSection) {
+          root.showSyncSection = false
+          root.showQrSection = false
+          root.showAboutSection = false
         } else {
           root.close()
         }
       }
       onTabRequested: function(direction) { root.switchPanel(direction) }
-      onMoveRequested: function(dx, dy) {
-        if (!root.showAboutModal && !root.showOmaIdQrModal && !root.showOmaIdPairModal) {
-          root.moveCursor(dy)
-        }
-      }
-      onActivateRequested: {
-        if (!root.showAboutModal && !root.showOmaIdQrModal && !root.showOmaIdPairModal) {
-          root.activateSelected()
-        }
-      }
       onTextKey: function(t) {
-        if (root.showAboutModal || root.showOmaIdQrModal || root.showOmaIdPairModal) return
-        if (t === "r" || t === "R") {
-          root.refresh()
-        } else if (t === "v" || t === "V") {
-          root.toggleVisibility()
-        } else if (t === "s" || t === "S") {
-          if (root.p2pPeers && root.p2pPeers.length > root.selectedPeerIndex) {
-            var peer = root.p2pPeers[root.selectedPeerIndex]
-            if (peer && peer.ip) root.sendFileTo(peer.ip)
-          } else if (root.p2pPeers && root.p2pPeers.length > 0) {
-            root.sendFileTo(root.p2pPeers[0].ip)
-          }
-        } else if (t === "p" || t === "P") {
-          if (root.p2pPeers && root.p2pPeers.length > root.selectedPeerIndex) {
-            var pPeer = root.p2pPeers[root.selectedPeerIndex]
-            if (pPeer && pPeer.ip) root.syncClipboardTo(pPeer.ip)
-          } else if (root.p2pPeers && root.p2pPeers.length > 0) {
-            root.syncClipboardTo(root.p2pPeers[0].ip)
-          }
-        } else if (t === "a" || t === "A") {
-          root.showAboutModal = !root.showAboutModal
-        } else if (t === "c" || t === "C") {
-          root.copyPortalUrl()
-        } else if (t === "o" || t === "O") {
-          root.openFolder()
-        }
+        if (t === "r" || t === "R") root.forceScan()
+        else if (t === "o" || t === "O") root.openFolder()
       }
 
-      Column {
-        id: panelColumn
-        anchors.fill: parent
-        spacing: Style.space(14)
+      Flickable {
+        id: panelFlick
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: stickyFooter.top
+        anchors.bottomMargin: Style.space(10)
+        contentWidth: width
+        contentHeight: column.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        flickableDirection: Flickable.VerticalFlick
+        interactive: contentHeight > height
+        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
-        // Hero: OmaSend icon, title & Visibility Toggle
-        Item {
-          width: parent.width
-          implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight, powerSwitch.implicitHeight)
-
-          Text {
-            id: heroIcon
-            textFormat: Text.PlainText
-            anchors.left: parent.left
-            anchors.verticalCenter: parent.verticalCenter
-            text: ""
-            color: root.bar ? root.bar.foreground : Color.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.display
-            opacity: root.p2pVisibility !== "OFF" ? 1.0 : 0.5
-          }
-
-          ToggleSwitch {
-            id: powerSwitch
-            checked: root.p2pVisibility !== "OFF"
-            foreground: root.bar ? root.bar.foreground : Color.foreground
-            anchors.right: parent.right
-            anchors.verticalCenter: parent.verticalCenter
-            onToggled: root.toggleVisibility()
-
-            PanelToolTip {
-              visible: powerSwitch.containsMouse
-              text: root.p2pVisibility !== "OFF" ? "Disable OmaSend discovery" : "Enable OmaSend discovery"
-              fontFamily: root.fontFamily
-            }
-          }
-
-          Column {
-            id: heroLabels
-            anchors.left: heroIcon.right
-            anchors.leftMargin: Style.space(14)
-            anchors.right: parent.right
-            anchors.rightMargin: powerSwitch.width + Style.space(12)
-            anchors.verticalCenter: parent.verticalCenter
-            spacing: Style.space(2)
-
-            Text {
-              text: "OmaSend"
-              color: root.bar ? root.bar.foreground : Color.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.title
-              font.bold: true
-              elide: Text.ElideRight
-              width: parent.width
-            }
-
-            Text {
-              textFormat: Text.PlainText
-              text: (root.p2pVisibility === "OFF" ? "DISCOVERY OFF" : (root.p2pVisibility === "EVERYONE" ? ("EVERYONE (" + Math.max(1, Math.floor(root.p2pVisibilityRemainingSecs / 60)) + "M)") : "KNOWN PEERS")).toUpperCase()
-              color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              font.bold: true
-              font.letterSpacing: 1.2
-              elide: Text.ElideRight
-              width: parent.width
-            }
-          }
+        Behavior on contentY {
+          NumberAnimation { duration: 220; easing.type: Easing.OutCubic }
         }
 
-        // OmaID Profile & Connection Mode Indicator
-        Rectangle {
-          width: parent.width
-          implicitHeight: omaidCardContent.implicitHeight + Style.space(16)
-          radius: Style.cornerRadius
-          color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.07)
-          border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.28)
-          border.width: 1
+        Column {
+          id: column
+          width: panelFlick.width
+          spacing: Style.space(12)
 
-          // 1px specular highlight inner rim
-          Rectangle {
-            anchors.fill: parent
-            anchors.margins: 1
-            radius: Math.max(0, parent.radius - 1)
-            color: "transparent"
-            border.color: Qt.rgba(1.0, 1.0, 1.0, 0.08)
-            border.width: 1
-          }
+          // -----------------------------------------------------------------
+          // 1. HERO HEADER (Exact Omarchy Network Panel Structure)
+          // -----------------------------------------------------------------
+          Item {
+            width: parent.width
+            implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight, heroActions.implicitHeight)
 
-          ColumnLayout {
-            id: omaidCardContent
-            anchors.fill: parent
-            anchors.margins: Style.space(8)
-            spacing: Style.space(6)
+            Text {
+              id: heroIcon
+              textFormat: Text.PlainText
+              text: ""
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.display
+              opacity: root.p2pVisibility !== "OFF" ? 1.0 : 0.5
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+            }
 
-            // Header Row: [󰌆] OMAID (BU CİHAZ) ... [• P2P / LAN]
             RowLayout {
-              Layout.fillWidth: true
-              spacing: Style.space(6)
+              id: heroActions
+              spacing: Style.space(8)
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
 
-              Text {
-                textFormat: Text.PlainText
-                text: "󰌆"
-                color: Color.accent
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
+              Button {
+                iconText: "󰐲"
+                tooltipText: root.t("show_qr_tooltip")
+                foreground: root.showQrSection ? Color.accent : root.foreground
+                fontFamily: root.fontFamily
+                iconSize: Style.font.subtitle * 1.4
+                horizontalPadding: Style.space(5)
+                verticalPadding: Style.space(2)
                 Layout.alignment: Qt.AlignVCenter
-              }
-
-              Text {
-                text: "OMAID (BU CİHAZ)"
-                color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.micro
-                font.bold: true
-                font.letterSpacing: 0.8
-                Layout.alignment: Qt.AlignVCenter
-              }
-
-              Text {
-                visible: root.omaIdCopiedFeedback
-                text: "COPIED"
-                color: Color.accent
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.micro
-                font.bold: true
-                Layout.alignment: Qt.AlignVCenter
-              }
-
-              Item {
-                Layout.fillWidth: true
-              }
-
-              // Connection Mode Indicator Badge (LAN / WAN / P2P)
-              Rectangle {
-                implicitWidth: modeRow.implicitWidth + Style.space(8)
-                implicitHeight: 20
-                radius: 4
-                color: {
-                  if (root.wanActive) return Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.20)
-                  if (root.activeMode === "P2P" || root.p2pVisibility !== "OFF") return Qt.rgba(0.73, 0.60, 0.97, 0.20)
-                  return Qt.rgba(0.62, 0.81, 0.42, 0.20)
+                onClicked: {
+                  root.showQrSection = !root.showQrSection
+                  root.showSyncSection = false
+                  if (root.showQrSection) root.executeAction(["--oma-id-qr"])
                 }
-                border.color: {
-                  if (root.wanActive) return Color.accent
-                  if (root.activeMode === "P2P" || root.p2pVisibility !== "OFF") return "#bb9af7"
-                  return "#9ece6a"
-                }
-                border.width: 1
+              }
+
+              Button {
+                iconText: "󰑐"
+                tooltipText: root.t("refresh_scan_tooltip")
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                iconSize: Style.font.subtitle * 1.4
+                horizontalPadding: Style.space(5)
+                verticalPadding: Style.space(2)
                 Layout.alignment: Qt.AlignVCenter
+                onClicked: root.forceScan()
+              }
 
-                RowLayout {
-                  id: modeRow
-                  anchors.centerIn: parent
-                  spacing: 4
-
-                  Rectangle {
-                    width: 6
-                    height: 6
-                    radius: 3
-                    color: {
-                      if (root.wanActive) return Color.accent
-                      if (root.activeMode === "P2P" || root.p2pVisibility !== "OFF") return "#bb9af7"
-                      return "#9ece6a"
-                    }
-                  }
-
-                  Text {
-                    textFormat: Text.PlainText
-                    text: {
-                      if (root.wanActive) return "WAN"
-                      if (root.activeMode === "P2P" || root.p2pVisibility !== "OFF") return "P2P"
-                      return "LAN"
-                    }
-                    color: root.bar ? root.bar.foreground : Color.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.micro
-                    font.bold: true
-                    font.letterSpacing: 0.5
-                  }
-                }
+              ToggleSwitch {
+                id: powerSwitch
+                checked: root.p2pVisibility !== "OFF"
+                foreground: root.foreground
+                Layout.alignment: Qt.AlignVCenter
+                onToggled: root.togglePower()
 
                 PanelToolTip {
-                  text: root.wanActive ? "Cloudflare WAN Tunnel Active" : (root.p2pVisibility !== "OFF" ? "AirBridge P2P WebRTC Active" : "LAN Local Network Only")
+                  visible: powerSwitch.containsMouse
+                  text: root.p2pVisibility !== "OFF" ? root.t("turn_off_service") : root.t("turn_on_service")
                   fontFamily: root.fontFamily
                 }
               }
             }
 
-            // Body Row: 16-Digit Code and Action Buttons
-            RowLayout {
-              Layout.fillWidth: true
-              spacing: Style.space(6)
+            Column {
+              id: heroLabels
+              anchors.left: heroIcon.right
+              anchors.leftMargin: Style.space(14)
+              anchors.right: parent.right
+              anchors.rightMargin: heroActions.width + Style.space(12)
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(2)
 
               Text {
-                Layout.fillWidth: true
-                text: root.formatOmaId(root.omaId, root.omaIdRevealed)
-                color: root.bar ? root.bar.foreground : Color.foreground
+                width: parent.width
+                textFormat: Text.PlainText
+                text: "OmaSend (" + root.hostname + ")"
+                color: root.foreground
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
+                font.pixelSize: Style.font.title
                 font.bold: true
-                font.letterSpacing: 1.0
-                Layout.alignment: Qt.AlignVCenter
                 elide: Text.ElideRight
               }
 
-              // Reveal/Mask Button
-              Rectangle {
-                implicitWidth: 26
-                implicitHeight: 26
-                radius: 4
-                color: revealMouse.containsMouse ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.20) : "transparent"
-                Layout.alignment: Qt.AlignVCenter
-
-                Text {
-                  anchors.centerIn: parent
-                  textFormat: Text.PlainText
-                  text: root.omaIdRevealed ? "󰈉" : "󰈈"
-                  color: root.omaIdRevealed ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.3)
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-
-                MouseArea {
-                  id: revealMouse
-                  anchors.fill: parent
-                  hoverEnabled: true
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: {
-                    root.omaIdRevealed = !root.omaIdRevealed
-                  }
-                }
-
-                PanelToolTip {
-                  visible: revealMouse.containsMouse
-                  text: root.omaIdRevealed ? "Mask OmaID" : "Reveal OmaID"
-                  fontFamily: root.fontFamily
-                }
-              }
-
-              // Copy OmaID Button
-              Rectangle {
-                implicitWidth: 26
-                implicitHeight: 26
-                radius: 4
-                color: copyOmaIdMouse.containsMouse ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.20) : "transparent"
-                Layout.alignment: Qt.AlignVCenter
-
-                Text {
-                  anchors.centerIn: parent
-                  textFormat: Text.PlainText
-                  text: "󰅟"
-                  color: root.omaIdCopiedFeedback ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-
-                MouseArea {
-                  id: copyOmaIdMouse
-                  anchors.fill: parent
-                  hoverEnabled: true
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: {
-                    if (root.omaId) {
-                      root.copyText(root.omaId)
-                      root.omaIdCopiedFeedback = true
-                      omaIdCopyTimer.restart()
-                    }
-                  }
-                }
-
-                PanelToolTip {
-                  visible: copyOmaIdMouse.containsMouse
-                  text: "OmaID Kopyala"
-                  fontFamily: root.fontFamily
-                }
-              }
-
-              // QR Göster Button
-              Rectangle {
-                implicitWidth: 26
-                implicitHeight: 26
-                radius: 4
-                color: showQrMouse.containsMouse ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.20) : "transparent"
-                Layout.alignment: Qt.AlignVCenter
-
-                Text {
-                  anchors.centerIn: parent
-                  textFormat: Text.PlainText
-                  text: "󰄲"
-                  color: root.showOmaIdQrModal ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-
-                MouseArea {
-                  id: showQrMouse
-                  anchors.fill: parent
-                  hoverEnabled: true
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: {
-                    root.showOmaIdQrModal = !root.showOmaIdQrModal
-                    root.showOmaIdPairModal = false
-                    root.showAboutModal = false
-                  }
-                }
-
-                PanelToolTip {
-                  visible: showQrMouse.containsMouse
-                  text: "QR Göster"
-                  fontFamily: root.fontFamily
-                }
-              }
-
-              // Barkod / QR Tara / Bağla Button
-              Rectangle {
-                implicitWidth: 26
-                implicitHeight: 26
-                radius: 4
-                color: pairMouse.containsMouse ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.20) : "transparent"
-                Layout.alignment: Qt.AlignVCenter
-
-                Text {
-                  anchors.centerIn: parent
-                  textFormat: Text.PlainText
-                  text: "󰄳"
-                  color: root.showOmaIdPairModal ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-
-                MouseArea {
-                  id: pairMouse
-                  anchors.fill: parent
-                  hoverEnabled: true
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: {
-                    root.showOmaIdPairModal = !root.showOmaIdPairModal
-                    root.showOmaIdQrModal = false
-                    root.showAboutModal = false
-                    root.pairInputOmaId = ""
-                    root.pairInputName = ""
-                    root.pairStatusMsg = ""
-                  }
-                }
-
-                PanelToolTip {
-                  visible: pairMouse.containsMouse
-                  text: "Barkod / QR Tara / Bağla"
-                  fontFamily: root.fontFamily
-                }
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: root.p2pVisibility !== "OFF"
+                      ? (root.omaIdCopiedFeedback ? root.t("omaid_copied_sub") : root.t("service_active_sub"))
+                      : root.t("service_disabled_sub")
+                color: root.omaIdCopiedFeedback ? Color.accent : Qt.darker(root.foreground, 1.4)
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 1.2
+                elide: Text.ElideRight
               }
             }
           }
-        }
 
-        // Gatekeeper Transfer Request (If Pending)
-        Rectangle {
-          visible: root.p2pPendingTransfer !== null && root.p2pPendingTransfer.status === "PENDING"
-          width: parent.width
-          implicitHeight: pendingCol.implicitHeight + Style.space(16)
-          radius: Style.cornerRadius
-          color: Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
-          border.color: Color.accent
-          border.width: 1
+          // -----------------------------------------------------------------
+          // 2. 4-COLUMN TELEMETRY & IDENTITY GRID (Exact Omarchy Network Style)
+          //    Displays: OmaID | Cihaz ID | Yerel IP | Alınan
+          // -----------------------------------------------------------------
+          GridLayout {
+            width: parent.width
+            columns: 4
+            columnSpacing: Style.space(16)
+            rowSpacing: Style.spacing.labelGap
 
-          Column {
-            id: pendingCol
-            anchors.fill: parent
-            anchors.margins: Style.space(10)
-            spacing: Style.space(6)
+            InfoLabel { text: "OmaID" }
+            DetailValue {
+              text: root.formatOmaId(root.omaId, root.omaIdRevealed)
+              copyable: true
+              tooltipText: root.t("copy_omaid_tooltip")
+              onClickedAction: {
+                if (root.omaId) {
+                  root.copyText(root.omaId)
+                  root.omaIdCopiedFeedback = true
+                  omaIdCopyTimer.restart()
+                }
+              }
+            }
+
+            InfoLabel { text: root.t("label_device_id") }
+            DetailValue {
+              text: root.formatShortDeviceId(root.deviceId)
+              copyable: true
+              tooltipText: root.t("copy_device_id_tooltip")
+              onClickedAction: {
+                if (root.deviceId) root.copyText(root.deviceId)
+              }
+            }
+
+            InfoLabel { text: root.t("label_ip_address") }
+            DetailValue {
+              text: root.localIp + ":" + root.port
+              copyable: true
+              tooltipText: root.t("copy_ip_tooltip")
+              onClickedAction: root.copyText(root.localIp)
+            }
+
+            InfoLabel { text: root.t("label_received") }
+            DetailValue {
+              text: root.totalReceived + " " + root.t("files_unit")
+              copyable: true
+              tooltipText: root.t("open_downloads_tooltip")
+              onClickedAction: root.openFolder()
+            }
+          }
+
+          // Inline QR Card (Only shown when QR icon in Hero is clicked)
+          BorderSurface {
+            visible: root.showQrSection
+            width: parent.width
+            implicitHeight: qrCol.implicitHeight + Style.space(18)
+            color: Style.normalFillFor(root.foreground, Color.accent)
+            borderSpec: Border.controlSpec("normal", root.foreground, Color.accent)
+            radius: Style.cornerRadius
+
+            Column {
+              id: qrCol
+              anchors.centerIn: parent
+              width: parent.width - Style.space(20)
+              spacing: Style.space(8)
+
+              Rectangle {
+                anchors.horizontalCenter: parent.horizontalCenter
+                width: Style.space(140)
+                height: Style.space(140)
+                radius: Style.cornerRadius
+                color: "#ffffff"
+
+                Image {
+                  anchors.centerIn: parent
+                  width: Style.space(126)
+                  height: Style.space(126)
+                  source: root.omaidQrPath ? ("file://" + root.omaidQrPath + "?v=" + root.refreshNonce) : ""
+                  fillMode: Image.PreserveAspectFit
+                  cache: false
+                }
+              }
+
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: "OMAID: " + root.formatOmaId(root.omaId, true) + " / " + root.t("label_device_id").toUpperCase() + ": " + root.formatShortDeviceId(root.deviceId)
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                horizontalAlignment: Text.AlignHCenter
+                elide: Text.ElideRight
+              }
+            }
+          }
+
+          // -----------------------------------------------------------------
+          // 2B. FIREWALL WARNING BANNER (Visible only when UFW/Nftables blocks 53317)
+          // -----------------------------------------------------------------
+          BorderSurface {
+            visible: root.firewallStatus.indexOf("UFW_ACTIVE_CHECK") === 0 || root.firewallStatus.indexOf("UFW_BLOCKED") === 0 || root.firewallStatus.indexOf("NFT_BLOCKED") === 0
+            width: parent.width
+            implicitHeight: fwWarnRow.implicitHeight + Style.space(12)
+            color: Style.normalFillFor(root.foreground, root.urgent)
+            borderSpec: Border.controlSpec("normal", root.foreground, root.urgent)
+            radius: Style.cornerRadius
 
             RowLayout {
-              width: parent.width
-              spacing: Style.space(6)
+              id: fwWarnRow
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.leftMargin: Style.space(10)
+              anchors.rightMargin: Style.space(10)
+              spacing: Style.space(8)
 
               Text {
                 textFormat: Text.PlainText
-                text: ""
-                color: Color.accent
+                text: "󰒃"
+                color: root.urgent
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
               }
@@ -1692,913 +1306,743 @@ Panel {
               Text {
                 Layout.fillWidth: true
                 textFormat: Text.PlainText
-                text: "INCOMING AIRBRIDGE TRANSFER"
-                color: Color.accent
+                text: root.t("firewall_warning_label")
+                color: root.urgent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+            }
+          }
+
+          // -----------------------------------------------------------------
+          // 3. INCOMING TRANSFER GATEKEEPER (Only visible when foreign OmaID sends)
+          // -----------------------------------------------------------------
+          Column {
+            visible: root.p2pPendingTransfer !== null && root.p2pPendingTransfer.status === "PENDING"
+            width: parent.width
+            spacing: Style.space(8)
+
+            PanelSeparator { foreground: root.foreground }
+
+            PanelSectionHeader {
+              text: root.t("incoming_transfer_header")
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            CursorSurface {
+              width: parent.width
+              current: true
+              foreground: root.foreground
+              implicitHeight: pendingRowLayout.implicitHeight + Style.spacing.rowPaddingX
+
+              RowLayout {
+                id: pendingRowLayout
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.leftMargin: Style.space(10)
+                anchors.rightMargin: Style.space(8)
+                spacing: Style.space(8)
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: "󰇚"
+                  color: Color.accent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.title
+                  Layout.alignment: Qt.AlignVCenter
+                }
+
+                ColumnLayout {
+                  Layout.fillWidth: true
+                  spacing: Style.space(1)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    Layout.fillWidth: true
+                    text: root.p2pPendingTransfer ? String(root.p2pPendingTransfer.sender_name || "") : ""
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    elide: Text.ElideRight
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    Layout.fillWidth: true
+                    text: root.p2pPendingTransfer
+                          ? (String(root.p2pPendingTransfer.sender_id || "") + " · " + (root.p2pPendingTransfer.file_names || []).join(", "))
+                          : ""
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                  }
+                }
+
+                PanelActionButton {
+                  iconText: "󰄬"
+                  tooltipText: root.t("accept_btn")
+                  foreground: Color.accent
+                  fontFamily: root.fontFamily
+                  onClicked: if (root.p2pPendingTransfer) root.acceptTransfer(root.p2pPendingTransfer.token)
+                }
+
+                PanelActionButton {
+                  iconText: "󰅖"
+                  tooltipText: root.t("reject_btn")
+                  foreground: root.urgent
+                  hoverColor: root.urgent
+                  fontFamily: root.fontFamily
+                  onClicked: if (root.p2pPendingTransfer) root.rejectTransfer(root.p2pPendingTransfer.token)
+                }
+              }
+            }
+          }
+
+          // -----------------------------------------------------------------
+          // 3B. ACTIVE TRANSFER PROGRESS & CANCEL CARD
+          // -----------------------------------------------------------------
+          Column {
+            visible: root.p2pTransferProgress !== null
+            width: parent.width
+            spacing: Style.space(8)
+
+            PanelSeparator { foreground: root.foreground }
+
+            PanelSectionHeader {
+              text: root.t("active_transfer_header")
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            CursorSurface {
+              width: parent.width
+              current: true
+              foreground: root.foreground
+              implicitHeight: activeTransferCol.implicitHeight + Style.space(14)
+
+              ColumnLayout {
+                id: activeTransferCol
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.leftMargin: Style.space(10)
+                anchors.rightMargin: Style.space(8)
+                spacing: Style.space(6)
+
+                RowLayout {
+                  Layout.fillWidth: true
+                  spacing: Style.space(8)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: (root.p2pTransferProgress && root.p2pTransferProgress.direction === "sending") ? "" : "󰇚"
+                    color: Color.accent
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                  }
+
+                  Text {
+                    Layout.fillWidth: true
+                    textFormat: Text.PlainText
+                    text: root.p2pTransferProgress
+                          ? (String(root.p2pTransferProgress.file_name || "") + " (" + Number(root.p2pTransferProgress.percent || 0) + "%)")
+                          : ""
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    font.bold: true
+                    elide: Text.ElideRight
+                  }
+
+                  PanelActionButton {
+                    iconText: "󰅖"
+                    tooltipText: root.t("cancel_btn")
+                    foreground: root.urgent
+                    hoverColor: root.urgent
+                    fontFamily: root.fontFamily
+                    onClicked: root.cancelTransfer()
+                  }
+                }
+
+                Rectangle {
+                  Layout.fillWidth: true
+                  height: Style.space(4)
+                  radius: Style.space(2)
+                  color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.14)
+
+                  Rectangle {
+                    width: parent.width * Math.max(0.02, Math.min(1.0, (root.p2pTransferProgress ? Number(root.p2pTransferProgress.percent || 0) : 0) / 100.0))
+                    height: parent.height
+                    radius: parent.radius
+                    color: Color.accent
+                  }
+                }
+              }
+            }
+          }
+
+          // -----------------------------------------------------------------
+          // 4. KENDİ CİHAZLARIM (Same OmaID, Different Device ID — Zero-Click)
+          //    Exact Omarchy "KNOWN NETWORKS" visual structure
+          // -----------------------------------------------------------------
+          PanelSeparator { foreground: root.foreground }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(6)
+
+            Item {
+              width: parent.width
+              implicitHeight: ownHeader.implicitHeight
+
+              PanelSectionHeader {
+                id: ownHeader
+                text: root.t("own_devices_header")
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              Text {
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: root.showSyncSection ? root.t("close_action") : root.t("sync_omaid_action")
+                color: root.showSyncSection ? Color.accent : root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 font.bold: true
+
+                MouseArea {
+                  anchors.fill: parent
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    root.showSyncSection = !root.showSyncSection
+                    root.syncInputOmaId = root.formatInputOmaId(root.omaId)
+                    root.syncStatusMsg = ""
+                    if (root.showSyncSection) {
+                      Qt.callLater(function() { syncField.forceActiveFocus() })
+                    }
+                  }
+                }
+              }
+            }
+
+            // Inline "OmaID Eşitle" Input (Only visible when "OmaID Eşitle" clicked)
+            Column {
+              visible: root.showSyncSection
+              width: parent.width
+              spacing: Style.space(6)
+
+              RowLayout {
+                width: parent.width
+                spacing: Style.space(6)
+
+                TextField {
+                  id: syncField
+                  Layout.fillWidth: true
+                  foreground: root.foreground
+                  placeholderText: root.t("own_omaid_placeholder")
+                  text: root.syncInputOmaId
+                  maximumLength: 19
+                  onTextChanged: {
+                    var formatted = root.formatInputOmaId(text)
+                    if (formatted !== text) text = formatted
+                    root.syncInputOmaId = text
+                  }
+                  onAccepted: root.syncOwnOmaId(root.syncInputOmaId)
+                }
+
+                PanelActionButton {
+                  iconText: "󰅍"
+                  tooltipText: root.t("paste_clipboard_tooltip")
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  onClicked: root.pasteOmaIdFromClipboard("sync")
+                }
+
+                PanelActionButton {
+                  iconText: "󰑓"
+                  tooltipText: root.t("generate_new_omaid_tooltip")
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  onClicked: root.generateNewOwnOmaId()
+                }
+
+                PanelActionButton {
+                  iconText: "󰄬"
+                  tooltipText: root.t("save_sync_omaid_tooltip")
+                  foreground: Color.accent
+                  bordered: true
+                  fontFamily: root.fontFamily
+                  onClicked: root.syncOwnOmaId(root.syncInputOmaId)
+                }
+              }
+
+              Text {
+                visible: root.syncStatusMsg !== ""
+                width: parent.width
+                textFormat: Text.PlainText
+                text: root.syncStatusMsg
+                color: root.syncStatusError ? root.urgent : Color.accent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+            }
+
+            Repeater {
+              model: root.ownPeers
+
+              PeerRow {
+                required property var modelData
+                required property int index
+                width: parent.width
+                peer: modelData
+                rowIndex: index
+                isOwnDevice: true
               }
             }
 
             Text {
+              visible: root.ownPeers.length === 0
               width: parent.width
-              wrapMode: Text.Wrap
               textFormat: Text.PlainText
-              text: root.p2pPendingTransfer ? ("From: " + root.p2pPendingTransfer.sender_name + "\nFiles: " + (root.p2pPendingTransfer.file_names || []).join(", ") + " (" + ((root.p2pPendingTransfer.total_size_bytes || 0) / 1024 / 1024).toFixed(1) + " MB)") : ""
-              color: root.bar ? root.bar.foreground : Color.foreground
+              text: root.t("no_own_devices")
+              color: root.dim
               font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+          }
+
+          // -----------------------------------------------------------------
+          // 5. YABANCI OMAID (Foreign OmaID Input + Discovered Foreign Peers)
+          //    Exact Omarchy "OTHER NETWORKS" visual structure
+          // -----------------------------------------------------------------
+          PanelSeparator { foreground: root.foreground }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(6)
+
+            PanelSectionHeader {
+              text: root.t("foreign_omaid_header")
+              foreground: root.foreground
+              fontFamily: root.fontFamily
             }
 
             RowLayout {
               width: parent.width
-              spacing: Style.space(8)
+              spacing: Style.space(6)
 
-              Rectangle {
+              TextField {
+                id: directSendField
                 Layout.fillWidth: true
-                Layout.preferredHeight: Style.space(28)
-                radius: Style.cornerRadius
-                color: Color.accent
-                Text {
-                  anchors.centerIn: parent
-                  textFormat: Text.PlainText
-                  text: "ACCEPT"
-                  color: "#000000"
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  font.bold: true
+                foreground: root.foreground
+                placeholderText: "XXXX-XXXX-XXXX-XXXX"
+                text: root.directTargetInput
+                maximumLength: 19
+                onTextChanged: {
+                  var formatted = root.formatInputOmaId(text)
+                  if (formatted !== text) text = formatted
+                  root.directTargetInput = text
                 }
-                MouseArea {
-                  anchors.fill: parent
-                  z: 10
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: {
-                    if (root.p2pPendingTransfer) root.acceptTransfer(root.p2pPendingTransfer.token)
-                  }
-                }
+                onAccepted: root.sendToDirectTarget(root.directTargetInput)
               }
 
-              Rectangle {
-                Layout.fillWidth: true
-                Layout.preferredHeight: Style.space(28)
-                radius: Style.cornerRadius
-                color: "transparent"
-                border.color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-                border.width: 1
-                Text {
-                  anchors.centerIn: parent
-                  textFormat: Text.PlainText
-                  text: "DECLINE"
-                  color: root.bar ? root.bar.foreground : Color.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  font.bold: true
-                }
-                MouseArea {
-                  anchors.fill: parent
-                  z: 10
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: {
-                    if (root.p2pPendingTransfer) root.rejectTransfer(root.p2pPendingTransfer.token)
-                  }
-                }
+              PanelActionButton {
+                iconText: "󰅍"
+                tooltipText: root.t("paste_clipboard_tooltip")
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                onClicked: root.pasteOmaIdFromClipboard("direct")
+              }
+
+              PanelActionButton {
+                iconText: "󰄳"
+                tooltipText: root.t("scan_screen_qr_tooltip")
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                onClicked: root.scanFromScreen(false)
+              }
+
+              PanelActionButton {
+                iconText: ""
+                tooltipText: root.t("select_file_send_tooltip")
+                foreground: Color.accent
+                bordered: true
+                fontFamily: root.fontFamily
+                onClicked: root.sendToDirectTarget(root.directTargetInput)
+              }
+            }
+
+            Text {
+              visible: root.directStatusMsg !== ""
+              width: parent.width
+              textFormat: Text.PlainText
+              text: root.directStatusMsg
+              color: root.directStatusError ? root.urgent : Color.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            Repeater {
+              model: root.otherPeers
+
+              PeerRow {
+                required property var modelData
+                required property int index
+                width: parent.width
+                peer: modelData
+                rowIndex: root.ownPeers.length + index
+                isOwnDevice: false
               }
             }
           }
-        }
 
-        // Section: PAIRED / AVAILABLE DEVICES
-        PanelSeparator {
-          foreground: root.bar ? root.bar.foreground : Color.foreground
-        }
-
-        Column {
-          id: peersSection
-          width: parent.width
-          spacing: Style.space(10)
-
-          PanelSectionHeader {
-            text: "DEVICES"
-            foreground: root.bar ? root.bar.foreground : Color.foreground
-            fontFamily: root.fontFamily
-          }
-
-          Flickable {
-            id: peersFlickable
+          // -----------------------------------------------------------------
+          // 7. INFO / HAKKINDA BÖLÜMÜ (Auto-scrolls into view when Info clicked)
+          // -----------------------------------------------------------------
+          BorderSurface {
+            id: aboutCard
+            visible: root.showAboutSection
             width: parent.width
-            implicitHeight: Math.min(peersCol.implicitHeight, Style.space(220))
-            contentWidth: width
-            contentHeight: peersCol.implicitHeight
-            clip: true
-            boundsBehavior: Flickable.StopAtBounds
+            implicitHeight: aboutInlineCol.implicitHeight + Style.space(18)
+            color: Style.normalFillFor(root.foreground, Color.accent)
+            borderSpec: Border.controlSpec("normal", root.foreground, Color.accent)
+            radius: Style.cornerRadius
 
             Column {
-              id: peersCol
-              width: parent.width
+              id: aboutInlineCol
+              anchors.centerIn: parent
+              width: parent.width - Style.space(20)
               spacing: Style.space(6)
 
-              Repeater {
-                model: root.p2pVisibility === "OFF" ? [] : root.p2pPeers
+              RowLayout {
+                width: parent.width
+                spacing: Style.space(8)
 
-                CursorSurface {
-                  id: peerRow
-                  required property var modelData
-                  required property int index
-                  width: peersCol.width
-                  implicitHeight: peerRowContent.implicitHeight + Style.spacing.rowPaddingX
-                  foreground: root.bar ? root.bar.foreground : Color.foreground
-                  fill: root.hoverFill
-                  currentFill: root.selectedFill
-                  current: false
-                  hasCursor: root.cursorActive && root.selectedPeerIndex === index
+                Text {
+                  textFormat: Text.PlainText
+                  text: ""
+                  color: Color.accent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
 
-                  MouseArea {
-                    id: rowMouse
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onEntered: {
-                      root.cursorActive = true
-                      root.selectedPeerIndex = index
-                    }
-                    onClicked: {
-                      if (modelData.ip) root.sendFileTo(modelData.ip)
-                    }
-                  }
+                Text {
+                  Layout.fillWidth: true
+                  textFormat: Text.PlainText
+                  text: "OmaSend v" + root.pluginVersion + " · " + root.t("about_subtitle")
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  font.bold: true
+                  elide: Text.ElideRight
+                }
 
-                  Item {
-                    id: peerRowContent
-                    anchors.left: parent.left
-                    anchors.right: parent.right
-                    anchors.verticalCenter: parent.verticalCenter
-                    anchors.leftMargin: Style.space(10)
-                    anchors.rightMargin: Style.space(10)
-                    implicitHeight: Math.max(devIcon.implicitHeight, devInfo.implicitHeight, actionBtns.implicitHeight)
-
-                    Text {
-                      id: devIcon
-                      textFormat: Text.PlainText
-                      text: modelData.transport === "BT" ? "" : (modelData.transport === "HYBRID" ? "󱘖" : "")
-                      color: root.bar ? root.bar.foreground : Color.foreground
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.heading
-                      anchors.left: parent.left
-                      anchors.verticalCenter: parent.verticalCenter
-                    }
-
-                    Column {
-                      id: devInfo
-                      spacing: Style.space(1)
-                      anchors.left: devIcon.right
-                      anchors.leftMargin: Style.space(10)
-                      anchors.right: actionBtns.left
-                      anchors.rightMargin: Style.space(8)
-                      anchors.verticalCenter: parent.verticalCenter
-
-                      Text {
-                        textFormat: Text.PlainText
-                        text: modelData.name || "Omarchy Device"
-                        color: root.bar ? root.bar.foreground : Color.foreground
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.body
-                        elide: Text.ElideRight
-                        width: parent.width
-                      }
-
-                      Text {
-                        textFormat: Text.PlainText
-                        text: modelData.last_seen_secs === 0 ? "OmaID Eşleşmiş (Çevrimdışı / Beklemede)" : (modelData.transport === "WAN" ? "OmaID Eşleşmiş (WAN Çevrimiçi)" : "OmaID Eşleşmiş (LAN Çevrimiçi)")
-                        color: modelData.last_seen_secs === 0 ? Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 2.0) : Color.accent
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
-                        elide: Text.ElideRight
-                        width: parent.width
-                      }
-                    }
-
-                    RowLayout {
-                      id: actionBtns
-                      anchors.right: parent.right
-                      anchors.verticalCenter: parent.verticalCenter
-                      spacing: Style.space(6)
-
-                      PanelActionButton {
-                        iconText: "󰛄"
-                        tooltipText: modelData.ip ? "Send File" : "Device Offline"
-                        foreground: root.bar ? root.bar.foreground : Color.foreground
-                        fontFamily: root.fontFamily
-                        opacity: modelData.ip ? 1.0 : 0.4
-                        onClicked: {
-                          if (modelData.ip) root.sendFileTo(modelData.ip)
-                        }
-                      }
-                    }
-                  }
+                PanelActionButton {
+                  iconText: "󰅖"
+                  tooltipText: root.t("close_action")
+                  foreground: root.dim
+                  fontFamily: root.fontFamily
+                  onClicked: root.showAboutSection = false
                 }
               }
+
+              PanelSeparator { foreground: root.foreground }
+
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: root.t("about_identity_prefix") + " (" + root.formatOmaId(root.omaId, true) + " / " + root.formatShortDeviceId(root.deviceId) + ")"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
+
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: root.t("about_security_line")
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
+
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: root.t("about_author_prefix") + ": " + root.pluginAuthor + " · " + root.t("about_save_prefix") + ": " + root.savePath
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
             }
           }
-
-          Text {
-            textFormat: Text.PlainText
-            visible: root.p2pVisibility === "OFF" || root.p2pPeers.length === 0
-            text: root.p2pVisibility === "OFF" ? "Turn discovery on to scan for paired devices." : "Scanning for paired OmaID devices..."
-            color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            wrapMode: Text.WordWrap
-            width: parent.width
-          }
-        }
-
-
-        // Footer / Actions Section
-        PanelSeparator {
-          foreground: root.bar ? root.bar.foreground : Color.foreground
-        }
-
-        RowLayout {
-          width: parent.width
-          spacing: Style.space(8)
-
-          PanelActionButton {
-            iconText: "󰋽"
-            tooltipText: "About OmaSend"
-            foreground: root.bar ? root.bar.foreground : Color.foreground
-            fontFamily: root.fontFamily
-            onClicked: root.showAboutModal = !root.showAboutModal
-          }
-
-          Item { Layout.fillWidth: true }
-
-          Button {
-            text: root.p2pVisibility === "EVERYONE" ? "EVERYONE" : "KNOWN"
-            bordered: true
-            fontSize: Style.font.caption
-            fontFamily: root.fontFamily
-            onClicked: root.toggleVisibility()
-          }
-
-          Button {
-            text: "Refresh"
-            bordered: true
-            fontSize: Style.font.caption
-            fontFamily: root.fontFamily
-            onClicked: root.refresh()
-          }
         }
       }
-    }
 
-    // OmaID QR Code Modal Overlay
-    Rectangle {
-      id: omaIdQrOverlay
-      anchors.fill: parent
-      visible: root.showOmaIdQrModal
-      color: Qt.rgba(0.05, 0.05, 0.07, 0.97)
-      z: 99
-
-      MouseArea {
-        anchors.fill: parent
-      }
-
+      // -----------------------------------------------------------------
+      // 8. STICKY FOOTER MENU (Always Fixed at Bottom While Scrolling)
+      // -----------------------------------------------------------------
       Column {
-        id: qrCol
-        anchors.centerIn: parent
-        width: parent.width - Style.space(40)
-        spacing: Style.space(12)
+        id: stickyFooter
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        spacing: Style.space(6)
 
-        Row {
+        PanelSeparator { foreground: root.foreground }
+
+        CursorSurface {
           width: parent.width
-          Item {
-            width: parent.width - closeQrBtn.implicitWidth
-            implicitHeight: qrTitleText.implicitHeight
-            RowLayout {
-              spacing: Style.space(6)
-              Text {
-                text: "󰄲"
-                color: Color.accent
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.title
-              }
-              Text {
-                id: qrTitleText
-                text: "OmaID QR Kodu"
-                color: root.bar ? root.bar.foreground : Color.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.title
-                font.bold: true
-              }
-            }
-          }
+          foreground: root.foreground
+          implicitHeight: utilityRowLayout.implicitHeight + Style.spacing.rowPaddingX
 
-          Button {
-            id: closeQrBtn
-            text: "✕"
-            bordered: true
-            foreground: root.bar ? root.bar.foreground : Color.foreground
-            fontFamily: root.fontFamily
-            fontSize: Style.font.caption
-            onClicked: root.showOmaIdQrModal = false
-          }
-        }
-
-        Text {
-          width: parent.width
-          wrapMode: Text.WordWrap
-          text: "Mobil cihazınızdan veya başka bir Omarchy masaüstünden bu QR kodu okutarak anında güvenli AirBridge eşleşmesi kurun."
-          color: root.bar ? root.bar.foreground : Color.foreground
-          opacity: 0.75
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          lineHeight: 1.3
-        }
-
-        // Acrylic Glass QR Container
-        Rectangle {
-          anchors.horizontalCenter: parent.horizontalCenter
-          width: 190
-          height: 190
-          radius: 12
-          color: "#ffffff"
-          border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.5)
-          border.width: 2
-
-          Image {
-            id: omaQrImg
+          MouseArea {
             anchors.fill: parent
-            anchors.margins: 10
-            source: "file://" + (root.omaidQrPath || root.omaidQrFilePath)
-            sourceSize.width: 170
-            sourceSize.height: 170
-            fillMode: Image.PreserveAspectFit
-            smooth: false
-            cache: false
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.openFolder()
           }
-        }
-
-        // Formatted OmaID Text Pill
-        Rectangle {
-          width: parent.width
-          implicitHeight: 36
-          radius: Style.cornerRadius
-          color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.10)
-          border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.35)
-          border.width: 1
 
           RowLayout {
-            anchors.fill: parent
+            id: utilityRowLayout
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
             anchors.leftMargin: Style.space(10)
-            anchors.rightMargin: Style.space(10)
+            anchors.rightMargin: Style.space(8)
             spacing: Style.space(8)
 
             Text {
-              text: "󰌆"
-              color: Color.accent
+              textFormat: Text.PlainText
+              text: "󰉋"
+              color: root.dim
               font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
+              font.pixelSize: Style.font.icon
             }
 
             Text {
               Layout.fillWidth: true
-              text: root.formatOmaId(root.omaId, true)
-              color: root.bar ? root.bar.foreground : Color.foreground
+              textFormat: Text.PlainText
+              text: root.t("downloads_footer") + " (" + root.totalReceived + " " + root.t("files_unit") + ")"
+              color: root.foreground
               font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              font.bold: true
-              font.letterSpacing: 1.2
-              horizontalAlignment: Text.AlignHCenter
+              font.pixelSize: Style.font.bodySmall
+              elide: Text.ElideRight
             }
 
-            Rectangle {
-              implicitWidth: 26
-              implicitHeight: 26
-              radius: 4
-              color: modalCopyOmaIdMouse.containsMouse ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.25) : "transparent"
-
-              Text {
-                anchors.centerIn: parent
-                textFormat: Text.PlainText
-                text: root.omaIdCopiedFeedback ? "󰄬" : "󰅟"
-                color: root.omaIdCopiedFeedback ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-
-              MouseArea {
-                id: modalCopyOmaIdMouse
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: {
-                  if (root.omaId) {
-                    root.copyText(root.omaId)
-                    root.omaIdCopiedFeedback = true
-                    omaIdCopyTimer.restart()
-                  }
-                }
-              }
-            }
-          }
-        }
-
-        PanelSeparator {
-          width: parent.width
-          foreground: root.bar ? root.bar.foreground : Color.foreground
-        }
-
-        Button {
-          width: parent.width
-          text: root.omaIdCopiedFeedback ? "OmaID Kopyalandı" : "OmaID Panoya Kopyala"
-          iconText: root.omaIdCopiedFeedback ? "󰄬" : "󰅟"
-          bordered: true
-          accent: Color.accent
-          foreground: root.bar ? root.bar.foreground : Color.foreground
-          fontFamily: root.fontFamily
-          fontSize: Style.font.caption
-          onClicked: {
-            if (root.omaId) {
-              root.copyText(root.omaId)
-              root.omaIdCopiedFeedback = true
-              omaIdCopyTimer.restart()
-            }
-          }
-        }
-      }
-    }
-
-    // OmaID Pair & Scan Modal Overlay
-    Rectangle {
-      id: omaIdPairOverlay
-      anchors.fill: parent
-      visible: root.showOmaIdPairModal
-      color: Qt.rgba(0.05, 0.05, 0.07, 0.97)
-      z: 99
-
-      MouseArea {
-        anchors.fill: parent
-      }
-
-      Column {
-        id: pairCol
-        anchors.centerIn: parent
-        width: parent.width - Style.space(40)
-        spacing: Style.space(10)
-
-        Row {
-          width: parent.width
-          Item {
-            width: parent.width - closePairBtn.implicitWidth
-            implicitHeight: pairTitleText.implicitHeight
-            RowLayout {
-              spacing: Style.space(6)
-              Text {
-                text: "󰄳"
-                color: Color.accent
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.title
-              }
-              Text {
-                id: pairTitleText
-                text: "OmaID Bağla & QR Tara"
-                color: root.bar ? root.bar.foreground : Color.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.title
-                font.bold: true
-              }
-            }
-          }
-
-          Button {
-            id: closePairBtn
-            text: "✕"
-            bordered: true
-            foreground: root.bar ? root.bar.foreground : Color.foreground
-            fontFamily: root.fontFamily
-            fontSize: Style.font.caption
-            onClicked: {
-              root.showOmaIdPairModal = false
-              root.pairStatusMsg = ""
-            }
-          }
-        }
-
-        Text {
-          width: parent.width
-          wrapMode: Text.WordWrap
-          text: "Ekrandaki QR kodunu tarayın, panodaki kodu aktarın veya 16 haneli OmaID'yi girerek güvenli cihaz bağlayın."
-          color: root.bar ? root.bar.foreground : Color.foreground
-          opacity: 0.75
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          lineHeight: 1.3
-        }
-
-        // Quick Action Buttons Row (Ekrandan Tara / Panodan Al)
-        RowLayout {
-          width: parent.width
-          spacing: Style.space(8)
-
-          Rectangle {
-            Layout.fillWidth: true
-            height: 34
-            radius: 6
-            color: scanHover.containsMouse ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.18) : Qt.rgba(1.0, 1.0, 1.0, 0.06)
-            border.color: scanHover.containsMouse ? Color.accent : Qt.rgba(1.0, 1.0, 1.0, 0.15)
-            border.width: 1
-
-            RowLayout {
-              anchors.centerIn: parent
-              spacing: Style.space(6)
-              Text {
-                text: "󰄳"
-                color: Color.accent
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-              Text {
-                text: "Ekrandan Tara"
-                color: root.bar ? root.bar.foreground : Color.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.micro
-                font.bold: true
-              }
+            PanelActionButton {
+              iconText: root.soundEnabled ? "󰕾" : "󰖁"
+              tooltipText: root.soundEnabled ? root.t("sound_on_tooltip") : root.t("sound_off_tooltip")
+              foreground: root.soundEnabled ? root.foreground : root.dim
+              fontFamily: root.fontFamily
+              onClicked: root.toggleSound()
             }
 
-            MouseArea {
-              id: scanHover
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.scanFromScreen()
-            }
-          }
-
-          Rectangle {
-            Layout.fillWidth: true
-            height: 34
-            radius: 6
-            color: pasteHover.containsMouse ? Qt.rgba(1.0, 1.0, 1.0, 0.12) : Qt.rgba(1.0, 1.0, 1.0, 0.06)
-            border.color: pasteHover.containsMouse ? Qt.rgba(1.0, 1.0, 1.0, 0.3) : Qt.rgba(1.0, 1.0, 1.0, 0.15)
-            border.width: 1
-
-            RowLayout {
-              anchors.centerIn: parent
-              spacing: Style.space(6)
-              Text {
-                text: "󰅍"
-                color: root.bar ? root.bar.foreground : Color.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-              Text {
-                text: "Panodan Al"
-                color: root.bar ? root.bar.foreground : Color.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.micro
-                font.bold: true
-              }
+            PanelActionButton {
+              iconText: "󰉋"
+              tooltipText: root.t("open_downloads_tooltip")
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: root.openFolder()
             }
 
-            MouseArea {
-              id: pasteHover
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.pasteOmaIdFromClipboard()
-            }
-          }
-        }
-
-        // 16-Digit OmaID Input Label & Field
-        Column {
-          width: parent.width
-          spacing: Style.space(4)
-
-          RowLayout {
-            width: parent.width
-            Text {
-              text: "16 HANELİ OMAID"
-              color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.micro
-              font.bold: true
-              font.letterSpacing: 0.8
-            }
-            Item { Layout.fillWidth: true }
-            Text {
-              property int cleanLen: root.pairInputOmaId.replace(/[^0-9]/g, "").length
-              text: "(" + cleanLen + " / 16)"
-              color: cleanLen === 16 ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.micro
-              font.bold: true
-            }
-          }
-
-          Rectangle {
-            width: parent.width
-            height: 38
-            radius: 6
-            color: Qt.rgba(1.0, 1.0, 1.0, 0.05)
-            border.color: pairOmaIdInput.activeFocus ? Color.accent : (root.pairInputOmaId.replace(/[^0-9]/g, "").length === 16 ? Color.accent : Qt.rgba(1.0, 1.0, 1.0, 0.15))
-            border.width: 1
-
-            RowLayout {
-              anchors.fill: parent
-              anchors.leftMargin: Style.space(10)
-              anchors.rightMargin: Style.space(10)
-              spacing: Style.space(6)
-
-              TextInput {
-                id: pairOmaIdInput
-                Layout.fillWidth: true
-                text: root.pairInputOmaId
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-                font.letterSpacing: 1.0
-                color: root.bar ? root.bar.foreground : Color.foreground
-                selectByMouse: true
-                cursorVisible: activeFocus
-                maximumLength: 19
-
-                onTextChanged: {
-                  var formatted = root.formatInputOmaId(text)
-                  if (formatted !== text) {
-                    var oldPos = cursorPosition
-                    root.pairInputOmaId = formatted
-                    cursorPosition = Math.min(formatted.length, oldPos + 1)
-                  } else {
-                    root.pairInputOmaId = text
-                  }
-                }
-
-                Text {
-                  anchors.fill: parent
-                  visible: !pairOmaIdInput.text && !pairOmaIdInput.activeFocus
-                  text: "0000-0000-0000-0000"
-                  color: Qt.rgba(1.0, 1.0, 1.0, 0.25)
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  font.bold: true
-                  font.letterSpacing: 1.0
-                  verticalAlignment: Text.AlignVCenter
-                }
-              }
-
-              Text {
-                visible: root.pairInputOmaId.replace(/[^0-9]/g, "").length === 16
-                text: "󰄬"
-                color: Color.accent
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-            }
-          }
-        }
-
-        // Friendly Device Name Input
-        Column {
-          width: parent.width
-          spacing: Style.space(4)
-
-          Text {
-            text: "CİHAZ ADI (İSTEĞE BAĞLI)"
-            color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.micro
-            font.bold: true
-            font.letterSpacing: 0.8
-          }
-
-          Rectangle {
-            width: parent.width
-            height: 38
-            radius: 6
-            color: Qt.rgba(1.0, 1.0, 1.0, 0.05)
-            border.color: pairNameInput.activeFocus ? Color.accent : Qt.rgba(1.0, 1.0, 1.0, 0.15)
-            border.width: 1
-
-            TextInput {
-              id: pairNameInput
-              anchors.fill: parent
-              anchors.leftMargin: Style.space(10)
-              anchors.rightMargin: Style.space(10)
-              text: root.pairInputName
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              color: root.bar ? root.bar.foreground : Color.foreground
-              selectByMouse: true
-              cursorVisible: activeFocus
-              verticalAlignment: Text.AlignVCenter
-              onTextChanged: root.pairInputName = text
-
-              Text {
-                anchors.fill: parent
-                visible: !pairNameInput.text && !pairNameInput.activeFocus
-                text: "Örn: Telefon, İş Dizüstü"
-                color: Qt.rgba(1.0, 1.0, 1.0, 0.25)
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                verticalAlignment: Text.AlignVCenter
-              }
-            }
-          }
-        }
-
-        // Status Feedback Banner
-        Rectangle {
-          width: parent.width
-          implicitHeight: statusText.implicitHeight + Style.space(8)
-          visible: root.pairStatusMsg.length > 0
-          radius: 6
-          color: root.pairStatusError ? Qt.rgba(0.9, 0.2, 0.2, 0.15) : Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.15)
-          border.color: root.pairStatusError ? "#f7768e" : Color.accent
-          border.width: 1
-
-          Text {
-            id: statusText
-            anchors.centerIn: parent
-            width: parent.width - Style.space(16)
-            wrapMode: Text.WordWrap
-            horizontalAlignment: Text.AlignHCenter
-            textFormat: Text.PlainText
-            text: root.pairStatusMsg
-            color: root.pairStatusError ? "#f7768e" : Color.accent
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.micro
-            font.bold: true
-          }
-        }
-
-        PanelSeparator {
-          width: parent.width
-          foreground: root.bar ? root.bar.foreground : Color.foreground
-        }
-
-        // Action Buttons
-        RowLayout {
-          width: parent.width
-          spacing: Style.space(8)
-
-          Rectangle {
-            id: pairActionBtn
-            Layout.fillWidth: true
-            height: 36
-            radius: 6
-            property bool isReady: root.pairInputOmaId.replace(/[^0-9]/g, "").length === 16
-            color: isReady
-              ? (pairActionHover.containsMouse ? Qt.darker(Color.accent, 1.15) : Color.accent)
-              : Qt.rgba(1.0, 1.0, 1.0, 0.05)
-            border.color: isReady ? Color.accent : Qt.rgba(1.0, 1.0, 1.0, 0.12)
-            border.width: 1
-
-            RowLayout {
-              anchors.centerIn: parent
-              spacing: Style.space(6)
-              Text {
-                text: "󰌆"
-                color: pairActionBtn.isReady ? "#000000" : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.8)
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-              }
-              Text {
-                text: "Cihazı Bağla"
-                color: pairActionBtn.isReady ? "#000000" : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.8)
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-              }
+            PanelActionButton {
+              iconText: "󰑐"
+              tooltipText: root.t("refresh_scan_tooltip")
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: root.forceScan()
             }
 
-            MouseArea {
-              id: pairActionHover
-              anchors.fill: parent
-              enabled: pairActionBtn.isReady
-              hoverEnabled: true
-              cursorShape: pairActionBtn.isReady ? Qt.PointingHandCursor : Qt.ArrowCursor
-              onClicked: root.bindOmaId(root.pairInputOmaId, root.pairInputName)
-            }
-          }
-
-          Rectangle {
-            Layout.preferredWidth: 60
-            height: 36
-            radius: 6
-            color: cancelHover.containsMouse ? Qt.rgba(1.0, 1.0, 1.0, 0.12) : Qt.rgba(1.0, 1.0, 1.0, 0.05)
-            border.color: Qt.rgba(1.0, 1.0, 1.0, 0.15)
-            border.width: 1
-
-            Text {
-              anchors.centerIn: parent
-              text: "İptal"
-              color: root.bar ? root.bar.foreground : Color.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-
-            MouseArea {
-              id: cancelHover
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
+            PanelActionButton {
+              iconText: "󰋽"
+              tooltipText: root.t("about_tooltip")
+              foreground: root.showAboutSection ? Color.accent : root.foreground
+              bordered: root.showAboutSection
+              fontFamily: root.fontFamily
               onClicked: {
-                root.showOmaIdPairModal = false
-                root.pairStatusMsg = ""
+                root.showAboutSection = !root.showAboutSection
+                if (root.showAboutSection) {
+                  Qt.callLater(function() {
+                    panelFlick.contentY = Math.max(0, panelFlick.contentHeight - panelFlick.height)
+                  })
+                }
               }
             }
           }
         }
       }
     }
+  }
 
+  // =========================================================================
+  // 4. REUSABLE COMPONENTS (Exact Omarchy Network Panel Components)
+  // =========================================================================
+  component ScopePill: Button {
+    id: pill
+    required property string label
+    required property string scopeKey
 
-    // About & Imprint Modal Overlay
-    Rectangle {
-      id: aboutOverlay
+    text: label
+    fontSize: Style.font.bodySmall
+    foreground: root.foreground
+    fontFamily: root.fontFamily
+    horizontalPadding: Style.spacing.controlPaddingX
+    verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
+    bordered: true
+    active: root.targetScope === scopeKey
+  }
+
+  component PeerRow: CursorSurface {
+    id: row
+    required property var peer
+    required property int rowIndex
+    required property bool isOwnDevice
+
+    current: isOwnDevice
+    hasCursor: root.cursorActive && root.selectedPeerIndex === rowIndex
+    foreground: root.foreground
+    fill: root.hoverFill
+    currentFill: root.selectedFill
+    implicitHeight: rowBody.implicitHeight
+
+    MouseArea {
       anchors.fill: parent
-      visible: root.showAboutModal
-      color: Qt.rgba(0.05, 0.05, 0.07, 0.96)
-      z: 99
+      hoverEnabled: true
+      acceptedButtons: Qt.LeftButton | Qt.RightButton
+      cursorShape: Qt.PointingHandCursor
+      onEntered: {
+        root.cursorActive = true
+        root.selectedPeerIndex = row.rowIndex
+      }
+      onClicked: function(mouse) {
+        if (!row.peer) return
+        var target = row.peer.ip || row.peer.oma_id
+        if (!target) return
+        if (mouse.button === Qt.RightButton) {
+          root.syncClipboardTo(target)
+        } else {
+          root.sendFileTo(target)
+        }
+      }
+    }
 
-      MouseArea {
-        anchors.fill: parent
+    Item {
+      id: rowBody
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.top: parent.top
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(10)
+      implicitHeight: Math.max(peerIcon.implicitHeight, peerInfo.implicitHeight, rightGlyph.implicitHeight) + Style.spacing.rowPaddingX
+
+      Text {
+        id: peerIcon
+        textFormat: Text.PlainText
+        text: (row.peer && row.peer.name && String(row.peer.name).toLowerCase().indexOf("android") !== -1) ? "󰏲" : "󰌢"
+        color: row.isOwnDevice ? root.foreground : Qt.darker(root.foreground, 1.4)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.title
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+      }
+
+      Text {
+        id: rightGlyph
+        textFormat: Text.PlainText
+        text: row.isOwnDevice ? "" : "󰌾"
+        color: row.isOwnDevice ? root.foreground : Qt.darker(root.foreground, 1.4)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.subtitle
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
       }
 
       Column {
-        id: aboutCol
-        anchors.centerIn: parent
-        width: parent.width - Style.space(40)
-        spacing: Style.space(12)
+        id: peerInfo
+        spacing: Style.space(1)
+        anchors.left: peerIcon.right
+        anchors.leftMargin: Style.space(10)
+        anchors.right: rightGlyph.left
+        anchors.rightMargin: Style.space(8)
+        anchors.verticalCenter: parent.verticalCenter
 
-        Row {
+        Text {
           width: parent.width
-          Item {
-            width: parent.width - closeAboutBtn.implicitWidth
-            implicitHeight: aboutTitleText.implicitHeight
-            Text {
-              id: aboutTitleText
-              text: "OmaSend"
-              color: root.bar ? root.bar.foreground : Color.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.title
-              font.bold: true
-            }
-          }
-
-          Button {
-            id: closeAboutBtn
-            text: "✕"
-            bordered: true
-            foreground: root.bar ? root.bar.foreground : Color.foreground
-            fontFamily: root.fontFamily
-            fontSize: Style.font.caption
-            onClicked: root.showAboutModal = false
-          }
+          textFormat: Text.PlainText
+          text: row.peer ? String(row.peer.name || "") : ""
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          elide: Text.ElideRight
         }
 
         Text {
           width: parent.width
-          wrapMode: Text.WordWrap
-          text: "Sürüm: " + root.pluginVersion + "\nGeliştirici: " + root.pluginAuthor + "\nLisans: " + root.pluginLicense + "\n" + root.pluginDescription
-          color: root.bar ? root.bar.foreground : Color.foreground
-          opacity: 0.8
+          textFormat: Text.PlainText
+          text: row.peer
+                ? (root.formatPeerIdentity(row.peer) + " · " + (row.isOwnDevice ? root.t("zero_click_linked") : root.t("approval_send")))
+                : ""
+          color: row.isOwnDevice ? root.foreground : Qt.darker(root.foreground, 1.5)
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
-          lineHeight: 1.3
-        }
-
-        PanelSeparator {
-          width: parent.width
-          foreground: root.bar ? root.bar.foreground : Color.foreground
-        }
-
-        Button {
-          width: parent.width
-          text: "GitHub / Contact"
-          iconText: "󰊤"
-          bordered: true
-          foreground: root.bar ? root.bar.foreground : Color.foreground
-          accent: Color.accent
-          fontFamily: root.fontFamily
-          fontSize: Style.font.caption
-          onClicked: Qt.openUrlExternally("https://github.com/ozdil")
-        }
-
-        Button {
-          width: parent.width
-          text: "Buy Me a Coffee"
-          iconText: "󰅖"
-          bordered: true
-          foreground: "#000000"
-          color: "#FFDD00"
-          fontFamily: root.fontFamily
-          fontSize: Style.font.caption
-          onClicked: Qt.openUrlExternally("https://buymeacoffee.com/ozdil")
+          elide: Text.ElideRight
         }
       }
     }
+  }
+
+  component DetailValue: InfoValue {
+    property bool copyable: false
+    property string tooltipText: "Kopyala"
+    signal clickedAction()
+
+    Layout.fillWidth: true
+    horizontalAlignment: Text.AlignRight
+    elide: Text.ElideRight
+
+    MouseArea {
+      id: valueMouse
+      anchors.fill: parent
+      enabled: parent.copyable && parent.text !== ""
+      hoverEnabled: enabled
+      cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+      onClicked: parent.clickedAction()
+    }
+
+    PanelToolTip {
+      visible: valueMouse.enabled && valueMouse.containsMouse
+      text: parent.tooltipText
+      fontFamily: root.fontFamily
+    }
+  }
+
+  component InfoLabel: Text {
+    textFormat: Text.PlainText
+    color: root.foreground
+    opacity: 0.6
+    font.family: root.fontFamily
+    font.pixelSize: Style.font.bodySmall
+  }
+
+  component InfoValue: Text {
+    textFormat: Text.PlainText
+    color: root.foreground
+    font.family: root.fontFamily
+    font.pixelSize: Style.font.bodySmall
   }
 }
