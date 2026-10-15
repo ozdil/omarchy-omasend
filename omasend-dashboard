@@ -32,6 +32,15 @@ for var in LD_PRELOAD LD_LIBRARY_PATH RUSTC_WRAPPER CARGO_BUILD_RUSTC_WRAPPER RU
     fi
 done
 
+DIR="$(cd "$(/usr/bin/dirname "$(/usr/bin/realpath "${BASH_SOURCE[0]}")")" && /usr/bin/pwd)"
+BIN="${DIR}/omasend-engine"
+if [[ ! -x "${BIN}" && -x "${DIR}/bin/omasend-engine" ]]; then
+    BIN="${DIR}/bin/omasend-engine"
+elif [[ ! -x "${BIN}" && -x /usr/bin/omasend-engine ]]; then
+    BIN="/usr/bin/omasend-engine"
+fi
+STAMP="${DIR}/.engine-provenance"
+
 # Resolve trusted quickshell binary
 QUICKSHELL_BIN=""
 if [[ -x /usr/bin/quickshell ]]; then
@@ -57,9 +66,18 @@ if [[ "${1:-}" == "--cli" ]]; then
     shift
 fi
 
-DIR="$(cd "$(/usr/bin/dirname "$(/usr/bin/realpath "${BASH_SOURCE[0]}")")" && /usr/bin/pwd)"
-BIN="${DIR}/omasend-engine"
-STAMP="${DIR}/.engine-provenance"
+# If running from a packaged installation (no src/ directory), execute prebuilt binary directly
+if [[ ! -d "${DIR}/src" ]]; then
+    if [[ ! -x "${BIN}" ]]; then
+        echo "Engine binary not found or not executable in ${DIR}" >&2
+        exit 1
+    fi
+    /usr/bin/clear 2>/dev/null || true
+    "${BIN}" "$@"
+    echo ""
+    read -r -p "Press Enter to exit..." || true
+    exit 0
+fi
 
 # Resolve trusted cargo binary
 CARGO_BIN=""

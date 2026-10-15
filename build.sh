@@ -79,12 +79,39 @@ PLUGIN_TARGET_DIR="${HOME}/.config/omarchy/plugins/ozdil.omasend"
 if [[ -d "${PLUGIN_TARGET_DIR}" && "${DIR}" != "${PLUGIN_TARGET_DIR}" ]]; then
     echo "Syncing updated plugin files to ${PLUGIN_TARGET_DIR}..."
     /usr/bin/cp -f "${DIR}/Panel.qml" "${PLUGIN_TARGET_DIR}/Panel.qml"
+    if [[ -f "${DIR}/OmaI18n.js" ]]; then
+        /usr/bin/cp -f "${DIR}/OmaI18n.js" "${PLUGIN_TARGET_DIR}/OmaI18n.js"
+    fi
     /usr/bin/cp -f "${DIR}/manifest.json" "${PLUGIN_TARGET_DIR}/manifest.json"
+    /usr/bin/cp -f "${DIR}/.engine-provenance" "${PLUGIN_TARGET_DIR}/.engine-provenance"
     /usr/bin/install -m 755 "${DIR}/omasend-engine" "${PLUGIN_TARGET_DIR}/omasend-engine"
     if [[ -d "${DIR}/assets" ]]; then
         /usr/bin/mkdir -p "${PLUGIN_TARGET_DIR}/assets"
         /usr/bin/cp -rf "${DIR}/assets/"* "${PLUGIN_TARGET_DIR}/assets/"
     fi
+fi
+
+# Sync engine binary to ~/.local/bin/omasend-engine (used by Panel.qml)
+LOCAL_BIN_DIR="${HOME}/.local/bin"
+LOCAL_BIN_ENGINE="${LOCAL_BIN_DIR}/omasend-engine"
+/usr/bin/mkdir -p "${LOCAL_BIN_DIR}"
+if [[ ! -L "${LOCAL_BIN_ENGINE}" ]]; then
+    /usr/bin/install -m 755 "${DIR}/omasend-engine" "${LOCAL_BIN_ENGINE}"
+fi
+
+STATE_DIR="${HOME}/.local/state/omarchy/omasend"
+/usr/bin/mkdir -p -m 700 "${STATE_DIR}"
+if [[ ! -L "${STATE_DIR}/install_manifest.json" ]]; then
+    /usr/bin/cat > "${STATE_DIR}/.tmp_install_manifest.json" <<EOF
+{
+  "plugin": "ozdil.omasend",
+  "files": {
+    "${LOCAL_BIN_ENGINE}": "${BIN_HASH}"
+  }
+}
+EOF
+    /usr/bin/chmod 600 "${STATE_DIR}/.tmp_install_manifest.json"
+    /usr/bin/mv -f "${STATE_DIR}/.tmp_install_manifest.json" "${STATE_DIR}/install_manifest.json"
 fi
 
 # Terminate any previous instance so new binary is invoked

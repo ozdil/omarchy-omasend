@@ -32,7 +32,21 @@ done
 
 DIR="$(cd "$(/usr/bin/dirname "$(/usr/bin/realpath "${BASH_SOURCE[0]}")")" && /usr/bin/pwd)"
 BIN="${DIR}/omasend-engine"
+if [[ ! -x "${BIN}" && -x "${DIR}/bin/omasend-engine" ]]; then
+    BIN="${DIR}/bin/omasend-engine"
+elif [[ ! -x "${BIN}" && -x /usr/bin/omasend-engine ]]; then
+    BIN="/usr/bin/omasend-engine"
+fi
 STAMP="${DIR}/.engine-provenance"
+
+# If running from a packaged installation (no src/ directory), execute prebuilt binary directly
+if [[ ! -d "${DIR}/src" ]]; then
+    if [[ ! -x "${BIN}" ]]; then
+        echo '{"text":"OMASEND: OFFLINE","tooltip":"Engine binary missing or not executable","class":"alert"}'
+        exit 1
+    fi
+    exec "${BIN}" --status
+fi
 
 # Resolve trusted cargo binary
 CARGO_BIN=""
