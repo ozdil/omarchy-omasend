@@ -8,7 +8,7 @@ OmaSend ("the Application") is an open-source, peer-to-peer file transfer and cl
 
 Your privacy is paramount. OmaSend follows a **Zero-Cloud, Local-First** operational model: the developer operates no servers that receive your files or clipboard contents.
 
-**Transport security notice:** Local network (LAN/P2P) transfers are integrity-checked but are not yet end-to-end encrypted or cryptographically authenticated. Anyone on the same network may be able to observe this traffic. Use OmaSend on networks you trust.
+**Transport security notice:** Transfers between QR-paired devices are end-to-end encrypted and mutually authenticated (QUIC/TLS 1.3 with per-device Ed25519 keys). Transfers with devices that are not QR-paired use the legacy HTTP path, which is integrity-checked but not encrypted; anyone on the same network may be able to observe that traffic. Use it only on networks you trust.
 
 ---
 
@@ -23,7 +23,7 @@ The Application does not include any third-party advertising SDKs, tracking pixe
 ### 2.3 Peer-to-Peer Transmission
 All file transfers and clipboard synchronization events happen directly between peer devices:
 - Devices discover each other on Local Area Networks (LAN) using UDP broadcast/multicast beacons on port `53317`.
-- Data streams directly between peer devices over HTTP/TCP sockets on port `53317` (or optional user-initiated Cloudflare WAN tunnels / STUN endpoint discovery when WAN mode is enabled).
+- Data between QR-paired devices streams directly over encrypted QUIC on UDP port `53318`; other peers use HTTP/TCP on port `53317` (or optional user-initiated Cloudflare WAN tunnels / STUN endpoint discovery when WAN mode is enabled).
 - No user files or clipboard contents are stored on any central cloud storage bucket operated by the developer.
 
 ---

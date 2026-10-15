@@ -10,7 +10,7 @@
 > **Direct peer-to-peer file transfer and clipboard sync between Omarchy Linux, Android, and modern web browsers, with an anonymous numbered identity (OmaID) and no accounts or cloud servers.**
 
 > [!IMPORTANT]
-> **Security status (v1.9.1):** Local network transfers are size- and (where provided) checksum-verified but are **not yet end-to-end encrypted or cryptographically authenticated**. Use OmaSend on networks you trust. Every incoming transfer requires your approval, and clipboard sync only works with explicitly paired devices. Per-device keys, QR pairing, and authenticated encryption are on the roadmap.
+> **Security status:** Devices paired by QR code (`omasend-engine --pair-offer`) use per-device Ed25519 keys and an encrypted, mutually authenticated QUIC/TLS 1.3 transport with BLAKE3-verified, resumable transfers. Devices that are *not* QR-paired still use the legacy HTTP path, which is **not encrypted** — use it only on networks you trust. Incoming transfers from anything other than your own paired devices always need your approval. Protocol details: [PROTOCOL_V2.md](PROTOCOL_V2.md).
 
 - **Author:** Ozan Özdil (ozdil)  
 - **License:** MIT  
@@ -40,7 +40,7 @@
 - **Integrity & Encryption:**
   - Upload size must match the approved request; BLAKE3 / SHA-256 / MD5 checksums are verified when the sender provides them (the desktop engine does; the Android app does not yet).
   - Web portal: the session key is passed inside the URL hash fragment (`#key=...`), which is not sent in HTTP requests (RFC 3986).
-  - Not yet available: end-to-end encryption and cryptographic peer authentication for LAN/P2P traffic (see the security status note above).
+  - Encrypted transport for QR-paired devices (QUIC/TLS 1.3 on UDP `53318`). If you use a firewall, allow `53317/tcp`, `53317/udp` and `53318/udp` on your local network.
 - **Multi-Platform Ecosystem:**
   - **Linux Desktop Plugin:** Native Quickshell QML widget and hardened Rust daemon (`omasend-engine`).
   - **Android Native App:** Kotlin & Jetpack Compose app with CameraX zero-GMS QR/Barcode scanner and tactile haptic feedback ([ozdil/omasend-android](https://github.com/ozdil/omasend-android)).
@@ -99,7 +99,7 @@ omarchy-restart-shell
 
 ## Security & Privacy Policy
 
-OmaSend does not collect telemetry, track users, or store data on central servers. Files and clipboard contents travel directly between your devices. LAN/P2P traffic is currently not end-to-end encrypted or cryptographically authenticated, so use it on trusted networks; every incoming transfer requires your approval. Security issues can be reported via GitHub.
+OmaSend does not collect telemetry, track users, or store data on central servers. Files and clipboard contents travel directly between your devices. Traffic between QR-paired devices is end-to-end encrypted and authenticated; traffic with unpaired devices is not, so use that only on trusted networks. Security issues can be reported via GitHub.
 
 For detailed security policies, review [PRIVACY_POLICY.md](PRIVACY_POLICY.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
 

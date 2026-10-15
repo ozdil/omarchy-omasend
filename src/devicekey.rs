@@ -75,6 +75,12 @@ impl DeviceIdentity {
         device_id_for_pk(self.signing.verifying_key().as_bytes())
     }
 
+    /// Raw 32-byte seed; also the omasend-core (iroh) endpoint secret, so the QUIC endpoint id
+    /// equals this device's public key.
+    pub fn seed(&self) -> [u8; 32] {
+        self.signing.to_bytes()
+    }
+
     pub fn sign_b64(&self, msg: &[u8]) -> String {
         B64.encode(self.signing.sign(msg).to_bytes())
     }
@@ -143,6 +149,9 @@ pub struct TrustedKey {
     pub ip: String,
     #[serde(default)]
     pub port: u16,
+    /// UDP port of the peer's omasend-core (QUIC) endpoint; 0 = default (53318).
+    #[serde(default)]
+    pub quic_port: u16,
     /// Explicitly marked by the user as one of their own devices: enables auto-accept.
     #[serde(default)]
     pub own_device: bool,
@@ -292,6 +301,7 @@ pub fn create_pair_offer(
     host: &str,
     port: u16,
     own_device: bool,
+    quic_port: u16,
 ) -> String {
     let secret = random_bytes::<32>();
     let _g = OFFER_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -306,13 +316,14 @@ pub fn create_pair_offer(
     });
     save_offers(state_dir, &offers);
     format!(
-        "omasend://pair?v=2&pk={}&s={}&h={}&p={}&n={}&o={}",
+        "omasend://pair?v=2&pk={}&s={}&h={}&p={}&n={}&o={}&q={}",
         identity.public_b64(),
         B64.encode(secret),
         url_encode(host),
         port,
         url_encode(name),
-        if own_device { 1 } else { 0 }
+        if own_device { 1 } else { 0 },
+        quic_port
     )
 }
 
@@ -324,6 +335,7 @@ pub struct ParsedOffer {
     pub port: u16,
     pub name: String,
     pub own_device: bool,
+    pub quic_port: u16,
 }
 
 pub fn parse_pair_uri(uri: &str) -> Result<ParsedOffer, String> {
@@ -352,15 +364,16 @@ pub fn parse_pair_uri(uri: &str) -> Result<ParsedOffer, String> {
         port,
         name: url_decode(map.get("n").map(String::as_str).unwrap_or("")),
         own_device: map.get("o").map(String::as_str) == Some("1"),
+        quic_port: map.get("q").and_then(|q| q.parse().ok()).unwrap_or(0),
     })
 }
 
 /// Initiator side: build the JSON body for POST /api/v2/pair.
-pub fn build_pair_request(identity: &DeviceIdentity, offer: &ParsedOffer, my_name: &str) -> serde_json::Value {
+pub fn build_pair_request(identity: &DeviceIdentity, offer: &ParsedOffer, my_name: &str, my_quic_port: u16) -> serde_json::Value {
     let my_pk = identity.public_b64();
     let mac = pair_mac(&offer.secret, &offer.pk, &my_pk);
     let sig = identity.sign_b64(pair_transcript(&offer.pk, &my_pk, &mac).as_bytes());
-    serde_json::json!({ "pk": my_pk, "name": my_name, "mac": mac, "sig": sig })
+    serde_json::json!({ "pk": my_pk, "name": my_name, "mac": mac, "sig": sig, "quic_port": my_quic_port })
 }
 
 /// Initiator side: verify the responder's reply against the key pinned in the QR code.
@@ -387,6 +400,7 @@ pub fn accept_pair_request(
     my_name: &str,
     body: &serde_json::Value,
     peer_ip: &str,
+    my_quic_port: u16,
 ) -> Result<(serde_json::Value, TrustedKey), String> {
     let i_pk = body["pk"].as_str().ok_or("Missing pk")?.to_string();
     let i_name = body["name"].as_str().unwrap_or("Unknown device").chars().take(64).collect::<String>();
@@ -427,11 +441,13 @@ pub fn accept_pair_request(
         name: i_name,
         ip: peer_ip.to_string(),
         port: 0,
+        quic_port: body["quic_port"].as_u64().and_then(|p| u16::try_from(p).ok()).unwrap_or(0),
         own_device: offer.own_device,
         added_at: now,
         last_seen: now,
     };
     let resp = serde_json::json!({
+        "quic_port": my_quic_port,
         "pk": r_pk,
         "name": my_name,
         "device_id": identity.device_id(),
@@ -570,19 +586,22 @@ mod tests {
         let initiator = DeviceIdentity::from_seed(random_bytes::<32>());
         let r_store = TrustStore::new(&r_dir);
 
-        let uri = create_pair_offer(&responder, &r_dir, "Desk & Co", "192.168.1.10", 53317, true);
+        let uri = create_pair_offer(&responder, &r_dir, "Desk & Co", "192.168.1.10", 53317, true, 53318);
         let offer = parse_pair_uri(&uri).unwrap();
         assert_eq!(offer.name, "Desk & Co");
         assert!(offer.own_device);
+        assert_eq!(offer.quic_port, 53318);
 
-        let req = build_pair_request(&initiator, &offer, "Phone");
-        let (resp, key) = accept_pair_request(&responder, &r_dir, "Desk", &req, "192.168.1.20").unwrap();
+        let req = build_pair_request(&initiator, &offer, "Phone", 53318);
+        let (resp, key) = accept_pair_request(&responder, &r_dir, "Desk", &req, "192.168.1.20", 53318).unwrap();
         verify_pair_response(&initiator, &offer, &resp).unwrap();
         assert!(key.own_device);
+        assert_eq!(key.quic_port, 53318);
+        assert_eq!(resp["quic_port"], 53318);
         r_store.upsert(key).unwrap();
 
         // Offer is single-use.
-        assert!(accept_pair_request(&responder, &r_dir, "Desk", &req, "192.168.1.20").is_err());
+        assert!(accept_pair_request(&responder, &r_dir, "Desk", &req, "192.168.1.20", 53318).is_err());
 
         // Signed request from the paired initiator is trusted.
         let body = br#"{"files":[]}"#;
@@ -606,18 +625,18 @@ mod tests {
         let r_dir = tmpdir("w");
         let responder = DeviceIdentity::from_seed(random_bytes::<32>());
         let attacker = DeviceIdentity::from_seed(random_bytes::<32>());
-        let uri = create_pair_offer(&responder, &r_dir, "Desk", "10.0.0.2", 53317, false);
+        let uri = create_pair_offer(&responder, &r_dir, "Desk", "10.0.0.2", 53317, false, 0);
         let mut offer = parse_pair_uri(&uri).unwrap();
         offer.secret = vec![0u8; 32]; // attacker does not know the QR secret
-        let req = build_pair_request(&attacker, &offer, "Evil");
-        assert!(accept_pair_request(&responder, &r_dir, "Desk", &req, "10.0.0.66").is_err());
+        let req = build_pair_request(&attacker, &offer, "Evil", 0);
+        assert!(accept_pair_request(&responder, &r_dir, "Desk", &req, "10.0.0.66", 53318).is_err());
         // After MAX_PAIR_FAILURES wrong attempts the real offer is burned too.
         for _ in 0..MAX_PAIR_FAILURES {
-            let _ = accept_pair_request(&responder, &r_dir, "Desk", &req, "10.0.0.66");
+            let _ = accept_pair_request(&responder, &r_dir, "Desk", &req, "10.0.0.66", 53318);
         }
         let real = parse_pair_uri(&uri).unwrap();
         let legit = DeviceIdentity::from_seed(random_bytes::<32>());
-        assert!(accept_pair_request(&responder, &r_dir, "Desk", &build_pair_request(&legit, &real, "Phone"), "10.0.0.3").is_err());
+        assert!(accept_pair_request(&responder, &r_dir, "Desk", &build_pair_request(&legit, &real, "Phone", 0), "10.0.0.3", 53318).is_err());
 
         // A correctly signed request from an unpaired key is rejected.
         let store = TrustStore::new(&tmpdir("u"));

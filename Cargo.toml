@@ -19,6 +19,7 @@ blake3 = "1.5"
 zeroize = { version = "1.8", features = ["derive"] }
 ed25519-dalek = "2"
 base64 = "0.22"
+omasend-core = { path = "core" }
 
 [profile.release]
 opt-level = 3

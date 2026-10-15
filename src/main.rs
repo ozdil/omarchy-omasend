@@ -236,6 +236,9 @@ pub struct PendingFileTransfer {
     /// v2: public key of the authenticated sender; uploads must be signed by the same key.
     #[serde(default)]
     pub sender_pk: Option<String>,
+    /// "quic" when the offer came through omasend-core; decisions are forwarded to the core.
+    #[serde(default)]
+    pub transport: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1583,10 +1586,10 @@ pub fn check_firewall_status() -> String {
         if let Some(out) = run_cmd_bounded("/usr/bin/ufw", &["status"], &[], deadline, 4096) {
             let s = String::from_utf8_lossy(&out);
             if s.contains("Status: active") {
-                if s.contains("53317") {
+                if s.contains("53317") && s.contains("53318") {
                     return "UFW_ALLOWED_53317".to_string();
                 } else {
-                    return "UFW_ACTIVE_CHECK_53317 (sudo ufw allow 53317/tcp && sudo ufw allow 53317/udp)".to_string();
+                    return "UFW_ACTIVE_CHECK_53317 (sudo ufw allow 53317/tcp && sudo ufw allow 53317/udp && sudo ufw allow 53318/udp)".to_string();
                 }
             }
         }
@@ -1748,6 +1751,25 @@ fn get_active_paired_peer_ips() -> Vec<String> {
 }
 
 fn p2p_push_clipboard_silent(target_ip: &str, text: &str) {
+    if target_ip.is_empty() {
+        return;
+    }
+    if let (Some(node), Some(key)) = (CORE_NODE.get().cloned(), trusted_key_for_ip(target_ip)) {
+        let text_owned = text.to_string();
+        let ip_owned = target_ip.to_string();
+        thread::spawn(move || {
+            if let Err(e) = node.send_clipboard(key.pk.clone(), core_addrs(&key), text_owned.clone()) {
+                if core_error_is_unavailable(&e.to_string()) {
+                    p2p_push_clipboard_http(&ip_owned, &text_owned);
+                }
+            }
+        });
+        return;
+    }
+    p2p_push_clipboard_http(target_ip, text);
+}
+
+fn p2p_push_clipboard_http(target_ip: &str, text: &str) {
     if target_ip.is_empty() {
         return;
     }
@@ -2360,6 +2382,218 @@ pub fn complete_remote_pairing(oma_id: &str, code: &str, source_ip: IpAddr) -> R
     rendezvous::complete_remote_pairing(oma_id, code, source_ip, &get_state_dir(), now)
 }
 
+// ------------------- PHASE 2: ENCRYPTED QUIC CORE (omasend-core / iroh) -------------------
+
+pub const CORE_QUIC_PORT: u16 = omasend_core::DEFAULT_PORT;
+static CORE_NODE: std::sync::OnceLock<std::sync::Arc<omasend_core::OmaNode>> = std::sync::OnceLock::new();
+
+fn trust_of(pk: &str) -> omasend_core::Trust {
+    match trust_store().get(pk) {
+        Some(k) if k.own_device => omasend_core::Trust::Own,
+        Some(_) => omasend_core::Trust::Paired,
+        None => omasend_core::Trust::Unknown,
+    }
+}
+
+fn trusted_key_for_ip(ip: &str) -> Option<devicekey::TrustedKey> {
+    trust_store().load().into_iter().find(|k| !k.ip.is_empty() && k.ip == ip)
+}
+
+fn core_addrs(key: &devicekey::TrustedKey) -> Vec<String> {
+    let port = if key.quic_port > 0 { key.quic_port } else { CORE_QUIC_PORT };
+    vec![format!("{}:{}", key.ip, port)]
+}
+
+/// Errors that mean "this peer/route has no working QUIC core": callers fall back to HTTP.
+fn core_error_is_unavailable(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    ["timed out", "connect", "not paired", "unreachable", "no such file", "permission denied", "core not running"]
+        .iter()
+        .any(|p| m.contains(p))
+}
+
+struct DesktopCoreCallbacks {
+    last_progress_write: Mutex<Instant>,
+}
+
+impl omasend_core::NodeCallbacks for DesktopCoreCallbacks {
+    fn trust(&self, peer_pk: String) -> omasend_core::Trust {
+        trust_of(&peer_pk)
+    }
+
+    fn peer_name(&self, peer_pk: String) -> String {
+        trust_store().get(&peer_pk).map(|k| k.name).unwrap_or_default()
+    }
+
+    fn incoming_offer(&self, offer: omasend_core::IncomingOffer) {
+        let node = CORE_NODE.get().cloned();
+        // Single pending slot (V2-FUNC-01): refuse while another transfer is live.
+        if get_pending_transfer().is_some_and(|p| p.status == "PENDING" || p.status == "ACCEPTED") {
+            if let Some(n) = node {
+                n.respond(offer.transfer_id, false);
+            }
+            return;
+        }
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let files: Vec<TransferFileInfo> = offer
+            .files
+            .iter()
+            .map(|f| TransferFileInfo { name: f.name.clone(), size_bytes: f.size, blake3: None, sha256: None, md5: None })
+            .collect();
+        let size_mb = (offer.total_size as f64) / 1024.0 / 1024.0;
+        save_pending_transfer(&PendingFileTransfer {
+            token: offer.transfer_id.clone(),
+            sender_id: offer.peer_pk.clone(),
+            sender_name: offer.peer_name.clone(),
+            sender_ip: trust_store().get(&offer.peer_pk).map(|k| k.ip).unwrap_or_default(),
+            file_names: files.iter().map(|f| f.name.clone()).collect(),
+            remaining_files: files.len().max(1),
+            files,
+            total_size_bytes: offer.total_size,
+            created_at: now,
+            expires_at: now + 120,
+            status: "PENDING".to_string(),
+            sender_pk: Some(offer.peer_pk.clone()),
+            transport: Some("quic".to_string()),
+        });
+        notify_desktop(
+            "OmaSend AirBridge: Transfer Request",
+            &format!("'{}' wants to send {} file(s) ({:.1} MB), end-to-end encrypted.\nOpen OmaSend panel to Accept or Decline.", offer.peer_name, offer.files.len(), size_mb),
+        );
+    }
+
+    fn progress(&self, transfer_id: String, direction: omasend_core::Direction, file_name: String, done: u64, total: u64) {
+        if is_transfer_cancelled() {
+            clear_transfer_cancel();
+            if let Some(n) = CORE_NODE.get() {
+                n.cancel(transfer_id);
+            }
+            return;
+        }
+        let mut last = self.last_progress_write.lock().unwrap_or_else(|p| p.into_inner());
+        if done >= total || last.elapsed() >= Duration::from_millis(250) {
+            *last = Instant::now();
+            let dir = if direction == omasend_core::Direction::Send { "send" } else { "receive" };
+            save_transfer_progress(dir, &file_name, done, total);
+        }
+    }
+
+    fn file_received(&self, _transfer_id: String, peer_pk: String, path: String) {
+        let name = Path::new(&path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
+        record_notified_file(&name);
+        play_samurai_receive_sound();
+        let from = trust_store().get(&peer_pk).map(|k| k.name).unwrap_or_else(|| "paired device".into());
+        notify_desktop("OmaSend: Transfer Complete", &format!("'{}' received from {} (encrypted, BLAKE3 verified).", name, from));
+    }
+
+    fn transfer_finished(&self, transfer_id: String, direction: omasend_core::Direction, ok: bool, error: Option<String>) {
+        clear_transfer_progress();
+        if direction == omasend_core::Direction::Receive {
+            if get_pending_transfer().is_some_and(|p| p.token == transfer_id) {
+                clear_pending_transfer();
+            }
+            if !ok {
+                if let Some(e) = error.filter(|e| e != "declined") {
+                    notify_desktop("OmaSend AirBridge", &format!("Incoming transfer failed: {}", e));
+                }
+            }
+        }
+    }
+
+    fn clipboard(&self, peer_pk: String, text: String) {
+        set_last_synced_clipboard_hash(&compute_clipboard_hash(&text));
+        if military::is_sensitive_clipboard_payload(&text) {
+            return;
+        }
+        set_pc_clipboard(&text);
+        let from = trust_store().get(&peer_pk).map(|k| k.name).unwrap_or_else(|| "paired device".into());
+        notify_desktop("OmaSend: Universal Clipboard", &format!("Received clipboard text from {}.", from));
+        play_clipboard_sound();
+    }
+}
+
+/// Started once by the daemon. Failure is non-fatal: the HTTP transport keeps working.
+fn start_core_node() {
+    if CORE_NODE.get().is_some() {
+        return;
+    }
+    let cb = std::sync::Arc::new(DesktopCoreCallbacks { last_progress_write: Mutex::new(Instant::now()) });
+    match omasend_core::OmaNode::start(
+        device_identity().seed().to_vec(),
+        get_system_hostname(),
+        get_download_dir().to_string_lossy().to_string(),
+        CORE_QUIC_PORT,
+        false,
+        cb,
+    ) {
+        Ok(node) => {
+            println!("omasend-core listening on UDP {}", node.bound_port());
+            let _ = CORE_NODE.set(node);
+        }
+        Err(e) => eprintln!("omasend-core unavailable, HTTP only: {}", e),
+    }
+}
+
+fn local_api_token_path() -> PathBuf {
+    get_state_dir().join("local_api.token")
+}
+
+/// Secret for daemon-local control endpoints (CLI -> daemon), mode 0600.
+fn ensure_local_api_token() -> String {
+    if let Ok(t) = read_secure_file(&local_api_token_path()) {
+        if t.trim().len() == 64 {
+            return t.trim().to_string();
+        }
+    }
+    let mut b = [0u8; 32];
+    let _ = getrandom::getrandom(&mut b);
+    let t = hex::encode(b);
+    let _ = write_secure_file(&local_api_token_path(), &t);
+    t
+}
+
+/// Sends through the daemon's QUIC endpoint. Err((unavailable, message)).
+fn core_send_via_daemon(key: &devicekey::TrustedKey, paths: &[String], names: &[String]) -> Result<(), (bool, String)> {
+    if let Some(node) = CORE_NODE.get() {
+        return node
+            .send_files(key.pk.clone(), core_addrs(key), paths.to_vec(), names.to_vec(), String::new())
+            .map(|_| ())
+            .map_err(|e| {
+                let m = e.to_string();
+                (core_error_is_unavailable(&m), m)
+            });
+    }
+    let token = read_secure_file(&local_api_token_path()).map_err(|_| (true, "core not running (no local token)".to_string()))?;
+    let body = serde_json::json!({ "pk": key.pk, "addrs": core_addrs(key), "paths": paths, "names": names }).to_string();
+    let mut stream = connect_peer_with_timeout(&format!("127.0.0.1:{}", PORT), Duration::from_secs(2))
+        .map_err(|e| (true, format!("core not running: {}", e)))?;
+    let _ = stream.set_read_timeout(None);
+    let head = format!(
+        "POST /api/local/core-send HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nX-OmaSend-Local: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        token.trim(),
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).map_err(|e| (true, e.to_string()))?;
+    stream.write_all(body.as_bytes()).map_err(|e| (true, e.to_string()))?;
+    let mut resp = String::new();
+    (&mut stream).take(64 * 1024).read_to_string(&mut resp).map_err(|e| (true, e.to_string()))?;
+    let json: serde_json::Value = resp
+        .split("\r\n\r\n")
+        .nth(1)
+        .and_then(|b| serde_json::from_str(b).ok())
+        .unwrap_or_default();
+    if json["ok"].as_bool() == Some(true) {
+        Ok(())
+    } else {
+        Err((
+            json["unavailable"].as_bool().unwrap_or(true),
+            json["error"].as_str().unwrap_or("core send failed").to_string(),
+        ))
+    }
+}
+
 // ------------------- PHASE 1: DEVICE KEYS (devicekey.rs) -------------------
 
 fn device_identity() -> &'static devicekey::DeviceIdentity {
@@ -2939,7 +3173,7 @@ const MAX_PAIR_RESPONSE_BYTES: u64 = 64 * 1024;
 fn p2p_pair_v2(uri: &str) -> Result<devicekey::TrustedKey, String> {
     let offer = devicekey::parse_pair_uri(uri)?;
     let _: IpAddr = offer.host.trim().parse().map_err(|_| "Invalid host in pairing link".to_string())?;
-    let body = devicekey::build_pair_request(device_identity(), &offer, &get_system_hostname())
+    let body = devicekey::build_pair_request(device_identity(), &offer, &get_system_hostname(), CORE_NODE.get().map(|n| n.bound_port()).unwrap_or(CORE_QUIC_PORT))
         .to_string()
         .into_bytes();
     let addr = format!("{}:{}", offer.host, offer.port);
@@ -2979,6 +3213,7 @@ fn p2p_pair_v2(uri: &str) -> Result<devicekey::TrustedKey, String> {
         name,
         ip: offer.host.clone(),
         port: offer.port,
+        quic_port: json["quic_port"].as_u64().and_then(|p| u16::try_from(p).ok()).unwrap_or(offer.quic_port),
         own_device: offer.own_device,
         added_at: now,
         last_seen: now,
@@ -3007,6 +3242,7 @@ fn create_pair_offer_json(own_device: bool) -> serde_json::Value {
         &get_local_ip(),
         PORT,
         own_device,
+        CORE_NODE.get().map(|n| n.bound_port()).unwrap_or(CORE_QUIC_PORT),
     );
     let png = get_state_dir().join("pair_offer_qr.png");
     let png_str = png.to_string_lossy().to_string();
@@ -3203,6 +3439,26 @@ fn p2p_send_files_to_peer(target_ip_or_omaid: &str, file_paths: &[PathBuf]) -> R
             sha256_hex,
             md5_hex,
         });
+    }
+
+    // Phase 2: QR-paired devices get the encrypted, resumable QUIC transport. If the peer has
+    // no core endpoint (older app) or the daemon cannot reach it, fall back to signed HTTP.
+    if let Some(key) = trusted_key_for_ip(target_ip) {
+        let paths: Vec<String> = prepared.iter().map(|p| p.path.to_string_lossy().to_string()).collect();
+        let names: Vec<String> = prepared.iter().map(|p| p.name.clone()).collect();
+        println!("Sending to {} over encrypted QUIC...", key.name);
+        match core_send_via_daemon(&key, &paths, &names) {
+            Ok(()) => {
+                println!("Transfer successfully completed to {} (QUIC, BLAKE3 verified)!", target_ip);
+                notify_desktop("OmaSend AirBridge", &format!("{} file(s) sent to {} (end-to-end encrypted).", prepared.len(), key.name));
+                return Ok(());
+            }
+            Err((true, e)) => eprintln!("QUIC unavailable ({}); falling back to HTTP.", e),
+            Err((false, e)) => {
+                notify_desktop("OmaSend AirBridge", &format!("Transfer to {} failed: {}", key.name, e));
+                return Err(e);
+            }
+        }
     }
 
     let (my_id, _) = get_or_create_device_id();
@@ -4852,6 +5108,42 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         return;
     }
 
+    if req.method == "POST" && req.path == "/api/local/core-send" {
+        let token_ok = req
+            .get_header("x-omasend-local")
+            .is_some_and(|t| constant_time_eq_str(t.trim(), &ensure_local_api_token()));
+        if !client_ip.to_canonical().is_loopback() || !token_ok {
+            respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Forbidden\"}", None, None);
+            return;
+        }
+        let body_deadline = Instant::now() + Duration::from_secs(DEFAULT_BODY_TIMEOUT_SECS);
+        let body = match read_http_body(&mut stream, content_length, &initial_body, body_deadline, false, MAX_CONTROL_BODY) {
+            Some(b) => b,
+            None => return,
+        };
+        let val: serde_json::Value = body.as_slice().and_then(|b| serde_json::from_slice(b).ok()).unwrap_or_default();
+        let strs = |k: &str| -> Vec<String> {
+            val[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default()
+        };
+        let pk = val["pk"].as_str().unwrap_or_default().to_string();
+        let out = match (CORE_NODE.get(), trust_store().get(&pk)) {
+            (None, _) => serde_json::json!({ "ok": false, "unavailable": true, "error": "core not running" }),
+            (_, None) => serde_json::json!({ "ok": false, "unavailable": true, "error": "not paired" }),
+            (Some(node), Some(_)) => {
+                let _ = stream.set_write_timeout(None);
+                match node.send_files(pk, strs("addrs"), strs("paths"), strs("names"), String::new()) {
+                    Ok(id) => serde_json::json!({ "ok": true, "transfer_id": id }),
+                    Err(e) => {
+                        let m = e.to_string();
+                        serde_json::json!({ "ok": false, "unavailable": core_error_is_unavailable(&m), "error": m })
+                    }
+                }
+            }
+        };
+        respond(&stream, "200 OK", "application/json", out.to_string().as_bytes(), None, None);
+        return;
+    }
+
     if req.method == "POST" && req.path == "/api/v2/pair" {
         if content_length > MAX_CONTROL_BODY {
             respond(&stream, "413 Payload Too Large", "application/json", b"{\"error\":\"Request payload exceeds limit\"}", None, None);
@@ -4870,7 +5162,8 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             }
         };
         let peer_ip = client_ip.to_canonical().to_string();
-        match devicekey::accept_pair_request(device_identity(), &get_state_dir(), &get_system_hostname(), &val, &peer_ip) {
+        let my_quic = CORE_NODE.get().map(|n| n.bound_port()).unwrap_or(CORE_QUIC_PORT);
+        match devicekey::accept_pair_request(device_identity(), &get_state_dir(), &get_system_hostname(), &val, &peer_ip, my_quic) {
             Ok((resp, key)) => {
                 let label = format!("{} ({})", key.name, key.device_id);
                 let own = key.own_device;
@@ -5156,6 +5449,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             expires_at: initial_expiry,
             status: initial_status.to_string(),
             sender_pk: v2_key.as_ref().map(|k| k.pk.clone()),
+            transport: None,
         };
         save_pending_transfer(&transfer);
 
@@ -5228,6 +5522,24 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                 let token = val["token"].as_str().unwrap_or_default();
                 let action = val["action"].as_str().unwrap_or_default();
                 if let Some(mut pending) = get_pending_transfer() {
+                    if pending.token == token && pending.transport.as_deref() == Some("quic") && (action == "accept" || action == "reject") {
+                        let accept = action == "accept";
+                        if let Some(node) = CORE_NODE.get() {
+                            node.respond(token.to_string(), accept);
+                        }
+                        if accept {
+                            pending.status = "ACCEPTED".to_string();
+                            pending.expires_at = now.saturating_add(600);
+                            save_pending_transfer(&pending);
+                            notify_desktop("OmaSend AirBridge", "Transfer accepted. Receiving files (encrypted)...");
+                            respond(&stream, "200 OK", "application/json", b"{\"status\":\"ACCEPTED\"}", None, None);
+                        } else {
+                            clear_pending_transfer();
+                            notify_desktop("OmaSend AirBridge", "Transfer declined.");
+                            respond(&stream, "200 OK", "application/json", b"{\"status\":\"REJECTED\"}", None, None);
+                        }
+                        return;
+                    }
                     if pending.token == token {
                         if action == "accept" {
                             pending.status = "ACCEPTED".to_string();
@@ -6078,6 +6390,9 @@ fn run_server() {
             Path::new("/run"),
         ],
     );
+
+    ensure_local_api_token();
+    start_core_node();
 
     let pid_file = state_dir.join("engine.pid");
     if let Ok(old_pid_str) = read_secure_file(&pid_file) {
@@ -7478,6 +7793,7 @@ mod tests {
             expires_at: 500,
             status: "ACCEPTED".to_string(),
             sender_pk: None,
+            transport: None,
         };
 
         // File listed in approved files
@@ -8660,7 +8976,7 @@ mod tests {
         // 1. Pair via QR offer marked "own device".
         let offer_json = create_pair_offer_json(true);
         let offer = devicekey::parse_pair_uri(offer_json["uri"].as_str().unwrap()).unwrap();
-        let pair_body = devicekey::build_pair_request(&phone, &offer, "Test Phone").to_string();
+        let pair_body = devicekey::build_pair_request(&phone, &offer, "Test Phone", 0).to_string();
         let r = post_json(addr, "/api/v2/pair", "", &serde_json::from_str(&pair_body).unwrap());
         assert!(r.starts_with("HTTP/1.1 200"), "pairing must succeed: {}", r);
         let resp_json: serde_json::Value = serde_json::from_str(r.split("\r\n\r\n").nth(1).unwrap()).unwrap();
@@ -8763,6 +9079,7 @@ mod tests {
             expires_at: now + 60,
             status: "ACCEPTED".to_string(),
             sender_pk: None,
+            transport: None,
         });
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");

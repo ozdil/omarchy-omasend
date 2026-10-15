@@ -100,11 +100,38 @@ The receiver accepts a request only if all of these hold:
 On every successful verification, the receiver updates the stored IP for that key. This
 handles DHCP address changes without trusting unauthenticated beacons.
 
-## Known limits (addressed in Phase 2)
+## Known limits of the signed-HTTP path
 
-- Traffic is authenticated but **not encrypted**. Phase 2 moves to QUIC/TLS with the same keys.
+- Traffic is authenticated but **not encrypted**. QR-paired devices use the Phase 2 transport below instead.
 - Upload bodies are not covered by the signature (`stream:<len>`). Integrity comes from the
   signed transfer request: the size must match, and hashes are checked when the sender provides them.
+
+## Phase 2: encrypted transport (`omasend-core`)
+
+Paired devices talk over [iroh](https://iroh.computer) (QUIC + TLS 1.3, raw public keys). The
+shared Rust crate `core/` is used by the desktop engine directly and by Android through UniFFI
+(`core/build-android.sh`).
+
+- **Identity:** the iroh endpoint secret is the same Ed25519 seed as above, so the endpoint id is
+  the device `pk`. A connection can only be established to the key stored at pairing time; TLS
+  proves the remote holds that key. No certificates, no CA.
+- **Transport:** UDP port `53318` (`quic_port` is exchanged during pairing). LAN-only by default:
+  relays and discovery are disabled; addresses come from the trust store (last verified IP).
+- **ALPN:** `omasend/2`.
+- **Control stream** (one bidirectional stream): length-prefixed (u32 BE) JSON frames tagged
+  by `t`: `hello` → `offer{transfer_id, files[{name,size,blake3}]}` →
+  `decision{accepted, resume[], reason}` → per file `file_done{index, ok, error}` from the
+  receiver; or `clipboard{text}` → `ack{ok, error}`.
+- **Data:** one unidirectional stream per file, starting with a
+  `file_header{transfer_id, index, offset}` frame (offset = the receiver's `resume[index]`),
+  followed by the raw bytes. The receiver writes to
+  `.omasend-partial/<blake3>.part`, verifies the BLAKE3 hash, then moves it into place.
+  A later offer of the same file resumes from the partial length; a hash mismatch deletes the
+  partial and fails the transfer (`integrity`).
+- **Receiver policy:** trust `Unknown` → refused (files and clipboard); `Paired` → user approval;
+  `Own` → auto-accept. File names are sanitized (no paths, no leading dots, ≤200 chars).
+- **Fallback:** if the peer has no reachable QUIC endpoint (older version, blocked UDP), senders
+  fall back to the signed-HTTP path above.
 
 ## Test vector (must match on both platforms)
 

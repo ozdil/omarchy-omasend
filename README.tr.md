@@ -10,7 +10,7 @@
 > **Omarchy Linux, Android ve modern web tarayıcıları arasında doğrudan eşler arası dosya aktarımı ve pano senkronu; anonim numaralı kimlik (OmaID), hesap ve bulut sunucusu yok.**
 
 > [!IMPORTANT]
-> **Güvenlik durumu (v1.9.1):** Yerel ağ aktarımlarında boyut ve (gönderildiğinde) sağlama toplamı doğrulanır, ancak trafik **henüz uçtan uca şifreli veya kriptografik olarak kimliği doğrulanmış değildir**. OmaSend'i güvendiğiniz ağlarda kullanın. Gelen her transfer onayınızı bekler, pano senkronu yalnızca açıkça eşleştirilmiş cihazlarla çalışır. Cihaz başına anahtarlar, QR ile eşleşme ve kimliği doğrulanmış şifreleme yol haritasındadır.
+> **Güvenlik durumu:** QR kodla eşleştirilen cihazlar (`omasend-engine --pair-offer`) cihaz başına Ed25519 anahtarları ve şifreli, karşılıklı kimlik doğrulamalı QUIC/TLS 1.3 aktarımı kullanır; transferler BLAKE3 ile doğrulanır ve kaldığı yerden devam eder. QR ile eşleştirilmemiş cihazlar hâlâ eski HTTP yolunu kullanır ve bu yol **şifreli değildir** — yalnızca güvendiğiniz ağlarda kullanın. Kendi eşleştirilmiş cihazlarınız dışındaki tüm gelen transferler onayınızı bekler. Protokol ayrıntıları: [PROTOCOL_V2.md](PROTOCOL_V2.md).
 
 - **Geliştirici:** Ozan Özdil (ozdil)  
 - **Lisans:** MIT  
@@ -40,7 +40,7 @@
 - **Bütünlük ve Şifreleme:**
   - Yüklenen dosyanın boyutu onaylanan istekle eşleşmek zorundadır; BLAKE3 / SHA-256 / MD5 sağlama toplamları gönderici sağladığında doğrulanır (masaüstü motoru sağlar, Android uygulaması henüz sağlamaz).
   - Web portalı: oturum anahtarı URL'nin karma (`#key=...`) bölümünde taşınır ve HTTP isteklerine eklenmez (RFC 3986).
-  - Henüz yok: yerel ağ/P2P trafiği için uçtan uca şifreleme ve kriptografik eş kimlik doğrulaması (yukarıdaki güvenlik durumu notuna bakın).
+  - QR ile eşleştirilmiş cihazlar için şifreli aktarım (UDP `53318` üzerinde QUIC/TLS 1.3). Güvenlik duvarı kullanıyorsanız yerel ağda `53317/tcp`, `53317/udp` ve `53318/udp` portlarına izin verin.
 - **Çoklu Platform Ekosistemi:**
   - **Linux Masaüstü Eklentisi:** Yerel Quickshell QML widget'ı ve sertleştirilmiş Rust arka plan motoru (`omasend-engine`).
   - **Android Yerel Uygulaması:** Kotlin ve Jetpack Compose ile sıfır GMS bağımlılıklı CameraX QR/Barkod vizörü ve dokunsal titreşim desteği ([ozdil/omasend-android](https://github.com/ozdil/omasend-android)).
@@ -99,7 +99,7 @@ omarchy-restart-shell
 
 ## Güvenlik ve Gizlilik Politikası
 
-OmaSend telemetri toplamaz, kullanıcıları izlemez ve verileri merkezi sunucularda saklamaz. Dosyalar ve pano içeriği doğrudan cihazlarınız arasında gider. Yerel ağ/P2P trafiği şu an uçtan uca şifreli veya kriptografik olarak kimliği doğrulanmış değildir; güvendiğiniz ağlarda kullanın. Gelen her transfer onayınızı bekler. Güvenlik sorunlarını GitHub üzerinden bildirebilirsiniz.
+OmaSend telemetri toplamaz, kullanıcıları izlemez ve verileri merkezi sunucularda saklamaz. Dosyalar ve pano içeriği doğrudan cihazlarınız arasında gider. QR ile eşleştirilmiş cihazlar arasındaki trafik uçtan uca şifreli ve kimliği doğrulanmıştır; eşleştirilmemiş cihazlarla olan trafik değildir, onu yalnızca güvendiğiniz ağlarda kullanın. Güvenlik sorunlarını GitHub üzerinden bildirebilirsiniz.
 
 Detaylı güvenlik ilkeleri için [PRIVACY_POLICY.md](PRIVACY_POLICY.md) ve [CONTRIBUTING.md](CONTRIBUTING.md) belgelerini inceleyin.
 
