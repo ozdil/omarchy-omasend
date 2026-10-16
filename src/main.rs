@@ -2534,13 +2534,6 @@ impl omasend_core::NodeCallbacks for DesktopCoreCallbacks {
 
     fn incoming_offer(&self, offer: omasend_core::IncomingOffer) {
         let node = CORE_NODE.get().cloned();
-        // Single pending slot (V2-FUNC-01): refuse while another transfer is live.
-        if get_pending_transfer().is_some_and(|p| p.status == "PENDING" || p.status == "ACCEPTED") {
-            if let Some(n) = node {
-                n.respond(offer.transfer_id, false);
-            }
-            return;
-        }
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let files: Vec<TransferFileInfo> = offer
             .files
@@ -2548,7 +2541,9 @@ impl omasend_core::NodeCallbacks for DesktopCoreCallbacks {
             .map(|f| TransferFileInfo { name: f.name.clone(), size_bytes: f.size, blake3: None, sha256: None, md5: None })
             .collect();
         let size_mb = (offer.total_size as f64) / 1024.0 / 1024.0;
-        save_pending_transfer(&PendingFileTransfer {
+        // Single pending slot (V2-FUNC-01): refuse while another transfer is live. The core only
+        // offers from paired keys, so this counts as a verified sender (M9).
+        let claimed = claim_pending_slot(&PendingFileTransfer {
             token: offer.transfer_id.clone(),
             sender_id: offer.peer_pk.clone(),
             sender_name: offer.peer_name.clone(),
@@ -2562,7 +2557,13 @@ impl omasend_core::NodeCallbacks for DesktopCoreCallbacks {
             status: "PENDING".to_string(),
             sender_pk: Some(offer.peer_pk.clone()),
             transport: Some("quic".to_string()),
-        });
+        }, true);
+        if !claimed {
+            if let Some(n) = node {
+                n.respond(offer.transfer_id, false);
+            }
+            return;
+        }
         notify_desktop(
             "OmaSend AirBridge: Transfer Request",
             &format!("'{}' wants to send {} file(s) ({:.1} MB), end-to-end encrypted.\nOpen OmaSend panel to Accept or Decline.", offer.peer_name, offer.files.len(), size_mb),
@@ -2942,6 +2943,25 @@ fn with_pending_transfer<R>(f: impl FnOnce(&mut Option<PendingFileTransfer>) -> 
         }
     }
     out
+}
+
+/// Atomically takes the single pending-transfer slot for `t` (V2-FUNC-01, M10). A live PENDING
+/// or ACCEPTED transfer keeps the slot, except that a cryptographically verified sender (v2
+/// signature or QUIC offer from a paired key) may displace a request from an unverified
+/// sender that is still only PENDING, so anonymous LAN requests cannot block paired devices (M9).
+fn claim_pending_slot(t: &PendingFileTransfer, verified: bool) -> bool {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    with_pending_transfer(|slot| {
+        if let Some(cur) = slot.as_ref() {
+            let live = now <= cur.expires_at && (cur.status == "PENDING" || cur.status == "ACCEPTED");
+            let unverified_pending = cur.status == "PENDING" && cur.sender_pk.is_none() && cur.transport.is_none();
+            if live && !(verified && unverified_pending) {
+                return false;
+            }
+        }
+        *slot = Some(t.clone());
+        true
+    })
 }
 
 /// Applies the local user's accept/reject to the pending transfer. Only a live PENDING request
@@ -5660,6 +5680,15 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
 
         let is_trusted = is_same_owner;
 
+        // Visibility KNOWN (the default) accepts only paired senders: a verified device key, or
+        // a legacy pairing that completed the code-verified handshake (its token was checked
+        // above). EVERYONE is the time-limited opt-in for strangers (M9).
+        if vis == "KNOWN" && v2_key.is_none() && !is_peer_confirmed(&sender_id) {
+            let err = serde_json::json!({ "error": "Recipient only accepts transfers from paired devices" });
+            respond(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
+            return;
+        }
+
         let mut file_names = Vec::new();
         let mut files_info = Vec::new();
         let mut total_size_bytes = 0u64;
@@ -5697,14 +5726,6 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             }
         }
 
-        // V2-FUNC-01: there is a single pending-transfer slot. Never overwrite a live request or an
-        // accepted transfer that is still uploading; the new sender must retry once it finishes/expires.
-        if get_pending_transfer().is_some_and(|p| p.status == "PENDING" || p.status == "ACCEPTED") {
-            let err = serde_json::json!({ "error": "Another transfer is in progress. Please retry shortly." });
-            respond(&stream, "409 Conflict", "application/json", err.to_string().as_bytes(), None, Some(&[("Retry-After", "30")]));
-            return;
-        }
-
         let mut token_bytes = [0u8; 16];
         let _ = getrandom::getrandom(&mut token_bytes);
         let token = hex::encode(token_bytes);
@@ -5738,7 +5759,12 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             sender_pk: v2_key.as_ref().map(|k| k.pk.clone()),
             transport: None,
         };
-        save_pending_transfer(&transfer);
+        // V2-FUNC-01: single pending slot; check and save under one lock (M10).
+        if !claim_pending_slot(&transfer, v2_key.is_some()) {
+            let err = serde_json::json!({ "error": "Another transfer is in progress. Please retry shortly." });
+            respond(&stream, "409 Conflict", "application/json", err.to_string().as_bytes(), None, Some(&[("Retry-After", "30")]));
+            return;
+        }
 
         let size_mb = (total_size_bytes as f64) / 1024.0 / 1024.0;
         if auto_accept {
@@ -9170,7 +9196,8 @@ mod tests {
         // V2-SEC-01: OmaID is public (broadcast in beacons), so claiming our own OmaID must NOT
         // auto-accept transfers or authorize clipboard writes.
         clear_pending_transfer();
-        set_visibility("KNOWN");
+        // EVERYONE: under KNOWN an unpaired sender is refused outright (see the test below).
+        set_visibility("EVERYONE");
         let my_oma_id = get_or_create_oma_id();
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
@@ -9644,5 +9671,42 @@ mod tests {
         let r = get_once("/api/status", &local);
         assert!(r.starts_with("HTTP/1.1 200"), "local token must bypass the PIN lockout: {}", r);
         reset_pin_rate_limiter();
+    }
+
+    /// M9: visibility KNOWN refuses unpaired HTTP senders (even with our own, public, OmaID).
+    #[test]
+    fn test_known_visibility_refuses_unpaired_sender() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        clear_pending_transfer();
+        set_visibility("KNOWN");
+        let my_oma_id = get_or_create_oma_id();
+        let r = post_once("/api/p2p/request", &format!("X-OmaSend-OmaID: {}\r\n", my_oma_id), &serde_json::json!({
+            "oma_id": my_oma_id, "sender_name": "Stranger", "files": [{"name": "x.txt", "size_bytes": 1}]
+        }));
+        assert!(r.starts_with("HTTP/1.1 403"), "{}", r);
+        assert!(get_pending_transfer().is_none());
+        set_visibility("ALL");
+    }
+
+    /// M9/M10: an unverified PENDING request does not block a verified sender, but a verified
+    /// or accepted transfer is never displaced.
+    #[test]
+    fn test_pending_slot_preemption_rules() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        clear_pending_transfer();
+        assert!(claim_pending_slot(&test_pending("anon-1", "PENDING", 30, None), false));
+        assert!(!claim_pending_slot(&test_pending("anon-2", "PENDING", 30, None), false), "unverified cannot displace");
+        assert!(claim_pending_slot(&test_pending("v2-1", "PENDING", 30, Some("pk1")), true), "verified displaces unverified");
+        assert!(!claim_pending_slot(&test_pending("v2-2", "PENDING", 30, Some("pk2")), true), "verified is not displaced");
+        assert_eq!(get_pending_transfer().unwrap().token, "v2-1");
+        clear_pending_transfer();
+        assert!(claim_pending_slot(&test_pending("anon-acc", "ACCEPTED", 30, None), false));
+        assert!(!claim_pending_slot(&test_pending("v2-3", "PENDING", 30, Some("pk3")), true), "accepted transfer is not displaced");
+        clear_pending_transfer();
+        let mut old = test_pending("old", "PENDING", 0, None);
+        old.expires_at -= 5;
+        save_pending_transfer(&old);
+        assert!(claim_pending_slot(&test_pending("new", "PENDING", 30, None), false), "expired record frees the slot");
+        clear_pending_transfer();
     }
 }
