@@ -1767,31 +1767,11 @@ fn get_active_paired_peer_ips() -> Vec<String> {
     ips
 }
 
-/// Legacy code-paired peers that receive automatic clipboard pushes over HTTP. Addresses that
-/// belong to a QR-paired key are excluded: those only ever get the encrypted channel.
-fn legacy_clipboard_ips() -> Vec<String> {
-    let keys = trust_store().load();
-    let mut ips = Vec::new();
-    for p in load_paired_peers() {
-        if !p.is_active() {
-            continue;
-        }
-        if let Some(ip) = p.ip.filter(|ip| !ip.is_empty()) {
-            if !ips.contains(&ip) && !keys.iter().any(|k| k.ip == ip) {
-                ips.push(ip);
-            }
-        }
-    }
-    ips
-}
-
-/// Automatic clipboard sync: legacy paired peers (HTTP, as before) and the user's OWN
-/// QR-paired devices (encrypted QUIC). Devices paired as someone else's never get
-/// automatic pushes.
+/// Automatic clipboard sync goes only to the user's OWN QR-paired devices, over the encrypted
+/// QUIC channel. Legacy (OmaID) peers and devices paired as someone else's never get automatic
+/// pushes: the legacy HTTP path is plaintext on the LAN (M6). `--sync-clipboard <peer>` still
+/// sends to a legacy peer when the user asks for it explicitly.
 fn auto_push_clipboard_text(text: &str) {
-    for ip in legacy_clipboard_ips() {
-        p2p_push_clipboard_http(&ip, text);
-    }
     for key in trust_store().load().into_iter().filter(|k| k.own_device) {
         let text = text.to_string();
         thread::spawn(move || {
@@ -1800,77 +1780,6 @@ fn auto_push_clipboard_text(text: &str) {
             }
         });
     }
-}
-
-
-fn p2p_push_clipboard_http(target_ip: &str, text: &str) {
-    if target_ip.is_empty() {
-        return;
-    }
-    let (my_id, _) = get_or_create_device_id();
-    let my_oma_id = get_or_create_oma_id();
-    let my_name = get_system_hostname();
-
-    let paired = load_paired_peers();
-    let matched_peer = paired.iter().find(|p| p.is_active() && p.ip.as_deref() == Some(target_ip));
-    let auth_token = matched_peer.and_then(|p| p.auth_token.clone()).unwrap_or_default();
-
-    let inner_json = serde_json::json!({
-        "sender_id": my_oma_id,
-        "oma_id": my_oma_id,
-        "device_id": my_id,
-        "sender_name": my_name,
-        "content_type": "text",
-        "text": text,
-        "auth_token": auth_token
-    });
-
-    let target_oma_id = matched_peer
-        .map(|p| p.oma_id.clone())
-        .or_else(|| {
-            get_discovered_peers()
-                .into_iter()
-                .find(|dp| dp.ip == target_ip && !dp.oma_id.is_empty())
-                .map(|dp| dp.oma_id)
-        })
-        .unwrap_or_default();
-    let final_payload = if !target_oma_id.is_empty() {
-        if let Ok(env) = encrypt_p2p_payload(&my_oma_id, &target_oma_id, inner_json.to_string().as_bytes()) {
-            serde_json::json!({
-                "encrypted_envelope": env,
-                "oma_id": my_oma_id,
-                "sender_id": my_oma_id,
-                "device_id": my_id,
-                "sender_name": my_name,
-                "content_type": "text",
-                "text": text,
-                "auth_token": auth_token
-            })
-        } else {
-            inner_json
-        }
-    } else {
-        inner_json
-    };
-
-    let addr = resolve_peer_addr(target_ip);
-    let req_bytes = final_payload.to_string().into_bytes();
-    let oma_id_hdr = my_oma_id.clone();
-    let auth_hdr = auth_token.clone();
-    thread::spawn(move || {
-        if let Ok(mut stream) = connect_peer_with_timeout(&addr, Duration::from_millis(1500)) {
-            let http_req = format!(
-                "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-OmaSend-OmaID: {}\r\nX-OmaSend-Auth-Token: {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
-                addr, oma_id_hdr, auth_hdr,
-                v2_auth_lines("POST", "/api/p2p/clipboard", &devicekey::body_tag_json(&req_bytes)),
-                req_bytes.len()
-            );
-            let _ = stream.write_all(http_req.as_bytes());
-            let _ = stream.write_all(&req_bytes);
-            let mut resp = Vec::new();
-            let _ = (&mut stream).take(64 * 1024).read_to_end(&mut resp);
-        }
-    });
 }
 
 pub fn p2p_push_image_clipboard_silent(
@@ -2047,40 +1956,14 @@ pub fn start_clipboard_sentinel() {
         if !initial_text.trim().is_empty() {
             let initial_hash = compute_clipboard_hash(&initial_text);
             set_last_synced_clipboard_hash(&initial_hash);
-        } else if let Some((img_bytes, _, _, _)) = get_pc_image_clipboard() {
-            let initial_hash = compute_image_clipboard_hash(&img_bytes);
-            set_last_synced_clipboard_hash(&initial_hash);
         }
 
         loop {
             thread::sleep(Duration::from_millis(250));
 
-            // Check image clipboard first
-            if let Some((img_bytes, ct, w, h)) = get_pc_image_clipboard() {
-                let img_hash = compute_image_clipboard_hash(&img_bytes);
-                let last_hash = get_last_synced_clipboard_hash();
-
-                if last_hash.as_deref() != Some(&img_hash) {
-                    set_last_synced_clipboard_hash(&img_hash);
-                    let size = img_bytes.len() as u64;
-                    let _ = stage_clipboard_image(&img_bytes, &ct);
-
-                    // Images go to legacy paired peers only (the encrypted channel carries text).
-                    for target_ip in legacy_clipboard_ips() {
-                        p2p_push_image_clipboard_silent(
-                            &target_ip,
-                            &ct,
-                            &img_hash,
-                            size,
-                            w,
-                            h,
-                            Some(&img_bytes),
-                        );
-                    }
-                    continue;
-                }
-            }
-
+            // Images are not synced automatically: the encrypted channel carries text only, and
+            // images used to go to legacy peers over plaintext HTTP (M6). Image clipboards are
+            // not valid text (see is_valid_text_clipboard), so they are skipped below.
 
             // Check text clipboard
             let text = get_pc_clipboard();
@@ -2938,6 +2821,7 @@ fn get_pending_transfer() -> Option<PendingFileTransfer> {
     read_pending_transfer_unlocked(false)
 }
 
+#[cfg(test)]
 fn save_pending_transfer(t: &PendingFileTransfer) {
     let _guard = lock_state_files();
     write_pending_transfer_unlocked(t);
@@ -9630,9 +9514,6 @@ mod tests {
 
         // Auto-send picks the own device by id, never a raw address.
         assert_eq!(auto_send_target(), Some(key.device_id.clone()));
-
-        // Legacy clipboard targets never include an address owned by a paired key.
-        assert!(!legacy_clipboard_ips().contains(&"192.168.1.20".to_string()));
 
         trust_store().remove(&pk).unwrap();
         save_discovered_peers(&[]);
