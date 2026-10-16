@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="OmaSend Web // AirBridge Portal - Zero-Install WebRTC P2P File & Clipboard Transfer">
+  <meta name="description" content="OmaSend Web // AirBridge Portal - experimental browser client for file &amp; clipboard transfer (not end-to-end encrypted)">
   <meta name="theme-color" content="#13141c">
   <title>OmaSend // AirBridge Web Portal</title>
   
@@ -851,7 +851,7 @@
         </div>
         <div class="brand-text">
           <h1>OMASEND WEB <span class="version-tag">AIRBRIDGE V2</span></h1>
-          <p>Zero-Install WebRTC P2P Transfer &amp; Universal Clipboard</p>
+          <p>Experimental browser client &middot; not end-to-end encrypted</p>
         </div>
       </div>
 
@@ -940,7 +940,7 @@
         </div>
         <div class="dropzone-title">DROP FILES TO AIRBRIDGE OR CLICK TO BROWSE</div>
         <div class="dropzone-subtitle">
-          Direct P2P DataChannel chunk streaming with ChaCha20 / AES zero-copy transfer. Files never touch third-party servers.
+          Files go to your OmaSend desktop over the local REST bridge (plain HTTP, not end-to-end encrypted). For encrypted transfers, pair the desktop and Android apps with a QR code.
         </div>
         <button class="btn-secondary" style="pointer-events: none;">SELECT FILES</button>
         <input type="file" id="file-input" class="file-input-hidden" multiple>
@@ -954,7 +954,7 @@
     <div class="glass-panel clipboard-section">
       <div class="id-card-title">
         <span>UNIVERSAL CLIPBOARD BRIDGE</span>
-        <span style="color: var(--accent-cyan);">E2EE SYNC</span>
+        <span style="color: var(--accent-orange);">NOT ENCRYPTED</span>
       </div>
 
       <textarea id="clipboard-text" class="clipboard-input-area" placeholder="Type or paste text, links, or code snippets to push across devices..."></textarea>
@@ -1016,11 +1016,11 @@
 
     <!-- Footer -->
     <footer>
-      <div>OMARCHY OMASEND // ZERO-TRUST WEBRTC PORTAL</div>
+      <div>OMARCHY OMASEND // EXPERIMENTAL WEB PORTAL</div>
       <div class="footer-badges">
         <span class="badge-chip">JETBRAINSMONO</span>
-        <span class="badge-chip">E2EE NOISE_IKPSK2</span>
-        <span class="badge-chip">WEBRTC DATACHANNEL</span>
+        <span class="badge-chip">NO E2EE</span>
+        <span class="badge-chip">EXPERIMENTAL</span>
       </div>
     </footer>
 

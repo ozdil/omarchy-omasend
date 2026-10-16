@@ -3,7 +3,7 @@ name = "omasend-engine"
 version = "2.0.0"
 edition = "2021"
 authors = ["Ozan Özdil <ozan@pm.me>"]
-description = "Anonymous Numbered Identity (Zero-Log OmaID), Zero-Click AirBridge, QR file transfer, and cross-device sharing daemon for Omarchy"
+description = "File and clipboard sharing daemon for Omarchy: QR-paired devices over encrypted QUIC (TLS 1.3)"
 license = "MIT"
 
 [dependencies]
