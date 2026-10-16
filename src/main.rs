@@ -878,6 +878,99 @@ fn start_wan_tunnel() -> Result<String, String> {
 
 // ------------------- QR CODE & URLS -------------------
 
+fn qr_modules(content: &str) -> Option<(usize, Vec<bool>)> {
+    let code = qrcode::QrCode::with_error_correction_level(content.as_bytes(), qrcode::EcLevel::M).ok()?;
+    let width = code.width();
+    Some((width, code.to_colors().into_iter().map(|c| c == qrcode::Color::Dark).collect()))
+}
+
+fn png_crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
+fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    let start = out.len();
+    out.extend_from_slice(kind);
+    out.extend_from_slice(data);
+    let crc = png_crc32(&out[start..]);
+    out.extend_from_slice(&crc.to_be_bytes());
+}
+
+/// Minimal PNG encoder for a QR code: 8-bit grayscale, zlib stream of stored (uncompressed)
+/// deflate blocks. Black modules on white, `scale` pixels per module, `margin` modules of
+/// quiet zone. Avoids depending on qrencode or an image crate.
+fn qr_png(content: &str, scale: usize, margin: usize) -> Option<Vec<u8>> {
+    let (width, dark) = qr_modules(content)?;
+    let side = (width + 2 * margin) * scale;
+    let mut raw = Vec::with_capacity(side * (side + 1));
+    for py in 0..side {
+        raw.push(0u8); // filter: none
+        let my = (py / scale).checked_sub(margin).filter(|&y| y < width);
+        for px in 0..side {
+            let mx = (px / scale).checked_sub(margin).filter(|&x| x < width);
+            let is_dark = matches!((mx, my), (Some(x), Some(y)) if dark[y * width + x]);
+            raw.push(if is_dark { 0 } else { 255 });
+        }
+    }
+    let mut z = vec![0x78, 0x01];
+    let mut chunks = raw.chunks(65_535).peekable();
+    while let Some(block) = chunks.next() {
+        z.push(if chunks.peek().is_none() { 1 } else { 0 });
+        let len = block.len() as u16;
+        z.extend_from_slice(&len.to_le_bytes());
+        z.extend_from_slice(&(!len).to_le_bytes());
+        z.extend_from_slice(block);
+    }
+    let (mut a, mut b) = (1u32, 0u32);
+    for &byte in &raw {
+        a = (a + byte as u32) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    z.extend_from_slice(&((b << 16) | a).to_be_bytes());
+
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&(side as u32).to_be_bytes());
+    ihdr.extend_from_slice(&(side as u32).to_be_bytes());
+    ihdr.extend_from_slice(&[8, 0, 0, 0, 0]); // 8-bit, grayscale, deflate, no filter, no interlace
+    png_chunk(&mut out, b"IHDR", &ihdr);
+    png_chunk(&mut out, b"IDAT", &z);
+    png_chunk(&mut out, b"IEND", &[]);
+    Some(out)
+}
+
+/// QR code for a terminal: two module rows per line with half blocks, black on white.
+fn qr_ansi(content: &str) -> Option<String> {
+    let (width, dark) = qr_modules(content)?;
+    let margin = 2;
+    let side = width + 2 * margin;
+    let at = |x: usize, y: usize| -> bool {
+        x >= margin && y >= margin && x - margin < width && y - margin < width && dark[(y - margin) * width + (x - margin)]
+    };
+    let mut out = String::new();
+    for y in (0..side).step_by(2) {
+        out.push_str("\x1b[30;47m");
+        for x in 0..side {
+            out.push(match (at(x, y), y + 1 < side && at(x, y + 1)) {
+                (true, true) => '█',
+                (true, false) => '▀',
+                (false, true) => '▄',
+                (false, false) => ' ',
+            });
+        }
+        out.push_str("\x1b[0m\n");
+    }
+    Some(out)
+}
+
 pub fn update_oma_id_qr() -> (String, String) {
     let state_dir = get_state_dir();
     let oma_id = get_or_create_oma_id();
@@ -900,45 +993,11 @@ pub fn update_oma_id_qr() -> (String, String) {
         return (svg_path, png_path);
     }
 
-    let deadline = Instant::now() + Duration::from_secs(2);
-    // Generate SVG via qrencode
-    let svg_ok = run_cmd_bounded(
-        "/usr/bin/qrencode",
-        &["-o", &svg_path, "-t", "SVG", "--", &qr_content],
-        &[],
-        deadline,
-        1024,
-    ).is_some();
-
-    if svg_file.exists() {
-        #[cfg(unix)]
-        let _ = fs::set_permissions(&svg_file, fs::Permissions::from_mode(0o600));
-    }
-
-    // Fallback internal SVG generator if qrencode fails or is absent
-    if !svg_ok || !svg_file.exists() {
-        let svg_data = rendezvous::generate_fallback_qr_svg(&qr_content);
-        let _ = write_secure_file(&svg_file, &svg_data);
-    }
-
-    // Sync legacy omaid_qr.svg path if needed
-    if let Ok(svg_bytes) = fs::read(&svg_file) {
-        let _ = write_secure_bytes(&legacy_svg_file, &svg_bytes);
-    }
-
-    // Generate PNG via qrencode
-    let deadline_png = Instant::now() + Duration::from_secs(2);
-    let _ = run_cmd_bounded(
-        "/usr/bin/qrencode",
-        &["-o", &png_path, "-t", "PNG", "-s", "8", "-m", "2", "--", &qr_content],
-        &[],
-        deadline_png,
-        1024,
-    );
-
-    if png_file.exists() {
-        #[cfg(unix)]
-        let _ = fs::set_permissions(&png_file, fs::Permissions::from_mode(0o600));
+    // Rendered in Rust: qrencode is not a dependency any more (M8).
+    let _ = write_secure_file(&svg_file, &rendezvous::generate_fallback_qr_svg(&qr_content));
+    let _ = write_secure_file(&legacy_svg_file, &rendezvous::generate_fallback_qr_svg(&qr_content));
+    if let Some(png) = qr_png(&qr_content, 8, 2) {
+        let _ = write_secure_bytes(&png_file, &png);
     }
 
     let _ = write_secure_file(&last_content_file, &qr_content);
@@ -968,18 +1027,9 @@ fn update_all_qr() {
     let qr_file = get_state_dir().join("qr.svg");
 
     if !qr_file.exists() || read_secure_file(&last_qr_file).map(|s| s.trim() != full_url).unwrap_or(true) {
-        let qr_path = qr_file.to_string_lossy().to_string();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let _ = run_cmd_bounded(
-            "/usr/bin/qrencode",
-            &["-o", &qr_path, "-t", "SVG", "--", &full_url],
-            &[],
-            deadline,
-            1024,
-        );
-        if qr_file.exists() {
-            #[cfg(unix)]
-            let _ = fs::set_permissions(&qr_file, fs::Permissions::from_mode(0o600));
+        // The URL carries the PIN, so the file is written 0600.
+        if let Some(svg) = rendezvous::qr_svg(&full_url) {
+            let _ = write_secure_file(&qr_file, &svg);
         }
         let _ = write_secure_file(&last_qr_file, &full_url);
     }
@@ -6802,7 +6852,9 @@ fn main() {
             println!("{}", out);
         } else {
             let uri = out["uri"].as_str().unwrap_or_default().to_string();
-            let _ = Command::new("/usr/bin/qrencode").args(["-t", "ANSIUTF8", "--", &uri]).status();
+            if let Some(qr) = qr_ansi(&uri) {
+                print!("{}", qr);
+            }
             println!("Scan this QR code with OmaSend on the other device (valid for {} minutes, single use).", devicekey::PAIR_OFFER_TTL_SECS / 60);
             println!("Or paste on another Omarchy desktop:  omasend-engine --pair-with '{}' [--own]", uri);
             println!("This device: {}{}", device_identity().device_id(), if own { "  (new device will be trusted as YOUR device)" } else { "" });
@@ -8481,6 +8533,10 @@ mod tests {
 
         assert!(svg_file.exists(), "oma_id_qr.svg must exist");
         assert!(png_file.exists(), "oma_id_qr.png must exist");
+        let png = fs::read(png_file).expect("Read oma_id_qr.png");
+        let (ct, w, h) = validate_image_header(&png).expect("valid PNG header");
+        assert_eq!(ct, "image_png");
+        assert_eq!(w, h);
 
         let svg_content = fs::read_to_string(svg_file).expect("Read oma_id_qr.svg");
         assert!(svg_content.contains("<svg"), "SVG must contain valid xml root tag");
