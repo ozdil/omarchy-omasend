@@ -3452,11 +3452,26 @@ fn resolve_peer_addr(target_ip_or_omaid: &str) -> String {
 
 const MAX_PAIR_RESPONSE_BYTES: u64 = 64 * 1024;
 
+/// Parses a pairing link and checks that it points at a private / link-local address on this
+/// network (a QR from a web page or chat must not make us connect anywhere else, M4).
+fn inspect_pair_uri(uri: &str) -> Result<(devicekey::ParsedOffer, String), String> {
+    let offer = devicekey::parse_pair_uri(uri)?;
+    let ip: IpAddr = offer.host.trim().parse().map_err(|_| "Invalid host in pairing link".to_string())?;
+    let ip = ip.to_canonical();
+    if !rendezvous::is_local_network_ip(&ip) || ip.is_loopback() {
+        return Err("Pairing link must point to a private (RFC 1918) or link-local address".to_string());
+    }
+    let vk = devicekey::decode_pk(&offer.pk).ok_or("Invalid responder key")?;
+    let device_id = devicekey::device_id_for_pk(vk.as_bytes());
+    Ok((offer, device_id))
+}
+
 /// Phase 1 initiator: scan/paste an `omasend://pair?...` link shown by the other device.
 /// The responder's key is pinned from the link, so a LAN attacker cannot impersonate it.
-fn p2p_pair_v2(uri: &str) -> Result<devicekey::TrustedKey, String> {
-    let offer = devicekey::parse_pair_uri(uri)?;
-    let _: IpAddr = offer.host.trim().parse().map_err(|_| "Invalid host in pairing link".to_string())?;
+/// The trust level is chosen here, by the user of this device (`own_device`); the link's
+/// `o=` flag only describes how the responder will trust us (M4).
+fn p2p_pair_v2(uri: &str, own_device: bool) -> Result<devicekey::TrustedKey, String> {
+    let (offer, _) = inspect_pair_uri(uri)?;
     let body = devicekey::build_pair_request(device_identity(), &offer, &get_system_hostname(), CORE_NODE.get().map(|n| n.bound_port()).unwrap_or(CORE_QUIC_PORT))
         .to_string()
         .into_bytes();
@@ -3498,7 +3513,7 @@ fn p2p_pair_v2(uri: &str) -> Result<devicekey::TrustedKey, String> {
         ip: offer.host.clone(),
         port: offer.port,
         quic_port: json["quic_port"].as_u64().and_then(|p| u16::try_from(p).ok()).unwrap_or(offer.quic_port),
-        own_device: offer.own_device,
+        own_device,
         added_at: now,
         last_seen: now,
     };
@@ -6856,17 +6871,35 @@ fn main() {
             let uri = out["uri"].as_str().unwrap_or_default().to_string();
             let _ = Command::new("/usr/bin/qrencode").args(["-t", "ANSIUTF8", "--", &uri]).status();
             println!("Scan this QR code with OmaSend on the other device (valid for {} minutes, single use).", devicekey::PAIR_OFFER_TTL_SECS / 60);
-            println!("Or paste on another Omarchy desktop:  omasend-engine --pair-with '{}'", uri);
+            println!("Or paste on another Omarchy desktop:  omasend-engine --pair-with '{}' [--own]", uri);
             println!("This device: {}{}", device_identity().device_id(), if own { "  (new device will be trusted as YOUR device)" } else { "" });
+        }
+        return;
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--pair-inspect") {
+        let Some(uri) = args.get(pos + 1) else {
+            eprintln!("Usage: --pair-inspect 'omasend://pair?...'");
+            std::process::exit(2);
+        };
+        match inspect_pair_uri(uri) {
+            Ok((offer, device_id)) => {
+                println!("{}", serde_json::json!({ "name": offer.name, "device_id": device_id, "host": offer.host, "port": offer.port }));
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
         }
         return;
     }
     if let Some(pos) = args.iter().position(|a| a == "--pair-with") {
         let Some(uri) = args.get(pos + 1) else {
-            eprintln!("Usage: --pair-with 'omasend://pair?...'");
+            eprintln!("Usage: --pair-with 'omasend://pair?...' [--own]");
             std::process::exit(2);
         };
-        match p2p_pair_v2(uri) {
+        // Trusting the other device as "mine" (auto-accept) is the local user's explicit choice.
+        let own = args.iter().any(|a| a == "--own");
+        match p2p_pair_v2(uri, own) {
             Ok(k) => {
                 println!("Paired with {} ({}){}", k.name, k.device_id, if k.own_device { " as one of your devices" } else { "" });
                 notify_desktop("OmaSend: Device paired", &format!("{} ({})", k.name, k.device_id));
@@ -9777,5 +9810,21 @@ mod tests {
         assert!(r.starts_with("HTTP/1.1 403"), "{}", r);
         let r = get_once("/api/p2p/peers", &format!("X-OmaSend-Local: {}\r\n", ensure_local_api_token()));
         assert!(r.starts_with("HTTP/1.1 200") && r.contains("\"peers\""), "{}", r);
+    }
+
+    /// M4: a pairing link must point into the local network.
+    #[test]
+    fn test_inspect_pair_uri_requires_private_host() {
+        use base64::Engine as _;
+        let id = devicekey::DeviceIdentity::from_seed([7u8; 32]);
+        let secret = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([9u8; 32]);
+        let mk = |h: &str| format!("omasend://pair?v=2&pk={}&s={}&h={}&p=53317&n=Desk&o=1&q=53318", id.public_b64(), secret, h);
+        let (offer, dev) = inspect_pair_uri(&mk("192.168.1.20")).expect("private host is fine");
+        assert_eq!(dev, "FE81-2C12-F3AB-4CE6");
+        assert_eq!(offer.name, "Desk");
+        assert!(inspect_pair_uri(&mk("fe80::1")).is_ok());
+        for bad in ["8.8.8.8", "127.0.0.1", "203.0.113.5", "example.com"] {
+            assert!(inspect_pair_uri(&mk(bad)).is_err(), "{} must be refused", bad);
+        }
     }
 }

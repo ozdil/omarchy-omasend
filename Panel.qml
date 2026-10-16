@@ -61,6 +61,12 @@ Panel {
 
   // --- Unpair confirmation (second click within 4 s) ---
   property string armedUnpair: ""
+  // Pairing QR found on screen, waiting for the user to confirm (name + device id shown).
+  property string scannedPairUri: ""
+  property string scannedPairName: ""
+  property string scannedPairId: ""
+  // Trust for a scanned device is chosen here and is opt-in; the QR's own flag is ignored.
+  property bool scannedPairOwn: false
 
   // --- Drop HUD ---
   property bool dropActive: false
@@ -204,9 +210,27 @@ Panel {
   }
 
   function scanScreenForPairing() {
+    root.cancelScannedPair()
     root.setStatus(root.t("pair_scanning_screen"), false)
     if (screenScanProc.running) screenScanProc.running = false
     screenScanProc.running = true
+  }
+
+  function cancelScannedPair() {
+    root.scannedPairUri = ""
+    root.scannedPairName = ""
+    root.scannedPairId = ""
+    root.scannedPairOwn = false
+  }
+
+  function confirmScannedPair() {
+    if (!root.scannedPairUri) return
+    root.setStatus(root.t("pair_connecting"), false)
+    if (pairWithProc.running) pairWithProc.running = false
+    pairWithProc.output = ""
+    pairWithProc.command = [root.engine(), "--pair-with", root.scannedPairUri].concat(root.scannedPairOwn ? ["--own"] : [])
+    pairWithProc.running = true
+    root.cancelScannedPair()
   }
 
   function requestUnpair(deviceId) {
@@ -379,6 +403,32 @@ Panel {
     }
   }
 
+  Process {
+    id: pairInspectProc
+    property string uri: ""
+    property string output: ""
+    property string errors: ""
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: pairInspectProc.output = String(text || "").trim() }
+    stderr: StdioCollector { waitForEnd: true; onStreamFinished: pairInspectProc.errors = String(text || "").trim() }
+    onExited: function(code) {
+      pairInspectProc.running = false
+      if (code !== 0) {
+        root.setStatus(pairInspectProc.errors || root.t("pair_failed"), true)
+        return
+      }
+      try {
+        var info = JSON.parse(pairInspectProc.output)
+        root.scannedPairName = String(info.name || "?")
+        root.scannedPairId = String(info.device_id || "")
+        root.scannedPairOwn = false
+        root.scannedPairUri = pairInspectProc.uri
+        root.setStatus("", false)
+      } catch (e) {
+        root.setStatus(root.t("pair_failed"), true)
+      }
+    }
+  }
+
   // Reads a pairing QR shown on this screen (another desktop, a mirrored phone, ...).
   Process {
     id: screenScanProc
@@ -391,11 +441,13 @@ Panel {
         for (var i = 0; i < lines.length; i++) {
           var l = lines[i].trim()
           if (l.indexOf("omasend://pair?") === 0) {
-            root.setStatus(root.t("pair_connecting"), false)
-            if (pairWithProc.running) pairWithProc.running = false
-            pairWithProc.output = ""
-            pairWithProc.command = [root.engine(), "--pair-with", l]
-            pairWithProc.running = true
+            // Do not pair yet: show who this is and let the user confirm.
+            if (pairInspectProc.running) pairInspectProc.running = false
+            pairInspectProc.uri = l
+            pairInspectProc.output = ""
+            pairInspectProc.errors = ""
+            pairInspectProc.command = [root.engine(), "--pair-inspect", l]
+            pairInspectProc.running = true
             return
           }
         }
@@ -951,6 +1003,62 @@ Panel {
                 width: parent.width
                 textFormat: Text.PlainText
                 text: root.pairOwn ? root.t("pair_own_hint") : root.t("pair_other_hint")
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+
+              // Confirmation for a pairing QR found on screen.
+              Text {
+                visible: root.scannedPairUri !== ""
+                width: parent.width
+                textFormat: Text.PlainText
+                text: root.tf("pair_scan_confirm", root.scannedPairName, root.scannedPairId)
+                color: Color.accent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+
+              RowLayout {
+                visible: root.scannedPairUri !== ""
+                width: parent.width
+                spacing: Style.space(6)
+
+                ScopePill {
+                  label: root.t("pair_own")
+                  activeWhen: root.scannedPairOwn
+                  onClicked: root.scannedPairOwn = true
+                }
+                ScopePill {
+                  label: root.t("pair_other")
+                  activeWhen: !root.scannedPairOwn
+                  onClicked: root.scannedPairOwn = false
+                }
+                Item { Layout.fillWidth: true }
+                PanelActionButton {
+                  iconText: "󰄬"
+                  tooltipText: root.t("pair_scan_confirm_btn")
+                  foreground: Color.accent
+                  fontFamily: root.fontFamily
+                  onClicked: root.confirmScannedPair()
+                }
+                PanelActionButton {
+                  iconText: "󰅖"
+                  tooltipText: root.t("reject_btn")
+                  foreground: root.urgent
+                  hoverColor: root.urgent
+                  fontFamily: root.fontFamily
+                  onClicked: root.cancelScannedPair()
+                }
+              }
+
+              Text {
+                visible: root.scannedPairUri !== ""
+                width: parent.width
+                textFormat: Text.PlainText
+                text: root.scannedPairOwn ? root.t("pair_own_hint") : root.t("pair_other_hint")
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
