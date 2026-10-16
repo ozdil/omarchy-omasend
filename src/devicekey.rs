@@ -199,6 +199,19 @@ pub struct TrustedKey {
     pub added_at: u64,
     #[serde(default)]
     pub last_seen: u64,
+    /// Kind of client that paired: "" for a native app/desktop, "web" for the browser
+    /// client served at /web/. A browser has no server, so it can only send.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client: String,
+}
+
+pub const CLIENT_WEB: &str = "web";
+
+impl TrustedKey {
+    /// Paired from the browser client: send-only (no HTTP server, no QUIC endpoint).
+    pub fn is_web(&self) -> bool {
+        self.client == CLIENT_WEB
+    }
 }
 
 pub struct TrustStore {
@@ -477,16 +490,24 @@ pub fn accept_pair_request(
     save_offers(state_dir, &offers);
     drop(_g);
 
+    // Only known client kinds are stored; anything else is a native client ("").
+    let client = if body["client"].as_str() == Some(CLIENT_WEB) { CLIENT_WEB.to_string() } else { String::new() };
+    let quic_port = if client == CLIENT_WEB {
+        0
+    } else {
+        body["quic_port"].as_u64().and_then(|p| u16::try_from(p).ok()).unwrap_or(0)
+    };
     let key = TrustedKey {
         device_id: device_id_for_pk(vk.as_bytes()),
         pk: i_pk.clone(),
         name: i_name,
         ip: peer_ip.to_string(),
         port: 0,
-        quic_port: body["quic_port"].as_u64().and_then(|p| u16::try_from(p).ok()).unwrap_or(0),
+        quic_port,
         own_device: offer.own_device,
         added_at: now,
         last_seen: now,
+        client,
     };
     let resp = serde_json::json!({
         "quic_port": my_quic_port,
@@ -667,6 +688,50 @@ mod tests {
         let (pk2, ts2, n2, s2) = (get2("X-OmaSend-Pk"), get2("X-OmaSend-Ts"), get2("X-OmaSend-Nonce"), get2("X-OmaSend-Sig"));
         let h2 = SignedHeaders { pk: pk2.as_deref(), ts: ts2.as_deref(), nonce: n2.as_deref(), sig: s2.as_deref() };
         assert_eq!(verify_request(&r_store, &h2, "POST", "/api/p2p/request", &body_tag_json(b"{\"evil\":1}")), AuthResult::Rejected("Invalid signature"));
+    }
+
+    #[test]
+    fn test_web_client_pairing_is_stored_send_only_and_store_stays_compatible() {
+        let r_dir = tmpdir("web");
+        let responder = DeviceIdentity::from_seed(random_bytes::<32>());
+        let browser = DeviceIdentity::from_seed(random_bytes::<32>());
+        let uri = create_pair_offer(&responder, &r_dir, "Desk", "192.168.1.10", 53317, false, 53318);
+        let offer = parse_pair_uri(&uri).unwrap();
+        // What the browser sends: no quic_port, client "web".
+        let mut req = build_pair_request(&browser, &offer, "Firefox on Phone", 0);
+        req.as_object_mut().unwrap().remove("quic_port");
+        req["client"] = serde_json::json!("web");
+        let (resp, key) = accept_pair_request(&responder, &r_dir, "Desk", &req, "192.168.1.30", 53318).unwrap();
+        verify_pair_response(&browser, &offer, &resp).unwrap();
+        assert!(key.is_web());
+        assert_eq!((key.port, key.quic_port), (0, 0));
+        // A web client cannot smuggle a QUIC port in.
+        let uri2 = create_pair_offer(&responder, &r_dir, "Desk", "192.168.1.10", 53317, false, 53318);
+        let mut req2 = build_pair_request(&browser, &parse_pair_uri(&uri2).unwrap(), "B", 0);
+        req2["quic_port"] = serde_json::json!(9999);
+        req2["client"] = serde_json::json!("web");
+        assert_eq!(accept_pair_request(&responder, &r_dir, "Desk", &req2, "", 0).unwrap().1.quic_port, 0);
+        // Unknown client kinds are not stored.
+        let uri3 = create_pair_offer(&responder, &r_dir, "Desk", "192.168.1.10", 53317, false, 53318);
+        let mut req3 = build_pair_request(&browser, &parse_pair_uri(&uri3).unwrap(), "B", 0);
+        req3["client"] = serde_json::json!("<script>");
+        assert_eq!(accept_pair_request(&responder, &r_dir, "Desk", &req3, "", 0).unwrap().1.client, "");
+
+        // Store round trip; native keys do not get a "client" field (old readers unaffected).
+        let store = TrustStore::new(&r_dir);
+        store.upsert(key.clone()).unwrap();
+        let mut native = key.clone();
+        native.pk = DeviceIdentity::from_seed(random_bytes::<32>()).public_b64();
+        native.client = String::new();
+        store.upsert(native.clone()).unwrap();
+        let raw = std::fs::read_to_string(r_dir.join("trusted_keys_v2.json")).unwrap();
+        assert_eq!(raw.matches("\"client\"").count(), 1, "{}", raw);
+        assert_eq!(store.get(&key.pk).unwrap(), key);
+        assert_eq!(store.get(&native.pk).unwrap(), native);
+        // A store written before the field existed still loads.
+        let old = r#"[{"pk":"x","device_id":"A","name":"n","ip":"","port":0,"quic_port":0,"own_device":false,"added_at":1,"last_seen":1}]"#;
+        let parsed: Vec<TrustedKey> = serde_json::from_str(old).unwrap();
+        assert!(!parsed[0].is_web());
     }
 
     #[test]
