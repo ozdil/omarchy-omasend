@@ -113,17 +113,55 @@ fn write_private(path: &Path, content: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let tmp = path.with_extension("tmp");
+    // Unique temp name: the CLI and the daemon may write the same file concurrently.
+    let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), hex::encode(random_bytes::<6>())));
     let mut f = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(&tmp)
         .map_err(|e| format!("open {:?}: {}", tmp, e))?;
-    f.write_all(content.as_bytes()).map_err(|e| e.to_string())?;
-    f.sync_all().map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+    let res = f
+        .write_all(content.as_bytes())
+        .and_then(|_| f.sync_all())
+        .and_then(|_| std::fs::rename(&tmp, path))
+        .map_err(|e| e.to_string());
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
+
+/// Exclusive lock for a read-modify-write of a state file: an in-process mutex plus an
+/// flock(2) on `<file>.lock`, because the CLI (pairing, unpair) and the daemon (pair accept,
+/// touch) are different processes writing the same files (M11).
+struct FileLock {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    _file: Option<std::fs::File>,
+}
+
+fn lock_file(mutex: &'static Mutex<()>, path: &Path) -> FileLock {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let guard = mutex.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path.with_extension("lock"))
+        .ok();
+    if let Some(ref f) = file {
+        // SAFETY: flock on a valid, owned descriptor; released when the file is closed.
+        unsafe {
+            let _ = libc::flock(f.as_raw_fd(), libc::LOCK_EX);
+        }
+    }
+    FileLock { _guard: guard, _file: file }
 }
 
 pub fn decode_pk(pk_b64: &str) -> Option<VerifyingKey> {
@@ -188,7 +226,7 @@ impl TrustStore {
     }
 
     pub fn upsert(&self, key: TrustedKey) -> Result<(), String> {
-        let _g = STORE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = lock_file(&STORE_LOCK, &self.path);
         let mut keys = self.load();
         if let Some(existing) = keys.iter_mut().find(|k| k.pk == key.pk) {
             *existing = key;
@@ -199,7 +237,7 @@ impl TrustStore {
     }
 
     pub fn remove(&self, pk_or_device_id: &str) -> Result<bool, String> {
-        let _g = STORE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = lock_file(&STORE_LOCK, &self.path);
         let mut keys = self.load();
         let before = keys.len();
         keys.retain(|k| k.pk != pk_or_device_id && k.device_id != pk_or_device_id);
@@ -212,7 +250,7 @@ impl TrustStore {
 
     /// Records the address an authenticated request came from (handles DHCP/IP changes).
     pub fn touch(&self, pk_b64: &str, ip: &str) {
-        let _g = STORE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = lock_file(&STORE_LOCK, &self.path);
         let mut keys = self.load();
         if let Some(k) = keys.iter_mut().find(|k| k.pk == pk_b64) {
             if !ip.is_empty() {
@@ -305,7 +343,7 @@ pub fn create_pair_offer(
     quic_port: u16,
 ) -> String {
     let secret = random_bytes::<32>();
-    let _g = OFFER_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = lock_file(&OFFER_LOCK, &offers_path(state_dir));
     let mut offers = load_offers(state_dir);
     let now = now_secs();
     offers.retain(|o| o.expires_at > now && o.failures < MAX_PAIR_FAILURES);
@@ -410,7 +448,7 @@ pub fn accept_pair_request(
     let vk = decode_pk(&i_pk).ok_or("Invalid public key")?;
     let r_pk = identity.public_b64();
 
-    let _g = OFFER_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = lock_file(&OFFER_LOCK, &offers_path(state_dir));
     let mut offers = load_offers(state_dir);
     let now = now_secs();
     offers.retain(|o| o.expires_at > now && o.failures < MAX_PAIR_FAILURES);
