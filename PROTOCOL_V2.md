@@ -189,11 +189,38 @@ its attempt back, so normal use never hits the limit. With 10^15 numbers and at 
 **Changing the number** (`--new-account-id`, "New number" on Android) affects future links
 only; devices already linked stay trusted until removed.
 
-**Not covered yet:** sharing the device list between linked devices, revoking a device
-everywhere, and the WAN rendezvous topic, which is still derived from the legacy `oma_id`.
-The web client (`omasend-web`) is still v1 and cannot link.
+### Own-device roster and removal
 
-Desktop CLI: `--account-id [--json]`, `--new-account-id`, `--link <OmaID> [--json]`.
+Linked devices keep each other's list in step, so linking with any one of them joins you to
+all of them, and removing a device on one removes it everywhere.
+
+- `POST /api/v2/account/sync` with a **signed** v2 request (see "Signed requests") from a key
+  stored as an own device. Anything else is refused (401/403); loopback is refused.
+- Body: `{v:1, devices:[{pk, name, ip?, port, quic_port}], revoked:[pk]}`. `devices` holds the
+  sender itself plus its own devices (at most 64), `revoked` the removed keys (at most 256).
+- The receiver first applies `revoked`: each new key goes on its local revocation list and is
+  dropped from the trust store. If any key was new, the receiver also **replaces its account
+  OmaID** with a fresh random one, since the removed device knows the old number. If its own
+  key is on the list, it was removed: it forgets every own device and stops there.
+- Then every listed device that is not itself and not revoked is stored as an own device. The
+  sender's address is taken from the connection.
+- A device pushes its roster after a link (both sides), after removing an own device, and when
+  the engine or app starts. Pushes are best effort; a device that was off catches up on the next
+  push it receives.
+- Revoked keys can never link again (`/link/finish` and the initiator both refuse them).
+
+After a removal the remaining devices hold different account numbers. Each still works for
+linking a new device, and the roster then adds the new device to the rest.
+
+The roster carries no secrets: public keys, names and addresses, on the LAN.
+
+**Not covered yet:** WAN discovery still derives its topic from the legacy `oma_id`. Neither
+platform publishes those records anywhere today (desktop anchors are local files, the Android
+announcer has no caller), so nothing is exposed; the topic must move to a random account key
+before WAN discovery ships. The web client (`omasend-web`) is still v1 and cannot link.
+
+Desktop CLI: `--account-id [--json]`, `--new-account-id`, `--link <OmaID> [--json]`, and
+`--unpair <device-id>`, which removes an own device everywhere as above.
 
 ## Test vector (must match on both platforms)
 

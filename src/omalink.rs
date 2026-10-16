@@ -390,6 +390,146 @@ pub fn responder() -> &'static Mutex<Responder> {
     R.get_or_init(|| Mutex::new(Responder::default()))
 }
 
+// ------------------- own-device roster and revocation -------------------
+//
+// Linked devices push their list of own devices to each other (signed v2 request), so
+// linking with one device joins you to all of them. Removing an own device puts its key
+// on a revocation list that spreads the same way; every device that learns of a new
+// revocation also replaces its account OmaID, because the removed device knows the old
+// one. Nothing secret is sent: the numbers are never part of the roster.
+
+const REVOKED_FILE: &str = "revoked_keys.json";
+pub const MAX_ROSTER: usize = 64;
+pub const MAX_REVOKED: usize = 256;
+
+pub fn load_revoked(state_dir: &Path) -> Vec<String> {
+    crate::read_secure_file(&state_dir.join(REVOKED_FILE))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_revoked(state_dir: &Path, list: &[String]) -> Result<(), String> {
+    let tail = &list[list.len().saturating_sub(MAX_REVOKED)..];
+    crate::write_secure_file(&state_dir.join(REVOKED_FILE), &serde_json::to_string(tail).map_err(|e| e.to_string())?)
+}
+
+pub fn is_revoked(state_dir: &Path, pk: &str) -> bool {
+    load_revoked(state_dir).iter().any(|r| r == pk)
+}
+
+/// Removes one of our own devices everywhere: revokes its key, drops it locally and
+/// replaces our account number. The caller then pushes the roster.
+pub fn revoke_own_device(state_dir: &Path, store: &devicekey::TrustStore, pk: &str) -> Result<(), String> {
+    let mut revoked = load_revoked(state_dir);
+    if !revoked.iter().any(|r| r == pk) {
+        revoked.push(pk.to_string());
+        save_revoked(state_dir, &revoked)?;
+    }
+    store.remove(pk)?;
+    new_account_id(state_dir);
+    Ok(())
+}
+
+/// The roster this device pushes: itself plus every own device, and the revocations.
+pub fn roster_body(state_dir: &Path, store: &devicekey::TrustStore, me: &DeviceIdentity, my_name: &str, my_port: u16, my_quic: u16) -> serde_json::Value {
+    let mut devices = vec![serde_json::json!({ "pk": me.public_b64(), "name": my_name, "port": my_port, "quic_port": my_quic })];
+    for k in store.load().into_iter().filter(|k| k.own_device) {
+        devices.push(serde_json::json!({ "pk": k.pk, "name": k.name, "ip": k.ip, "port": k.port, "quic_port": k.quic_port }));
+    }
+    devices.truncate(MAX_ROSTER);
+    serde_json::json!({ "v": 1, "devices": devices, "revoked": load_revoked(state_dir) })
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub struct SyncOutcome {
+    pub added: Vec<String>,
+    pub removed: usize,
+    /// We were removed from the account by another device.
+    pub self_revoked: bool,
+    pub rotated: bool,
+}
+
+/// Applies a roster pushed by `sender`, which must already be one of our own devices.
+pub fn apply_roster(
+    state_dir: &Path,
+    store: &devicekey::TrustStore,
+    my_pk: &str,
+    sender: &devicekey::TrustedKey,
+    sender_ip: &str,
+    body: &serde_json::Value,
+) -> Result<SyncOutcome, String> {
+    if !sender.own_device {
+        return Err("Only your own devices can share the device list".into());
+    }
+    if body["v"].as_u64() != Some(1) {
+        return Err("Unsupported roster".into());
+    }
+    let mut out = SyncOutcome::default();
+    let mut revoked = load_revoked(state_dir);
+    let mut newly_revoked = false;
+    for pk in body["revoked"].as_array().into_iter().flatten().take(MAX_REVOKED).filter_map(|v| v.as_str()) {
+        if devicekey::decode_pk(pk).is_none() || revoked.iter().any(|r| r == pk) {
+            continue;
+        }
+        revoked.push(pk.to_string());
+        newly_revoked = true;
+        if pk == my_pk {
+            out.self_revoked = true;
+        } else if store.remove(pk)? {
+            out.removed += 1;
+        }
+    }
+    if newly_revoked {
+        save_revoked(state_dir, &revoked)?;
+        new_account_id(state_dir);
+        out.rotated = true;
+    }
+    if out.self_revoked {
+        // Removed from the account: forget every device we trusted as our own.
+        for k in store.load().into_iter().filter(|k| k.own_device) {
+            if store.remove(&k.pk)? {
+                out.removed += 1;
+            }
+        }
+        return Ok(out);
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    for d in body["devices"].as_array().into_iter().flatten().take(MAX_ROSTER) {
+        let Some(pk) = d["pk"].as_str() else { continue };
+        let Some(vk) = devicekey::decode_pk(pk) else { continue };
+        if pk == my_pk || revoked.iter().any(|r| r == pk) {
+            continue;
+        }
+        let name: String = d["name"].as_str().unwrap_or("Unknown device").chars().take(64).collect();
+        let port = |k: &str| d[k].as_u64().and_then(|p| u16::try_from(p).ok()).unwrap_or(0);
+        let existing = store.get(pk);
+        // The sender's own entry has no ip in the body; we know where it came from.
+        let ip = if pk == sender.pk {
+            sender_ip.to_string()
+        } else {
+            existing.as_ref().map(|k| k.ip.clone()).filter(|ip| !ip.is_empty())
+                .or_else(|| d["ip"].as_str().map(str::to_string))
+                .unwrap_or_default()
+        };
+        if existing.as_ref().is_none_or(|k| !k.own_device) {
+            out.added.push(name.clone());
+        }
+        store.upsert(devicekey::TrustedKey {
+            pk: pk.to_string(),
+            device_id: devicekey::device_id_for_pk(vk.as_bytes()),
+            name,
+            ip: ip.chars().take(64).collect(),
+            port: if port("port") != 0 { port("port") } else { existing.as_ref().map(|k| k.port).unwrap_or(0) },
+            quic_port: if port("quic_port") != 0 { port("quic_port") } else { existing.as_ref().map(|k| k.quic_port).unwrap_or(0) },
+            own_device: true,
+            added_at: existing.as_ref().map(|k| k.added_at).unwrap_or(now),
+            last_seen: existing.as_ref().map(|k| k.last_seen).unwrap_or(0),
+        })?;
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,5 +682,88 @@ mod tests {
         assert!(parse_identity(&plain, |i| sig_transcript(&pa_b64, &B64.encode(&pb), i, None)).is_err());
         // Direction is part of the AAD.
         assert!(open(&rk.box_key, "R", &sealed).is_err());
+    }
+    fn roster_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("omalink-roster-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn own_key(id: &DeviceIdentity, name: &str) -> devicekey::TrustedKey {
+        devicekey::TrustedKey {
+            pk: id.public_b64(),
+            device_id: id.device_id(),
+            name: name.into(),
+            ip: "192.168.1.5".into(),
+            port: 53317,
+            quic_port: 0,
+            own_device: true,
+            added_at: 1,
+            last_seen: 0,
+        }
+    }
+
+    #[test]
+    fn roster_joins_devices_and_revocation_spreads() {
+        let (a, b, c) = (ident(1), ident(2), ident(3));
+        // A knows B and C; B only knows A.
+        let dir_a = roster_dir("a");
+        let store_a = devicekey::TrustStore::new(&dir_a);
+        store_a.upsert(own_key(&b, "B")).unwrap();
+        store_a.upsert(own_key(&c, "C")).unwrap();
+        let dir_b = roster_dir("b");
+        let store_b = devicekey::TrustStore::new(&dir_b);
+        store_b.upsert(own_key(&a, "A")).unwrap();
+        let sender_a = store_b.get(&a.public_b64()).unwrap();
+
+        let body = roster_body(&dir_a, &store_a, &a, "A", 53317, 53318);
+        let out = apply_roster(&dir_b, &store_b, &b.public_b64(), &sender_a, "192.168.1.9", &body).unwrap();
+        assert_eq!(out.added, vec!["C".to_string()]);
+        assert!(store_b.get(&c.public_b64()).unwrap().own_device);
+        assert_eq!(store_b.get(&a.public_b64()).unwrap().ip, "192.168.1.9");
+        assert!(store_b.get(&b.public_b64()).is_none(), "never adds itself");
+
+        // A removes C: B drops it, refuses it later and gets a new number.
+        let before = get_or_create_account_id(&dir_b);
+        revoke_own_device(&dir_a, &store_a, &c.public_b64()).unwrap();
+        let body = roster_body(&dir_a, &store_a, &a, "A", 53317, 53318);
+        let out = apply_roster(&dir_b, &store_b, &b.public_b64(), &sender_a, "192.168.1.9", &body).unwrap();
+        assert_eq!(out.removed, 1);
+        assert!(out.rotated);
+        assert!(store_b.get(&c.public_b64()).is_none());
+        assert!(is_revoked(&dir_b, &c.public_b64()));
+        assert_ne!(get_or_create_account_id(&dir_b), before);
+
+        // A stale roster from elsewhere cannot bring C back.
+        let mut stale = body.clone();
+        stale["devices"].as_array_mut().unwrap().push(serde_json::json!({ "pk": c.public_b64(), "name": "C" }));
+        apply_roster(&dir_b, &store_b, &b.public_b64(), &sender_a, "192.168.1.9", &stale).unwrap();
+        assert!(store_b.get(&c.public_b64()).is_none());
+
+        // The removed device forgets the account too.
+        let dir_c = roster_dir("c");
+        let store_c = devicekey::TrustStore::new(&dir_c);
+        store_c.upsert(own_key(&a, "A")).unwrap();
+        store_c.upsert(own_key(&b, "B")).unwrap();
+        let out = apply_roster(&dir_c, &store_c, &c.public_b64(), &store_c.get(&a.public_b64()).unwrap(), "192.168.1.9", &body).unwrap();
+        assert!(out.self_revoked);
+        assert!(store_c.load().is_empty());
+
+        for d in [dir_a, dir_b, dir_c] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn roster_only_from_own_devices() {
+        let dir = roster_dir("paired");
+        let store = devicekey::TrustStore::new(&dir);
+        let mut friend = own_key(&ident(4), "friend");
+        friend.own_device = false;
+        let body = serde_json::json!({ "v": 1, "devices": [{ "pk": ident(5).public_b64(), "name": "x" }], "revoked": [] });
+        assert!(apply_roster(&dir, &store, &ident(6).public_b64(), &friend, "10.0.0.1", &body).is_err());
+        assert!(store.load().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

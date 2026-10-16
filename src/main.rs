@@ -3356,6 +3356,9 @@ fn link_one(addr: &str, account_id: &str) -> Result<devicekey::TrustedKey, Strin
     });
     let reply = post_json_v2(addr, "/api/v2/link/finish", &finish, t)?;
     let peer = omalink::open_responder_box(&keys, &pa_b64, &pb_b64, &id.public_b64(), reply["box"].as_str().ok_or("Missing box")?)?;
+    if omalink::is_revoked(&get_state_dir(), &peer.pk) {
+        return Err("That device was removed from the account".into());
+    }
     let vk = devicekey::decode_pk(&peer.pk).ok_or("Invalid responder key")?;
     let (host, port) = addr.rsplit_once(':').unwrap_or((addr, "0"));
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -3388,6 +3391,7 @@ fn link_with_account_id(account_id: &str) -> Result<Vec<devicekey::TrustedKey>, 
     let targets: Vec<String> = get_discovered_peers()
         .into_iter()
         .filter(|p| !p.pk.is_empty() && p.pk != my_pk && !known.contains(&p.pk) && now.saturating_sub(p.last_seen_secs) < 120)
+        .filter(|p| !omalink::is_revoked(&get_state_dir(), &p.pk))
         .filter_map(|p| p.ip.parse::<IpAddr>().ok().map(|ip| std::net::SocketAddr::new(ip, p.port).to_string()))
         .collect();
     if targets.is_empty() {
@@ -3408,7 +3412,63 @@ fn link_with_account_id(account_id: &str) -> Result<Vec<devicekey::TrustedKey>, 
     for k in &linked {
         notify_desktop("OmaSend: Device linked", &format!("{} ({}) is now one of your devices.", k.name, k.device_id));
     }
+    push_roster();
     Ok(linked)
+}
+
+/// Sends our own-device list and revocations to every own device we can address, so a
+/// link or removal on one device reaches all of them. Runs in the background.
+fn push_roster() {
+    std::thread::spawn(|| {
+        let state_dir = get_state_dir();
+        let store = trust_store();
+        let my_quic = CORE_NODE.get().map(|n| n.bound_port()).unwrap_or(CORE_QUIC_PORT);
+        let body = omalink::roster_body(&state_dir, &store, device_identity(), &get_system_hostname(), PORT, my_quic);
+        // The keys we just revoked get the list too, so they leave the account.
+        let revoked = omalink::load_revoked(&state_dir);
+        let discovered = get_discovered_peers();
+        let targets: Vec<String> = store
+            .load()
+            .into_iter()
+            .filter(|k| k.own_device)
+            .chain(discovered.iter().filter(|p| revoked.contains(&p.pk)).map(|p| devicekey::TrustedKey {
+                pk: p.pk.clone(),
+                device_id: String::new(),
+                name: p.name.clone(),
+                ip: p.ip.clone(),
+                port: p.port,
+                quic_port: 0,
+                own_device: true,
+                added_at: 0,
+                last_seen: 0,
+            }))
+            .filter_map(|k| {
+                let seen = discovered.iter().find(|p| p.pk == k.pk);
+                let ip = seen.map(|p| p.ip.clone()).unwrap_or(k.ip);
+                let port = seen.map(|p| p.port).filter(|p| *p != 0).unwrap_or(if k.port != 0 { k.port } else { PORT });
+                ip.parse::<IpAddr>().ok().map(|ip| std::net::SocketAddr::new(ip, port).to_string())
+            })
+            .collect();
+        let raw = body.to_string().into_bytes();
+        let auth = v2_auth_lines("POST", "/api/v2/account/sync", &devicekey::body_tag_json(&raw));
+        for addr in targets {
+            let raw = raw.clone();
+            let auth = auth.clone();
+            std::thread::spawn(move || {
+                let Ok(mut stream) = connect_peer_with_timeout(&addr, Duration::from_secs(3)) else { return };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+                let head = format!(
+                    "POST /api/v2/account/sync HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
+                    addr,
+                    raw.len(),
+                    auth
+                );
+                let _ = stream.write_all(head.as_bytes()).and_then(|_| stream.write_all(&raw));
+                let mut sink = Vec::new();
+                let _ = (&mut stream).take(4096).read_to_end(&mut sink);
+            });
+        }
+    });
 }
 
 fn p2p_pair_v2(uri: &str) -> Result<devicekey::TrustedKey, String> {
@@ -5405,6 +5465,44 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         return;
     }
 
+    if req.method == "POST" && req.path == "/api/v2/account/sync" {
+        if client_ip.to_canonical().is_loopback() {
+            respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Not available\"}", None, None);
+            return;
+        }
+        if content_length > MAX_CONTROL_BODY {
+            respond(&stream, "413 Payload Too Large", "application/json", b"{\"error\":\"Request payload exceeds limit\"}", None, None);
+            return;
+        }
+        let body_deadline = Instant::now() + Duration::from_secs(DEFAULT_BODY_TIMEOUT_SECS);
+        let Some(body) = read_http_body(&mut stream, content_length, &initial_body, body_deadline, false, MAX_CONTROL_BODY) else { return };
+        let Some(raw) = body.as_slice() else {
+            respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid request\"}", None, None);
+            return;
+        };
+        let ip = client_ip.to_canonical().to_string();
+        let devicekey::AuthResult::Trusted(sender) = v2_verify(&req, &devicekey::body_tag_json(raw), &ip) else {
+            respond(&stream, "401 Unauthorized", "application/json", b"{\"error\":\"Signed request from a linked device required\"}", None, None);
+            return;
+        };
+        let Ok(val) = serde_json::from_slice::<serde_json::Value>(raw) else {
+            respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid JSON\"}", None, None);
+            return;
+        };
+        match omalink::apply_roster(&get_state_dir(), &trust_store(), &device_identity().public_b64(), &sender, &ip, &val) {
+            Ok(out) => {
+                if out.self_revoked {
+                    notify_desktop("OmaSend", &format!("{} removed this device from your account.", sender.name));
+                } else if !out.added.is_empty() {
+                    notify_desktop("OmaSend: Devices linked", &format!("Now also linked: {}", out.added.join(", ")));
+                }
+                respond(&stream, "200 OK", "application/json", b"{\"ok\":true}", None, None);
+            }
+            Err(e) => respond(&stream, "403 Forbidden", "application/json", serde_json::json!({ "error": e }).to_string().as_bytes(), None, None),
+        }
+        return;
+    }
+
     if req.method == "POST" && (req.path == "/api/v2/link/start" || req.path == "/api/v2/link/finish") {
         // Linking is LAN-only: the WAN tunnel arrives from loopback, and a
         // hidden device takes no guesses at all.
@@ -5453,6 +5551,9 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             .unwrap_or_else(|p| p.into_inner())
             .finish(device_identity(), &get_system_hostname(), my_quic, ip, &val, now);
         match res {
+            Ok((peer, _)) if omalink::is_revoked(&get_state_dir(), &peer.pk) => {
+                respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"This device was removed from the account\"}", None, None);
+            }
             Ok((peer, reply)) => {
                 let Some(vk) = devicekey::decode_pk(&peer.pk) else { return };
                 let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -5474,6 +5575,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                 }
                 notify_desktop("OmaSend: Device linked", &format!("{} is now one of your devices.", label));
                 respond(&stream, "200 OK", "application/json", reply.to_string().as_bytes(), None, None);
+                push_roster();
             }
             Err(e) => {
                 respond(&stream, "403 Forbidden", "application/json", serde_json::json!({ "error": e }).to_string().as_bytes(), None, None);
@@ -6787,6 +6889,11 @@ fn run_server() {
     // Spawn P2P AirBridge discovery threads
     thread::spawn(run_p2p_discovery_listener);
     thread::spawn(run_p2p_beacon_broadcaster);
+    // Catch up own devices that missed a link or removal while we were off.
+    thread::spawn(|| {
+        thread::sleep(Duration::from_secs(10));
+        push_roster();
+    });
     start_download_dir_watcher(&get_download_dir());
     start_clipboard_sentinel();
 
@@ -6921,7 +7028,23 @@ fn main() {
             eprintln!("Usage: --unpair <device-id>");
             std::process::exit(2);
         };
-        match trust_store().remove(id) {
+        let store = trust_store();
+        if let Some(k) = store.load().into_iter().find(|k| k.own_device && (k.pk == *id || k.device_id == *id)) {
+            match omalink::revoke_own_device(&get_state_dir(), &store, &k.pk) {
+                Ok(()) => {
+                    push_roster();
+                    // Give the background push a moment before the CLI process exits.
+                    std::thread::sleep(Duration::from_secs(4));
+                    println!("Removed {} from all your devices. Your account OmaID was replaced.", k.name);
+                }
+                Err(e) => {
+                    eprintln!("Failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        match store.remove(id) {
             Ok(true) => println!("Removed {}", id),
             Ok(false) => {
                 eprintln!("No paired device {}", id);
