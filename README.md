@@ -82,7 +82,9 @@ This script compiles the engine using `cargo build --release --locked`, installs
 2. On Android: OmaSend → **Pair a device** → **Scan QR code**. Between two desktops: `omasend-engine --pair-with '<link>'`, or the screen-scan button in the pairing card.
 3. The device appears under **My devices**. Drop files on the bar icon, click a device to pick files, right-click to send the clipboard.
 
-Command line: `--pair-offer [--own] [--json]`, `--pair-with <link>`, `--devices`, `--unpair <device-id>`, `--send <device-id|ip|auto> <file>...`.
+Command line: `--pair-offer [--own] [--json]`, `--pair-offer-web [--own]`, `--pair-with <link>`, `--devices`, `--unpair <device-id>`, `--send <device-id|ip|auto> <file>...`.
+
+**Browser client (send-only):** any phone or computer with a browser can send files and clipboard text to this desktop without installing an app. `./build.sh` builds it from an `omasend-web` checkout next to this one (needs `npm`), and the engine serves it at `http://<desktop-ip>:53317/web/`. Run `omasend-engine --pair-offer-web` and scan the QR code with the phone's camera: the page opens and pairs itself. A browser cannot receive files. Its requests are signed with its own key but travel over plain HTTP on the LAN (authenticated, **not encrypted**), so use it on networks you trust; see [PROTOCOL_V2.md](PROTOCOL_V2.md#browser-client).
 
 ### Step 4: Top Bar Placement (Optional)
 If not automatically present in your panel, add `ozdil.omasend` to `bar.layout.right` in `~/.config/omarchy/shell.json`:

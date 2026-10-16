@@ -170,6 +170,82 @@ peers). Loopback alone is not trusted: the WAN tunnel connects from `127.0.0.1`.
 - Upload bodies are not covered by the signature (`stream:<len>`). Integrity comes from the
   signed transfer request: the size must match, and hashes are checked when the sender provides them.
 
+## Browser client
+
+The `omasend-web` PWA is a v2 client that runs in a browser. The desktop engine serves it on
+the same origin as the API, so it needs no CORS and never mixes HTTPS and HTTP:
+
+- `GET /web` → `301` to `/web/`. `GET|HEAD /web/` and `/web/index.html` serve `index.html`;
+  `/web/<path>` serves files from the first existing web root: `$OMASEND_WEB_DIR`,
+  `~/.local/share/omarchy/omasend/web` (installed by `build.sh`), `/usr/share/omasend/web`.
+  Without one, `/web/` returns a short "not installed" page.
+- Paths are percent-decoded once; malformed escapes, anything still encoded after that
+  (double encoding), `.`/`..`, absolute paths, NUL, backslashes, control characters and
+  dot-files are refused. The resolved file must stay inside the canonical web root (symlinks
+  cannot escape). Files are limited to 20 MiB.
+- Responses carry `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and
+  `X-Frame-Options: DENY`. `/web/assets/*` is `Cache-Control: public, max-age=31536000,
+  immutable`; everything else (`index.html`, `sw.js`, the manifest) is `no-cache`.
+- Other methods get `405`. While visibility is `OFF`, `/web` returns `403` like every other
+  endpoint.
+
+### Pairing a browser
+
+`omasend-engine --pair-offer-web [--own]` creates the usual single-use, 5-minute offer and
+prints:
+
+```
+{ "uri": "omasend://pair?...",
+  "web_url": "http://<lan-ip>:53317/web/#pair=<encodeURIComponent(uri)>",
+  "qr_svg": "<path of a 0600 SVG QR code of web_url>",
+  "expires_at": <unix seconds>, "expires_in_secs": 300,
+  "device_id": "...", "own_device": false, "web_installed": true }
+```
+
+The phone scans the QR code with its normal camera and opens `web_url`. The pairing link is in
+the URL fragment, which the browser never sends over the network. The page has its own Ed25519
+key; it decodes `#pair=` (`decodeURIComponent`) and sends the normal pair request to the same
+origin, with `client` set and no `quic_port`:
+
+```
+POST /api/v2/pair
+{ "pk": ..., "name": ..., "mac": ..., "sig": ..., "client": "web" }
+```
+
+The desktop stores the key with `client: "web"`, `port: 0` and `quic_port: 0`. Keys of native
+clients have no `client` field, so older trust stores load unchanged. `--devices` lists
+`client` and `can_receive` for each device.
+
+### Sending from a browser
+
+The browser uses the signed-HTTP endpoints above (`/api/p2p/request`, `GET /api/p2p/decision`,
+`/api/p2p/upload`, `/api/p2p/clipboard`) with the same headers and canonical string. The
+signed path is the path and query exactly as the browser sends them, percent-encoding
+included (for example `/api/p2p/upload?token=…&filename=%C3%A7ay%20(1).txt`). Body tags do not
+change. A signed request does not need an OmaID; the desktop labels it with the device ID.
+
+The usual trust rules apply: a browser paired as "not mine" needs approval for each transfer,
+and its clipboard text is accepted. With `--own`, its transfers are auto-accepted.
+
+A browser has no server and no QUIC endpoint, so it is **send-only**. Sending to a browser key
+fails at once with "Browser devices can't receive files". A browser key is never matched by IP
+address, never gets automatic clipboard pushes and is never picked by `--send auto`.
+
+### Security of the browser client
+
+- Requests are **authenticated but not encrypted**. They travel as plain HTTP on the LAN, so
+  anyone on the network can read the files and clipboard text a browser sends. They cannot
+  forge, change or replay requests: the signature covers the JSON body, and an upload must
+  match the signed request (size, and hashes when the page sends them).
+- The page itself is also served over plain HTTP. An active attacker on the LAN could serve a
+  modified page to a browser that loads it while the attacker is present. Load the page and
+  pair only on a network you trust.
+- The browser keeps its private key in its own site storage. Clearing site data loses the key;
+  remove the stale pairing on the desktop with `--unpair <device-id>`.
+- Over the internet, use the HTTPS WAN tunnel, and only if the user turns it on. It encrypts the
+  connection between the browser and the tunnel; it is never enabled for the browser client
+  automatically.
+
 ## Phase 2: encrypted transport (`omasend-core`)
 
 Paired devices talk over [iroh](https://iroh.computer) (QUIC + TLS 1.3, raw public keys). The
