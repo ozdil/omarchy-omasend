@@ -7,7 +7,7 @@ reuses the O, M, A letters of the Omarchy wordmark with S, E, N, D drawn on the
 same 15 px grid. Colours are Omarchy's default Tokyo Night theme.
 
     pip install cairosvg pillow
-    python3 omasend_brand.py [A|B|C] [out_dir]
+    python3 omasend_brand.py [B|A|C] [out_dir]
 """
 import sys, io, os, json
 import cairosvg
@@ -243,7 +243,7 @@ for y in range(15):
         if (y==0 and x<7) or (x==0 and y<7) or (y==14 and x>7) or (x==14 and y>7): cf[y][x]='#'
 OPT['C']=([''.join(r) for r in cf], put(E,A3,4,4))
 
-OPTN=sys.argv[1] if len(sys.argv)>1 else 'A'
+OPTN=sys.argv[1] if len(sys.argv)>1 else 'B'
 O=sys.argv[2] if len(sys.argv)>2 else 'omasend-brand-'+OPTN
 os.makedirs(O,exist_ok=True)
 f,a=OPT[OPTN]
