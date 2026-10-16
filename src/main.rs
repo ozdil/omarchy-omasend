@@ -3041,7 +3041,13 @@ fn save_discovered_peers(peers: &[DiscoveredPeer]) {
     save_discovered_peers_unlocked(peers);
 }
 
-fn update_discovered_peer(packet: &P2pBeaconPacket) {
+/// Upper bound on remembered discovered peers; the oldest are evicted first (M13).
+const MAX_DISCOVERED_PEERS: usize = 256;
+
+/// Records a beacon. `src` is the UDP source address: it is used instead of the packet's
+/// self-reported `ip`, which any host can fill with someone else's address (M13).
+fn update_discovered_peer(packet: &P2pBeaconPacket, src: IpAddr) {
+    let src_ip = src.to_canonical().to_string();
     let _guard = lock_state_files();
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let (my_id, _) = get_or_create_device_id();
@@ -3053,9 +3059,10 @@ fn update_discovered_peer(packet: &P2pBeaconPacket) {
 
     // Instant offline handling when remote peer turns discovery OFF
     if packet.mode == "OFF" || packet.mode == "STOP" {
+        // Only the device itself (same id, same source address) can take itself off the list.
         let mut peers = get_discovered_peers_unlocked();
         let initial_len = peers.len();
-        peers.retain(|p| p.id != packet.id && p.ip != packet.ip);
+        peers.retain(|p| !(p.id == packet.id && p.ip == src_ip));
         if peers.len() != initial_len {
             save_discovered_peers_unlocked(&peers);
         }
@@ -3080,7 +3087,7 @@ fn update_discovered_peer(packet: &P2pBeaconPacket) {
         true
     } else if is_paired {
         let paired = load_paired_peers();
-        paired.iter().any(|p| p.is_active() && rendezvous::normalize_oma_id(&p.oma_id) == packet_norm && p.ip.as_deref() == Some(&packet.ip))
+        paired.iter().any(|p| p.is_active() && rendezvous::normalize_oma_id(&p.oma_id) == packet_norm && p.ip.as_deref() == Some(src_ip.as_str()))
     } else {
         false
     };
@@ -3090,7 +3097,7 @@ fn update_discovered_peer(packet: &P2pBeaconPacket) {
         existing.id = packet.id.clone();
         existing.oma_id = packet.oma_id.clone();
         existing.name = packet.name.clone();
-        existing.ip = packet.ip.clone();
+        existing.ip = src_ip.clone();
         existing.port = packet.port;
         existing.transport = "LAN".to_string();
         existing.fingerprint = packet.fp.clone();
@@ -3103,7 +3110,7 @@ fn update_discovered_peer(packet: &P2pBeaconPacket) {
             id: packet.id.clone(),
             oma_id: packet.oma_id.clone(),
             name: packet.name.clone(),
-            ip: packet.ip.clone(),
+            ip: src_ip.clone(),
             port: packet.port,
             transport: "LAN".to_string(),
             fingerprint: packet.fp.clone(),
@@ -3113,6 +3120,10 @@ fn update_discovered_peer(packet: &P2pBeaconPacket) {
             pk: packet.pk.clone(),
             key_trust: String::new(),
         });
+        if peers.len() > MAX_DISCOVERED_PEERS {
+            peers.sort_by_key(|p| std::cmp::Reverse(p.last_seen_secs));
+            peers.truncate(MAX_DISCOVERED_PEERS);
+        }
     }
     save_discovered_peers_unlocked(&peers);
 }
@@ -3265,11 +3276,11 @@ fn run_p2p_discovery_listener() {
     let mut buf = [0u8; 2048];
     loop {
         match socket.recv_from(&mut buf) {
-            Ok((amt, _src)) => {
+            Ok((amt, src)) => {
                 if amt > 0 && amt <= 2048 {
                     if let Ok(packet) = serde_json::from_slice::<P2pBeaconPacket>(&buf[..amt]) {
                         if packet.magic == "OMASEND_P2P" {
-                            update_discovered_peer(&packet);
+                            update_discovered_peer(&packet, src.ip());
                         }
                     }
                 }
@@ -9944,5 +9955,45 @@ mod tests {
         assert!(r.starts_with("HTTP/1.1 403") && r.contains("Off"), "{}", r);
         set_visibility("ALL");
         reset_pin_rate_limiter();
+    }
+
+    /// M13: beacons are attributed to their UDP source, OFF only removes the sender itself,
+    /// and the list is capped.
+    #[test]
+    fn test_beacons_use_source_address_and_are_capped() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        set_visibility("ALL");
+        save_discovered_peers(&[]);
+        let beacon = |id: &str, ip: &str, mode: &str| P2pBeaconPacket {
+            magic: "OMASEND_P2P".to_string(),
+            v: 1,
+            id: id.to_string(),
+            oma_id: rendezvous::format_oma_id(&rendezvous::generate_raw_oma_id()),
+            name: id.to_string(),
+            ip: ip.to_string(),
+            port: PORT,
+            mode: mode.to_string(),
+            fp: String::new(),
+            pk: String::new(),
+        };
+        let a: IpAddr = "192.168.7.10".parse().unwrap();
+        let b: IpAddr = "192.168.7.11".parse().unwrap();
+        // Claims another host's address: the source address wins.
+        update_discovered_peer(&beacon("dev-a", "192.168.7.99", "KNOWN"), a);
+        let peers = get_discovered_peers();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].ip, "192.168.7.10");
+        // OFF from a different source does not remove dev-a.
+        update_discovered_peer(&beacon("dev-a", "192.168.7.10", "OFF"), b);
+        assert_eq!(get_discovered_peers().len(), 1);
+        // OFF from dev-a itself does.
+        update_discovered_peer(&beacon("dev-a", "", "OFF"), a);
+        assert!(get_discovered_peers().is_empty());
+        // Random ids cannot grow the list without bound.
+        for i in 0..(MAX_DISCOVERED_PEERS + 20) {
+            update_discovered_peer(&beacon(&format!("flood-{}", i), "", "KNOWN"), b);
+        }
+        assert!(get_discovered_peers().len() <= MAX_DISCOVERED_PEERS);
+        save_discovered_peers(&[]);
     }
 }
