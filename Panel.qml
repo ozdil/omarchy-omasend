@@ -145,7 +145,10 @@ Panel {
     return s.length > 9 ? s.slice(0, 9) : (s || "----")
   }
 
-  function engine() { return root.userHome + "/.local/bin/omasend-engine" }
+  // Source installs (build.sh) put the engine in ~/.local/bin, the package in /usr/bin.
+  property string enginePath: root.userHome + "/.local/bin/omasend-engine"
+  property bool engineLocated: false
+  function engine() { return root.enginePath }
 
   function run(args) {
     if (actionProc.running) actionProc.running = false
@@ -154,7 +157,7 @@ Panel {
   }
 
   function refresh() {
-    if (!serverProc.running) serverProc.running = true
+    if (root.engineLocated && !serverProc.running) serverProc.running = true
     if (scanProc.running) scanProc.running = false
     scanProc.running = true
   }
@@ -331,9 +334,24 @@ Panel {
 
   // --- Processes ---
   Process {
+    id: engineLocator
+    running: true
+    command: ["sh", "-c", "for p in \"$HOME/.local/bin/omasend-engine\" /usr/bin/omasend-engine; do if [ -x \"$p\" ]; then echo \"$p\"; exit 0; fi; done"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var p = String(text || "").trim()
+        if (p) root.enginePath = p
+        root.engineLocated = true
+        if (!serverProc.running) serverProc.running = true
+      }
+    }
+  }
+
+  Process {
     id: serverProc
     command: [root.engine(), "--serve"]
-    running: true
+    running: false
   }
 
   Process {
@@ -496,7 +514,7 @@ Panel {
     running: true
     repeat: true
     onTriggered: {
-      if (!serverProc.running) serverProc.running = true
+      if (root.engineLocated && !serverProc.running) serverProc.running = true
       if (root.opened) root.refresh()
     }
   }

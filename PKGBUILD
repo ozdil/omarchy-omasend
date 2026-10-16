@@ -6,11 +6,15 @@ pkgdesc="Local file and clipboard sharing between Omarchy and Android: QR pairin
 arch=('x86_64')
 url="https://github.com/ozdil/omarchy-omasend"
 license=('MIT')
-depends=('glibc' 'gcc-libs' 'curl' 'jq' 'libnotify')
+# quickshell runs the panel; wl-clipboard is needed for clipboard sync. QR codes are rendered
+# by the engine itself (no qrencode).
+depends=('glibc' 'gcc-libs' 'libnotify' 'quickshell' 'wl-clipboard')
 optdepends=(
-    'wl-clipboard: for Wayland clipboard sync'
     'zenity: for native file chooser dialog'
     'libwebp: for clipboard image WebP thumbnail compression'
+    'grim: to scan a pairing QR code shown on screen'
+    'zbar: to scan a pairing QR code shown on screen'
+    'cloudflared: for the optional WAN tunnel'
 )
 makedepends=('cargo' 'rust')
 
@@ -21,9 +25,8 @@ build() {
 
 package() {
     cd "${startdir}"
+    # One copy: the panel and the omasend-status/-dashboard scripts fall back to /usr/bin.
     install -Dm755 "target/release/omasend-engine" "${pkgdir}/usr/bin/omasend-engine"
-    install -Dm755 "target/release/omasend-engine" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/omasend-engine"
-    install -Dm755 "target/release/omasend-engine" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/bin/omasend-engine"
     install -Dm755 "omasend-status" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/omasend-status"
     install -Dm755 "omasend-dashboard" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/omasend-dashboard"
     install -Dm644 "manifest.json" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/manifest.json"
