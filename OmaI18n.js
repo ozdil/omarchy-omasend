@@ -21,6 +21,30 @@ function detectLang(rawEnv, qtLocaleName) {
 }
 
 var DICT = {
+  "pair_mode_web": {
+    tr: "Tarayıcı",
+    en: "Browser"
+  },
+  "web_pair_instructions": {
+    tr: "Telefonun kamerasıyla okut ya da bağlantıyı tarayıcıda aç; sayfa bu cihazla uçtan uca şifreli eşleşir.",
+    en: "Scan with your phone's camera or open the link in a browser; the page pairs with this device end to end encrypted."
+  },
+  "web_link_copy_tooltip": {
+    tr: "Bağlantıyı kopyala",
+    en: "Copy link"
+  },
+  "web_link_copied": {
+    tr: "Bağlantı kopyalandı",
+    en: "Link copied"
+  },
+  "web_not_installed": {
+    tr: "Web istemcisi kurulu değil",
+    en: "Web client is not installed"
+  },
+  "web_pair_unsupported": {
+    tr: "Bu motor sürümü tarayıcı eşleştirmeyi desteklemiyor",
+    en: "This engine version does not support browser pairing"
+  },
   "account_copied": {
     tr: "Hesap numarası kopyalandı",
     en: "Account number copied"

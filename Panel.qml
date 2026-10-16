@@ -65,6 +65,11 @@ Panel {
   property bool showAccountId: false
   property bool linkSupported: false
 
+  // --- Pair a browser (needs an engine with --pair-offer-web; detected on first use) ---
+  property bool webSupported: true
+  property string pairWebUrl: ""
+  property bool pairWebInstalled: true
+
   // --- Unpair confirmation (second click within 4 s) ---
   property string armedUnpair: ""
 
@@ -259,7 +264,9 @@ Panel {
   function newPairOffer() {
     root.pairQrPath = ""
     if (pairProc.running) pairProc.running = false
-    pairProc.command = [root.engine(), "--pair-offer", "--json"].concat(root.pairOwn ? ["--own"] : [])
+    root.pairWebUrl = ""
+    var flag = root.pairMode === "web" ? "--pair-offer-web" : "--pair-offer"
+    pairProc.command = [root.engine(), flag, "--json"].concat(root.pairOwn ? ["--own"] : [])
     pairProc.running = true
   }
 
@@ -418,6 +425,16 @@ Panel {
         pairProc.running = false
         try {
           var d = JSON.parse(String(text || ""))
+          // Older engines answer --pair-offer-web --json with the status JSON (no web_url): hide the browser tab.
+          if (root.pairMode === "web" && !d.web_url) {
+            root.webSupported = false
+            root.pairMode = "qr"
+            root.setStatus(root.t("web_pair_unsupported"), true)
+            root.newPairOffer()
+            return
+          }
+          root.pairWebUrl = String(d.web_url || "")
+          root.pairWebInstalled = d.web_installed !== false
           root.pairQrPath = String(d.qr_svg || "")
           root.pairExpiresAt = Math.floor(Date.now() / 1000) + (Number(d.expires_in_secs) || 300)
           root.refreshNonce++
@@ -1178,16 +1195,23 @@ Panel {
               }
 
               RowLayout {
-                visible: root.linkSupported
+                visible: root.linkSupported || root.webSupported
                 width: parent.width
                 spacing: Style.space(6)
 
                 ScopePill {
                   label: root.t("pair_mode_qr")
                   activeWhen: root.pairMode === "qr"
-                  onClicked: root.pairMode = "qr"
+                  onClicked: { if (root.pairMode !== "qr") { var wasWeb = root.pairMode === "web"; root.pairMode = "qr"; if (wasWeb || !root.pairQrPath) root.newPairOffer() } }
                 }
                 ScopePill {
+                  visible: root.webSupported
+                  label: root.t("pair_mode_web")
+                  activeWhen: root.pairMode === "web"
+                  onClicked: { if (root.pairMode !== "web") { root.pairMode = "web"; root.newPairOffer() } }
+                }
+                ScopePill {
+                  visible: root.linkSupported
                   label: root.t("pair_mode_omaid")
                   activeWhen: root.pairMode === "omaid"
                   onClicked: root.pairMode = "omaid"
@@ -1196,7 +1220,7 @@ Panel {
               }
 
               Column {
-                visible: root.pairMode === "qr"
+                visible: root.pairMode === "qr" || root.pairMode === "web"
                 width: parent.width
                 spacing: Style.space(8)
 
@@ -1223,7 +1247,7 @@ Panel {
                 Text {
                   width: parent.width
                   textFormat: Text.PlainText
-                  text: root.t("pair_instructions")
+                  text: root.pairMode === "web" ? root.t("web_pair_instructions") : root.t("pair_instructions")
                   color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -1238,6 +1262,42 @@ Panel {
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
+                  horizontalAlignment: Text.AlignHCenter
+                }
+
+                RowLayout {
+                  visible: root.pairMode === "web" && root.pairWebUrl !== ""
+                  width: parent.width
+                  spacing: Style.space(4)
+
+                  Text {
+                    Layout.fillWidth: true
+                    textFormat: Text.PlainText
+                    text: root.pairWebUrl
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideMiddle
+                  }
+                  PanelActionButton {
+                    iconText: "󰆏"
+                    tooltipText: root.t("web_link_copy_tooltip")
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    onClicked: { root.copyText(root.pairWebUrl); root.setStatus(root.t("web_link_copied"), false) }
+                  }
+                }
+
+                Text {
+                  visible: root.pairMode === "web" && !root.pairWebInstalled
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: root.t("web_not_installed")
+                  color: root.urgent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  wrapMode: Text.WordWrap
                   horizontalAlignment: Text.AlignHCenter
                 }
 
@@ -1257,6 +1317,7 @@ Panel {
                   }
                   Item { Layout.fillWidth: true }
                   PanelActionButton {
+                    visible: root.pairMode === "qr"
                     iconText: "󰐳"
                     tooltipText: root.t("pair_scan_screen_tooltip")
                     foreground: root.foreground
