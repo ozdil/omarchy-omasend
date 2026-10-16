@@ -21,6 +21,62 @@ function detectLang(rawEnv, qtLocaleName) {
 }
 
 var DICT = {
+  "account_copied": {
+    tr: "Hesap numarası kopyalandı",
+    en: "Account number copied"
+  },
+  "account_copy_tooltip": {
+    tr: "Numarayı kopyala",
+    en: "Copy number"
+  },
+  "account_hide_tooltip": {
+    tr: "Numarayı gizle",
+    en: "Hide number"
+  },
+  "account_number_label": {
+    tr: "HESAP NUMARANIZ (OmaID)",
+    en: "YOUR ACCOUNT NUMBER (OmaID)"
+  },
+  "account_show_tooltip": {
+    tr: "Numarayı göster",
+    en: "Show number"
+  },
+  "link_btn": {
+    tr: "Bağla",
+    en: "Link"
+  },
+  "link_failed": {
+    tr: "Bağlanamadı",
+    en: "Could not link"
+  },
+  "link_hint": {
+    tr: "Numara ağda gönderilmez, yalnızca bağlantıyı doğrulamak için kullanılır. Kimseyle paylaşmayın: bu numarayı bilen, cihazınızı kendi cihazı gibi bağlayabilir.",
+    en: "The number is never sent over the network; it only proves the link. Do not share it: anyone who knows it can link a device as yours."
+  },
+  "link_instructions": {
+    tr: "Kendi cihazlarınızı bağlamak için diğer cihazın hesap numarasını buraya yazın. İki cihaz da aynı ağda ve açık olmalı.",
+    en: "To link your own devices, type the other device's account number here. Both devices must be on and on the same network."
+  },
+  "link_invalid": {
+    tr: "Geçersiz numara: 16 haneli OmaID girin.",
+    en: "Invalid number: enter the 16-digit OmaID."
+  },
+  "link_ok": {
+    tr: "Bağlandı: %1",
+    en: "Linked: %1"
+  },
+  "link_working": {
+    tr: "Bağlanıyor…",
+    en: "Linking…"
+  },
+  "pair_mode_omaid": {
+    tr: "OmaID",
+    en: "OmaID"
+  },
+  "pair_mode_qr": {
+    tr: "QR kod",
+    en: "QR code"
+  },
   "add_device": {
     tr: "Cihaz ekle",
     en: "Add device"

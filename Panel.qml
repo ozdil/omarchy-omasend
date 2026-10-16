@@ -59,6 +59,12 @@ Panel {
   property string statusMsg: ""
   property bool statusError: false
 
+  // --- Link with OmaID (needs an engine with --link / --account-id) ---
+  property string pairMode: "qr"
+  property string accountId: ""
+  property bool showAccountId: false
+  property bool linkSupported: false
+
   // --- Unpair confirmation (second click within 4 s) ---
   property string armedUnpair: ""
 
@@ -211,7 +217,43 @@ Panel {
   function openPairing() {
     root.showPair = true
     root.pairedCountAtOpen = root.pairedDevices.length
+    root.showAccountId = false
     root.newPairOffer()
+    if (!accountProc.running) accountProc.running = true
+  }
+
+  function omaIdDigits(text) { return String(text || "").replace(/[^0-9]/g, "") }
+
+  // 16 digits with a valid Luhn check digit, same rule as the engine.
+  function omaIdValid(text) {
+    var d = root.omaIdDigits(text)
+    if (d.length !== 16) return false
+    var sum = 0
+    for (var i = 0; i < 16; i++) {
+      var n = Number(d.charAt(15 - i))
+      if (i % 2 === 1) { n *= 2; if (n > 9) n -= 9 }
+      sum += n
+    }
+    return sum % 10 === 0
+  }
+
+  function formatAccountId(id, masked) {
+    var d = root.omaIdDigits(id)
+    var groups = []
+    for (var i = 0; i < d.length; i += 4) groups.push(masked && i < d.length - 4 ? "••••" : d.slice(i, i + 4))
+    return groups.join(" ")
+  }
+
+  function linkWithOmaId(text) {
+    if (linkProc.running) return
+    if (!root.omaIdValid(text)) {
+      root.setStatus(root.t("link_invalid"), true)
+      return
+    }
+    root.setStatus(root.t("link_working"), false)
+    linkProc.output = ""
+    linkProc.command = [root.engine(), "--link", root.omaIdDigits(text), "--json"]
+    linkProc.running = true
   }
 
   function newPairOffer() {
@@ -301,6 +343,8 @@ Panel {
       Qt.callLater(function() { keyCatcher.forceActiveFocus() })
     } else {
       root.showPair = false
+      root.showAccountId = false
+      linkInput.text = ""
     }
   }
 
@@ -382,6 +426,48 @@ Panel {
           root.setStatus(root.t("pair_qr_failed"), true)
         }
       }
+    }
+  }
+
+  // Older engines answer --account-id --json with the status JSON, which has no account_id: the OmaID tab stays hidden.
+  Process {
+    id: accountProc
+    command: [root.engine(), "--account-id", "--json"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        accountProc.running = false
+        try {
+          var d = JSON.parse(String(text || "").slice(0, 65536))
+          var id = String(d.account_id || "")
+          root.linkSupported = root.omaIdValid(id)
+          root.accountId = root.linkSupported ? root.omaIdDigits(id) : ""
+        } catch (e) {
+          root.linkSupported = false
+        }
+        if (!root.linkSupported && root.pairMode === "omaid") root.pairMode = "qr"
+      }
+    }
+  }
+
+  Process {
+    id: linkProc
+    property string output: ""
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: linkProc.output = String(text || "").slice(0, 65536) }
+    onExited: function(code) {
+      linkProc.running = false
+      var d = null
+      try { d = JSON.parse(linkProc.output) } catch (e) {}
+      if (d && d.ok) {
+        var names = []
+        for (var i = 0; i < (d.linked || []).length; i++) names.push(String(d.linked[i].name || ""))
+        root.setStatus(root.tf("link_ok", names.join(", ")), false)
+        linkInput.text = ""
+        root.showPair = false
+      } else {
+        root.setStatus(d && d.error ? String(d.error) : root.t("link_failed"), true)
+      }
+      root.refresh()
     }
   }
 
@@ -1091,79 +1177,226 @@ Panel {
                 }
               }
 
-              Rectangle {
-                anchors.horizontalCenter: parent.horizontalCenter
-                width: Style.space(176)
-                height: Style.space(176)
-                radius: Style.cornerRadius
-                color: "#ffffff"
-
-                Image {
-                  anchors.centerIn: parent
-                  width: Style.space(164)
-                  height: Style.space(164)
-                  source: root.pairQrPath ? ("file://" + root.pairQrPath + "?v=" + root.refreshNonce) : ""
-                  sourceSize.width: 512
-                  sourceSize.height: 512
-                  fillMode: Image.PreserveAspectFit
-                  smooth: false
-                  cache: false
-                }
-              }
-
-              Text {
-                width: parent.width
-                textFormat: Text.PlainText
-                text: root.t("pair_instructions")
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
-                horizontalAlignment: Text.AlignHCenter
-              }
-
-              Text {
-                width: parent.width
-                textFormat: Text.PlainText
-                text: root.tf("pair_expires", Math.max(0, root.pairExpiresAt - root.nowSecs))
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                horizontalAlignment: Text.AlignHCenter
-              }
-
               RowLayout {
+                visible: root.linkSupported
                 width: parent.width
                 spacing: Style.space(6)
 
                 ScopePill {
-                  label: root.t("pair_own")
-                  activeWhen: root.pairOwn
-                  onClicked: { if (!root.pairOwn) { root.pairOwn = true; root.newPairOffer() } }
+                  label: root.t("pair_mode_qr")
+                  activeWhen: root.pairMode === "qr"
+                  onClicked: root.pairMode = "qr"
                 }
                 ScopePill {
-                  label: root.t("pair_other")
-                  activeWhen: !root.pairOwn
-                  onClicked: { if (root.pairOwn) { root.pairOwn = false; root.newPairOffer() } }
+                  label: root.t("pair_mode_omaid")
+                  activeWhen: root.pairMode === "omaid"
+                  onClicked: root.pairMode = "omaid"
                 }
                 Item { Layout.fillWidth: true }
-                PanelActionButton {
-                  iconText: "󰐳"
-                  tooltipText: root.t("pair_scan_screen_tooltip")
-                  foreground: root.foreground
-                  fontFamily: root.fontFamily
-                  onClicked: root.scanScreenForPairing()
+              }
+
+              Column {
+                visible: root.pairMode === "qr"
+                width: parent.width
+                spacing: Style.space(8)
+
+                Rectangle {
+                  anchors.horizontalCenter: parent.horizontalCenter
+                  width: Style.space(176)
+                  height: Style.space(176)
+                  radius: Style.cornerRadius
+                  color: "#ffffff"
+
+                  Image {
+                    anchors.centerIn: parent
+                    width: Style.space(164)
+                    height: Style.space(164)
+                    source: root.pairQrPath ? ("file://" + root.pairQrPath + "?v=" + root.refreshNonce) : ""
+                    sourceSize.width: 512
+                    sourceSize.height: 512
+                    fillMode: Image.PreserveAspectFit
+                    smooth: false
+                    cache: false
+                  }
+                }
+
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: root.t("pair_instructions")
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                  horizontalAlignment: Text.AlignHCenter
+                }
+
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: root.tf("pair_expires", Math.max(0, root.pairExpiresAt - root.nowSecs))
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  horizontalAlignment: Text.AlignHCenter
+                }
+
+                RowLayout {
+                  width: parent.width
+                  spacing: Style.space(6)
+
+                  ScopePill {
+                    label: root.t("pair_own")
+                    activeWhen: root.pairOwn
+                    onClicked: { if (!root.pairOwn) { root.pairOwn = true; root.newPairOffer() } }
+                  }
+                  ScopePill {
+                    label: root.t("pair_other")
+                    activeWhen: !root.pairOwn
+                    onClicked: { if (root.pairOwn) { root.pairOwn = false; root.newPairOffer() } }
+                  }
+                  Item { Layout.fillWidth: true }
+                  PanelActionButton {
+                    iconText: "󰐳"
+                    tooltipText: root.t("pair_scan_screen_tooltip")
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    onClicked: root.scanScreenForPairing()
+                  }
+                }
+
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: root.pairOwn ? root.t("pair_own_hint") : root.t("pair_other_hint")
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
                 }
               }
 
-              Text {
+              // Link your own devices by typing the account OmaID (SPAKE2; the number itself is never sent).
+              Column {
+                visible: root.pairMode === "omaid"
                 width: parent.width
-                textFormat: Text.PlainText
-                text: root.pairOwn ? root.t("pair_own_hint") : root.t("pair_other_hint")
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
+                spacing: Style.space(8)
+
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: root.t("account_number_label")
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  font.letterSpacing: 1.0
+                }
+
+                RowLayout {
+                  width: parent.width
+                  spacing: Style.space(4)
+
+                  Text {
+                    Layout.fillWidth: true
+                    textFormat: Text.PlainText
+                    text: root.accountId === "" ? "…" : root.formatAccountId(root.accountId, !root.showAccountId)
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    font.bold: true
+                    font.letterSpacing: 1.0
+                    elide: Text.ElideRight
+                  }
+                  PanelActionButton {
+                    iconText: root.showAccountId ? "󰈉" : "󰈈"
+                    tooltipText: root.showAccountId ? root.t("account_hide_tooltip") : root.t("account_show_tooltip")
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    onClicked: root.showAccountId = !root.showAccountId
+                  }
+                  PanelActionButton {
+                    iconText: "󰆏"
+                    tooltipText: root.t("account_copy_tooltip")
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    onClicked: if (root.accountId) { root.copyText(root.accountId); root.setStatus(root.t("account_copied"), false) }
+                  }
+                }
+
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: root.t("link_instructions")
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                }
+
+                RowLayout {
+                  width: parent.width
+                  spacing: Style.space(6)
+
+                  BorderSurface {
+                    Layout.fillWidth: true
+                    implicitHeight: linkInput.implicitHeight + Style.space(12)
+                    color: "transparent"
+                    borderSpec: Border.controlSpec("normal", root.foreground, linkInput.activeFocus ? Color.accent : root.foreground)
+                    radius: Style.cornerRadius
+
+                    TextInput {
+                      id: linkInput
+                      anchors.left: parent.left
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      anchors.leftMargin: Style.space(8)
+                      anchors.rightMargin: Style.space(8)
+                      color: root.foreground
+                      selectionColor: Color.accent
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      font.letterSpacing: 1.0
+                      maximumLength: 24
+                      inputMethodHints: Qt.ImhDigitsOnly
+                      validator: RegularExpressionValidator { regularExpression: /[0-9 -]*/ }
+                      clip: true
+                      enabled: !linkProc.running
+                      onAccepted: root.linkWithOmaId(text)
+                      Keys.onEscapePressed: keyCatcher.forceActiveFocus()
+
+                      Text {
+                        anchors.fill: parent
+                        visible: linkInput.text === "" && !linkInput.activeFocus
+                        textFormat: Text.PlainText
+                        text: "0000 0000 0000 0000"
+                        color: root.dim
+                        font: linkInput.font
+                      }
+                    }
+                  }
+                  Button {
+                    text: linkProc.running ? root.t("link_working") : root.t("link_btn")
+                    fontSize: Style.font.bodySmall
+                    foreground: Color.accent
+                    fontFamily: root.fontFamily
+                    horizontalPadding: Style.space(12)
+                    verticalPadding: Style.spacing.controlPaddingY
+                    bordered: true
+                    active: root.omaIdValid(linkInput.text) && !linkProc.running
+                    onClicked: root.linkWithOmaId(linkInput.text)
+                  }
+                }
+
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: root.t("link_hint")
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                }
               }
             }
           }
