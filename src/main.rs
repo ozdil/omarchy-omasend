@@ -2,6 +2,7 @@ mod subproc;
 pub mod devicekey;
 pub mod military;
 pub mod rendezvous;
+pub mod webclient;
 
 pub use rendezvous::{
     build_github_anchor_payload, compute_rendezvous_topic, create_stun_binding_request,
@@ -44,7 +45,9 @@ static RECEIVED_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 // Global and per-peer connection concurrency limits to protect against thread & memory exhaustion DOS
 pub const MAX_GLOBAL_CONNECTIONS: usize = 32;
-pub const MAX_PEER_CONNECTIONS: usize = 4;
+/// Browsers open up to 6 parallel HTTP/1.1 connections per host when loading the web client
+/// (every response here is `Connection: close`), plus API calls; 8 leaves room for both.
+pub const MAX_PEER_CONNECTIONS: usize = 8;
 static GLOBAL_ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 static PEER_CONNECTION_TRACKER: Mutex<Option<HashMap<IpAddr, usize>>> = Mutex::new(None);
 static RECENTLY_NOTIFIED_FILES: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
@@ -5346,6 +5349,80 @@ window.addEventListener('load', async function() {{
 
 // ------------------- CONNECTION HANDLER -------------------
 
+/// Writes a `/web` response: security headers always, body omitted for HEAD.
+fn send_web_response(mut stream: &TcpStream, head_only: bool, status: &str, content_type: &str, body: &[u8], extra: &[(&str, &str)]) {
+    let mut hdr = format!("HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n", status, content_type, body.len());
+    for (k, v) in webclient::SECURITY_HEADERS.iter().chain(extra.iter()) {
+        hdr.push_str(&format!("{}: {}\r\n", k, v));
+    }
+    hdr.push_str("Connection: close\r\n\r\n");
+    let _ = stream.write_all(hdr.as_bytes());
+    if !head_only {
+        let _ = stream.write_all(body);
+    }
+}
+
+/// Reads a resolved web-root file without following a symlink swapped in after resolution,
+/// bounded by MAX_WEB_FILE_BYTES.
+fn read_web_file(path: &Path) -> Result<Vec<u8>, bool> {
+    let f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| false)?;
+    let meta = f.metadata().map_err(|_| false)?;
+    if !meta.is_file() {
+        return Err(false);
+    }
+    if meta.len() > webclient::MAX_WEB_FILE_BYTES {
+        return Err(true);
+    }
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    f.take(webclient::MAX_WEB_FILE_BYTES + 1).read_to_end(&mut buf).map_err(|_| false)?;
+    if buf.len() as u64 > webclient::MAX_WEB_FILE_BYTES {
+        return Err(true);
+    }
+    Ok(buf)
+}
+
+/// `GET|HEAD /web[/...]`: the browser client, see `webclient`.
+fn serve_web_client(stream: &TcpStream, req: &HttpRequest) {
+    let head = req.method == "HEAD";
+    let text = "text/plain; charset=utf-8";
+    let no_cache = [("Cache-Control", "no-cache")];
+    if req.method != "GET" && !head {
+        send_web_response(stream, false, "405 Method Not Allowed", text, b"Method not allowed", &[("Allow", "GET, HEAD")]);
+        return;
+    }
+    // Harmless static files, but OFF means OFF for everything this port offers.
+    if get_visibility().0 == "OFF" {
+        send_web_response(stream, head, "403 Forbidden", text, b"OmaSend visibility is turned Off", &no_cache);
+        return;
+    }
+    match webclient::resolve(webclient::web_root().as_deref(), &req.path) {
+        Some(webclient::WebTarget::Redirect) => {
+            send_web_response(stream, head, "301 Moved Permanently", text, b"", &[("Location", "/web/"), ("Cache-Control", "no-cache")]);
+        }
+        Some(webclient::WebTarget::NotInstalled) => {
+            send_web_response(stream, head, "200 OK", "text/html; charset=utf-8", webclient::NOT_INSTALLED_HTML.as_bytes(), &no_cache);
+        }
+        Some(webclient::WebTarget::File { path, rel }) => match read_web_file(&path) {
+            Ok(body) => {
+                let extra = [("Cache-Control", webclient::cache_control(&rel))];
+                send_web_response(stream, head, "200 OK", webclient::content_type(&rel), &body, &extra);
+            }
+            Err(true) => send_web_response(stream, head, "413 Payload Too Large", text, b"File too large", &no_cache),
+            Err(false) => send_web_response(stream, head, "404 Not Found", text, b"Not found", &no_cache),
+        },
+        Some(webclient::WebTarget::BadRequest) => {
+            send_web_response(stream, head, "400 Bad Request", text, b"Bad request", &no_cache);
+        }
+        Some(webclient::WebTarget::NotFound) | None => {
+            send_web_response(stream, head, "404 Not Found", text, b"Not found", &no_cache);
+        }
+    }
+}
+
 pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) {
     let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
     let header_deadline = Instant::now() + Duration::from_secs(HEADER_READ_TIMEOUT_SECS);
@@ -5383,6 +5460,13 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                 ("Access-Control-Allow-Headers", "Content-Type, X-OmaSend-PIN, X-OmaSend-IV, X-OmaSend-Filename"),
             ]),
         );
+        return;
+    }
+
+    // Browser client (static files, same origin as the API). No PIN: it is a public app,
+    // pairing and every request it makes are authorized separately.
+    if req.path == webclient::WEB_PREFIX || req.path.starts_with("/web/") {
+        serve_web_client(&stream, &req);
         return;
     }
 
@@ -6821,6 +6905,15 @@ fn sandbox_read_paths(home: &Path, exe_dir: Option<&Path>) -> Vec<PathBuf> {
     ] {
         paths.push(home.join(rel));
     }
+    // Browser client web roots (see webclient::web_root); /usr/share is covered by /usr.
+    paths.push(home.join(webclient::USER_WEB_DIR));
+    if let Some(d) = env::var_os("OMASEND_WEB_DIR").filter(|d| !d.is_empty()) {
+        let d = PathBuf::from(d);
+        // Never let the variable re-grant $HOME (or a parent of it).
+        if d.is_absolute() && !home.starts_with(&d) {
+            paths.push(d);
+        }
+    }
     if let Some(dir) = exe_dir {
         // Dev builds run from the source tree and read ./assets next to the binary.
         // Skip it if it is $HOME or one of its parents, which would re-grant all of $HOME.
@@ -7895,7 +7988,7 @@ mod tests {
         let peer_a = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
         let peer_b = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20));
 
-        // 1. Peer A acquires up to MAX_PEER_CONNECTIONS (4)
+        // 1. Peer A acquires up to MAX_PEER_CONNECTIONS
         let mut guards_a = Vec::new();
         for _ in 0..MAX_PEER_CONNECTIONS {
             let g = try_acquire_connection(peer_a);
@@ -10078,5 +10171,93 @@ mod tests {
         assert!(html.contains("data-name=\"x&#39;);alert(1);(&#39;&lt;img&gt;.txt\""));
         assert_eq!(notification_text("<b>evil</b> & co"), "&lt;b&gt;evil&lt;/b&gt; &amp; co");
         assert!(notification_text("-u critical").starts_with('\u{2060}'));
+    }
+
+    fn http_raw_once(req: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
+        let addr = listener.local_addr().unwrap();
+        let server = serve_one(listener);
+        let r = raw_http(addr, &req.replace("{addr}", &addr.to_string()), b"");
+        server.join().unwrap();
+        r
+    }
+
+    fn header_of<'a>(resp: &'a str, name: &str) -> Option<&'a str> {
+        let head = resp.split("\r\n\r\n").next().unwrap_or("");
+        head.lines().find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+        })
+    }
+
+    #[test]
+    fn test_web_client_static_serving_over_http() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        reset_connection_tracker();
+        let base = std::env::temp_dir().join(format!("omasend_test_webroot_{}", std::process::id()));
+        let root = base.join("web");
+        fs::create_dir_all(root.join("assets")).unwrap();
+        fs::write(root.join("index.html"), "<!doctype html><title>OmaSend</title>").unwrap();
+        fs::write(root.join("sw.js"), "self.addEventListener('fetch',()=>{})").unwrap();
+        fs::write(root.join("manifest.webmanifest"), "{}").unwrap();
+        fs::write(root.join("assets/index-abc123.js"), "console.log(1)").unwrap();
+        fs::write(base.join("secret.txt"), "outside").unwrap();
+        std::env::set_var("OMASEND_WEB_DIR", &root);
+        set_visibility("KNOWN");
+
+        let get = |p: &str| http_raw_once(&format!("GET {} HTTP/1.1\r\nHost: {{addr}}\r\nConnection: close\r\n\r\n", p));
+
+        let r = get("/web");
+        assert!(r.starts_with("HTTP/1.1 301"), "{}", r);
+        assert_eq!(header_of(&r, "Location"), Some("/web/"));
+
+        for p in ["/web/", "/web/index.html", "/web/?utm=x"] {
+            let r = get(p);
+            assert!(r.starts_with("HTTP/1.1 200"), "{}: {}", p, r);
+            assert_eq!(header_of(&r, "Content-Type"), Some("text/html; charset=utf-8"));
+            assert_eq!(header_of(&r, "Cache-Control"), Some("no-cache"));
+            assert_eq!(header_of(&r, "X-Content-Type-Options"), Some("nosniff"));
+            assert_eq!(header_of(&r, "Referrer-Policy"), Some("no-referrer"));
+            assert_eq!(header_of(&r, "X-Frame-Options"), Some("DENY"));
+            assert!(r.ends_with("<!doctype html><title>OmaSend</title>"), "{}", r);
+        }
+        let r = get("/web/assets/index-abc123.js");
+        assert_eq!(header_of(&r, "Content-Type"), Some("text/javascript; charset=utf-8"));
+        assert_eq!(header_of(&r, "Cache-Control"), Some("public, max-age=31536000, immutable"));
+        let r = get("/web/sw.js");
+        assert_eq!(header_of(&r, "Cache-Control"), Some("no-cache"));
+        let r = get("/web/manifest.webmanifest");
+        assert_eq!(header_of(&r, "Content-Type"), Some("application/manifest+json"));
+        assert_eq!(header_of(&r, "Cache-Control"), Some("no-cache"));
+
+        // HEAD: same headers, no body.
+        let r = http_raw_once("HEAD /web/sw.js HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        assert!(r.starts_with("HTTP/1.1 200"), "{}", r);
+        assert!(r.ends_with("\r\n\r\n"), "HEAD must not carry a body: {:?}", r);
+
+        for p in ["/web/../secret.txt", "/web/%2e%2e/secret.txt", "/web/%252e%252e/secret.txt", "/web/assets/..%2f..%2fsecret.txt"] {
+            let r = get(p);
+            assert!(r.starts_with("HTTP/1.1 400") || r.starts_with("HTTP/1.1 404"), "{}: {}", p, r);
+            assert!(!r.contains("outside"), "{}", p);
+        }
+        assert!(get("/web/nope.js").starts_with("HTTP/1.1 404"));
+
+        let r = http_raw_once("POST /web/ HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        assert!(r.starts_with("HTTP/1.1 405"), "{}", r);
+        assert_eq!(header_of(&r, "Allow"), Some("GET, HEAD"));
+
+        set_visibility("OFF");
+        assert!(get("/web/").starts_with("HTTP/1.1 403"));
+        set_visibility("KNOWN");
+
+        // Without any web root the page explains that the client is not installed.
+        if webclient::find_web_root(None, env::var("HOME").ok().as_deref().map(Path::new)).is_none() {
+            std::env::set_var("OMASEND_WEB_DIR", base.join("missing"));
+            let r = get("/web/");
+            assert!(r.starts_with("HTTP/1.1 200") && r.contains("not installed"), "{}", r);
+        }
+
+        std::env::remove_var("OMASEND_WEB_DIR");
+        let _ = fs::remove_dir_all(&base);
     }
 }
