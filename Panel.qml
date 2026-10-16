@@ -586,7 +586,7 @@ Panel {
     OmaLogo {
       anchors.centerIn: parent
       visible: !root.dropBlasting
-      size: Math.round(Math.min(parent.width, parent.height) * 0.6)
+      size: Math.round(Math.min(parent.width, parent.height) * 0.66)
       color: root.dropActive ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
     }
 
@@ -1643,7 +1643,8 @@ Panel {
   // =========================================================================
   // COMPONENTS
   // =========================================================================
-  // The OmaSend paper-plane mark (same silhouette as the app icon), one color so it follows the bar theme.
+  // OmaSend on Omarchy: the Omarchy mark with the OmaSend paper plane inside (assets/omasend-symbolic.svg).
+  // One color, so it follows the bar theme.
   component OmaLogo: Item {
     id: logo
     property color color: root.foreground
@@ -1654,9 +1655,9 @@ Panel {
     implicitHeight: size
 
     Shape {
-      width: 512
-      height: 512
-      scale: logo.size / 512
+      width: 54
+      height: 54
+      scale: logo.size / 54
       transformOrigin: Item.TopLeft
       preferredRendererType: Shape.CurveRenderer
 
@@ -1664,14 +1665,14 @@ Panel {
         fillColor: logo.color
         strokeColor: "transparent"
         strokeWidth: 0
-        fillRule: ShapePath.OddEvenFill
-        PathSvg { path: "M440 72 L416 238 L314 440 L248 374 L266 344 L226 286 L168 246 L138 264 L72 198 L274 96 Z M440 72 L222 274 L234 286 Z" }
+        PathSvg { path: "M0 1h54v4h-54z M0 5h4v4h-4z M25 5h4v4h-4z M50 5h4v4h-4z M0 9h4v4h-4z M8 9h21v4h-21z M38 9h8v4h-8z M50 9h4v4h-4z M0 13h4v4h-4z M8 13h4v4h-4z M42 13h4v4h-4z M50 13h4v4h-4z M0 17h4v4h-4z M8 17h4v4h-4z M42 17h4v4h-4z M50 17h4v4h-4z M0 21h4v4h-4z M8 21h4v4h-4z M42 21h4v4h-4z M50 21h4v4h-4z M0 25h12v4h-12z M42 25h4v4h-4z M50 25h4v4h-4z M0 29h4v4h-4z M8 29h4v4h-4z M42 29h4v4h-4z M50 29h4v4h-4z M0 33h4v4h-4z M8 33h4v4h-4z M42 33h4v4h-4z M50 33h4v4h-4z M0 37h4v4h-4z M8 37h4v4h-4z M42 37h4v4h-4z M50 37h4v4h-4z M0 41h4v4h-4z M8 41h38v4h-38z M50 41h4v4h-4z M0 45h4v4h-4z M25 45h4v4h-4z M50 45h4v4h-4z M0 49h29v4h-29z M34 49h20v4h-20z" }
       }
       ShapePath {
         fillColor: logo.color
         strokeColor: "transparent"
         strokeWidth: 0
-        PathSvg { path: "M206 306 L98 372 L140 414 Z" }
+        fillRule: ShapePath.OddEvenFill
+        PathSvg { path: "M39.02 16.18 L37.63 25.8 L31.71 37.52 L27.88 33.69 L28.93 31.95 L26.61 28.59 L23.24 26.27 L21.5 27.31 L17.68 23.48 L29.39 17.57 Z M39.02 16.18 L26.38 27.89 L27.07 28.59 Z M25.45 29.75 L19.18 33.58 L21.62 36.01 Z" }
       }
     }
   }
