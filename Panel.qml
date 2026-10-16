@@ -1643,7 +1643,7 @@ Panel {
   // =========================================================================
   // COMPONENTS
   // =========================================================================
-  // OmaSend on Omarchy: the Omarchy mark with the OmaSend paper plane inside (assets/omasend-symbolic.svg).
+  // OmaSend mark from the brand guide (assets/omasend-symbolic.svg): Omarchy frame with the send arrow on its grid.
   // One color, so it follows the bar theme.
   component OmaLogo: Item {
     id: logo
@@ -1655,9 +1655,9 @@ Panel {
     implicitHeight: size
 
     Shape {
-      width: 54
-      height: 54
-      scale: logo.size / 54
+      width: 300
+      height: 300
+      scale: logo.size / 300
       transformOrigin: Item.TopLeft
       preferredRendererType: Shape.CurveRenderer
 
@@ -1665,14 +1665,7 @@ Panel {
         fillColor: logo.color
         strokeColor: "transparent"
         strokeWidth: 0
-        PathSvg { path: "M0 1h54v4h-54z M0 5h4v4h-4z M25 5h4v4h-4z M50 5h4v4h-4z M0 9h4v4h-4z M8 9h21v4h-21z M38 9h8v4h-8z M50 9h4v4h-4z M0 13h4v4h-4z M8 13h4v4h-4z M42 13h4v4h-4z M50 13h4v4h-4z M0 17h4v4h-4z M8 17h4v4h-4z M42 17h4v4h-4z M50 17h4v4h-4z M0 21h4v4h-4z M8 21h4v4h-4z M42 21h4v4h-4z M50 21h4v4h-4z M0 25h12v4h-12z M42 25h4v4h-4z M50 25h4v4h-4z M0 29h4v4h-4z M8 29h4v4h-4z M42 29h4v4h-4z M50 29h4v4h-4z M0 33h4v4h-4z M8 33h4v4h-4z M42 33h4v4h-4z M50 33h4v4h-4z M0 37h4v4h-4z M8 37h4v4h-4z M42 37h4v4h-4z M50 37h4v4h-4z M0 41h4v4h-4z M8 41h38v4h-38z M50 41h4v4h-4z M0 45h4v4h-4z M25 45h4v4h-4z M50 45h4v4h-4z M0 49h29v4h-29z M34 49h20v4h-20z" }
-      }
-      ShapePath {
-        fillColor: logo.color
-        strokeColor: "transparent"
-        strokeWidth: 0
-        fillRule: ShapePath.OddEvenFill
-        PathSvg { path: "M39.02 16.18 L37.63 25.8 L31.71 37.52 L27.88 33.69 L28.93 31.95 L26.61 28.59 L23.24 26.27 L21.5 27.31 L17.68 23.48 L29.39 17.57 Z M39.02 16.18 L26.38 27.89 L27.07 28.59 Z M25.45 29.75 L19.18 33.58 L21.62 36.01 Z" }
+        PathSvg { path: "M0 0h300v20h-300zM0 20h20v20h-20zM140 20h20v20h-20zM280 20h20v20h-20zM0 40h20v20h-20zM40 40h120v20h-120zM220 40h40v20h-40zM280 40h20v20h-20zM0 60h20v20h-20zM40 60h20v20h-20zM240 60h20v20h-20zM280 60h20v20h-20zM0 80h20v20h-20zM40 80h20v20h-20zM120 80h100v20h-100zM240 80h20v20h-20zM280 80h20v20h-20zM0 100h20v20h-20zM40 100h20v20h-20zM160 100h60v20h-60zM240 100h20v20h-20zM280 100h20v20h-20zM0 120h20v20h-20zM40 120h20v20h-20zM140 120h40v20h-40zM200 120h20v20h-20zM240 120h20v20h-20zM280 120h20v20h-20zM0 140h60v20h-60zM120 140h40v20h-40zM200 140h20v20h-20zM240 140h20v20h-20zM280 140h20v20h-20zM0 160h20v20h-20zM40 160h20v20h-20zM100 160h40v20h-40zM240 160h20v20h-20zM280 160h20v20h-20zM0 180h20v20h-20zM40 180h20v20h-20zM80 180h40v20h-40zM240 180h20v20h-20zM280 180h20v20h-20zM0 200h20v20h-20zM40 200h20v20h-20zM80 200h20v20h-20zM240 200h20v20h-20zM280 200h20v20h-20zM0 220h20v20h-20zM40 220h20v20h-20zM240 220h20v20h-20zM280 220h20v20h-20zM0 240h20v20h-20zM40 240h220v20h-220zM280 240h20v20h-20zM0 260h20v20h-20zM140 260h20v20h-20zM280 260h20v20h-20zM0 280h160v20h-160zM180 280h120v20h-120z" }
       }
     }
   }
