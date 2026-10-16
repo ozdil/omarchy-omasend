@@ -2000,13 +2000,19 @@ pub fn p2p_fetch_image_clipboard_and_apply(sender_ip: &str, hash: &str, _content
     let ip = sender_ip.to_string();
     let h = hash.to_string();
     let my_oma_id = get_or_create_oma_id();
+    // Legacy peers authorize the fetch with the token from the code-verified pairing.
+    let auth_token = load_paired_peers()
+        .into_iter()
+        .find(|p| p.is_active() && p.ip.as_deref() == Some(sender_ip))
+        .and_then(|p| p.auth_token)
+        .unwrap_or_default();
     thread::spawn(move || {
         let addr = resolve_peer_addr(&ip);
         if let Ok(mut stream) = connect_peer_with_timeout(&addr, Duration::from_secs(5)) {
             let pq = format!("/api/p2p/clipboard/image?hash={}", h);
             let http_req = format!(
-                "GET {} HTTP/1.1\r\nHost: {}\r\nX-OmaSend-OmaID: {}\r\n{}Connection: close\r\n\r\n",
-                pq, addr, my_oma_id, v2_auth_lines("GET", &pq, &devicekey::body_tag_json(b""))
+                "GET {} HTTP/1.1\r\nHost: {}\r\nX-OmaSend-OmaID: {}\r\nX-OmaSend-Auth-Token: {}\r\n{}Connection: close\r\n\r\n",
+                pq, addr, my_oma_id, auth_token, v2_auth_lines("GET", &pq, &devicekey::body_tag_json(b""))
             );
             if stream.write_all(http_req.as_bytes()).is_ok() {
                 let max_resp_bytes = (MAX_IMAGE_CLIP_SIZE + 65536) as u64;
@@ -2832,6 +2838,22 @@ fn is_peer_confirmed(oma_id: &str) -> bool {
         return false;
     }
     load_paired_peers().iter().any(|p| p.confirmed && rendezvous::normalize_oma_id(&p.oma_id) == norm)
+}
+
+/// Legacy (OmaID) authorization: a pairing that completed the code-verified handshake, and,
+/// when that pairing stored an auth token, the same token (compared in constant time).
+fn legacy_peer_authorized(oma_id: &str, provided_token: &str) -> bool {
+    let norm = rendezvous::normalize_oma_id(oma_id);
+    if norm.len() != 16 {
+        return false;
+    }
+    load_paired_peers()
+        .into_iter()
+        .find(|p| p.confirmed && rendezvous::normalize_oma_id(&p.oma_id) == norm)
+        .is_some_and(|p| match p.auth_token.as_deref() {
+            Some(expected) if !expected.is_empty() => !provided_token.is_empty() && constant_time_eq_str(expected, provided_token),
+            _ => true,
+        })
 }
 
 fn is_peer_trusted(peer_id: &str) -> bool {
@@ -5570,6 +5592,12 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
     }
 
     if req.method == "GET" && req.path == "/api/p2p/peers" {
+        // The discovered-device list is for the local user only (it is reachable from the
+        // internet when the WAN tunnel is on). The panel and CLI read it via --json (M12).
+        if !local_ctl && !authorized {
+            respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Forbidden\"}", None, None);
+            return;
+        }
         let peers = get_discovered_peers();
         let (vis, remaining) = get_visibility();
         let resp = serde_json::json!({
@@ -6013,6 +6041,25 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         let (vis, _) = get_visibility();
         if vis == "OFF" {
             respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Visibility is Off\"}", None, None);
+            return;
+        }
+        // Staged clipboard images can be screenshots: serve them only to the peers that may
+        // receive the clipboard, with the same rules as POST /api/p2p/clipboard (a paired
+        // device key, or a confirmed legacy pairing with its token), or to the local user (M12).
+        let peer_ok = match v2_verify(&req, &devicekey::body_tag_json(b""), &client_ip.to_canonical().to_string()) {
+            devicekey::AuthResult::Trusted(_) => true,
+            devicekey::AuthResult::Rejected(why) => {
+                let err = serde_json::json!({ "error": format!("Signature rejected: {}", why) });
+                respond(&stream, "401 Unauthorized", "application/json", err.to_string().as_bytes(), None, None);
+                return;
+            }
+            devicekey::AuthResult::Absent => legacy_peer_authorized(
+                req.get_header("x-omasend-omaid").unwrap_or_default(),
+                req.get_header("x-omasend-auth-token").unwrap_or_default(),
+            ),
+        };
+        if !peer_ok && !local_ctl && !authorized {
+            respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Peer is not paired\"}", None, None);
             return;
         }
         let raw_hash = req.get_param("hash").unwrap_or_else(|| {
@@ -8796,6 +8843,9 @@ mod tests {
 
             let (stream, _) = listener.accept().expect("Accept client 3");
             handle_connection(stream, "127.0.0.1", "1234", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+
+            let (stream, _) = listener.accept().expect("Accept client 4");
+            handle_connection(stream, "127.0.0.1", "1234", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
         });
 
         // 1. Post image clipboard
@@ -8835,11 +8885,19 @@ mod tests {
         client1.read_to_string(&mut resp1).unwrap();
         assert!(resp1.starts_with("HTTP/1.1 200 OK"), "POST /api/p2p/clipboard must return 200 OK: {}", resp1);
 
-        // 2. Fetch image via /api/p2p/clipboard/image/<hash>
+        // 2a. Fetching without pairing credentials is refused (M12).
+        let mut client_anon = TcpStream::connect(local_addr).expect("Connect anonymous client");
+        let req_anon = format!("GET /api/p2p/clipboard/image?hash={} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", img_hash, local_addr);
+        client_anon.write_all(req_anon.as_bytes()).unwrap();
+        let mut resp_anon = String::new();
+        client_anon.read_to_string(&mut resp_anon).unwrap();
+        assert!(resp_anon.starts_with("HTTP/1.1 403"), "Unauthenticated image fetch must be refused: {}", resp_anon);
+
+        // 2b. Fetch image via /api/p2p/clipboard/image/<hash> as the paired legacy peer
         let mut client2 = TcpStream::connect(local_addr).expect("Connect client 2");
         let req2 = format!(
-            "GET /api/p2p/clipboard/image/{} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-            img_hash, local_addr
+            "GET /api/p2p/clipboard/image/{} HTTP/1.1\r\nHost: {}\r\nX-OmaSend-OmaID: {}\r\nX-OmaSend-Auth-Token: {}\r\nConnection: close\r\n\r\n",
+            img_hash, local_addr, valid_peer_oma_id, auth_token
         );
         client2.write_all(req2.as_bytes()).unwrap();
         let mut resp2 = Vec::new();
@@ -9708,5 +9766,16 @@ mod tests {
         save_pending_transfer(&old);
         assert!(claim_pending_slot(&test_pending("new", "PENDING", 30, None), false), "expired record frees the slot");
         clear_pending_transfer();
+    }
+
+    /// M12: the discovered-peer list is local-only.
+    #[test]
+    fn test_peers_endpoint_requires_local_token() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        reset_pin_rate_limiter();
+        let r = get_once("/api/p2p/peers", "");
+        assert!(r.starts_with("HTTP/1.1 403"), "{}", r);
+        let r = get_once("/api/p2p/peers", &format!("X-OmaSend-Local: {}\r\n", ensure_local_api_token()));
+        assert!(r.starts_with("HTTP/1.1 200") && r.contains("\"peers\""), "{}", r);
     }
 }
