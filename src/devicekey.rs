@@ -33,7 +33,10 @@ pub const PAIR_DOMAIN: &str = "omasend-pair-v2";
 pub const SIG_DOMAIN: &str = "omasend-v2";
 pub const MAX_CLOCK_SKEW_SECS: u64 = 300;
 pub const PAIR_OFFER_TTL_SECS: u64 = 300;
-pub const MAX_PAIR_FAILURES: u32 = 5;
+/// Backstop only: failed attempts (from any address) after which every open offer is burned.
+/// The daemon limits failures per source address first (5/min), so one LAN host can no longer
+/// invalidate the user's QR code with a handful of bogus requests (M17).
+pub const MAX_PAIR_FAILURES: u32 = 50;
 
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
@@ -458,7 +461,7 @@ pub fn accept_pair_request(
             .unwrap_or(false)
     });
     let Some(idx) = idx else {
-        // Brute-force protection: every failed attempt burns all live offers' budgets.
+        // Backstop: every failed attempt counts against all live offers (see MAX_PAIR_FAILURES).
         for o in offers.iter_mut() {
             o.failures += 1;
         }

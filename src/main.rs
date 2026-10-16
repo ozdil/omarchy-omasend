@@ -4629,10 +4629,22 @@ struct PinAttemptState {
     blocked_until: Option<Instant>,
 }
 
-static PIN_RATE_LIMITER: Mutex<Option<HashMap<IpAddr, PinAttemptState>>> = Mutex::new(None);
+type AttemptLimiter = Mutex<Option<HashMap<IpAddr, PinAttemptState>>>;
+
+static PIN_RATE_LIMITER: AttemptLimiter = Mutex::new(None);
+/// Failed /api/v2/pair attempts per source address (M17).
+static PAIR_RATE_LIMITER: AttemptLimiter = Mutex::new(None);
 
 pub fn is_pin_rate_limited(ip: IpAddr) -> bool {
-    let mut guard = match PIN_RATE_LIMITER.lock() {
+    is_rate_limited(&PIN_RATE_LIMITER, ip)
+}
+
+pub fn record_pin_attempt(ip: IpAddr, success: bool) -> bool {
+    record_attempt(&PIN_RATE_LIMITER, ip, success)
+}
+
+fn is_rate_limited(limiter: &AttemptLimiter, ip: IpAddr) -> bool {
+    let mut guard = match limiter.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -4648,8 +4660,9 @@ pub fn is_pin_rate_limited(ip: IpAddr) -> bool {
     false
 }
 
-pub fn record_pin_attempt(ip: IpAddr, success: bool) -> bool {
-    let mut guard = match PIN_RATE_LIMITER.lock() {
+/// Records an attempt; returns false once `ip` is blocked (5 failures within 60 s -> 60 s).
+fn record_attempt(limiter: &AttemptLimiter, ip: IpAddr, success: bool) -> bool {
+    let mut guard = match limiter.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -4686,12 +4699,14 @@ pub fn record_pin_attempt(ip: IpAddr, success: bool) -> bool {
 
 #[cfg(test)]
 pub fn reset_pin_rate_limiter() {
-    let mut guard = match PIN_RATE_LIMITER.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    if let Some(ref mut map) = *guard {
-        map.clear();
+    for limiter in [&PIN_RATE_LIMITER, &PAIR_RATE_LIMITER] {
+        let mut guard = match limiter.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(ref mut map) = *guard {
+            map.clear();
+        }
     }
 }
 
@@ -5426,6 +5441,16 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
     }
 
     if req.method == "POST" && req.path == "/api/v2/pair" {
+        if get_visibility().0 == "OFF" {
+            respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Recipient AirBridge visibility is turned Off\"}", None, None);
+            return;
+        }
+        // Offer secrets are 256-bit, so guessing is hopeless; the per-address limit only stops
+        // one host from hammering the endpoint. Failures no longer burn everyone's offers (M17).
+        if is_rate_limited(&PAIR_RATE_LIMITER, rl_ip) {
+            respond(&stream, "429 Too Many Requests", "application/json", b"{\"error\":\"Too many pairing attempts\"}", None, Some(&[("Retry-After", "60")]));
+            return;
+        }
         if content_length > MAX_CONTROL_BODY {
             respond(&stream, "413 Payload Too Large", "application/json", b"{\"error\":\"Request payload exceeds limit\"}", None, None);
             return;
@@ -5442,10 +5467,12 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                 return;
             }
         };
-        let peer_ip = client_ip.to_canonical().to_string();
+        // Through the WAN tunnel the source is loopback, which is not the peer's address (M14).
+        let peer_ip = if client_ip.to_canonical().is_loopback() { String::new() } else { client_ip.to_canonical().to_string() };
         let my_quic = CORE_NODE.get().map(|n| n.bound_port()).unwrap_or(CORE_QUIC_PORT);
         match devicekey::accept_pair_request(device_identity(), &get_state_dir(), &get_system_hostname(), &val, &peer_ip, my_quic) {
             Ok((resp, key)) => {
+                record_attempt(&PAIR_RATE_LIMITER, rl_ip, true);
                 let label = format!("{} ({})", key.name, key.device_id);
                 let own = key.own_device;
                 if trust_store().upsert(key).is_err() {
@@ -5459,6 +5486,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                 respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
             }
             Err(e) => {
+                record_attempt(&PAIR_RATE_LIMITER, rl_ip, false);
                 let err = serde_json::json!({ "error": e });
                 respond(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
             }
@@ -9876,5 +9904,40 @@ mod tests {
             assert_eq!(fs::read(&saved).unwrap(), data);
             let _ = fs::remove_file(saved);
         }
+    }
+
+    /// M17: failed pairing attempts are limited per address and no longer burn the real offer.
+    #[test]
+    fn test_v2_pair_failures_limited_per_ip_and_offer_survives() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        reset_pin_rate_limiter();
+        set_visibility("ALL");
+        let uri = create_pair_offer_json(false)["uri"].as_str().unwrap().to_string();
+        let offer = devicekey::parse_pair_uri(&uri).unwrap();
+        let attacker = devicekey::DeviceIdentity::from_seed([3u8; 32]);
+        let bogus = serde_json::json!({ "pk": attacker.public_b64(), "name": "x", "mac": "00", "sig": "AA" });
+        let hdr = "Cf-Connecting-Ip: 198.51.100.20\r\n";
+        for _ in 0..5 {
+            let r = post_once("/api/v2/pair", hdr, &bogus);
+            assert!(r.starts_with("HTTP/1.1 403"), "{}", r);
+        }
+        let r = post_once("/api/v2/pair", hdr, &bogus);
+        assert!(r.starts_with("HTTP/1.1 429"), "same address is now limited: {}", r);
+
+        // The genuine initiator (another address) still pairs with the same QR code.
+        let phone = devicekey::DeviceIdentity::from_seed([4u8; 32]);
+        let body = devicekey::build_pair_request(&phone, &offer, "Phone", 53318);
+        let r = post_once("/api/v2/pair", "Cf-Connecting-Ip: 198.51.100.21\r\n", &body);
+        assert!(r.starts_with("HTTP/1.1 200"), "{}", r);
+        let stored = trust_store().get(&phone.public_b64()).expect("paired");
+        assert!(!stored.own_device);
+        assert!(stored.ip.is_empty(), "a tunnel (loopback) source is not stored as the peer address");
+        trust_store().remove(&stored.pk).unwrap();
+
+        set_visibility("OFF");
+        let r = post_once("/api/v2/pair", "", &bogus);
+        assert!(r.starts_with("HTTP/1.1 403") && r.contains("Off"), "{}", r);
+        set_visibility("ALL");
+        reset_pin_rate_limiter();
     }
 }
