@@ -18,6 +18,7 @@ if [ "${OMASEND_SECURE_ENV:-0}" != "1" ]; then
         XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(/usr/bin/id -u)}" \
         WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-1}" \
         HYPRLAND_INSTANCE_SIGNATURE="${HYPRLAND_INSTANCE_SIGNATURE:-}" \
+        OMASEND_WEB_SRC="${OMASEND_WEB_SRC:-}" \
         OMASEND_SECURE_ENV=1 \
         /bin/bash -p "$0" "$@"
 fi
@@ -121,6 +122,49 @@ EOF
     /usr/bin/chmod 600 "${STATE_DIR}/.tmp_install_manifest.json"
     /usr/bin/mv -f "${STATE_DIR}/.tmp_install_manifest.json" "${STATE_DIR}/install_manifest.json"
 fi
+
+# Browser client (omasend-web): built from a sibling checkout (or $OMASEND_WEB_SRC) and served
+# by the engine at http://<lan-ip>:53317/web/. Optional: skipped when there is no checkout or
+# no npm. Installed atomically: the new build is staged next to the target and renamed in.
+WEB_PARENT="${HOME}/.local/share/omarchy/omasend"
+WEB_DEST="${WEB_PARENT}/web"
+WEB_SRC="${OMASEND_WEB_SRC:-${DIR}/../omasend-web}"
+/usr/bin/mkdir -p "${WEB_PARENT}"
+install_web_client() {
+    local src="$1" stage old
+    if [[ ! -f "${src}/package.json" ]]; then
+        return 0
+    fi
+    src="$(/usr/bin/realpath "${src}")"
+    if ! command -v npm >/dev/null 2>&1; then
+        echo "Note: npm not found; skipping the browser client build (${src})."
+        return 0
+    fi
+    echo "Building the browser client from ${src}..."
+    if ! (cd "${src}" && npm ci && npm run build); then
+        echo "Warning: browser client build failed; keeping the installed version (if any)." >&2
+        return 0
+    fi
+    if [[ ! -f "${src}/dist/index.html" ]]; then
+        echo "Warning: ${src}/dist/index.html missing after build; not installing the browser client." >&2
+        return 0
+    fi
+    stage="$(/usr/bin/mktemp -d "${WEB_PARENT}/.web-new.XXXXXX")"
+    old="${WEB_PARENT}/.web-old.$$"
+    # -L: copy file contents, so the web root never contains symlinks into the checkout.
+    /usr/bin/cp -RL "${src}/dist/." "${stage}/"
+    /usr/bin/chmod -R u=rwX,go=rX "${stage}"
+    /usr/bin/chmod 755 "${stage}"
+    if [[ -L "${WEB_DEST}" ]]; then
+        /usr/bin/rm -f "${WEB_DEST}"
+    elif [[ -e "${WEB_DEST}" ]]; then
+        /usr/bin/mv -T "${WEB_DEST}" "${old}"
+    fi
+    /usr/bin/mv -T "${stage}" "${WEB_DEST}"
+    /usr/bin/rm -rf "${old}"
+    echo "Browser client installed to ${WEB_DEST} (served at /web/)."
+}
+install_web_client "${WEB_SRC}"
 
 # Terminate any previous instance so new binary is invoked
 /usr/bin/pkill -u "$UID" -f "omasend-engine --serve" >/dev/null 2>&1 || true

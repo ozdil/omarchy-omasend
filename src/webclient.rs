@@ -14,6 +14,8 @@ pub const WEB_PREFIX: &str = "/web";
 pub const MAX_WEB_FILE_BYTES: u64 = 20 * 1024 * 1024;
 /// Installed by build.sh (relative to $HOME).
 pub const USER_WEB_DIR: &str = ".local/share/omarchy/omasend/web";
+/// Parent of USER_WEB_DIR (granted to the Landlock sandbox).
+pub const USER_WEB_PARENT: &str = ".local/share/omarchy/omasend";
 /// Optional system-wide install (packagers).
 pub const SYSTEM_WEB_DIR: &str = "/usr/share/omasend/web";
 

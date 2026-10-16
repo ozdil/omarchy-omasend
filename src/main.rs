@@ -6970,7 +6970,9 @@ fn sandbox_read_paths(home: &Path, exe_dir: Option<&Path>) -> Vec<PathBuf> {
         paths.push(home.join(rel));
     }
     // Browser client web roots (see webclient::web_root); /usr/share is covered by /usr.
-    paths.push(home.join(webclient::USER_WEB_DIR));
+    // The parent of the user web root is granted, not the root itself: build.sh replaces the
+    // web dir by rename, and Landlock rules follow the directory present at startup.
+    paths.push(home.join(webclient::USER_WEB_PARENT));
     if let Some(d) = env::var_os("OMASEND_WEB_DIR").filter(|d| !d.is_empty()) {
         let d = PathBuf::from(d);
         // Never let the variable re-grant $HOME (or a parent of it).
@@ -6996,6 +6998,8 @@ fn run_server() {
     let shared_dir = get_shared_dir();
     let home_dir = env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/tmp"));
     let exe_dir = env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
+    // Must exist before Landlock starts, so a web client installed later is readable.
+    let _ = fs::create_dir_all(home_dir.join(webclient::USER_WEB_PARENT));
     let read_paths = sandbox_read_paths(&home_dir, exe_dir.as_deref());
     let read_refs: Vec<&Path> = read_paths.iter().map(PathBuf::as_path).collect();
     let sandboxed = military::enable_landlock_sandbox(
@@ -8507,6 +8511,7 @@ mod tests {
         assert!(paths
             .iter()
             .any(|p| p == Path::new("/home/alice/.local/share/omarchy/plugins/ozdil.omasend")));
+        assert!(paths.iter().any(|p| p == Path::new("/home/alice/.local/share/omarchy/omasend")), "web client root parent");
 
         // A binary sitting in $HOME (or above it) must not re-grant the whole home dir.
         for exe_dir in ["/home/alice", "/home", "/"] {
