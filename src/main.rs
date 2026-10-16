@@ -9426,10 +9426,12 @@ mod tests {
     fn raw_http(addr: std::net::SocketAddr, head: &str, body: &[u8]) -> String {
         let mut c = TcpStream::connect(addr).expect("Connect test client");
         c.write_all(head.as_bytes()).unwrap();
-        c.write_all(body).unwrap();
-        let mut resp = String::new();
-        c.read_to_string(&mut resp).unwrap();
-        resp
+        // The server may answer (e.g. 401) and close before reading the body; a reset while
+        // writing or reading the rest is expected then, the status line is what matters.
+        let _ = c.write_all(body);
+        let mut resp = Vec::new();
+        let _ = c.read_to_end(&mut resp);
+        String::from_utf8_lossy(&resp).to_string()
     }
 
     #[test]
@@ -9772,12 +9774,15 @@ mod tests {
         let r = get_once("/api/status", "");
         assert!(r.starts_with("HTTP/1.1 200"), "plain loopback keeps working: {}", r);
 
-        for _ in 0..6 {
-            let _ = get_once("/api/status?pin=0000", "");
-        }
+        // Wrong PINs sent together with the local token are not counted, so they never lock out
+        // loopback. (Asserting this without locking out 127.0.0.1 keeps parallel tests safe.)
         let local = format!("X-OmaSend-Local: {}\r\n", ensure_local_api_token());
-        let r = get_once("/api/status", &local);
-        assert!(r.starts_with("HTTP/1.1 200"), "local token must bypass the PIN lockout: {}", r);
+        for _ in 0..6 {
+            let r = get_once("/api/status?pin=0000", &local);
+            assert!(r.starts_with("HTTP/1.1 200"), "{}", r);
+        }
+        let r = get_once("/api/status", "");
+        assert!(r.starts_with("HTTP/1.1 200"), "loopback must not be locked out: {}", r);
         reset_pin_rate_limiter();
     }
 
