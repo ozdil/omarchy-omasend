@@ -2733,7 +2733,10 @@ fn v2_verify(req: &HttpRequest, body_tag: &str, client_ip: &str) -> devicekey::A
     match devicekey::verify_request(&store, &h, &req.method, &pq, body_tag) {
         devicekey::AuthResult::Rejected("Unknown device key") => devicekey::AuthResult::Absent,
         devicekey::AuthResult::Trusted(k) => {
-            store.touch(&k.pk, client_ip);
+            // A loopback source is the WAN tunnel (or this machine), not the peer's LAN address:
+            // storing it would make later QUIC sends dial ourselves (M14).
+            let is_loopback = client_ip.parse::<IpAddr>().is_ok_and(|ip| ip.to_canonical().is_loopback());
+            store.touch(&k.pk, if is_loopback { "" } else { client_ip });
             devicekey::AuthResult::Trusted(k)
         }
         other => other,
