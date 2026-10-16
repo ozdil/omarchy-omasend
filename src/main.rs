@@ -711,6 +711,22 @@ fn is_process_alive(pid: i32) -> bool {
     Path::new(&format!("/proc/{}", pid)).exists()
 }
 
+/// True if `pid` is a live process of the current user whose name (`/proc/<pid>/comm`) is
+/// `name`. Stale pid files can point at a reused pid; never signal anything else (M16).
+fn pid_is(pid: i32, name: &str) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    let owned = fs::metadata(format!("/proc/{}", pid)).is_ok_and(|m| m.uid() == get_current_uid());
+    let comm = fs::read_to_string(format!("/proc/{}/comm", pid)).unwrap_or_default();
+    // comm is truncated to 15 bytes by the kernel.
+    let expected: String = name.chars().take(15).collect();
+    owned && comm.trim_end() == expected
+}
+
+const CLOUDFLARED_COMM: &str = "cloudflared";
+const ENGINE_COMM: &str = "omasend-engine";
+
 fn get_wan_provider() -> Option<String> {
     let provider_file = get_state_dir().join("wan_provider.txt");
     read_secure_file(&provider_file).ok().map(|s| s.trim().to_string())
@@ -746,7 +762,7 @@ fn get_wan_status() -> (bool, bool, Option<String>) {
 
     if let Ok(pid_str) = read_secure_file(&pid_file) {
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            if is_process_alive(pid) {
+            if is_process_alive(pid) && pid_is(pid, CLOUDFLARED_COMM) {
                 // If URL is already recorded, return immediately
                 if let Ok(url) = read_secure_file(&url_file) {
                     let u = url.trim().to_string();
@@ -795,7 +811,9 @@ fn stop_wan_tunnel() {
 
     if let Ok(pid_str) = read_secure_file(&pid_file) {
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            kill_process_group(pid);
+            if pid_is(pid, CLOUDFLARED_COMM) {
+                kill_process_group(pid);
+            }
         }
     }
 
@@ -831,7 +849,9 @@ fn start_wan_tunnel() -> Result<String, String> {
     // Stop any dangling previous process
     if let Ok(pid_str) = read_secure_file(&pid_file) {
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            kill_process_group(pid);
+            if pid_is(pid, CLOUDFLARED_COMM) {
+                kill_process_group(pid);
+            }
         }
     }
 
@@ -6805,7 +6825,7 @@ fn run_server() {
     if let Ok(old_pid_str) = read_secure_file(&pid_file) {
         if let Ok(old_pid) = old_pid_str.trim().parse::<i32>() {
             let my_pid = std::process::id() as i32;
-            if old_pid != my_pid {
+            if old_pid != my_pid && pid_is(old_pid, ENGINE_COMM) {
                 kill_process_group(old_pid);
                 thread::sleep(Duration::from_millis(60));
             }
@@ -9995,5 +10015,16 @@ mod tests {
         }
         assert!(get_discovered_peers().len() <= MAX_DISCOVERED_PEERS);
         save_discovered_peers(&[]);
+    }
+
+    /// M16: a stale pid file must not make us signal an unrelated process.
+    #[test]
+    fn test_pid_is_checks_process_name() {
+        let me = std::process::id() as i32;
+        let my_comm = fs::read_to_string(format!("/proc/{}/comm", me)).unwrap();
+        assert!(pid_is(me, my_comm.trim_end()));
+        assert!(!pid_is(me, CLOUDFLARED_COMM));
+        assert!(!pid_is(1, "systemd"));
+        assert!(!pid_is(i32::MAX, ENGINE_COMM));
     }
 }
