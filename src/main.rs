@@ -6494,79 +6494,59 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         };
 
         let ddir = get_download_dir();
-        let mut saved_name = format!("transfer_{}.bin", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs());
         let mut success = false;
+        let content_type = req.get_header("content-type").map(str::to_string);
 
-        match body {
-            HttpBody::Memory(bytes) => {
-                let body_str = String::from_utf8_lossy(&bytes);
-                if let Some(pos) = body_str.find("filename=\"") {
-                    if let Some(end) = body_str[pos + 10..].find('"') {
-                        saved_name = sanitize_filename(&body_str[pos + 10..pos + 10 + end]);
-                    }
-                }
-                let data_start = bytes.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(0);
-                let data_slice = if data_start < bytes.len() { &bytes[data_start..] } else { &bytes[..] };
-
-                if let Some(avail) = get_available_disk_space(&ddir) {
-                    if (data_slice.len() as u64).saturating_add(10 * 1024 * 1024) > avail {
-                        respond(&stream, "507 Insufficient Storage", "text/plain", b"Insufficient disk space to save file", None, None);
-                        return;
-                    }
-                }
-
-                let file_path = get_unique_filepath(&ddir, &saved_name);
-                if write_secure_bytes(&file_path, data_slice).is_ok() {
-                    let final_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                    record_notified_file(&final_name);
-                    success = true;
-                    RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
-                    notify_desktop(
-                        "OmaSend: File Received",
-                        &format!("'{}' saved to Downloads/omasend.", final_name),
-                    );
-                }
+        // Single-file multipart/form-data body (the portal's FormData upload). Only the file
+        // part's bytes are saved: not the part headers, not the closing boundary (M7).
+        let located = match body {
+            HttpBody::Memory(ref bytes) => {
+                locate_multipart_file(&mut std::io::Cursor::new(bytes.as_slice()), bytes.len() as u64, content_type.as_deref())
+                    .map(|loc| (loc, None))
             }
-            HttpBody::Staged(staged) => {
-                if let Ok(mut sf) = File::open(&staged.path) {
-                    let mut head_buf = [0u8; 4096];
-                    let n = sf.read(&mut head_buf).unwrap_or(0);
-                    let head_str = String::from_utf8_lossy(&head_buf[..n]);
-                    if let Some(pos) = head_str.find("filename=\"") {
-                        if let Some(end) = head_str[pos + 10..].find('"') {
-                            saved_name = sanitize_filename(&head_str[pos + 10..pos + 10 + end]);
-                        }
-                    }
-                    let dstart = head_buf[..n].windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(0) as u64;
-                    let dlen = staged.size.saturating_sub(dstart);
-
-                    let file_path = get_unique_filepath(&ddir, &saved_name);
-                    if let Ok(mut src) = File::open(&staged.path) {
-                        if src.seek(SeekFrom::Start(dstart)).is_ok() {
-                            let mut opts = OpenOptions::new();
-                            opts.write(true).create_new(true);
-                            #[cfg(unix)]
-                            {
-                                opts.mode(0o600);
-                            }
-                            if let Ok(mut dest) = opts.open(&file_path) {
-                                let mut take = src.take(dlen);
-                                if std::io::copy(&mut take, &mut dest).is_ok() {
-                                    let final_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                                    record_notified_file(&final_name);
-                                    success = true;
-                                    RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
-                                    notify_desktop(
-                                        "OmaSend: File Received",
-                                        &format!("'{}' saved to Downloads/omasend.", final_name),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
+            HttpBody::Staged(ref staged) => File::open(&staged.path)
+                .ok()
+                .and_then(|mut f| locate_multipart_file(&mut f, staged.size, content_type.as_deref()).map(|loc| (loc, Some(staged.path.clone())))),
+        };
+        let Some(((dstart, dend, raw_name), staged_path)) = located else {
+            respond(&stream, "400 Bad Request", "text/plain", b"Expected a multipart/form-data file upload", None, None);
+            return;
+        };
+        let saved_name = if raw_name.is_empty() {
+            format!("transfer_{}.bin", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
+        } else {
+            sanitize_filename(&raw_name)
+        };
+        let dlen = dend - dstart;
+        if let Some(avail) = get_available_disk_space(&ddir) {
+            if dlen.saturating_add(10 * 1024 * 1024) > avail {
+                respond(&stream, "507 Insufficient Storage", "text/plain", b"Insufficient disk space to save file", None, None);
+                return;
             }
         }
+
+        let file_path = get_unique_filepath(&ddir, &saved_name);
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true).mode(0o600);
+        let copied = opts.open(&file_path).ok().and_then(|mut dest| match (&body, staged_path) {
+            (HttpBody::Memory(bytes), _) => dest.write_all(&bytes[dstart as usize..dend as usize]).ok(),
+            (_, Some(path)) => {
+                let mut src = File::open(path).ok()?;
+                src.seek(SeekFrom::Start(dstart)).ok()?;
+                std::io::copy(&mut src.take(dlen), &mut dest).ok().filter(|n| *n == dlen).map(|_| ())
+            }
+            _ => None,
+        });
+        if copied.is_some() {
+            let final_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            record_notified_file(&final_name);
+            success = true;
+            RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
+            notify_desktop("OmaSend: File Received", &format!("'{}' saved to Downloads/omasend.", final_name));
+        } else {
+            let _ = fs::remove_file(&file_path);
+        }
+        drop(body);
 
         if success {
             let resp = "{\"status\":\"OK\"}";
@@ -6577,6 +6557,75 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
     } else {
         respond(&stream, "404 Not Found", "text/plain", b"Not Found", None, None);
     }
+}
+
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+fn rfind_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).rposition(|w| w == needle)
+}
+
+/// Locates the first file part of a multipart/form-data body of `total` bytes. Returns the
+/// byte range of the file data (part headers and the closing `\r\n--boundary--` excluded) and
+/// the part's filename (may be empty). The boundary comes from the Content-Type header, or,
+/// if that is missing, from the body's first line.
+fn locate_multipart_file<R: Read + Seek>(r: &mut R, total: u64, content_type: Option<&str>) -> Option<(u64, u64, String)> {
+    let mut head = vec![0u8; total.min(16 * 1024) as usize];
+    r.seek(SeekFrom::Start(0)).ok()?;
+    r.read_exact(&mut head).ok()?;
+
+    let from_header = content_type.and_then(|ct| {
+        ct.split(';')
+            .map(str::trim)
+            .find_map(|p| p.strip_prefix("boundary="))
+            .map(|b| b.trim_matches('"').to_string())
+    });
+    let boundary = match from_header.filter(|b| !b.is_empty() && b.len() <= 200) {
+        Some(b) => b,
+        None => {
+            let line_end = find_bytes(&head, b"\r\n")?;
+            let first = std::str::from_utf8(&head[..line_end]).ok()?;
+            first.strip_prefix("--").filter(|b| !b.is_empty() && b.len() <= 200)?.to_string()
+        }
+    };
+    let delim = format!("--{}", boundary);
+
+    let first = find_bytes(&head, delim.as_bytes())?;
+    let hdr_start = first + delim.len() + 2; // delimiter line ends with CRLF
+    if hdr_start > head.len() {
+        return None;
+    }
+    let hdr_end = hdr_start + find_bytes(&head[hdr_start..], b"\r\n\r\n")?;
+    let part_headers = String::from_utf8_lossy(&head[hdr_start..hdr_end]);
+    let filename = part_headers
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("content-disposition:"))
+        .and_then(|l| {
+            let lower = l.to_ascii_lowercase();
+            let pos = lower.find("filename=\"")? + "filename=\"".len();
+            let rest = &l[pos..];
+            rest.find('"').map(|end| rest[..end].to_string())
+        })
+        .unwrap_or_default();
+    let data_start = (hdr_end + 4) as u64;
+
+    // The file data ends right before the last "\r\n--boundary" (the closing delimiter).
+    let closing = format!("\r\n{}", delim);
+    let tail_len = total.min(4096 + closing.len() as u64);
+    let tail_off = total - tail_len;
+    let mut tail = vec![0u8; tail_len as usize];
+    r.seek(SeekFrom::Start(tail_off)).ok()?;
+    r.read_exact(&mut tail).ok()?;
+    let data_end = tail_off + rfind_bytes(&tail, closing.as_bytes())? as u64;
+    (data_end >= data_start).then_some((data_start, data_end, filename))
 }
 
 fn urlencoding_decode(input: &str) -> String {
@@ -9706,6 +9755,67 @@ mod tests {
         assert!(inspect_pair_uri(&mk("fe80::1")).is_ok());
         for bad in ["8.8.8.8", "127.0.0.1", "203.0.113.5", "example.com"] {
             assert!(inspect_pair_uri(&mk(bad)).is_err(), "{} must be refused", bad);
+        }
+    }
+
+    fn multipart_body(boundary: &str, filename: &str, data: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(format!("--{}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\nContent-Type: application/octet-stream\r\n\r\n", boundary, filename).as_bytes());
+        b.extend_from_slice(data);
+        b.extend_from_slice(format!("\r\n--{}--\r\n", boundary).as_bytes());
+        b
+    }
+
+    /// M7: only the file bytes are saved, not the closing boundary.
+    #[test]
+    fn test_locate_multipart_file_strips_closing_boundary() {
+        let boundary = "----WebKitFormBoundaryAbC123";
+        // Data that itself contains CRLFs and a boundary-like line must survive intact.
+        let data = b"line1\r\n--not-the-boundary\r\n\r\nend\r\n".to_vec();
+        let body = multipart_body(boundary, "résumé.txt", &data);
+        let ct = format!("multipart/form-data; boundary={}", boundary);
+        let (start, end, name) = locate_multipart_file(&mut std::io::Cursor::new(&body), body.len() as u64, Some(&ct)).unwrap();
+        assert_eq!(&body[start as usize..end as usize], data.as_slice());
+        assert_eq!(name, "résumé.txt");
+        // Without a Content-Type header the boundary is taken from the first line.
+        let (s2, e2, _) = locate_multipart_file(&mut std::io::Cursor::new(&body), body.len() as u64, None).unwrap();
+        assert_eq!((s2, e2), (start, end));
+        // Empty file.
+        let empty = multipart_body(boundary, "e.bin", b"");
+        let (s3, e3, _) = locate_multipart_file(&mut std::io::Cursor::new(&empty), empty.len() as u64, Some(&ct)).unwrap();
+        assert_eq!(s3, e3);
+        // Not multipart.
+        assert!(locate_multipart_file(&mut std::io::Cursor::new(b"hello"), 5, None).is_none());
+    }
+
+    #[test]
+    fn test_portal_upload_saves_exact_file_bytes() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        reset_pin_rate_limiter();
+        // In-memory body, and one above IN_MEMORY_BODY_LIMIT that is staged to disk.
+        for size in [5000u32, 1_600_000] {
+            let boundary = "xYzBoundary42";
+            let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let name = format!("m7_upload_{}_{}.bin", std::process::id(), size);
+            let body = multipart_body(boundary, &name, &data);
+
+            let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
+            let addr = listener.local_addr().unwrap();
+            let server = serve_one(listener);
+            let mut c = TcpStream::connect(addr).unwrap();
+            let head = format!(
+                "POST /upload?pin=1234 HTTP/1.1\r\nHost: {}\r\nContent-Type: multipart/form-data; boundary={}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                addr, boundary, body.len()
+            );
+            c.write_all(head.as_bytes()).unwrap();
+            c.write_all(&body).unwrap();
+            let mut resp = String::new();
+            c.read_to_string(&mut resp).unwrap();
+            server.join().unwrap();
+            assert!(resp.starts_with("HTTP/1.1 200"), "{}", resp);
+            let saved = get_download_dir().join(&name);
+            assert_eq!(fs::read(&saved).unwrap(), data);
+            let _ = fs::remove_file(saved);
         }
     }
 }
