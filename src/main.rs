@@ -1106,7 +1106,37 @@ fn get_desktop_gui_envs() -> Vec<(&'static str, String)> {
     envs
 }
 
+/// Escapes text for HTML (and Pango/notification body markup): `& < > " '`.
+fn html_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Notification bodies contain names chosen by remote devices. Notification daemons (mako,
+/// dunst) interpret body markup, so escape it, and never let the text start with '-' where a
+/// helper could read it as an option.
+fn notification_text(text: &str) -> String {
+    let escaped = text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    if escaped.starts_with('-') {
+        format!("\u{2060}{}", escaped)
+    } else {
+        escaped
+    }
+}
+
 fn notify_desktop(title: &str, body: &str) {
+    let title = &notification_text(title);
+    let body = &notification_text(body);
     let env_store = get_desktop_gui_envs();
     let envs: Vec<(&str, &str)> = env_store.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let deadline = Instant::now() + Duration::from_millis(1500);
@@ -4967,12 +4997,17 @@ fn render_web_app(active_endpoint: &str, shared_files: &[FileInfo]) -> String {
         files_html.push_str("<div class='empty'>No files shared from PC.<br><small style='color:#6e7681;'>Add files to ~/Downloads/omasend/shared.</small></div>");
     } else {
         for f in shared_files {
+            // File names are arbitrary: escape them, and pass the name to JS through a data
+            // attribute instead of splicing it into a JS string literal.
+            let name = html_escape(&f.name);
             files_html.push_str(&format!(
                 r#"<div class="file-item">
 <div class="file-info"><div class="file-name">{}</div><div class="file-size">{}</div></div>
-<button onclick="downloadFile('{}')" class="btn-sm">Download</button>
+<button data-name="{}" onclick="downloadFile(this.dataset.name)" class="btn-sm">Download</button>
 </div>"#,
-                f.name, f.size_str, f.name
+                name,
+                html_escape(&f.size_str),
+                name
             ));
         }
     }
@@ -6806,7 +6841,7 @@ fn run_server() {
     let exe_dir = env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
     let read_paths = sandbox_read_paths(&home_dir, exe_dir.as_deref());
     let read_refs: Vec<&Path> = read_paths.iter().map(PathBuf::as_path).collect();
-    let _ = military::enable_landlock_sandbox(
+    let sandboxed = military::enable_landlock_sandbox(
         &read_refs,
         &[
             &state_dir,
@@ -6817,6 +6852,11 @@ fn run_server() {
             Path::new("/run"),
         ],
     );
+    if sandboxed {
+        println!("Landlock sandbox enabled");
+    } else {
+        eprintln!("Landlock sandbox NOT enabled (kernel without Landlock, or setup failed); running unsandboxed");
+    }
 
     ensure_local_api_token();
     start_core_node();
@@ -10026,5 +10066,17 @@ mod tests {
         assert!(!pid_is(me, CLOUDFLARED_COMM));
         assert!(!pid_is(1, "systemd"));
         assert!(!pid_is(i32::MAX, ENGINE_COMM));
+    }
+
+    #[test]
+    fn test_portal_and_notification_escaping() {
+        assert_eq!(html_escape(r#"a<b>&"c'.txt"#), "a&lt;b&gt;&amp;&quot;c&#39;.txt");
+        let files = vec![FileInfo { name: "x');alert(1);('<img>.txt".to_string(), size_str: "1 B".to_string(), size_bytes: 1 }];
+        let html = render_web_app("127.0.0.1", &files);
+        assert!(!html.contains("<img>.txt"));
+        assert!(!html.contains("downloadFile('x')"));
+        assert!(html.contains("data-name=\"x&#39;);alert(1);(&#39;&lt;img&gt;.txt\""));
+        assert_eq!(notification_text("<b>evil</b> & co"), "&lt;b&gt;evil&lt;/b&gt; &amp; co");
+        assert!(notification_text("-u critical").starts_with('\u{2060}'));
     }
 }
