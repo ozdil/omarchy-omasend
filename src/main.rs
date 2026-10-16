@@ -6515,6 +6515,38 @@ fn urlencoding_decode(input: &str) -> String {
 
 // ------------------- SERVER DAEMON -------------------
 
+/// Read-only paths the daemon keeps under Landlock (V2-SEC-07). `$HOME` itself is not
+/// granted: a compromised engine must not read `~/.ssh`, browser profiles or password
+/// stores. Sending files runs in the unsandboxed CLI (`--send`, `--send-picker`), so the
+/// daemon only needs system paths, its own install/asset dirs and helper-tool config.
+/// Missing paths are skipped by `enable_landlock_sandbox`.
+fn sandbox_read_paths(home: &Path, exe_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = ["/usr", "/bin", "/lib", "/lib64", "/etc", "/proc", "/dev", "/run"]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    for rel in [
+        // Bundled sounds and assets (see resolve_omasend_asset_wav).
+        ".config/omarchy/plugins/ozdil.omasend",
+        ".local/share/omarchy/plugins/ozdil.omasend",
+        // cloudflared for the WAN tunnel (see get_cloudflared_bin) and its config.
+        ".local/bin",
+        ".cloudflared",
+        // PulseAudio cookie for paplay.
+        ".config/pulse",
+    ] {
+        paths.push(home.join(rel));
+    }
+    if let Some(dir) = exe_dir {
+        // Dev builds run from the source tree and read ./assets next to the binary.
+        // Skip it if it is $HOME or one of its parents, which would re-grant all of $HOME.
+        if !home.starts_with(dir) {
+            paths.push(dir.to_path_buf());
+        }
+    }
+    paths
+}
+
 fn run_server() {
     // Enforce military-grade defense: anti-forensics memory protection + Landlock LSM
     military::enable_anti_forensics();
@@ -6522,18 +6554,11 @@ fn run_server() {
     let download_dir = get_download_dir();
     let shared_dir = get_shared_dir();
     let home_dir = env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/tmp"));
+    let exe_dir = env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
+    let read_paths = sandbox_read_paths(&home_dir, exe_dir.as_deref());
+    let read_refs: Vec<&Path> = read_paths.iter().map(PathBuf::as_path).collect();
     let _ = military::enable_landlock_sandbox(
-        &[
-            Path::new("/usr"),
-            Path::new("/bin"),
-            Path::new("/lib"),
-            Path::new("/lib64"),
-            Path::new("/etc"),
-            Path::new("/proc"),
-            Path::new("/dev"),
-            Path::new("/run"),
-            &home_dir,
-        ],
+        &read_refs,
         &[
             &state_dir,
             &download_dir,
@@ -7981,6 +8006,24 @@ mod tests {
         assert_eq!(checksums.blake3_hex, expected_b3);
         assert!(!checksums.sha256_hex.is_empty());
         assert!(!checksums.md5_hex.is_empty());
+    }
+
+    #[test]
+    fn test_sandbox_read_paths_exclude_home() {
+        let home = Path::new("/home/alice");
+        let paths = sandbox_read_paths(home, Some(Path::new("/home/alice/Projects/omasend")));
+        assert!(!paths.iter().any(|p| p == home));
+        assert!(!paths.iter().any(|p| p.starts_with("/home/alice/.ssh")));
+        assert!(paths.iter().any(|p| p == Path::new("/home/alice/Projects/omasend")));
+        assert!(paths
+            .iter()
+            .any(|p| p == Path::new("/home/alice/.local/share/omarchy/plugins/ozdil.omasend")));
+
+        // A binary sitting in $HOME (or above it) must not re-grant the whole home dir.
+        for exe_dir in ["/home/alice", "/home", "/"] {
+            let paths = sandbox_read_paths(home, Some(Path::new(exe_dir)));
+            assert!(!paths.iter().any(|p| home.starts_with(p)), "{exe_dir}");
+        }
     }
 
     #[test]
