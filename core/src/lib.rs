@@ -535,10 +535,25 @@ impl OmaNode {
                     .alpns(vec![ALPN.to_vec()])
                     .bind_addr(SocketAddr::from(([0, 0, 0, 0], p)))
             };
-            let endpoint = match make(port).map_err(|e| fail(chain(&e)))?.bind().await {
-                Ok(ep) => ep,
-                // Port busy: fall back to an ephemeral port rather than failing.
-                Err(_) => make(0).map_err(|e| fail(chain(&e)))?.bind().await.map_err(|e| fail(chain(&e)))?,
+            // Paired peers expect the well-known port, so a briefly busy port (a previous
+            // instance still shutting down) is retried for a few seconds before falling back
+            // to an ephemeral one.
+            let mut endpoint = None;
+            if port != 0 {
+                for attempt in 0..16 {
+                    match make(port).map_err(|e| fail(chain(&e)))?.bind().await {
+                        Ok(ep) => {
+                            endpoint = Some(ep);
+                            break;
+                        }
+                        Err(_) if attempt < 15 => tokio::time::sleep(Duration::from_millis(500)).await,
+                        Err(_) => {}
+                    }
+                }
+            }
+            let endpoint = match endpoint {
+                Some(ep) => ep,
+                None => make(0).map_err(|e| fail(chain(&e)))?.bind().await.map_err(|e| fail(chain(&e)))?,
             };
             let router = Router::builder(endpoint.clone()).accept(ALPN, Handler(inner.clone())).spawn();
             Ok::<_, CoreError>((endpoint, router))
