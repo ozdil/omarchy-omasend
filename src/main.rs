@@ -2695,7 +2695,63 @@ fn core_send_via_daemon(key: &devicekey::TrustedKey, paths: &[String], names: &[
                 (core_error_is_unavailable(&m), m)
             });
     }
-    core_daemon_request(serde_json::json!({ "pk": key.pk, "addrs": core_addrs(key), "paths": paths, "names": names }))
+    // The daemon runs under Landlock without read access to $HOME, so it cannot open the
+    // user's files itself (EACCES, "os error 13"). Hand it links or copies in a private
+    // directory it may read, and remove them once the (blocking) send has returned.
+    let stage = stage_outgoing_files(paths).map_err(|e| (false, format!("could not prepare files: {}", e)))?;
+    let staged: Vec<String> = stage.paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+    core_daemon_request(serde_json::json!({ "pk": key.pk, "addrs": core_addrs(key), "paths": staged, "names": names }))
+}
+
+fn outgoing_stage_root() -> PathBuf {
+    get_state_dir().join("outgoing")
+}
+
+/// Files handed to the sandboxed daemon for one send; the directory is removed on drop.
+struct OutgoingStage {
+    dir: PathBuf,
+    paths: Vec<PathBuf>,
+}
+
+impl Drop for OutgoingStage {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn stage_outgoing_files(paths: &[String]) -> std::io::Result<OutgoingStage> {
+    let mut rand_bytes = [0u8; 8];
+    let _ = getrandom::getrandom(&mut rand_bytes);
+    let dir = outgoing_stage_root().join(hex::encode(rand_bytes));
+    fs::create_dir_all(&dir)?;
+    let _ = fs::set_permissions(outgoing_stage_root(), fs::Permissions::from_mode(0o700));
+    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    let mut stage = OutgoingStage { dir, paths: Vec::with_capacity(paths.len()) };
+    for (i, src) in paths.iter().enumerate() {
+        // One subdirectory per file keeps the file name and avoids clashes between equal names.
+        let slot = stage.dir.join(i.to_string());
+        fs::create_dir(&slot)?;
+        let name = Path::new(src).file_name().map(|n| n.to_os_string()).unwrap_or_else(|| "file".into());
+        let dst = slot.join(name);
+        // A hard link is instant and costs no space; across file systems fall back to a copy.
+        if fs::hard_link(src, &dst).is_err() {
+            fs::copy(src, &dst)?;
+        }
+        stage.paths.push(dst);
+    }
+    Ok(stage)
+}
+
+/// Removes staging directories left behind by a CLI that was killed mid-send.
+fn clean_stale_outgoing() {
+    let Ok(entries) = fs::read_dir(outgoing_stage_root()) else { return };
+    let day = Duration::from_secs(24 * 3600);
+    for e in entries.flatten() {
+        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > day);
+        if old {
+            let _ = fs::remove_dir_all(e.path());
+        }
+    }
 }
 
 /// Encrypted clipboard push to a paired key. Never downgraded to plaintext HTTP.
@@ -7146,6 +7202,7 @@ fn run_server() {
     }
 
     ensure_local_api_token();
+    clean_stale_outgoing();
     start_core_node();
 
     let pid_file = state_dir.join("engine.pid");
@@ -8699,6 +8756,28 @@ mod tests {
             let paths = sandbox_read_paths(home, Some(Path::new(exe_dir)));
             assert!(!paths.iter().any(|p| home.starts_with(p)), "{exe_dir}");
         }
+    }
+
+    #[test]
+    fn test_outgoing_stage_links_files_and_cleans_up() {
+        let src_dir = std::env::temp_dir().join(format!("omasend_stage_src_{}", std::process::id()));
+        fs::create_dir_all(&src_dir).unwrap();
+        let a = src_dir.join("photo.jpg");
+        let b = src_dir.join("sub_photo.jpg");
+        fs::write(&a, b"one").unwrap();
+        fs::write(&b, b"two").unwrap();
+        let paths = vec![a.to_string_lossy().to_string(), b.to_string_lossy().to_string()];
+        let dir;
+        {
+            let stage = stage_outgoing_files(&paths).unwrap();
+            dir = stage.dir.clone();
+            assert!(stage.paths[0].starts_with(get_state_dir()));
+            assert_eq!(stage.paths[0].file_name().unwrap(), "photo.jpg");
+            assert_eq!(fs::read(&stage.paths[1]).unwrap(), b"two");
+        }
+        assert!(!dir.exists());
+        assert!(a.exists() && b.exists());
+        let _ = fs::remove_dir_all(&src_dir);
     }
 
     #[test]
