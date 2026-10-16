@@ -400,6 +400,14 @@ var DICT = {
     tr: "Ekrandaki eşleşme kodu bulundu, bağlanılıyor…",
     en: "Pairing code found on screen, connecting…"
   },
+  "pair_scan_confirm": {
+    tr: "Ekranda bulunan cihazla eşleşilsin mi: %1 (%2)? Güven seviyesini seçip onaylayın.",
+    en: "Pair with the device found on screen: %1 (%2)? Choose the trust level and confirm."
+  },
+  "pair_scan_confirm_btn": {
+    tr: "Eşleştir",
+    en: "Pair"
+  },
   "pair_expires": {
     tr: "%1 sn geçerli · tek kullanımlık",
     en: "Valid for %1 s · single use"
