@@ -6,6 +6,7 @@ import Quickshell.Io
 import Quickshell.Wayland
 import qs.Commons
 import qs.Ui
+import "qml"
 
 Panel {
   id: root
@@ -2310,7 +2311,10 @@ Panel {
               anchors.rightMargin: Style.space(10)
               spacing: Style.space(6)
 
-              TextInput {
+              // Bounded TextEdit instead of a native TextInput: Qt reads the clipboard into
+              // every live TextInput on clipboard changes, with no size limit or deadline,
+              // even while this overlay is hidden. Paste goes through a capped wl-paste.
+              BoundedTextInput {
                 id: pairOmaIdInput
                 Layout.fillWidth: true
                 text: root.pairInputOmaId
@@ -2319,9 +2323,11 @@ Panel {
                 font.bold: true
                 font.letterSpacing: 1.0
                 color: root.bar ? root.bar.foreground : Color.foreground
-                selectByMouse: true
                 cursorVisible: activeFocus
-                maximumLength: 19
+                maxLength: 19
+                maxPasteBytes: 64
+                placeholderText: "0000-0000-0000-0000"
+                placeholderTextColor: Qt.rgba(1.0, 1.0, 1.0, 0.25)
 
                 onTextChanged: {
                   var formatted = root.formatInputOmaId(text)
@@ -2332,18 +2338,6 @@ Panel {
                   } else {
                     root.pairInputOmaId = text
                   }
-                }
-
-                Text {
-                  anchors.fill: parent
-                  visible: !pairOmaIdInput.text && !pairOmaIdInput.activeFocus
-                  text: "0000-0000-0000-0000"
-                  color: Qt.rgba(1.0, 1.0, 1.0, 0.25)
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  font.bold: true
-                  font.letterSpacing: 1.0
-                  verticalAlignment: Text.AlignVCenter
                 }
               }
 
@@ -2380,7 +2374,7 @@ Panel {
             border.color: pairNameInput.activeFocus ? Color.accent : Qt.rgba(1.0, 1.0, 1.0, 0.15)
             border.width: 1
 
-            TextInput {
+            BoundedTextInput {
               id: pairNameInput
               anchors.fill: parent
               anchors.leftMargin: Style.space(10)
@@ -2389,20 +2383,13 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               color: root.bar ? root.bar.foreground : Color.foreground
-              selectByMouse: true
               cursorVisible: activeFocus
-              verticalAlignment: Text.AlignVCenter
+              verticalAlignment: TextEdit.AlignVCenter
+              maxLength: 64
+              maxPasteBytes: 256
+              placeholderText: "Örn: Telefon, İş Dizüstü"
+              placeholderTextColor: Qt.rgba(1.0, 1.0, 1.0, 0.25)
               onTextChanged: root.pairInputName = text
-
-              Text {
-                anchors.fill: parent
-                visible: !pairNameInput.text && !pairNameInput.activeFocus
-                text: "Örn: Telefon, İş Dizüstü"
-                color: Qt.rgba(1.0, 1.0, 1.0, 0.25)
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                verticalAlignment: Text.AlignVCenter
-              }
             }
           }
         }

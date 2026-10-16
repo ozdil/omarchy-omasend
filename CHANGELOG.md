@@ -4,6 +4,11 @@ Bu belgede OmaSend masaüstü ve Android uygulamaları için yapılan tüm sür�
 
 ---
 
+## [Unreleased]
+
+### Güvenlik
+- **Eşleştirme formu:** `Panel.qml` içindeki OmaID ve cihaz adı alanları artık yerel `TextInput` değil, sınırlı bir `TextEdit` (`qml/BoundedTextInput.qml`). Qt, pano her değiştiğinde canlı her `TextInput` için panoyu boyut sınırı ve süre sınırı olmadan okuyordu; eşleştirme penceresi gizliyken bile. Bu da yabancı bir pano kaynağının paylaşılan kabuğu kilitlemesine ya da belleğini tüketmesine yol açabiliyordu. Yapıştırma artık 1 sn zaman aşımlı ve bayt sınırlı bir `wl-paste` üzerinden yapılıyor (OmaID 64 bayt, cihaz adı 256 bayt).
+
 ## [1.8.1] - 2026-10-14
 
 ### Full-Stack Denetim Düzeltmeleri (Masaüstü)

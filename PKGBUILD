@@ -7,7 +7,7 @@ arch=('x86_64')
 url="https://github.com/ozdil/omarchy-omasend"
 license=('MIT')
 depends=('glibc' 'gcc-libs')
-optdepends=('wl-clipboard: for Wayland clipboard sync')
+optdepends=('wl-clipboard: for Wayland clipboard sync and pasting into the pairing form')
 makedepends=('cargo' 'rust')
 
 build() {
@@ -23,6 +23,7 @@ package() {
     install -Dm755 "omasend-dashboard" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/omasend-dashboard"
     install -Dm644 "manifest.json" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/manifest.json"
     install -Dm644 "Panel.qml" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/Panel.qml"
+    install -Dm644 "qml/BoundedTextInput.qml" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/qml/BoundedTextInput.qml"
     install -Dm644 "README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
     install -Dm644 "LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 }
