@@ -38,6 +38,8 @@ package() {
         install -Dm644 "${f}" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/${f}"
     done
     install -Dm644 "omasend.desktop" "${pkgdir}/usr/share/applications/omasend.desktop"
+    install -Dm644 "assets/omasend.svg" "${pkgdir}/usr/share/icons/hicolor/scalable/apps/omasend.svg"
+    install -Dm644 "assets/omasend-symbolic.svg" "${pkgdir}/usr/share/icons/hicolor/symbolic/apps/omasend-symbolic.svg"
     install -Dm644 "README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
     install -Dm644 "LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 }

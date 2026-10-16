@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Layouts
 import QtQuick.Controls
+import QtQuick.Shapes
 import Quickshell
 import Quickshell.Io
 import "theme"
@@ -174,11 +175,30 @@ Rectangle {
             Layout.fillWidth: true
             spacing: 12
 
-            Text {
-                text: ""
-                font.family: Theme.iconFont
-                font.pixelSize: 26
-                color: root.serviceOn ? Theme.accent : Theme.textDim
+            // OmaSend paper-plane mark (same paths as assets/omasend-symbolic.svg)
+            Item {
+                implicitWidth: 28
+                implicitHeight: 28
+                Shape {
+                    width: 512
+                    height: 512
+                    scale: 28 / 512
+                    transformOrigin: Item.TopLeft
+                    preferredRendererType: Shape.CurveRenderer
+                    ShapePath {
+                        fillColor: root.serviceOn ? Theme.accent : Theme.textDim
+                        strokeColor: "transparent"
+                        strokeWidth: 0
+                        fillRule: ShapePath.OddEvenFill
+                        PathSvg { path: "M440 72 L416 238 L314 440 L248 374 L266 344 L226 286 L168 246 L138 264 L72 198 L274 96 Z M440 72 L222 274 L234 286 Z" }
+                    }
+                    ShapePath {
+                        fillColor: root.serviceOn ? Theme.accent : Theme.textDim
+                        strokeColor: "transparent"
+                        strokeWidth: 0
+                        PathSvg { path: "M206 306 L98 372 L140 414 Z" }
+                    }
+                }
             }
             ColumnLayout {
                 spacing: 2

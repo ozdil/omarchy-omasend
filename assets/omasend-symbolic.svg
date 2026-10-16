@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- One-color OmaSend mark (the app icon's paper plane), used for the bar and symbolic icon themes. -->
+  <path fill="#bebebe" fill-rule="evenodd" d="M440 72 L416 238 L314 440 L248 374 L266 344 L226 286 L168 246 L138 264 L72 198 L274 96 Z M440 72 L222 274 L234 286 Z"/>
+  <path fill="#bebebe" d="M206 306 L98 372 L140 414 Z"/>
+</svg>
