@@ -2201,11 +2201,9 @@ fn sanitize_filename(raw: &str) -> String {
     if trimmed.is_empty() || trimmed.starts_with('.') || trimmed.contains("..") {
         format!("file_{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
     } else {
-        if trimmed.len() > 180 {
-            trimmed[..180].to_string()
-        } else {
-            trimmed.to_string()
-        }
+        // Truncate by characters, never by bytes: a byte index can land inside a multibyte
+        // character and panic (with panic = "abort" that kills the daemon).
+        trimmed.chars().take(180).collect::<String>().trim_end().to_string()
     }
 }
 
@@ -7319,6 +7317,22 @@ mod tests {
         // Leading dot files must be renamed to safe file_TIMESTAMP
         let hidden = sanitize_filename(".hidden_config");
         assert!(hidden.starts_with("file_"));
+    }
+
+    /// M1: a long name made of multibyte characters must not panic (byte-index truncation
+    /// used to split a character and abort the daemon).
+    #[test]
+    fn test_sanitize_filename_long_multibyte_name() {
+        for unit in ["ğ", "Ж", "日本", "😀", "aç"] {
+            let name = format!("{}.txt", unit.repeat(200));
+            let clean = sanitize_filename(&name);
+            assert!(clean.chars().count() <= 180, "{} chars", clean.chars().count());
+            assert!(!clean.is_empty());
+        }
+        // Offset by one ASCII byte so the 180-byte boundary falls inside a character.
+        let clean = sanitize_filename(&format!("a{}", "ğ".repeat(120)));
+        assert!(clean.starts_with('a') && clean.chars().count() == 120 + 1);
+        assert_eq!(urlencoding_decode("%aç%41"), "%aç%41".replace("%41", "A"));
     }
 
     #[test]

@@ -281,7 +281,8 @@ fn url_decode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+            // Byte-wise: slicing `s` here could split a multibyte character and panic.
+            if let Some(v) = std::str::from_utf8(&bytes[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()) {
                 out.push(v);
                 i += 3;
                 continue;
@@ -551,6 +552,13 @@ mod tests {
 
     /// Cross-language test vector: the Android app must produce identical values (see
     /// app/src/test/.../ProtocolV2VectorTest.kt). Do not change without updating both.
+    #[test]
+    fn test_url_decode_does_not_split_multibyte_chars() {
+        assert_eq!(url_decode("%aç"), "%aç");
+        assert_eq!(url_decode("%ç"), "%ç");
+        assert_eq!(url_decode("a%20b+c"), "a b c");
+    }
+
     #[test]
     fn test_vectors_match_android() {
         let id = DeviceIdentity::from_seed([7u8; 32]);
