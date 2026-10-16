@@ -4714,17 +4714,23 @@ fn extract_provided_pin(req: &HttpRequest) -> Option<String> {
             return Some(h.to_string());
         }
     }
-    if let Some(cookie_val) = req.get_header("cookie") {
-        for c in cookie_val.split(';') {
-            let ct = c.trim();
-            if let Some(val) = ct.strip_prefix("pin=") {
-                if !val.is_empty() {
-                    return Some(val.to_string());
-                }
-            }
-        }
-    }
     None
+}
+
+const WEB_SESSION_COOKIE: &str = "omasend_session";
+
+/// Portal session cookie value: HMAC(session key, PIN). It changes whenever the PIN or the
+/// session key is rotated and does not reveal the PIN.
+fn web_session_value(pin: &str, key_hex: &str) -> String {
+    hex::encode(rendezvous::hmac_sha256(key_hex.as_bytes(), format!("omasend-web-session|{}", pin).as_bytes()))
+}
+
+fn web_session_cookie(req: &HttpRequest) -> Option<&str> {
+    req.get_header("cookie")?
+        .split(';')
+        .filter_map(|c| c.trim().split_once('='))
+        .find(|(k, v)| *k == WEB_SESSION_COOKIE && !v.is_empty())
+        .map(|(_, v)| v)
 }
 
 fn is_trusted_origin(origin: &str, local_ip: &str) -> bool {
@@ -5305,7 +5311,9 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         return;
     }
 
-    if is_pin_rate_limited(client_ip) {
+    // The local CLI/panel is never locked out by someone else's wrong PINs (M5).
+    let rl_ip = rate_limit_ip(&req, client_ip);
+    if !local_ctl && is_pin_rate_limited(rl_ip) {
         let err = b"{\"error\":\"Too many failed PIN attempts. Please wait 60 seconds.\"}";
         respond(
             &stream,
@@ -5318,14 +5326,15 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         return;
     }
 
+    let web_session = web_session_value(pin, key_hex);
     let maybe_pin = extract_provided_pin(&req);
     let authorized = match maybe_pin {
-        Some(ref p) if p == pin => {
-            record_pin_attempt(client_ip, true);
+        Some(ref p) if constant_time_eq_str(p, pin) => {
+            record_pin_attempt(rl_ip, true);
             true
         }
-        Some(_) => {
-            let not_blocked = record_pin_attempt(client_ip, false);
+        Some(_) if !local_ctl => {
+            let not_blocked = record_pin_attempt(rl_ip, false);
             if !not_blocked {
                 let err = b"{\"error\":\"Too many failed PIN attempts. Please wait 60 seconds.\"}";
                 respond(
@@ -5340,7 +5349,8 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             }
             false
         }
-        None => false,
+        Some(_) => false,
+        None => web_session_cookie(&req).is_some_and(|c| constant_time_eq_str(c, &web_session)),
     };
 
     if req.path == "/api/status" {
@@ -6208,7 +6218,8 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         return;
     }
 
-    let set_cookie = Some(format!("pin={}", pin));
+    // The cookie holds a value derived from the PIN and the session key, never the PIN itself.
+    let set_cookie = Some(format!("{}={}", WEB_SESSION_COOKIE, web_session));
 
     if req.method == "GET" && req.path == "/" {
         let shared_files = get_directory_files(&get_shared_dir());
@@ -6702,7 +6713,8 @@ fn run_server() {
             return;
         }
     };
-    println!("OmaSend listening on http://{}:{} [PIN: {}]", local_ip, PORT, pin);
+    // The PIN is not logged: daemon stdout ends up in the journal.
+    println!("OmaSend listening on http://{}:{}", local_ip, PORT);
 
     // Spawn P2P AirBridge discovery threads
     thread::spawn(run_p2p_discovery_listener);
@@ -7602,11 +7614,17 @@ mod tests {
         };
         assert_eq!(extract_provided_pin(&req_header), Some("9988".to_string()));
 
+        // The raw PIN is no longer accepted from (or stored in) a cookie.
         let req_cookie = HttpRequest {
-            headers: vec![("cookie".to_string(), "session=abc; pin=1122; test=1".to_string())],
+            headers: vec![("cookie".to_string(), "session=abc; pin=1122; omasend_session=deadbeef".to_string())],
             ..Default::default()
         };
-        assert_eq!(extract_provided_pin(&req_cookie), Some("1122".to_string()));
+        assert_eq!(extract_provided_pin(&req_cookie), None);
+        assert_eq!(web_session_cookie(&req_cookie), Some("deadbeef"));
+        let v = web_session_value("1122", "k");
+        assert_eq!(v.len(), 64);
+        assert!(!v.contains("1122"));
+        assert_ne!(v, web_session_value("1123", "k"));
 
         let req_empty = HttpRequest::default();
         assert_eq!(extract_provided_pin(&req_empty), None);
@@ -9601,5 +9619,30 @@ mod tests {
         let r = get_once("/api/p2p/decision?token=other", "");
         assert!(r.starts_with("HTTP/1.1 404"), "{}", r);
         clear_pending_transfer();
+    }
+
+    /// M5: WAN clients (all loopback) are rate limited by their real address, and the local
+    /// CLI with the local token is never locked out by them.
+    #[test]
+    fn test_pin_lockout_does_not_block_local_control() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        reset_pin_rate_limiter();
+        for _ in 0..6 {
+            let _ = get_once("/api/status?pin=0000", "Cf-Connecting-Ip: 198.51.100.7\r\n");
+        }
+        let r = get_once("/api/status", "Cf-Connecting-Ip: 198.51.100.7\r\n");
+        assert!(r.starts_with("HTTP/1.1 429"), "attacker bucket must be blocked: {}", r);
+        let r = get_once("/api/status", "Cf-Connecting-Ip: 198.51.100.8\r\n");
+        assert!(r.starts_with("HTTP/1.1 200"), "other WAN clients keep working: {}", r);
+        let r = get_once("/api/status", "");
+        assert!(r.starts_with("HTTP/1.1 200"), "plain loopback keeps working: {}", r);
+
+        for _ in 0..6 {
+            let _ = get_once("/api/status?pin=0000", "");
+        }
+        let local = format!("X-OmaSend-Local: {}\r\n", ensure_local_api_token());
+        let r = get_once("/api/status", &local);
+        assert!(r.starts_with("HTTP/1.1 200"), "local token must bypass the PIN lockout: {}", r);
+        reset_pin_rate_limiter();
     }
 }
