@@ -2661,6 +2661,38 @@ fn ensure_local_api_token() -> String {
     t
 }
 
+/// Headers a reverse proxy (cloudflared for the WAN tunnel) adds. A loopback connection that
+/// carries one of them came from the internet, not from a process on this machine.
+const TUNNEL_HEADERS: &[&str] = &["cf-connecting-ip", "cf-ray", "x-forwarded-for", "x-real-ip", "forwarded", "cdn-loop"];
+
+fn has_tunnel_headers(req: &HttpRequest) -> bool {
+    TUNNEL_HEADERS.iter().any(|h| req.get_header(h).is_some())
+}
+
+fn local_token_matches(req: &HttpRequest) -> bool {
+    req.get_header("x-omasend-local")
+        .is_some_and(|t| constant_time_eq_str(t.trim(), &ensure_local_api_token()))
+}
+
+/// True only for a request from a local process that can read the 0600 local API token (the
+/// CLI and the panel through it). Loopback alone proves nothing: the WAN tunnel connects
+/// from 127.0.0.1.
+fn is_local_control(req: &HttpRequest, client_ip: IpAddr) -> bool {
+    client_ip.to_canonical().is_loopback() && !has_tunnel_headers(req) && local_token_matches(req)
+}
+
+/// The address rate limiters key on. WAN tunnel clients all arrive from loopback, so use the
+/// client address cloudflared reports for them instead of one shared bucket.
+fn rate_limit_ip(req: &HttpRequest, client_ip: IpAddr) -> IpAddr {
+    let ip = client_ip.to_canonical();
+    if ip.is_loopback() {
+        if let Some(real) = req.get_header("cf-connecting-ip").and_then(|v| v.trim().parse::<IpAddr>().ok()) {
+            return real.to_canonical();
+        }
+    }
+    ip
+}
+
 /// Sends files through the daemon's QUIC endpoint. Err((unavailable, message)).
 fn core_send_via_daemon(key: &devicekey::TrustedKey, paths: &[String], names: &[String]) -> Result<(), (bool, String)> {
     if let Some(node) = CORE_NODE.get() {
@@ -2686,27 +2718,34 @@ fn core_clipboard(key: &devicekey::TrustedKey, text: &str) -> Result<(), (bool, 
     core_daemon_request(serde_json::json!({ "pk": key.pk, "addrs": core_addrs(key), "text": text }))
 }
 
-/// CLI -> daemon request on the loopback-only, token-protected core endpoint.
-fn core_daemon_request(body: serde_json::Value) -> Result<(), (bool, String)> {
-    let token = read_secure_file(&local_api_token_path()).map_err(|_| (true, "core not running (no local token)".to_string()))?;
+/// CLI -> daemon request on a loopback-only, token-protected endpoint. Returns the JSON body.
+/// Err means the daemon could not be reached.
+fn local_api_request(path: &str, body: &serde_json::Value, timeout: Option<Duration>) -> Result<serde_json::Value, String> {
+    let token = read_secure_file(&local_api_token_path()).map_err(|_| "daemon not running (no local token)".to_string())?;
     let body = body.to_string();
     let mut stream = connect_peer_with_timeout(&format!("127.0.0.1:{}", PORT), Duration::from_secs(2))
-        .map_err(|e| (true, format!("core not running: {}", e)))?;
-    let _ = stream.set_read_timeout(None);
+        .map_err(|e| format!("daemon not running: {}", e))?;
+    let _ = stream.set_read_timeout(timeout);
     let head = format!(
-        "POST /api/local/core-send HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nX-OmaSend-Local: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nX-OmaSend-Local: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        path,
         token.trim(),
         body.len()
     );
-    stream.write_all(head.as_bytes()).map_err(|e| (true, e.to_string()))?;
-    stream.write_all(body.as_bytes()).map_err(|e| (true, e.to_string()))?;
+    stream.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
+    stream.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
     let mut resp = String::new();
-    (&mut stream).take(64 * 1024).read_to_string(&mut resp).map_err(|e| (true, e.to_string()))?;
-    let json: serde_json::Value = resp
+    (&mut stream).take(64 * 1024).read_to_string(&mut resp).map_err(|e| e.to_string())?;
+    Ok(resp
         .split("\r\n\r\n")
         .nth(1)
         .and_then(|b| serde_json::from_str(b).ok())
-        .unwrap_or_default();
+        .unwrap_or_default())
+}
+
+/// CLI -> daemon request on the loopback-only, token-protected core endpoint.
+fn core_daemon_request(body: serde_json::Value) -> Result<(), (bool, String)> {
+    let json = local_api_request("/api/local/core-send", &body, None).map_err(|e| (true, format!("core not running: {}", e)))?;
     if json["ok"].as_bool() == Some(true) {
         Ok(())
     } else {
@@ -2849,32 +2888,104 @@ fn lock_state_files() -> StateFileGuard<'static> {
     }
 }
 
+/// How long an accepted HTTP transfer may sit idle between uploads before it expires.
+const PENDING_IDLE_SECS: u64 = 600;
+
+fn pending_transfer_path() -> PathBuf {
+    get_state_dir().join("pending_transfer.json")
+}
+
+/// Reads the pending transfer without taking the state lock. `include_expired` also returns
+/// an expired record (so pollers can be told EXPIRED instead of NOT_FOUND).
+fn read_pending_transfer_unlocked(include_expired: bool) -> Option<PendingFileTransfer> {
+    let content = read_secure_file(&pending_transfer_path()).ok()?;
+    let t = serde_json::from_str::<PendingFileTransfer>(&content).ok()?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    (include_expired || now <= t.expires_at).then_some(t)
+}
+
+fn write_pending_transfer_unlocked(t: &PendingFileTransfer) {
+    if let Ok(s) = serde_json::to_string(t) {
+        let _ = write_secure_file(&pending_transfer_path(), &s);
+    }
+}
+
 fn get_pending_transfer() -> Option<PendingFileTransfer> {
     let _guard = lock_state_files();
-    let path = get_state_dir().join("pending_transfer.json");
-    if let Ok(content) = read_secure_file(&path) {
-        if let Ok(t) = serde_json::from_str::<PendingFileTransfer>(&content) {
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-            if now <= t.expires_at {
-                return Some(t);
-            }
-        }
-    }
-    None
+    read_pending_transfer_unlocked(false)
 }
 
 fn save_pending_transfer(t: &PendingFileTransfer) {
     let _guard = lock_state_files();
-    let path = get_state_dir().join("pending_transfer.json");
-    if let Ok(s) = serde_json::to_string(t) {
-        let _ = write_secure_file(&path, &s);
-    }
+    write_pending_transfer_unlocked(t);
 }
 
 fn clear_pending_transfer() {
     let _guard = lock_state_files();
-    let path = get_state_dir().join("pending_transfer.json");
-    let _ = fs::remove_file(path);
+    let _ = fs::remove_file(pending_transfer_path());
+}
+
+/// Runs `f` on the pending transfer (expired ones included) under a single state lock, so a
+/// read-modify-write cannot interleave with another thread or process.
+fn with_pending_transfer<R>(f: impl FnOnce(&mut Option<PendingFileTransfer>) -> R) -> R {
+    let _guard = lock_state_files();
+    let mut cur = read_pending_transfer_unlocked(true);
+    let before = cur.as_ref().and_then(|t| serde_json::to_string(t).ok());
+    let out = f(&mut cur);
+    let after = cur.as_ref().and_then(|t| serde_json::to_string(t).ok());
+    if before != after {
+        match cur {
+            Some(ref t) => write_pending_transfer_unlocked(t),
+            None => {
+                let _ = fs::remove_file(pending_transfer_path());
+            }
+        }
+    }
+    out
+}
+
+/// Applies the local user's accept/reject to the pending transfer. Only a live PENDING request
+/// can be decided. Runs in the daemon: QUIC offers are answered through the core node, HTTP
+/// transfers get a fresh idle window for their uploads.
+fn decide_pending_transfer(token: &str, accept: bool) -> Result<&'static str, String> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let quic = with_pending_transfer(|slot| {
+        let p = slot.as_mut().filter(|p| !token.is_empty() && constant_time_eq_str(&p.token, token));
+        let Some(p) = p else {
+            return Err("Invalid or expired transfer token".to_string());
+        };
+        if now > p.expires_at {
+            return Err("Transfer request expired".to_string());
+        }
+        if p.status != "PENDING" {
+            return Err(format!("Transfer is already {}", p.status.to_lowercase()));
+        }
+        let quic = p.transport.as_deref() == Some("quic");
+        if accept {
+            p.status = "ACCEPTED".to_string();
+            p.expires_at = now.saturating_add(PENDING_IDLE_SECS);
+        } else if quic {
+            *slot = None;
+        } else {
+            // Keep the record briefly so the polling sender sees REJECTED.
+            p.status = "REJECTED".to_string();
+            p.expires_at = p.expires_at.max(now.saturating_add(30));
+        }
+        Ok(quic)
+    })?;
+    if quic {
+        match CORE_NODE.get() {
+            Some(node) => node.respond(token.to_string(), accept),
+            None => return Err("core not running".to_string()),
+        }
+    }
+    if accept {
+        notify_desktop("OmaSend AirBridge", if quic { "Transfer accepted. Receiving files (encrypted)..." } else { "Transfer accepted. Receiving files..." });
+        Ok("ACCEPTED")
+    } else {
+        notify_desktop("OmaSend AirBridge", "Transfer declined.");
+        Ok("REJECTED")
+    }
 }
 
 fn get_discovered_peers_unlocked() -> Vec<DiscoveredPeer> {
@@ -3770,8 +3881,25 @@ fn p2p_send_files_to_peer(target_ip_or_omaid: &str, file_paths: &[PathBuf]) -> R
         save_transfer_progress("send", &pf.name, cumulative_sent, total_size_bytes);
         upload_stream.flush().map_err(|e| format!("Failed to flush upload stream: {}", e))?;
 
-        let mut final_resp = String::new();
-        let _ = (&mut upload_stream).take(64 * 1024).read_to_string(&mut final_resp);
+        let mut final_resp = Vec::new();
+        let _ = (&mut upload_stream).take(64 * 1024).read_to_end(&mut final_resp);
+        let resp_text = String::from_utf8_lossy(&final_resp);
+        let status_ok = resp_text
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .is_some_and(|code| code.starts_with('2'));
+        if !status_ok {
+            let reason = resp_text
+                .split("\r\n\r\n")
+                .nth(1)
+                .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                .and_then(|v| v["error"].as_str().map(String::from))
+                .unwrap_or_else(|| resp_text.lines().next().unwrap_or("no response").to_string());
+            let msg = format!("Upload of '{}' was not accepted by {}: {}", pf.name, target_ip, reason);
+            notify_desktop("OmaSend AirBridge", &msg);
+            return Err(msg);
+        }
     }
 
     println!("Transfer successfully completed to {}!", target_ip);
@@ -5156,6 +5284,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
     let origin = req.get_header("origin");
     let allowed_cors = origin.filter(|&o| is_trusted_origin(o, ip));
+    let local_ctl = is_local_control(&req, client_ip);
 
     let respond = |s: &TcpStream, status: &str, content_type: &str, body: &[u8], cookie: Option<&str>, extra: Option<&[(&str, &str)]>| {
         send_response(s, status, content_type, body, cookie, extra, allowed_cors);
@@ -5256,10 +5385,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
     }
 
     if req.method == "POST" && req.path == "/api/local/core-send" {
-        let token_ok = req
-            .get_header("x-omasend-local")
-            .is_some_and(|t| constant_time_eq_str(t.trim(), &ensure_local_api_token()));
-        if !client_ip.to_canonical().is_loopback() || !token_ok {
+        if !local_ctl {
             respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Forbidden\"}", None, None);
             return;
         }
@@ -5632,8 +5758,9 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         if req.method == "GET" {
             let token = req.get_param("token").unwrap_or_default();
-            if let Some(pending) = get_pending_transfer() {
-                if pending.token == token {
+            // Read expired records too, so a sender learns EXPIRED instead of NOT_FOUND (M10).
+            if let Some(pending) = with_pending_transfer(|p| p.clone()) {
+                if !token.is_empty() && constant_time_eq_str(&pending.token, &token) {
                     if now > pending.expires_at {
                         respond(&stream, "200 OK", "application/json", b"{\"status\":\"EXPIRED\"}", None, None);
                     } else {
@@ -5646,8 +5773,10 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             respond(&stream, "404 Not Found", "application/json", b"{\"status\":\"NOT_FOUND\"}", None, None);
             return;
         } else if req.method == "POST" {
-            // Security Gate: Only local user or authenticated web portal session can approve/reject a transfer
-            if !client_ip.to_canonical().is_loopback() && !authorized {
+            // Only the local user may decide: the CLI/panel with the local API token, or a
+            // PIN-authenticated portal session. Bare loopback is not enough, because the WAN
+            // tunnel delivers internet traffic from 127.0.0.1 (M2).
+            if !local_ctl && !authorized {
                 respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Only local user can approve or reject transfers\"}", None, None);
                 return;
             }
@@ -5661,56 +5790,21 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                 Some(b) => b,
                 None => return,
             };
-
-            let body_slice = match body.as_slice() {
-                Some(s) => s,
-                None => {
-                    respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid payload\"}", None, None);
+            let val: serde_json::Value = body.as_slice().and_then(|b| serde_json::from_slice(b).ok()).unwrap_or_default();
+            let token = val["token"].as_str().unwrap_or_default();
+            let accept = match val["action"].as_str() {
+                Some("accept") => true,
+                Some("reject") => false,
+                _ => {
+                    respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid token or action\"}", None, None);
                     return;
                 }
             };
-            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(body_slice) {
-                let token = val["token"].as_str().unwrap_or_default();
-                let action = val["action"].as_str().unwrap_or_default();
-                if let Some(mut pending) = get_pending_transfer() {
-                    if pending.token == token && pending.transport.as_deref() == Some("quic") && (action == "accept" || action == "reject") {
-                        let accept = action == "accept";
-                        if let Some(node) = CORE_NODE.get() {
-                            node.respond(token.to_string(), accept);
-                        }
-                        if accept {
-                            pending.status = "ACCEPTED".to_string();
-                            pending.expires_at = now.saturating_add(600);
-                            save_pending_transfer(&pending);
-                            notify_desktop("OmaSend AirBridge", "Transfer accepted. Receiving files (encrypted)...");
-                            respond(&stream, "200 OK", "application/json", b"{\"status\":\"ACCEPTED\"}", None, None);
-                        } else {
-                            clear_pending_transfer();
-                            notify_desktop("OmaSend AirBridge", "Transfer declined.");
-                            respond(&stream, "200 OK", "application/json", b"{\"status\":\"REJECTED\"}", None, None);
-                        }
-                        return;
-                    }
-                    if pending.token == token {
-                        if action == "accept" {
-                            pending.status = "ACCEPTED".to_string();
-                            pending.expires_at = now.saturating_add(600); // 10 minutes to complete file transfer
-                            save_pending_transfer(&pending);
-                            add_trusted_peer(&pending.sender_id, &pending.sender_name, "");
-                            notify_desktop("OmaSend AirBridge", "Transfer accepted. Receiving files...");
-                            respond(&stream, "200 OK", "application/json", b"{\"status\":\"ACCEPTED\"}", None, None);
-                            return;
-                        } else if action == "reject" {
-                            pending.status = "REJECTED".to_string();
-                            save_pending_transfer(&pending);
-                            notify_desktop("OmaSend AirBridge", "Transfer declined.");
-                            respond(&stream, "200 OK", "application/json", b"{\"status\":\"REJECTED\"}", None, None);
-                            return;
-                        }
-                    }
-                }
-            }
-            respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid token or action\"}", None, None);
+            let (status, out) = match decide_pending_transfer(token, accept) {
+                Ok(st) => ("200 OK", serde_json::json!({ "ok": true, "status": st })),
+                Err(e) => ("409 Conflict", serde_json::json!({ "ok": false, "error": e })),
+            };
+            respond(&stream, status, "application/json", out.to_string().as_bytes(), None, None);
             return;
         }
     }
@@ -5732,7 +5826,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             return;
         }
 
-        let Some(mut pending) = pending_opt else {
+        let Some(pending) = pending_opt else {
             return;
         };
         let matching_info = pending.files.iter().find(|f| f.name == clean_filename).cloned();
@@ -5767,6 +5861,12 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         }
 
         let upload_secs = (content_length as u64 / (512 * 1024)).clamp(30, MAX_UPLOAD_DURATION_SECS);
+        // Keep the transfer alive while this file streams, plus an idle window for the next one.
+        with_pending_transfer(|slot| {
+            if let Some(p) = slot.as_mut().filter(|p| p.token == token && p.status == "ACCEPTED") {
+                p.expires_at = p.expires_at.max(now.saturating_add(upload_secs).saturating_add(PENDING_IDLE_SECS));
+            }
+        });
         let body_deadline = Instant::now() + Duration::from_secs(upload_secs);
         let body = match read_http_body(&mut stream, content_length, &initial_body, body_deadline, true, MAX_P2P_UPLOAD_SIZE) {
             Some(b) => b,
@@ -5833,17 +5933,24 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         };
         if write_res.is_ok() {
             RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
-            if let Some(pos) = pending.file_names.iter().position(|f| f == &clean_filename) {
-                pending.file_names.remove(pos);
-            }
-            if let Some(pos) = pending.files.iter().position(|f| f.name == clean_filename) {
-                pending.files.remove(pos);
-            }
-            if pending.file_names.is_empty() && pending.files.is_empty() {
-                clear_pending_transfer();
-            } else {
-                save_pending_transfer(&pending);
-            }
+            // Re-read under the lock: the record may have changed while this file streamed.
+            let done_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            with_pending_transfer(|slot| {
+                let Some(p) = slot.as_mut().filter(|p| p.token == pending.token) else {
+                    return;
+                };
+                if let Some(pos) = p.file_names.iter().position(|f| f == &clean_filename) {
+                    p.file_names.remove(pos);
+                }
+                if let Some(pos) = p.files.iter().position(|f| f.name == clean_filename) {
+                    p.files.remove(pos);
+                }
+                if p.file_names.is_empty() && p.files.is_empty() {
+                    *slot = None;
+                } else {
+                    p.expires_at = done_at.saturating_add(PENDING_IDLE_SECS);
+                }
+            });
             let final_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
             record_notified_file(&final_name);
             play_samurai_receive_sound();
@@ -6943,38 +7050,34 @@ fn main() {
         }
     }
 
-    if let Some(pos) = args.iter().position(|a| a == "--accept-transfer") {
-        if let Some(token) = args.get(pos + 1) {
-            if let Some(mut pending) = get_pending_transfer() {
-                if pending.token == *token {
-                    pending.status = "ACCEPTED".to_string();
-                    save_pending_transfer(&pending);
-                    let _ = add_paired_peer(&pending.sender_id, &pending.sender_name, Some(&pending.sender_ip));
-                    add_trusted_peer(&pending.sender_id, &pending.sender_name, "");
-                    let snd = play_samurai_receive_sound();
-                    notify_desktop("OmaSend AirBridge", "Transfer accepted. Receiving files...");
-                    println!("Transfer accepted");
-                    finish_sound(snd);
-                    return;
+    // Accept/decline go through the running daemon: it owns the QUIC node that must answer
+    // encrypted offers, and it is the only writer that can safely extend the upload window.
+    for (flag, accept) in [("--accept-transfer", true), ("--reject-transfer", false)] {
+        if let Some(pos) = args.iter().position(|a| a == flag) {
+            let Some(token) = args.get(pos + 1) else {
+                eprintln!("Usage: omasend-engine {} <token>", flag);
+                std::process::exit(2);
+            };
+            let body = serde_json::json!({ "token": token, "action": if accept { "accept" } else { "reject" } });
+            match local_api_request("/api/p2p/decision", &body, Some(Duration::from_secs(15))) {
+                Ok(v) if v["ok"].as_bool() == Some(true) => {
+                    if accept {
+                        let snd = play_samurai_receive_sound();
+                        println!("Transfer accepted");
+                        finish_sound(snd);
+                    } else {
+                        println!("Transfer declined");
+                    }
+                }
+                Ok(v) => {
+                    eprintln!("{}", v["error"].as_str().unwrap_or("Invalid or expired transfer token"));
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("OmaSend daemon is not reachable: {}", e);
+                    std::process::exit(1);
                 }
             }
-            eprintln!("Invalid or expired transfer token");
-            return;
-        }
-    }
-
-    if let Some(pos) = args.iter().position(|a| a == "--reject-transfer") {
-        if let Some(token) = args.get(pos + 1) {
-            if let Some(mut pending) = get_pending_transfer() {
-                if pending.token == *token {
-                    pending.status = "REJECTED".to_string();
-                    save_pending_transfer(&pending);
-                    notify_desktop("OmaSend AirBridge", "Transfer declined.");
-                    println!("Transfer declined");
-                    return;
-                }
-            }
-            eprintln!("Invalid or expired transfer token");
             return;
         }
     }
@@ -9406,5 +9509,97 @@ mod tests {
         let p: P2pBeaconPacket = serde_json::from_str(old).unwrap();
         assert!(p.pk.is_empty());
         assert!(!serde_json::to_string(&p).unwrap().contains("\"pk\""));
+    }
+
+    fn serve_one(listener: TcpListener) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let (s, _) = listener.accept().expect("Accept");
+            handle_connection(s, "127.0.0.1", "1234", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+        })
+    }
+
+    fn post_once(path: &str, headers: &str, body: &serde_json::Value) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
+        let addr = listener.local_addr().unwrap();
+        let server = serve_one(listener);
+        let r = post_json(addr, path, headers, body);
+        server.join().unwrap();
+        r
+    }
+
+    fn get_once(path: &str, headers: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
+        let addr = listener.local_addr().unwrap();
+        let server = serve_one(listener);
+        let mut c = TcpStream::connect(addr).expect("Connect test client");
+        let req = format!("GET {} HTTP/1.1\r\nHost: {}\r\n{}Connection: close\r\n\r\n", path, addr, headers);
+        c.write_all(req.as_bytes()).unwrap();
+        let mut resp = String::new();
+        let _ = c.read_to_string(&mut resp);
+        server.join().unwrap();
+        resp
+    }
+
+    fn test_pending(token: &str, status: &str, expires_in: u64, sender_pk: Option<&str>) -> PendingFileTransfer {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        PendingFileTransfer {
+            token: token.to_string(),
+            sender_id: "0000-0000-0000-0000".to_string(),
+            sender_name: "Test".to_string(),
+            sender_ip: String::new(),
+            file_names: vec!["a.txt".to_string(), "b.txt".to_string()],
+            files: Vec::new(),
+            remaining_files: 2,
+            total_size_bytes: 2,
+            created_at: now,
+            expires_at: now + expires_in,
+            status: status.to_string(),
+            sender_pk: sender_pk.map(String::from),
+            transport: None,
+        }
+    }
+
+    /// M2: the WAN tunnel connects from loopback, so loopback alone must not approve transfers.
+    #[test]
+    fn test_decision_requires_local_token_not_bare_loopback() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        reset_pin_rate_limiter();
+        save_pending_transfer(&test_pending("tok-m2", "PENDING", 30, None));
+        let body = serde_json::json!({ "token": "tok-m2", "action": "accept" });
+
+        let r = post_once("/api/p2p/decision", "", &body);
+        assert!(r.starts_with("HTTP/1.1 403"), "bare loopback must be refused: {}", r);
+
+        let local = format!("X-OmaSend-Local: {}\r\n", ensure_local_api_token());
+        let tunneled = format!("{}Cf-Connecting-Ip: 203.0.113.9\r\n", local);
+        let r = post_once("/api/p2p/decision", &tunneled, &body);
+        assert!(r.starts_with("HTTP/1.1 403"), "tunnelled request must be refused even with a token: {}", r);
+        assert_eq!(get_pending_transfer().unwrap().status, "PENDING");
+
+        let r = post_once("/api/p2p/decision", &local, &body);
+        assert!(r.starts_with("HTTP/1.1 200") && r.contains("ACCEPTED"), "{}", r);
+        let p = get_pending_transfer().unwrap();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        assert_eq!(p.status, "ACCEPTED");
+        assert!(p.expires_at >= now + PENDING_IDLE_SECS - 5, "accept must extend the upload window");
+
+        // A decided transfer cannot be decided again.
+        let r = post_once("/api/p2p/decision", &local, &serde_json::json!({ "token": "tok-m2", "action": "reject" }));
+        assert!(r.starts_with("HTTP/1.1 409"), "{}", r);
+        clear_pending_transfer();
+    }
+
+    /// M10: an expired request reports EXPIRED, not NOT_FOUND.
+    #[test]
+    fn test_decision_poll_reports_expired() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let mut p = test_pending("tok-exp", "PENDING", 0, None);
+        p.expires_at -= 5;
+        save_pending_transfer(&p);
+        let r = get_once("/api/p2p/decision?token=tok-exp", "");
+        assert!(r.contains("EXPIRED"), "{}", r);
+        let r = get_once("/api/p2p/decision?token=other", "");
+        assert!(r.starts_with("HTTP/1.1 404"), "{}", r);
+        clear_pending_transfer();
     }
 }
