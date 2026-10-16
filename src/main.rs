@@ -1291,7 +1291,7 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
         return Err("Invalid Base64 length".to_string());
     }
     let mut out = Vec::with_capacity(clean.len() / 4 * 3);
-    #[allow(clippy::chunks_exact_to_as_chunks)]
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
     for chunk in clean.chunks_exact(4) {
         let mut buf = [0u8; 4];
         let mut pad_count = 0;
