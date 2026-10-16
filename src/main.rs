@@ -2,6 +2,7 @@ mod subproc;
 pub mod devicekey;
 pub mod military;
 pub mod rendezvous;
+pub mod omalink;
 
 pub use rendezvous::{
     build_github_anchor_payload, compute_rendezvous_topic, create_stun_binding_request,
@@ -3303,6 +3304,113 @@ const MAX_PAIR_RESPONSE_BYTES: u64 = 64 * 1024;
 
 /// Phase 1 initiator: scan/paste an `omasend://pair?...` link shown by the other device.
 /// The responder's key is pinned from the link, so a LAN attacker cannot impersonate it.
+/// POSTs JSON to a peer's v2 HTTP API and returns the 200 body, or the peer's error.
+fn post_json_v2(addr: &str, path: &str, body: &serde_json::Value, timeout: Duration) -> Result<serde_json::Value, String> {
+    let body = body.to_string().into_bytes();
+    let mut stream = connect_peer_with_timeout(addr, timeout)?;
+    let _ = stream.set_read_timeout(Some(timeout));
+    let head = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        path,
+        addr,
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
+    stream.write_all(&body).map_err(|e| e.to_string())?;
+    let mut resp = Vec::new();
+    (&mut stream)
+        .take(MAX_PAIR_RESPONSE_BYTES + 1)
+        .read_to_end(&mut resp)
+        .map_err(|e| format!("Read failed: {}", e))?;
+    if resp.len() as u64 > MAX_PAIR_RESPONSE_BYTES {
+        return Err("Response exceeds size limit".to_string());
+    }
+    let header_end = resp.windows(4).position(|w| w == b"\r\n\r\n").ok_or("Malformed response")?;
+    let status_line = String::from_utf8_lossy(&resp[..header_end]).to_string();
+    let json: serde_json::Value = serde_json::from_slice(&resp[header_end + 4..]).map_err(|_| "Malformed response body".to_string())?;
+    if !status_line.starts_with("HTTP/1.1 200") {
+        return Err(json["error"].as_str().unwrap_or("Rejected by peer").to_string());
+    }
+    Ok(json)
+}
+
+/// Runs one "link with OmaID" exchange against a peer at `addr`.
+fn link_one(addr: &str, account_id: &str) -> Result<devicekey::TrustedKey, String> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let t = Duration::from_secs(4);
+    let ini = omalink::Initiator::new(account_id);
+    let pa_b64 = b64.encode(&ini.pa);
+    let start = post_json_v2(addr, "/api/v2/link/start", &serde_json::json!({ "v": 1, "pA": pa_b64 }), t)?;
+    let pb_b64 = start["pB"].as_str().ok_or("Missing pB")?.to_string();
+    let pb = b64.decode(&pb_b64).map_err(|_| "Invalid pB")?;
+    let c_b = b64.decode(start["cB"].as_str().ok_or("Missing cB")?).map_err(|_| "Invalid cB")?;
+    // Stops here for every device on another account; nothing more is sent.
+    let keys = ini.finish(&pb, &c_b)?;
+    let id = device_identity();
+    let my_quic = CORE_NODE.get().map(|n| n.bound_port()).unwrap_or(CORE_QUIC_PORT);
+    let finish = serde_json::json!({
+        "sid": start["sid"],
+        "cA": b64.encode(keys.c_a),
+        "box": omalink::initiator_box(id, &keys, &pa_b64, &pb_b64, &get_system_hostname(), my_quic),
+    });
+    let reply = post_json_v2(addr, "/api/v2/link/finish", &finish, t)?;
+    let peer = omalink::open_responder_box(&keys, &pa_b64, &pb_b64, &id.public_b64(), reply["box"].as_str().ok_or("Missing box")?)?;
+    let vk = devicekey::decode_pk(&peer.pk).ok_or("Invalid responder key")?;
+    let (host, port) = addr.rsplit_once(':').unwrap_or((addr, "0"));
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let key = devicekey::TrustedKey {
+        pk: peer.pk,
+        device_id: devicekey::device_id_for_pk(vk.as_bytes()),
+        name: peer.name,
+        ip: host.trim_matches(|c| c == '[' || c == ']').to_string(),
+        port: port.parse().unwrap_or(0),
+        quic_port: peer.quic_port,
+        own_device: true,
+        added_at: now,
+        last_seen: now,
+    };
+    trust_store().upsert(key.clone())?;
+    Ok(key)
+}
+
+/// Links this device to every nearby device that holds `account_id`. On any
+/// success the number becomes this device's account OmaID too.
+fn link_with_account_id(account_id: &str) -> Result<Vec<devicekey::TrustedKey>, String> {
+    if !rendezvous::validate_oma_id(account_id) {
+        return Err("Invalid OmaID (16 digits, checksum mismatch)".into());
+    }
+    send_immediate_beacon_broadcast();
+    std::thread::sleep(Duration::from_millis(1500));
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let my_pk = device_identity().public_b64();
+    let known: Vec<String> = trust_store().load().into_iter().map(|k| k.pk).collect();
+    let targets: Vec<String> = get_discovered_peers()
+        .into_iter()
+        .filter(|p| !p.pk.is_empty() && p.pk != my_pk && !known.contains(&p.pk) && now.saturating_sub(p.last_seen_secs) < 120)
+        .filter_map(|p| p.ip.parse::<IpAddr>().ok().map(|ip| std::net::SocketAddr::new(ip, p.port).to_string()))
+        .collect();
+    if targets.is_empty() {
+        return Err("No new OmaSend devices nearby. Open OmaSend on the other device and keep it visible.".into());
+    }
+    let handles: Vec<_> = targets
+        .into_iter()
+        .map(|addr| {
+            let id = account_id.to_string();
+            std::thread::spawn(move || link_one(&addr, &id))
+        })
+        .collect();
+    let linked: Vec<devicekey::TrustedKey> = handles.into_iter().filter_map(|h| h.join().ok().and_then(Result::ok)).collect();
+    if linked.is_empty() {
+        return Err("No nearby device uses this OmaID".into());
+    }
+    omalink::set_account_id(&get_state_dir(), account_id)?;
+    for k in &linked {
+        notify_desktop("OmaSend: Device linked", &format!("{} ({}) is now one of your devices.", k.name, k.device_id));
+    }
+    Ok(linked)
+}
+
 fn p2p_pair_v2(uri: &str) -> Result<devicekey::TrustedKey, String> {
     let offer = devicekey::parse_pair_uri(uri)?;
     let _: IpAddr = offer.host.trim().parse().map_err(|_| "Invalid host in pairing link".to_string())?;
@@ -5297,6 +5405,83 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         return;
     }
 
+    if req.method == "POST" && (req.path == "/api/v2/link/start" || req.path == "/api/v2/link/finish") {
+        // Linking is LAN-only: the WAN tunnel arrives from loopback, and a
+        // hidden device takes no guesses at all.
+        if client_ip.to_canonical().is_loopback() || get_visibility().0 == "OFF" {
+            respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Linking not available\"}", None, None);
+            return;
+        }
+        if content_length > MAX_CONTROL_BODY {
+            respond(&stream, "413 Payload Too Large", "application/json", b"{\"error\":\"Request payload exceeds limit\"}", None, None);
+            return;
+        }
+        let body_deadline = Instant::now() + Duration::from_secs(DEFAULT_BODY_TIMEOUT_SECS);
+        let body = match read_http_body(&mut stream, content_length, &initial_body, body_deadline, false, MAX_CONTROL_BODY) {
+            Some(b) => b,
+            None => return,
+        };
+        let val: serde_json::Value = match body.as_slice().and_then(|b| serde_json::from_slice(b).ok()) {
+            Some(v) => v,
+            None => {
+                respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid JSON\"}", None, None);
+                return;
+            }
+        };
+        let ip = client_ip.to_canonical();
+        let now = Instant::now();
+        if req.path == "/api/v2/link/start" {
+            let account = omalink::get_or_create_account_id(&get_state_dir());
+            let res = match (val["v"].as_u64(), val["pA"].as_str()) {
+                (Some(1), Some(pa)) => omalink::responder().lock().unwrap_or_else(|p| p.into_inner()).start(&account, ip, pa, now),
+                _ => Err(omalink::StartError::Bad("Unsupported link request".into())),
+            };
+            match res {
+                Ok(out) => respond(&stream, "200 OK", "application/json", out.to_string().as_bytes(), None, None),
+                Err(omalink::StartError::RateLimited) => {
+                    respond(&stream, "429 Too Many Requests", "application/json", b"{\"error\":\"Too many link attempts\"}", None, None)
+                }
+                Err(omalink::StartError::Bad(e)) => {
+                    respond(&stream, "400 Bad Request", "application/json", serde_json::json!({ "error": e }).to_string().as_bytes(), None, None)
+                }
+            }
+            return;
+        }
+        let my_quic = CORE_NODE.get().map(|n| n.bound_port()).unwrap_or(CORE_QUIC_PORT);
+        let res = omalink::responder()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .finish(device_identity(), &get_system_hostname(), my_quic, ip, &val, now);
+        match res {
+            Ok((peer, reply)) => {
+                let Some(vk) = devicekey::decode_pk(&peer.pk) else { return };
+                let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                let key = devicekey::TrustedKey {
+                    device_id: devicekey::device_id_for_pk(vk.as_bytes()),
+                    pk: peer.pk,
+                    name: peer.name,
+                    ip: ip.to_string(),
+                    port: 0,
+                    quic_port: peer.quic_port,
+                    own_device: true,
+                    added_at: ts,
+                    last_seen: ts,
+                };
+                let label = format!("{} ({})", key.name, key.device_id);
+                if trust_store().upsert(key).is_err() {
+                    respond(&stream, "500 Internal Server Error", "application/json", b"{\"error\":\"Failed to store device key\"}", None, None);
+                    return;
+                }
+                notify_desktop("OmaSend: Device linked", &format!("{} is now one of your devices.", label));
+                respond(&stream, "200 OK", "application/json", reply.to_string().as_bytes(), None, None);
+            }
+            Err(e) => {
+                respond(&stream, "403 Forbidden", "application/json", serde_json::json!({ "error": e }).to_string().as_bytes(), None, None);
+            }
+        }
+        return;
+    }
+
     if req.method == "POST" && req.path == "/api/v2/pair" {
         if content_length > MAX_CONTROL_BODY {
             respond(&stream, "413 Payload Too Large", "application/json", b"{\"error\":\"Request payload exceeds limit\"}", None, None);
@@ -6653,6 +6838,45 @@ fn main() {
     }
 
     // ---- Phase 1: device keys & QR pairing ----
+    if args.iter().any(|a| a == "--account-id") {
+        let id = omalink::get_or_create_account_id(&get_state_dir());
+        if args.iter().any(|a| a == "--json") {
+            println!("{}", serde_json::json!({ "account_id": id }));
+        } else {
+            println!("{}", id);
+        }
+        return;
+    }
+    if args.iter().any(|a| a == "--new-account-id") {
+        println!("{}", omalink::new_account_id(&get_state_dir()));
+        return;
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--link") {
+        let Some(id) = args.get(pos + 1) else {
+            eprintln!("Usage: --link <OmaID> [--json]");
+            std::process::exit(2);
+        };
+        let res = link_with_account_id(id);
+        if args.iter().any(|a| a == "--json") {
+            let out = match &res {
+                Ok(keys) => serde_json::json!({
+                    "ok": true,
+                    "linked": keys.iter().map(|k| serde_json::json!({ "name": k.name, "device_id": k.device_id })).collect::<Vec<_>>(),
+                }),
+                Err(e) => serde_json::json!({ "ok": false, "error": e }),
+            };
+            println!("{}", out);
+        } else {
+            match &res {
+                Ok(keys) => keys.iter().for_each(|k| println!("Linked {} ({})", k.name, k.device_id)),
+                Err(e) => eprintln!("Link failed: {}", e),
+            }
+        }
+        if res.is_err() {
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--device-id") {
         println!("{}", device_identity().device_id());
         return;
