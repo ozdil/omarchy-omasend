@@ -1,15 +1,14 @@
 # Maintainer: Ozan Özdil <ozan@pm.me>
 pkgname=omarchy-omasend
-pkgver=1.9.1
+pkgver=2.0.0
 pkgrel=1
-pkgdesc="Anonymous Numbered Identity (Zero-Log OmaID), Zero-Click AirBridge, and cross-device sharing plugin for Omarchy Linux"
+pkgdesc="Local file and clipboard sharing between Omarchy and Android: QR pairing, end-to-end encrypted QUIC between paired devices"
 arch=('x86_64')
 url="https://github.com/ozdil/omarchy-omasend"
 license=('MIT')
 depends=('glibc' 'gcc-libs' 'curl' 'jq' 'libnotify')
 optdepends=(
     'wl-clipboard: for Wayland clipboard sync'
-    'qrencode: for QR code generation'
     'zenity: for native file chooser dialog'
     'libwebp: for clipboard image WebP thumbnail compression'
 )
@@ -33,8 +32,11 @@ package() {
     install -Dm644 "qml/MainWindow.qml" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/qml/MainWindow.qml"
     install -Dm644 "qml/shell.qml" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/qml/shell.qml"
     install -Dm644 "qml/theme/Theme.qml" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/qml/theme/Theme.qml"
-    install -Dm644 "assets/receive.wav" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/assets/receive.wav"
-    install -Dm644 "assets/send.wav" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/assets/send.wav"
+    install -Dm644 "qml/theme/qmldir" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/qml/theme/qmldir"
+    ln -s ../OmaI18n.js "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/qml/OmaI18n.js"
+    for f in assets/*.wav; do
+        install -Dm644 "${f}" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/${f}"
+    done
     install -Dm644 "omasend.desktop" "${pkgdir}/usr/share/applications/omasend.desktop"
     install -Dm644 "README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
     install -Dm644 "LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"

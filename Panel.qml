@@ -18,66 +18,51 @@ Panel {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  // --- Automatic Multi-Language (i18n) Detection from Device Locale ---
+  // --- Language (from the session locale) ---
   readonly property string rawSystemLocale: Quickshell.env("LC_ALL")
     || Quickshell.env("LC_MESSAGES")
     || Quickshell.env("LANG")
     || Qt.locale().name
     || "en"
   readonly property string systemLang: OmaI18n.detectLang(root.rawSystemLocale, Qt.locale().name)
-
-  function t(key) {
-    return OmaI18n.tr(root.systemLang, key)
+  function t(key) { return OmaI18n.tr(root.systemLang, key) }
+  function tf(key, a, b) {
+    var s = OmaI18n.tr(root.systemLang, key)
+    if (a !== undefined) s = s.replace("%1", a)
+    if (b !== undefined) s = s.replace("%2", b)
+    return s
   }
 
-  // --- Core Engine & Network State ---
+  // --- Engine state (from `omasend-engine --json`) ---
   property string localIp: "127.0.0.1"
   property int port: 53317
-  property string pin: "----"
-  property string sessionKey: ""
-  property string activeMode: "LAN"
-  property bool wanActive: false
-  property bool wanConnecting: false
-  property string wanUrl: ""
-  property string activeUrl: ""
   property string savePath: "~/Downloads/omasend"
-  property string qrPath: ""
   property int totalReceived: 0
-  property var recentFiles: []
-  property var sharedFiles: []
-  property int refreshNonce: 0
-
-  // --- Anonim OmaID (Zero-Knowledge Account ID) & Device ID State ---
-  property string p2pVisibility: "KNOWN"
-  property int p2pVisibilityRemainingSecs: 0
-  property var p2pPeers: []
-  property var p2pPendingTransfer: null
-  property var p2pTransferProgress: null
+  property string visibility: "KNOWN"
+  property var discovered: []
+  property var pairedDevices: []
+  property var pendingTransfer: null
+  property var transferProgress: null
   property bool soundEnabled: true
   property string firewallStatus: "OK"
+  property string deviceKeyId: ""
+  property string hostname: "Omarchy"
+  property int refreshNonce: 0
 
-  property string omaId: ""
-  property string deviceId: ""
-  property string hostname: "Omarchy-PC"
-  property string omaidQrPath: ""
-  property bool omaIdRevealed: true
-  property bool omaIdCopiedFeedback: false
+  // --- Pairing card ---
+  property bool showPair: false
+  property bool pairOwn: true
+  property string pairQrPath: ""
+  property int pairExpiresAt: 0
+  property int nowSecs: 0
+  property int pairedCountAtOpen: 0
+  property string statusMsg: ""
+  property bool statusError: false
 
-  // --- Two-Mode Selector: "own" (Kendi OmaID) vs "foreign" (Yabancı OmaID) ---
-  property string targetScope: "own"
-  property bool showSyncSection: false
-  property bool showQrSection: false
-  property bool showAboutSection: false
+  // --- Unpair confirmation (second click within 4 s) ---
+  property string armedUnpair: ""
 
-  property string syncInputOmaId: ""
-  property string syncStatusMsg: ""
-  property bool syncStatusError: false
-
-  property string directTargetInput: ""
-  property string directStatusMsg: ""
-  property bool directStatusError: false
-
-  // --- Drop HUD State (Strictly Native Wayland DropArea) ---
+  // --- Drop HUD ---
   property bool dropActive: false
   property bool dropBlasting: false
   property real dropProximity: 0.0
@@ -85,10 +70,9 @@ Panel {
   property string blastTargetName: ""
   property int blastedCount: 0
 
-  // --- Keyboard & Mouse Cursor Model (Official Omarchy Network Panel Standard) ---
-  property int selectedPeerIndex: 0
+  // --- Keyboard cursor ---
+  property int selectedIndex: 0
   property bool cursorActive: false
-  property string focusSection: "peers"
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
@@ -102,183 +86,71 @@ Panel {
       : "JetBrainsMono Nerd Font, JetBrains Mono, monospace")
 
   readonly property string userHome: Quickshell.env("HOME") || ("/home/" + (Quickshell.env("USER") || "user"))
-  readonly property string peersPath: root.userHome + "/.local/state/omarchy/omasend/discovered_peers.json"
-  readonly property string omaidQrFilePath: root.userHome + "/.local/state/omarchy/omasend/omaid_qr.svg"
   readonly property string manifestPath: Qt.resolvedUrl("manifest.json").toString().replace(/^file:\/\//, "")
-  readonly property string manifestFallbackPath: root.userHome + "/.config/omarchy/plugins/ozdil.omasend/manifest.json"
+  property string pluginVersion: ""
 
-  property string pluginVersion: "1.9.1"
-  property string pluginDescription: "Anonim OmaID (Zero-Knowledge Identity) & AirBridge P2P Dosya Aktarım Sistemi"
-  property string pluginAuthor: "Ozan Özdil (@ozdil)"
-  property string pluginLicense: "MIT"
+  readonly property bool serviceOn: root.visibility !== "OFF"
 
-  // --- Peer Separation: Own Devices (Same OmaID -> Zero-Click) vs Foreign OmaID Devices ---
-  readonly property var ownPeers: {
-    if (root.p2pVisibility === "OFF" || !root.p2pPeers) return []
-    var myClean = String(root.omaId || "").replace(/[^0-9]/g, "")
+  // Discovered peers that are not QR-paired keys (legacy transport, receiver approves).
+  readonly property var nearby: {
+    if (!root.serviceOn || !root.discovered) return []
     var out = []
-    for (var i = 0; i < root.p2pPeers.length; i++) {
-      var p = root.p2pPeers[i]
-      if (!p) continue
-      var pClean = String(p.oma_id || "").replace(/[^0-9]/g, "")
-      if (pClean.length !== 16) continue
-      var sameOwner = Boolean(p.is_same_owner) || (myClean.length === 16 && pClean === myClean)
-      if (sameOwner) out.push(p)
+    for (var i = 0; i < root.discovered.length; i++) {
+      var p = root.discovered[i]
+      if (p && !p.key_trust) out.push(p)
     }
     return out
   }
 
-  readonly property var otherPeers: {
-    if (root.p2pVisibility === "OFF" || !root.p2pPeers) return []
-    var myClean = String(root.omaId || "").replace(/[^0-9]/g, "")
+  readonly property int onlineCount: {
+    var n = 0
+    for (var i = 0; i < root.pairedDevices.length; i++) if (root.pairedDevices[i].online) n++
+    return n
+  }
+
+  // Keyboard / drop targets: paired devices first, then nearby peers.
+  readonly property var targets: {
     var out = []
-    for (var i = 0; i < root.p2pPeers.length; i++) {
-      var p = root.p2pPeers[i]
-      if (!p) continue
-      var pClean = String(p.oma_id || "").replace(/[^0-9]/g, "")
-      if (pClean.length !== 16) continue
-      var sameOwner = Boolean(p.is_same_owner) || (myClean.length === 16 && pClean === myClean)
-      if (!sameOwner) out.push(p)
+    for (var i = 0; i < root.pairedDevices.length; i++) {
+      var d = root.pairedDevices[i]
+      out.push({ kind: "paired", id: d.device_id, name: d.name, address: d.device_id, online: Boolean(d.online), own: Boolean(d.own_device) })
+    }
+    for (var j = 0; j < root.nearby.length; j++) {
+      var p = root.nearby[j]
+      out.push({ kind: "nearby", id: p.id, name: p.name, address: p.ip, online: true, own: false })
     }
     return out
   }
 
-  function loadManifest(rawJson) {
-    try {
-      if (!rawJson) return
-      var parsed = JSON.parse(rawJson)
-      if (parsed.version) root.pluginVersion = parsed.version
-      if (parsed.description) root.pluginDescription = parsed.description
-      if (parsed.author) root.pluginAuthor = parsed.author
-      if (parsed.license) root.pluginLicense = parsed.license
-    } catch (e) {}
-  }
-
-  function formatOmaId(id, revealed) {
-    if (!id || String(id).trim() === "") return "---- ---- ---- ----"
-    var clean = String(id).replace(/[^0-9]/g, "")
-    if (!revealed) {
-      if (clean.length >= 16) return "••••-••••-••••-" + clean.slice(12, 16)
-      return "••••-••••-••••-••••"
+  // Default drop target: the single online device of your own.
+  readonly property var defaultTarget: {
+    var own = []
+    for (var i = 0; i < root.targets.length; i++) {
+      var t = root.targets[i]
+      if (t.kind === "paired" && t.own && t.online) own.push(t)
     }
-    if (clean.length === 16) {
-      return clean.slice(0, 4) + "-" + clean.slice(4, 8) + "-" + clean.slice(8, 12) + "-" + clean.slice(12, 16)
-    }
-    return clean
+    if (own.length === 1) return own[0]
+    if (root.cursorActive && root.selectedIndex >= 0 && root.selectedIndex < root.targets.length) return root.targets[root.selectedIndex]
+    return null
   }
 
-  function formatShortDeviceId(devId) {
-    if (!devId || String(devId).trim() === "") return "----"
-    var clean = String(devId).trim().toUpperCase()
-    if (clean.length > 8) return clean.slice(0, 4) + "-" + clean.slice(4, 8)
-    return clean
+  function shortId(id) {
+    var s = String(id || "")
+    return s.length > 9 ? s.slice(0, 9) : (s || "----")
   }
 
-  function formatPeerIdentity(peer) {
-    if (!peer) return ""
-    var oma = root.formatOmaId(peer.oma_id || "", true)
-    var dev = root.formatShortDeviceId(peer.id || "")
-    return oma + " / " + dev
+  function engine() { return root.userHome + "/.local/bin/omasend-engine" }
+
+  function run(args) {
+    if (actionProc.running) actionProc.running = false
+    actionProc.command = [root.engine()].concat(args)
+    actionProc.running = true
   }
 
-  function formatInputOmaId(val) {
-    if (!val) return ""
-    var clean = String(val).replace(/[^0-9]/g, "").slice(0, 16)
-    var parts = []
-    for (var i = 0; i < clean.length; i += 4) {
-      parts.push(clean.slice(i, i + 4))
-    }
-    return parts.join("-")
-  }
-
-  function isValidLuhnOmaId(val) {
-    var clean = String(val || "").replace(/[^0-9]/g, "")
-    if (clean.length !== 16) return false
-    var sum = 0
-    for (var i = 0; i < 16; i++) {
-      var d = parseInt(clean.charAt(15 - i), 10)
-      if (isNaN(d)) return false
-      if (i % 2 === 1) {
-        d *= 2
-        if (d > 9) d -= 9
-      }
-      sum += d
-    }
-    return (sum % 10) === 0
-  }
-
-  function loadDiscoveredPeers(content) {
-    try {
-      if (!content || String(content).trim() === "") return
-      var parsed = JSON.parse(content)
-      if (Array.isArray(parsed)) root.p2pPeers = parsed
-    } catch (e) {}
-  }
-
-  function syncOwnOmaId(candidateId) {
-    var clean = String(candidateId || "").replace(/[^0-9]/g, "")
-    if (clean.length !== 16) {
-      root.syncStatusMsg = root.t("err_omaid_16_digits")
-      root.syncStatusError = true
-      return
-    }
-    if (!root.isValidLuhnOmaId(clean)) {
-      root.syncStatusMsg = root.t("err_omaid_luhn")
-      root.syncStatusError = true
-      return
-    }
-    var formatted = root.formatOmaId(clean, true)
-    root.syncStatusMsg = root.t("msg_syncing_id")
-    root.syncStatusError = false
-    if (setOwnOmaIdProc.running) setOwnOmaIdProc.running = false
-    setOwnOmaIdProc.targetFormattedId = formatted
-    setOwnOmaIdProc.command = [root.resolveEnginePath(), "--set-oma-id", formatted]
-    setOwnOmaIdProc.running = true
-  }
-
-  function generateNewOwnOmaId() {
-    root.syncStatusMsg = root.t("msg_generating_new_id")
-    root.syncStatusError = false
-    if (newOwnOmaIdProc.running) newOwnOmaIdProc.running = false
-    newOwnOmaIdProc.running = true
-  }
-
-  function sendToDirectTarget(targetStr) {
-    var trimmed = String(targetStr || "").trim()
-    if (trimmed === "") {
-      root.directStatusMsg = root.t("msg_enter_foreign_omaid")
-      root.directStatusError = true
-      return
-    }
-    var digitsOnly = trimmed.replace(/[^0-9]/g, "")
-    if (digitsOnly.length !== 16 || !root.isValidLuhnOmaId(digitsOnly)) {
-      root.directStatusMsg = root.t("err_omaid_16_digits")
-      root.directStatusError = true
-      return
-    }
-    var formatted = root.formatOmaId(digitsOnly, true)
-    root.directStatusMsg = root.t("msg_opening_file_picker") + " (" + formatted + ")..."
-    root.directStatusError = false
-    root.sendFileTo(formatted)
-  }
-
-  function scanFromScreen(forSync) {
-    if (forSync) {
-      root.syncStatusMsg = root.t("msg_scanning_screen_qr")
-      root.syncStatusError = false
-    } else {
-      root.directStatusMsg = root.t("msg_scanning_screen_qr")
-      root.directStatusError = false
-    }
-    screenScanProc.forSync = Boolean(forSync)
-    if (screenScanProc.running) screenScanProc.running = false
-    screenScanProc.running = true
-  }
-
-  function pasteOmaIdFromClipboard(targetMode) {
-    pasteProc.targetMode = targetMode || "direct"
-    if (pasteProc.running) pasteProc.running = false
-    pasteProc.running = true
+  function refresh() {
+    if (!serverProc.running) serverProc.running = true
+    if (scanProc.running) scanProc.running = false
+    scanProc.running = true
   }
 
   function forceScan() {
@@ -286,143 +158,17 @@ Panel {
     forceScanProc.running = true
   }
 
-  function resolveEnginePath() {
-    return root.userHome + "/.local/bin/omasend-engine"
-  }
+  function toggleService() { root.run(["--set-visibility", root.serviceOn ? "OFF" : "KNOWN"]); root.visibility = root.serviceOn ? "OFF" : "KNOWN" }
+  function acceptTransfer(token) { root.run(["--accept-transfer", token]) }
+  function rejectTransfer(token) { root.run(["--reject-transfer", token]) }
+  function cancelTransfer() { root.transferProgress = null; root.run(["--cancel-transfer"]) }
+  function toggleSound() { root.soundEnabled = !root.soundEnabled; root.run(["--toggle-sound"]) }
+  function syncClipboardTo(address) { root.run(["--sync-clipboard", address]) }
 
-  function executeAction(args) {
-    if (actionProc.running) actionProc.running = false
-    actionProc.command = [root.resolveEnginePath()].concat(args)
-    actionProc.running = true
-  }
-
-  function refresh() {
-    if (!serverProc.running) serverProc.running = true
-    if (omaIdDirectReadProc.running) omaIdDirectReadProc.running = false
-    omaIdDirectReadProc.running = true
-    if (scanProc.running) scanProc.running = false
-    scanProc.running = true
-  }
-
-  function setP2pVisibility(mode) {
-    var m = (mode === "OFF") ? "OFF" : "KNOWN"
-    root.p2pVisibility = m
-    if (m === "OFF") root.p2pPeers = []
-    root.executeAction(["--set-visibility", m])
-  }
-
-  function togglePower() {
-    if (root.p2pVisibility === "OFF") {
-      root.setP2pVisibility("KNOWN")
-    } else {
-      root.setP2pVisibility("OFF")
-    }
-  }
-
-  function resolveActiveDropPeer() {
-    if (root.ownPeers && root.ownPeers.length > 0) return root.ownPeers[0]
-    if (root.p2pPeers && root.selectedPeerIndex >= 0 && root.selectedPeerIndex < root.p2pPeers.length) {
-      return root.p2pPeers[root.selectedPeerIndex]
-    }
-    if (root.p2pPeers && root.p2pPeers.length > 0) return root.p2pPeers[0]
-    return null
-  }
-
-  function handleDroppedData(drop) {
-    var fileList = []
-    if (drop.hasUrls && drop.urls.length > 0) {
-      for (var i = 0; i < drop.urls.length; i++) {
-        var u = drop.urls[i].toString().replace(/^file:\/\//, "")
-        try { u = decodeURIComponent(u) } catch (e) {}
-        if (u.trim() !== "") fileList.push(u.trim())
-      }
-    } else if (drop.hasText && drop.text) {
-      var lines = drop.text.split("\n")
-      for (var j = 0; j < lines.length; j++) {
-        var l = lines[j].replace(/^file:\/\//, "").trim()
-        try { l = decodeURIComponent(l) } catch (e) {}
-        if (l !== "") fileList.push(l)
-      }
-    }
-
-    root.blastedCount = fileList.length
-    if (root.soundEnabled) {
-      if (playSendSoundProc.running) playSendSoundProc.running = false
-      playSendSoundProc.running = true
-    }
-
-    var targetPeer = root.resolveActiveDropPeer()
-    var targetAddr = targetPeer ? (targetPeer.ip || targetPeer.oma_id) : ""
-    root.blastTargetName = targetPeer ? (targetPeer.name || targetPeer.ip) : root.t("waiting_for_device")
-
-    if (targetAddr !== "" && fileList.length > 0) {
-      for (var k = 0; k < fileList.length; k++) {
-        root.executeAction(["--send", targetAddr, fileList[k]])
-      }
-    }
-
-    root.dropBlasting = true
-    blastAnim.restart()
-  }
-
-  function moveCursor(dy) {
-    if (!cursorActive) {
-      cursorActive = true
-      selectedPeerIndex = 0
-      return
-    }
-    var total = root.ownPeers.length + root.otherPeers.length
-    if (total === 0) return
-    selectedPeerIndex = Math.max(0, Math.min(total - 1, selectedPeerIndex + dy))
-  }
-
-  function activateSelected() {
-    if (root.p2pPendingTransfer && root.p2pPendingTransfer.status === "PENDING") {
-      root.acceptTransfer(root.p2pPendingTransfer.token)
-      return
-    }
-    var all = root.ownPeers.concat(root.otherPeers)
-    if (all.length > selectedPeerIndex && selectedPeerIndex >= 0) {
-      var peer = all[selectedPeerIndex]
-      if (peer && (peer.ip || peer.oma_id)) {
-        root.sendFileTo(peer.ip || peer.oma_id)
-      }
-    }
-  }
-
-  onOpenedChanged: {
-    if (root.opened) {
-      selectedPeerIndex = 0
-      cursorActive = false
-      if (panelFlick) panelFlick.contentY = 0
-      root.forceScan()
-      root.refresh()
-      Qt.callLater(function() { keyCatcher.forceActiveFocus() })
-    }
-  }
-
-  function acceptTransfer(token) { root.executeAction(["--accept-transfer", token]) }
-  function rejectTransfer(token) { root.executeAction(["--reject-transfer", token]) }
-  function cancelTransfer() {
-    root.p2pTransferProgress = null
-    root.executeAction(["--cancel-transfer"])
-  }
-  function toggleSound() {
-    root.soundEnabled = !root.soundEnabled
-    root.executeAction(["--toggle-sound"])
-  }
-  function syncClipboardTo(ipOrOmaId) { root.executeAction(["--sync-clipboard", ipOrOmaId]) }
-
-  function sendFileTo(ipOrOmaId) {
+  function sendFileTo(address) {
     if (sendDialogProc.running) sendDialogProc.running = false
-    sendDialogProc.command = [root.resolveEnginePath(), "--send-dialog", ipOrOmaId]
+    sendDialogProc.command = [root.engine(), "--send-dialog", address]
     sendDialogProc.running = true
-  }
-
-  function copyText(text) {
-    if (copyProc.running) copyProc.running = false
-    copyProc.command = ["wl-copy", text]
-    copyProc.running = true
   }
 
   function openFolder() {
@@ -431,280 +177,269 @@ Panel {
     folderProc.running = true
   }
 
+  function copyText(text) {
+    if (copyProc.running) copyProc.running = false
+    copyProc.command = ["wl-copy", text]
+    copyProc.running = true
+  }
+
+  function setStatus(msg, isError) {
+    root.statusMsg = msg
+    root.statusError = Boolean(isError)
+    statusClearTimer.restart()
+  }
+
+  // --- Pairing ---
+  function openPairing() {
+    root.showPair = true
+    root.pairedCountAtOpen = root.pairedDevices.length
+    root.newPairOffer()
+  }
+
+  function newPairOffer() {
+    root.pairQrPath = ""
+    if (pairProc.running) pairProc.running = false
+    pairProc.command = [root.engine(), "--pair-offer", "--json"].concat(root.pairOwn ? ["--own"] : [])
+    pairProc.running = true
+  }
+
+  function scanScreenForPairing() {
+    root.setStatus(root.t("pair_scanning_screen"), false)
+    if (screenScanProc.running) screenScanProc.running = false
+    screenScanProc.running = true
+  }
+
+  function requestUnpair(deviceId) {
+    if (root.armedUnpair === deviceId) {
+      root.armedUnpair = ""
+      root.run(["--unpair", deviceId])
+    } else {
+      root.armedUnpair = deviceId
+      unpairArmTimer.restart()
+    }
+  }
+
+  function activateTarget(tgt) {
+    if (!tgt) return
+    root.sendFileTo(tgt.address)
+  }
+
+  function moveCursor(dy) {
+    if (!root.cursorActive) {
+      root.cursorActive = true
+      root.selectedIndex = 0
+      return
+    }
+    if (root.targets.length === 0) return
+    root.selectedIndex = Math.max(0, Math.min(root.targets.length - 1, root.selectedIndex + dy))
+  }
+
+  function activateSelected() {
+    if (root.pendingTransfer && root.pendingTransfer.status === "PENDING") {
+      root.acceptTransfer(root.pendingTransfer.token)
+      return
+    }
+    if (root.selectedIndex >= 0 && root.selectedIndex < root.targets.length) root.activateTarget(root.targets[root.selectedIndex])
+  }
+
+  function handleDroppedData(drop) {
+    var files = []
+    if (drop.hasUrls && drop.urls.length > 0) {
+      for (var i = 0; i < drop.urls.length; i++) {
+        var u = drop.urls[i].toString().replace(/^file:\/\//, "")
+        try { u = decodeURIComponent(u) } catch (e) {}
+        if (u.trim() !== "") files.push(u.trim())
+      }
+    } else if (drop.hasText && drop.text) {
+      var lines = drop.text.split("\n")
+      for (var j = 0; j < lines.length; j++) {
+        var l = lines[j].replace(/^file:\/\//, "").trim()
+        try { l = decodeURIComponent(l) } catch (e) {}
+        if (l !== "") files.push(l)
+      }
+    }
+    var tgt = root.defaultTarget
+    root.blastedCount = files.length
+    root.blastTargetName = tgt ? tgt.name : root.t("drop_choose_target")
+    if (tgt && files.length > 0) {
+      // One detached transfer for all files (one approval); never killed by other actions.
+      Quickshell.execDetached([root.engine(), "--send", tgt.address].concat(files))
+    } else if (files.length > 0) {
+      root.open()
+    }
+    root.dropBlasting = true
+    blastAnim.restart()
+  }
+
+  onOpenedChanged: {
+    if (root.opened) {
+      root.selectedIndex = 0
+      root.cursorActive = false
+      root.armedUnpair = ""
+      if (panelFlick) panelFlick.contentY = 0
+      root.forceScan()
+      root.refresh()
+      Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    } else {
+      root.showPair = false
+    }
+  }
+
+  // Pairing finished on the other device: close the card and say so.
+  onPairedDevicesChanged: {
+    if (root.showPair && root.pairedDevices.length > root.pairedCountAtOpen) {
+      var d = root.pairedDevices[root.pairedDevices.length - 1]
+      root.showPair = false
+      root.setStatus(root.tf("paired_with", d ? d.name : ""), false)
+    }
+  }
+
   IpcHandler {
     target: "ozdil.omasend"
     function open(): void { root.open() }
     function close(): void { root.close() }
     function toggle(): void { root.toggle() }
     function refresh(): void { root.refresh() }
-    function setVisibility(mode: string): void { root.setP2pVisibility(mode) }
-    function sendFile(ip: string): void { root.sendFileTo(ip) }
+    function pair(): void { root.open(); root.openPairing() }
+    function setVisibility(mode: string): void { root.run(["--set-visibility", mode]) }
+    function sendFile(target: string): void { root.sendFileTo(target) }
   }
 
-  // --- Background Processes ---
-  Process {
-    id: omaIdDirectReadProc
-    command: ["cat", root.userHome + "/.local/state/omarchy/omasend/oma_id"]
-    running: true
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        omaIdDirectReadProc.running = false
-        var val = String(text || "").trim()
-        if (val.length >= 16) root.omaId = val
-      }
-    }
-  }
-
-  Process {
-    id: setOwnOmaIdProc
-    property string targetFormattedId: ""
-    onExited: function(code) {
-      setOwnOmaIdProc.running = false
-      if (code === 0) {
-        root.omaId = setOwnOmaIdProc.targetFormattedId
-        root.syncStatusMsg = root.t("msg_id_synced") + setOwnOmaIdProc.targetFormattedId
-        root.syncStatusError = false
-        root.refresh()
-        syncCloseTimer.restart()
-      } else {
-        root.syncStatusMsg = root.t("msg_id_save_failed")
-        root.syncStatusError = true
-      }
-    }
-  }
-
-  Process {
-    id: newOwnOmaIdProc
-    command: [root.resolveEnginePath(), "--new-oma-id"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        newOwnOmaIdProc.running = false
-        var val = String(text || "").trim()
-        if (val.length >= 16) {
-          root.omaId = val
-          root.syncInputOmaId = root.formatInputOmaId(val)
-          root.syncStatusMsg = root.t("msg_new_id_generated") + root.formatOmaId(val, true)
-          root.syncStatusError = false
-          root.forceScan()
-          root.refresh()
-        }
-      }
-    }
-  }
-
-  Timer {
-    id: syncCloseTimer
-    interval: 1200
-    repeat: false
-    onTriggered: {
-      if (!root.syncStatusError) {
-        root.showSyncSection = false
-        root.syncStatusMsg = ""
-      }
-    }
-  }
-
+  // --- Processes ---
   Process {
     id: serverProc
-    command: [root.resolveEnginePath(), "--serve"]
+    command: [root.engine(), "--serve"]
     running: true
   }
 
   Process {
     id: forceScanProc
-    command: [root.resolveEnginePath(), "--force-scan"]
-    onExited: function(code) {
-      forceScanProc.running = false
-      root.refresh()
-    }
+    command: [root.engine(), "--force-scan"]
+    onExited: function(code) { forceScanProc.running = false; root.refresh() }
   }
 
   Process {
     id: scanProc
-    command: [root.resolveEnginePath(), "--json"]
+    command: [root.engine(), "--json"]
     onExited: function(code) { scanProc.running = false }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         scanProc.running = false
         try {
-          var clean = String(text || "").slice(0, 65536)
-          var d = JSON.parse(clean)
+          var d = JSON.parse(String(text || "").slice(0, 262144))
           root.localIp = String(d.local_ip || "127.0.0.1")
           root.port = Number(d.port) || 53317
-          root.pin = String(d.pin || "----")
-          root.sessionKey = String(d.session_key || "")
-          root.activeMode = String(d.active_mode || "LAN")
-          root.wanActive = Boolean(d.wan_active)
-          root.wanConnecting = Boolean(d.wan_connecting)
-          root.wanUrl = String(d.wan_url || "")
-          root.activeUrl = String(d.active_url || "")
           root.savePath = String(d.download_dir || "~/Downloads/omasend")
-          root.qrPath = String(d.qr_path || "")
-          root.omaidQrPath = String(d.omaid_qr_path || root.omaidQrFilePath)
           root.totalReceived = Number(d.total_received) || 0
-          root.recentFiles = d.recent_files || []
-          root.sharedFiles = d.shared_files || []
-          var rawVis = String(d.p2p_visibility || "KNOWN")
-          root.p2pVisibility = (rawVis === "OFF") ? "OFF" : "KNOWN"
-          root.p2pVisibilityRemainingSecs = Number(d.p2p_visibility_remaining_secs) || 0
-          root.p2pPeers = d.p2p_discovered_peers || []
-          root.p2pPendingTransfer = d.p2p_pending_transfer || null
-          root.p2pTransferProgress = d.p2p_transfer_progress || null
+          root.visibility = (String(d.p2p_visibility || "KNOWN") === "OFF") ? "OFF" : "KNOWN"
+          root.discovered = d.p2p_discovered_peers || []
+          root.pairedDevices = d.paired_devices || []
+          root.pendingTransfer = d.p2p_pending_transfer || null
+          root.transferProgress = d.p2p_transfer_progress || null
           if (d.sound_enabled !== undefined) root.soundEnabled = Boolean(d.sound_enabled)
           root.firewallStatus = String(d.firewall_status || "OK")
-          root.deviceId = String(d.p2p_device_id || "")
-          root.hostname = String(d.p2p_hostname || "Omarchy-PC")
-          root.omaId = String(d.oma_id || "")
+          root.deviceKeyId = String(d.device_key_id || "")
+          root.hostname = String(d.p2p_hostname || "Omarchy")
           root.refreshNonce++
         } catch (e) {}
       }
     }
   }
 
-  Timer {
-    id: omaIdCopyTimer
-    interval: 1800
-    repeat: false
-    onTriggered: root.omaIdCopiedFeedback = false
-  }
-
   Process {
-    id: screenScanProc
-    property bool forSync: false
-    command: ["bash", "-c", "rm -f /tmp/oma_qr_scan.png && /usr/bin/grim /tmp/oma_qr_scan.png 2>/dev/null && (/usr/bin/zbarimg -q --raw /tmp/oma_qr_scan.png 2>/dev/null || true) && rm -f /tmp/oma_qr_scan.png"]
+    id: pairProc
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        screenScanProc.running = false
-        var raw = String(text || "").trim()
-        var clean = raw.replace(/[^0-9]/g, "")
-        if (clean.length >= 16) {
-          var formatted = root.formatInputOmaId(clean.slice(0, 16))
-          if (screenScanProc.forSync) {
-            root.syncInputOmaId = formatted
-            root.syncStatusMsg = root.t("msg_qr_read") + formatted
-            root.syncStatusError = false
-          } else {
-            root.directTargetInput = formatted
-            root.directStatusMsg = root.t("msg_qr_read") + formatted
-            root.directStatusError = false
-          }
-        } else {
-          if (screenScanProc.forSync) {
-            root.syncStatusMsg = root.t("msg_qr_not_found")
-            root.syncStatusError = true
-          } else {
-            root.directStatusMsg = root.t("msg_qr_not_found")
-            root.directStatusError = true
-          }
+        pairProc.running = false
+        try {
+          var d = JSON.parse(String(text || ""))
+          root.pairQrPath = String(d.qr_svg || "")
+          root.pairExpiresAt = Math.floor(Date.now() / 1000) + (Number(d.expires_in_secs) || 300)
+          root.refreshNonce++
+          if (!root.pairQrPath) root.setStatus(root.t("pair_qr_failed"), true)
+        } catch (e) {
+          root.setStatus(root.t("pair_qr_failed"), true)
         }
       }
     }
   }
 
   Process {
-    id: pasteProc
-    property string targetMode: "direct"
-    command: ["wl-paste", "--no-newline"]
+    id: pairWithProc
+    property string output: ""
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: pairWithProc.output = String(text || "").trim() }
+    stderr: StdioCollector { waitForEnd: true; onStreamFinished: if (String(text || "").trim() !== "") pairWithProc.output = String(text).trim() }
+    onExited: function(code) {
+      pairWithProc.running = false
+      root.setStatus(pairWithProc.output || (code === 0 ? root.t("paired_ok") : root.t("pair_failed")), code !== 0)
+      if (code === 0) root.showPair = false
+      root.refresh()
+    }
+  }
+
+  // Reads a pairing QR shown on this screen (another desktop, a mirrored phone, ...).
+  Process {
+    id: screenScanProc
+    command: ["bash", "-c", "f=$(mktemp --suffix=.png) && /usr/bin/grim \"$f\" 2>/dev/null && (/usr/bin/zbarimg -q --raw \"$f\" 2>/dev/null || true); rm -f \"$f\""]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        pasteProc.running = false
-        var raw = String(text || "").trim()
-        if (raw.length === 0) return
-        var clean = raw.replace(/[^0-9]/g, "")
-        if (pasteProc.targetMode === "sync") {
-          if (clean.length >= 16) {
-            root.syncInputOmaId = root.formatInputOmaId(clean.slice(0, 16))
-            root.syncStatusMsg = root.t("msg_clipboard_pasted")
-            root.syncStatusError = false
-          } else {
-            root.syncStatusMsg = root.t("msg_clipboard_no_omaid")
-            root.syncStatusError = true
-          }
-        } else {
-          if (clean.length >= 16) {
-            root.directTargetInput = root.formatInputOmaId(clean.slice(0, 16))
-            root.directStatusMsg = ""
-            root.directStatusError = false
-          } else {
-            root.directStatusMsg = root.t("msg_clipboard_no_omaid")
-            root.directStatusError = true
+        screenScanProc.running = false
+        var lines = String(text || "").split("\n")
+        for (var i = 0; i < lines.length; i++) {
+          var l = lines[i].trim()
+          if (l.indexOf("omasend://pair?") === 0) {
+            root.setStatus(root.t("pair_connecting"), false)
+            if (pairWithProc.running) pairWithProc.running = false
+            pairWithProc.output = ""
+            pairWithProc.command = [root.engine(), "--pair-with", l]
+            pairWithProc.running = true
+            return
           }
         }
+        root.setStatus(root.t("pair_no_qr_on_screen"), true)
       }
     }
   }
 
   Process {
     id: actionProc
-    onExited: function(code) {
-      actionProc.running = false
-      root.refresh()
-    }
+    onExited: function(code) { actionProc.running = false; root.refresh() }
   }
 
   Process {
     id: sendDialogProc
-    onExited: function(code) {
-      sendDialogProc.running = false
-      root.directStatusMsg = ""
-      root.refresh()
-    }
+    onExited: function(code) { sendDialogProc.running = false; root.refresh() }
   }
 
   Process { id: copyProc }
   Process { id: folderProc }
-  Process {
-    id: playSendSoundProc
-    command: ["pw-play", Qt.resolvedUrl("assets/send.wav").toString().replace(/^file:\/\//, "")]
-  }
-
-  FileView {
-    id: peersWatcher
-    path: root.peersPath
-    watchChanges: true
-    atomicWrites: true
-    printErrors: false
-    onLoaded: root.loadDiscoveredPeers(text())
-    onLoadFailed: {}
-    onFileChanged: reload()
-  }
 
   FileView {
     id: manifestWatcher
     path: root.manifestPath
     watchChanges: true
-    atomicWrites: true
     printErrors: false
-    onLoaded: root.loadManifest(text())
-    onLoadFailed: manifestFallbackWatcher.reload()
-    onFileChanged: reload()
-  }
-
-  FileView {
-    id: manifestFallbackWatcher
-    path: root.manifestFallbackPath
-    watchChanges: true
-    atomicWrites: true
-    printErrors: false
-    onLoaded: root.loadManifest(text())
+    onLoaded: {
+      try { root.pluginVersion = String(JSON.parse(text()).version || "") } catch (e) {}
+    }
     onFileChanged: reload()
   }
 
   Timer {
-    id: refreshTimer
     interval: 1000
     running: root.opened
     repeat: true
-    onTriggered: root.refresh()
+    onTriggered: {
+      root.refresh()
+      root.nowSecs = Math.floor(Date.now() / 1000)
+      if (root.showPair && root.pairQrPath !== "" && root.nowSecs >= root.pairExpiresAt - 5) root.newPairOffer()
+    }
   }
 
   Timer {
-    id: watchdogTimer
     interval: 5000
     running: true
     repeat: true
@@ -714,20 +449,19 @@ Panel {
     }
   }
 
+  Timer { id: statusClearTimer; interval: 6000; onTriggered: root.statusMsg = "" }
+  Timer { id: unpairArmTimer; interval: 4000; onTriggered: root.armedUnpair = "" }
+
   Component.onCompleted: refresh()
   Component.onDestruction: {
     if (serverProc.running) serverProc.running = false
     if (scanProc.running) scanProc.running = false
     if (actionProc.running) actionProc.running = false
     if (sendDialogProc.running) sendDialogProc.running = false
-    if (copyProc.running) copyProc.running = false
-    if (folderProc.running) folderProc.running = false
-    if (refreshTimer.running) refreshTimer.running = false
-    if (watchdogTimer.running) watchdogTimer.running = false
   }
 
   // =========================================================================
-  // 1. BAR BUTTON & PROXIMITY WAYLAND DROP SENSOR
+  // BAR BUTTON & DROP SENSOR
   // =========================================================================
   BarIconButton {
     id: button
@@ -737,7 +471,7 @@ Panel {
     active: root.dropActive || root.dropBlasting
     useActiveColor: false
     foreground: (root.dropActive || root.dropBlasting) ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
-    tooltipText: "OmaSend (" + root.formatOmaId(root.omaId, true) + " / " + root.formatShortDeviceId(root.deviceId) + ")"
+    tooltipText: "OmaSend · " + root.tf("tooltip_devices", root.onlineCount, root.pairedDevices.length)
     onPressed: function(b) {
       if (b === Qt.RightButton) root.forceScan()
       else root.toggle()
@@ -760,7 +494,6 @@ Panel {
           root.dropProximity = 0.5 * (1.0 - Math.cos(raw * Math.PI))
         }
       }
-
       onPositionChanged: function(drag) {
         if (drag.hasUrls || drag.hasText) {
           dropHandoffTimer.stop()
@@ -771,11 +504,7 @@ Panel {
           root.dropProximity = Math.max(root.dropProximity, 0.5 * (1.0 - Math.cos(raw * Math.PI)))
         }
       }
-
-      onExited: {
-        dropHandoffTimer.restart()
-      }
-
+      onExited: dropHandoffTimer.restart()
       onDropped: function(drop) {
         dropHandoffTimer.stop()
         if (drop.hasUrls || drop.hasText) {
@@ -786,14 +515,11 @@ Panel {
     }
   }
 
-  Behavior on dropProximity {
-    NumberAnimation { duration: 140; easing.type: Easing.OutCubic }
-  }
+  Behavior on dropProximity { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
 
   Timer {
     id: dropHandoffTimer
     interval: 160
-    repeat: false
     onTriggered: {
       if (!iconDropArea.containsDrag && !hudDropArea.containsDrag && !root.dropBlasting) {
         root.dropActive = false
@@ -803,7 +529,6 @@ Panel {
   }
 
   Timer {
-    id: dropSafetyWatchdog
     interval: 350
     repeat: true
     running: root.dropActive && !root.dropBlasting
@@ -817,15 +542,7 @@ Panel {
 
   SequentialAnimation {
     id: blastAnim
-    running: false
-    NumberAnimation {
-      target: root
-      property: "blastProgress"
-      from: 0.0
-      to: 1.0
-      duration: 520
-      easing.type: Easing.OutCubic
-    }
+    NumberAnimation { target: root; property: "blastProgress"; from: 0.0; to: 1.0; duration: 520; easing.type: Easing.OutCubic }
     ScriptAction {
       script: {
         root.dropBlasting = false
@@ -836,9 +553,7 @@ Panel {
     }
   }
 
-  // =========================================================================
-  // 2. BAR-INTEGRATED MAGNETIC DROP HUD (`PopupCard`)
-  // =========================================================================
+  // Drop HUD shown while dragging files over the bar icon.
   PopupCard {
     id: dropHud
     anchorItem: button
@@ -854,7 +569,6 @@ Panel {
       id: hudDropArea
       anchors.fill: parent
       keys: ["text/uri-list", "text/plain", "application/x-kde-urilist"]
-
       onEntered: function(drag) {
         if (drag.hasUrls || drag.hasText) {
           dropHandoffTimer.stop()
@@ -863,7 +577,6 @@ Panel {
           drag.acceptProposedAction()
         }
       }
-
       onPositionChanged: function(drag) {
         if (drag.hasUrls || drag.hasText) {
           dropHandoffTimer.stop()
@@ -872,11 +585,7 @@ Panel {
           drag.acceptProposedAction()
         }
       }
-
-      onExited: {
-        dropHandoffTimer.restart()
-      }
-
+      onExited: dropHandoffTimer.restart()
       onDropped: function(drop) {
         dropHandoffTimer.stop()
         if (drop.hasUrls || drop.hasText) {
@@ -898,69 +607,33 @@ Panel {
         Shape {
           anchors.fill: parent
           preferredRendererType: Shape.CurveRenderer
-
           ShapePath {
             strokeWidth: Style.space(3)
             strokeColor: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.14)
             fillColor: "transparent"
             capStyle: ShapePath.RoundCap
-            PathAngleArc {
-              centerX: Style.space(22)
-              centerY: Style.space(22)
-              radiusX: Style.space(19)
-              radiusY: Style.space(19)
-              startAngle: 0
-              sweepAngle: 360
-            }
+            PathAngleArc { centerX: Style.space(22); centerY: Style.space(22); radiusX: Style.space(19); radiusY: Style.space(19); startAngle: 0; sweepAngle: 360 }
           }
-
-          ShapePath {
-            strokeWidth: Style.space(7)
-            strokeColor: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.18 * root.dropProximity)
-            fillColor: "transparent"
-            capStyle: ShapePath.RoundCap
-            PathAngleArc {
-              centerX: Style.space(22)
-              centerY: Style.space(22)
-              radiusX: Style.space(19)
-              radiusY: Style.space(19)
-              startAngle: -90
-              sweepAngle: 360 * (root.dropBlasting ? 1.0 : Math.min(1.0, 0.25 + root.dropProximity * 0.75))
-            }
-          }
-
           ShapePath {
             strokeWidth: Style.space(3)
             strokeColor: Color.accent
             fillColor: "transparent"
             capStyle: ShapePath.RoundCap
             PathAngleArc {
-              centerX: Style.space(22)
-              centerY: Style.space(22)
-              radiusX: Style.space(19)
-              radiusY: Style.space(19)
+              centerX: Style.space(22); centerY: Style.space(22); radiusX: Style.space(19); radiusY: Style.space(19)
               startAngle: -90
               sweepAngle: 360 * (root.dropBlasting ? 1.0 : Math.min(1.0, 0.25 + root.dropProximity * 0.75))
             }
           }
         }
 
-        BorderSurface {
+        Text {
           anchors.centerIn: parent
-          implicitWidth: Style.space(30)
-          implicitHeight: Style.space(30)
-          radius: Style.space(15)
-          color: Style.selectedFillFor(root.foreground, Color.accent)
-          borderSpec: Border.none()
-
-          Text {
-            anchors.centerIn: parent
-            textFormat: Text.PlainText
-            text: root.dropBlasting ? "󰄬" : ""
-            color: Color.accent
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.body
-          }
+          textFormat: Text.PlainText
+          text: root.dropBlasting ? "󰄬" : ""
+          color: Color.accent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
         }
       }
 
@@ -972,11 +645,7 @@ Panel {
         Text {
           Layout.fillWidth: true
           textFormat: Text.PlainText
-          text: {
-            if (root.dropBlasting) return root.t("drop_transfer_started")
-            var p = root.resolveActiveDropPeer()
-            return "OMASEND AIRBRIDGE"
-          }
+          text: root.dropBlasting ? root.t("drop_transfer_started") : "OMASEND"
           color: Color.accent
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -984,28 +653,22 @@ Panel {
           font.letterSpacing: 1.0
           elide: Text.ElideRight
         }
-
         Text {
           Layout.fillWidth: true
           textFormat: Text.PlainText
-          text: {
-            if (root.dropBlasting && root.blastTargetName !== "") return root.blastTargetName
-            var p = root.resolveActiveDropPeer()
-            return p ? (p.name + " (" + root.formatShortDeviceId(p.id) + ")") : root.t("waiting_for_device")
-          }
+          text: root.dropBlasting ? root.blastTargetName : (root.defaultTarget ? root.defaultTarget.name : root.t("drop_choose_target"))
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
           font.bold: true
           elide: Text.ElideRight
         }
-
         Text {
           Layout.fillWidth: true
           textFormat: Text.PlainText
           text: root.dropBlasting
                 ? (root.blastedCount + " " + root.t("sending_files"))
-                : root.t("drop_here_hint")
+                : (root.defaultTarget && root.defaultTarget.kind === "paired" ? root.t("drop_encrypted_hint") : root.t("drop_here_hint"))
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -1016,7 +679,7 @@ Panel {
   }
 
   // =========================================================================
-  // 3. MAIN KEYBOARD PANEL (100% Omarchy Network Panel Style — Ultra Clean)
+  // MAIN PANEL
   // =========================================================================
   KeyboardPanel {
     id: panel
@@ -1026,28 +689,30 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(380))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight + stickyFooter.implicitHeight + Style.space(12), Style.space(580))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight + footer.implicitHeight + Style.space(12), Style.space(600))
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      onMoveRequested: function(dx, dy) {
-        if (dy !== 0) root.moveCursor(dy)
-      }
+      onMoveRequested: function(dx, dy) { if (dy !== 0) root.moveCursor(dy) }
       onActivateRequested: root.activateSelected()
+      onDeleteRequested: {
+        var tg = root.targets[root.selectedIndex]
+        if (root.cursorActive && tg && tg.kind === "paired") root.requestUnpair(tg.id)
+      }
       onCloseRequested: {
-        if (root.showSyncSection || root.showQrSection || root.showAboutSection) {
-          root.showSyncSection = false
-          root.showQrSection = false
-          root.showAboutSection = false
-        } else {
-          root.close()
-        }
+        if (root.showPair) root.showPair = false
+        else root.close()
       }
       onTabRequested: function(direction) { root.switchPanel(direction) }
-      onTextKey: function(t) {
-        if (t === "r" || t === "R") root.forceScan()
-        else if (t === "o" || t === "O") root.openFolder()
+      onTextKey: function(key) {
+        if (key === "r" || key === "R") root.forceScan()
+        else if (key === "o" || key === "O") root.openFolder()
+        else if (key === "p" || key === "P") { if (root.showPair) root.showPair = false; else root.openPairing() }
+        else if (key === "c" || key === "C") {
+          var tg = root.targets[root.selectedIndex]
+          if (root.cursorActive && tg) root.syncClipboardTo(tg.address)
+        }
       }
 
       Flickable {
@@ -1055,7 +720,7 @@ Panel {
         anchors.top: parent.top
         anchors.left: parent.left
         anchors.right: parent.right
-        anchors.bottom: stickyFooter.top
+        anchors.bottom: footer.top
         anchors.bottomMargin: Style.space(10)
         contentWidth: width
         contentHeight: column.implicitHeight
@@ -1065,18 +730,14 @@ Panel {
         interactive: contentHeight > height
         ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
-        Behavior on contentY {
-          NumberAnimation { duration: 220; easing.type: Easing.OutCubic }
-        }
-
         Column {
           id: column
           width: panelFlick.width
           spacing: Style.space(12)
 
-          // -----------------------------------------------------------------
-          // 1. HERO HEADER (Exact Omarchy Network Panel Structure)
-          // -----------------------------------------------------------------
+          // ---------------------------------------------------------------
+          // HERO
+          // ---------------------------------------------------------------
           Item {
             width: parent.width
             implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight, heroActions.implicitHeight)
@@ -1088,7 +749,7 @@ Panel {
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.display
-              opacity: root.p2pVisibility !== "OFF" ? 1.0 : 0.5
+              opacity: root.serviceOn ? 1.0 : 0.5
               anchors.left: parent.left
               anchors.verticalCenter: parent.verticalCenter
             }
@@ -1101,42 +762,26 @@ Panel {
 
               Button {
                 iconText: "󰐲"
-                tooltipText: root.t("show_qr_tooltip")
-                foreground: root.showQrSection ? Color.accent : root.foreground
+                tooltipText: root.t("pair_tooltip")
+                foreground: root.showPair ? Color.accent : root.foreground
                 fontFamily: root.fontFamily
                 iconSize: Style.font.subtitle * 1.4
                 horizontalPadding: Style.space(5)
                 verticalPadding: Style.space(2)
                 Layout.alignment: Qt.AlignVCenter
-                onClicked: {
-                  root.showQrSection = !root.showQrSection
-                  root.showSyncSection = false
-                  if (root.showQrSection) root.executeAction(["--oma-id-qr"])
-                }
-              }
-
-              Button {
-                iconText: "󰑐"
-                tooltipText: root.t("refresh_scan_tooltip")
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                iconSize: Style.font.subtitle * 1.4
-                horizontalPadding: Style.space(5)
-                verticalPadding: Style.space(2)
-                Layout.alignment: Qt.AlignVCenter
-                onClicked: root.forceScan()
+                onClicked: { if (root.showPair) root.showPair = false; else root.openPairing() }
               }
 
               ToggleSwitch {
                 id: powerSwitch
-                checked: root.p2pVisibility !== "OFF"
+                checked: root.serviceOn
                 foreground: root.foreground
                 Layout.alignment: Qt.AlignVCenter
-                onToggled: root.togglePower()
+                onToggled: root.toggleService()
 
                 PanelToolTip {
                   visible: powerSwitch.containsMouse
-                  text: root.p2pVisibility !== "OFF" ? root.t("turn_off_service") : root.t("turn_on_service")
+                  text: root.serviceOn ? root.t("turn_off_service") : root.t("turn_on_service")
                   fontFamily: root.fontFamily
                 }
               }
@@ -1154,21 +799,18 @@ Panel {
               Text {
                 width: parent.width
                 textFormat: Text.PlainText
-                text: "OmaSend (" + root.hostname + ")"
+                text: "OmaSend · " + root.hostname
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.title
                 font.bold: true
                 elide: Text.ElideRight
               }
-
               Text {
                 width: parent.width
                 textFormat: Text.PlainText
-                text: root.p2pVisibility !== "OFF"
-                      ? (root.omaIdCopiedFeedback ? root.t("omaid_copied_sub") : root.t("service_active_sub"))
-                      : root.t("service_disabled_sub")
-                color: root.omaIdCopiedFeedback ? Color.accent : Qt.darker(root.foreground, 1.4)
+                text: root.serviceOn ? root.tf("hero_sub_on", root.onlineCount) : root.t("service_disabled_sub")
+                color: Qt.darker(root.foreground, 1.4)
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 font.bold: true
@@ -1178,48 +820,31 @@ Panel {
             }
           }
 
-          // -----------------------------------------------------------------
-          // 2. 4-COLUMN TELEMETRY & IDENTITY GRID (Exact Omarchy Network Style)
-          //    Displays: OmaID | Cihaz ID | Yerel IP | Alınan
-          // -----------------------------------------------------------------
+          // ---------------------------------------------------------------
+          // INFO GRID
+          // ---------------------------------------------------------------
           GridLayout {
             width: parent.width
             columns: 4
             columnSpacing: Style.space(16)
             rowSpacing: Style.spacing.labelGap
 
-            InfoLabel { text: "OmaID" }
-            DetailValue {
-              text: root.formatOmaId(root.omaId, root.omaIdRevealed)
-              copyable: true
-              tooltipText: root.t("copy_omaid_tooltip")
-              onClickedAction: {
-                if (root.omaId) {
-                  root.copyText(root.omaId)
-                  root.omaIdCopiedFeedback = true
-                  omaIdCopyTimer.restart()
-                }
-              }
-            }
-
             InfoLabel { text: root.t("label_device_id") }
             DetailValue {
-              text: root.formatShortDeviceId(root.deviceId)
+              text: root.shortId(root.deviceKeyId)
               copyable: true
-              tooltipText: root.t("copy_device_id_tooltip")
-              onClickedAction: {
-                if (root.deviceId) root.copyText(root.deviceId)
-              }
+              tooltipText: root.deviceKeyId
+              onClickedAction: if (root.deviceKeyId) root.copyText(root.deviceKeyId)
             }
-
             InfoLabel { text: root.t("label_ip_address") }
             DetailValue {
-              text: root.localIp + ":" + root.port
+              text: root.localIp
               copyable: true
               tooltipText: root.t("copy_ip_tooltip")
               onClickedAction: root.copyText(root.localIp)
             }
-
+            InfoLabel { text: root.t("label_paired") }
+            DetailValue { text: root.onlineCount + "/" + root.pairedDevices.length }
             InfoLabel { text: root.t("label_received") }
             DetailValue {
               text: root.totalReceived + " " + root.t("files_unit")
@@ -1229,34 +854,50 @@ Panel {
             }
           }
 
-          // Inline QR Card (Only shown when QR icon in Hero is clicked)
+          // ---------------------------------------------------------------
+          // PAIRING CARD
+          // ---------------------------------------------------------------
           BorderSurface {
-            visible: root.showQrSection
+            visible: root.showPair
             width: parent.width
-            implicitHeight: qrCol.implicitHeight + Style.space(18)
+            implicitHeight: pairCol.implicitHeight + Style.space(20)
             color: Style.normalFillFor(root.foreground, Color.accent)
             borderSpec: Border.controlSpec("normal", root.foreground, Color.accent)
             radius: Style.cornerRadius
 
             Column {
-              id: qrCol
+              id: pairCol
               anchors.centerIn: parent
               width: parent.width - Style.space(20)
               spacing: Style.space(8)
 
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: root.t("pair_title")
+                color: Color.accent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 1.0
+              }
+
               Rectangle {
                 anchors.horizontalCenter: parent.horizontalCenter
-                width: Style.space(140)
-                height: Style.space(140)
+                width: Style.space(176)
+                height: Style.space(176)
                 radius: Style.cornerRadius
                 color: "#ffffff"
 
                 Image {
                   anchors.centerIn: parent
-                  width: Style.space(126)
-                  height: Style.space(126)
-                  source: root.omaidQrPath ? ("file://" + root.omaidQrPath + "?v=" + root.refreshNonce) : ""
+                  width: Style.space(164)
+                  height: Style.space(164)
+                  source: root.pairQrPath ? ("file://" + root.pairQrPath + "?v=" + root.refreshNonce) : ""
+                  sourceSize.width: 512
+                  sourceSize.height: 512
                   fillMode: Image.PreserveAspectFit
+                  smooth: false
                   cache: false
                 }
               }
@@ -1264,30 +905,85 @@ Panel {
               Text {
                 width: parent.width
                 textFormat: Text.PlainText
-                text: "OMAID: " + root.formatOmaId(root.omaId, true) + " / " + root.t("label_device_id").toUpperCase() + ": " + root.formatShortDeviceId(root.deviceId)
+                text: root.t("pair_instructions")
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
-                font.bold: true
+                wrapMode: Text.WordWrap
                 horizontalAlignment: Text.AlignHCenter
-                elide: Text.ElideRight
+              }
+
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: root.tf("pair_expires", Math.max(0, root.pairExpiresAt - root.nowSecs))
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                horizontalAlignment: Text.AlignHCenter
+              }
+
+              RowLayout {
+                width: parent.width
+                spacing: Style.space(6)
+
+                ScopePill {
+                  label: root.t("pair_own")
+                  activeWhen: root.pairOwn
+                  onClicked: { if (!root.pairOwn) { root.pairOwn = true; root.newPairOffer() } }
+                }
+                ScopePill {
+                  label: root.t("pair_other")
+                  activeWhen: !root.pairOwn
+                  onClicked: { if (root.pairOwn) { root.pairOwn = false; root.newPairOffer() } }
+                }
+                Item { Layout.fillWidth: true }
+                PanelActionButton {
+                  iconText: "󰐳"
+                  tooltipText: root.t("pair_scan_screen_tooltip")
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  onClicked: root.scanScreenForPairing()
+                }
+              }
+
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: root.pairOwn ? root.t("pair_own_hint") : root.t("pair_other_hint")
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
               }
             }
           }
 
-          // -----------------------------------------------------------------
-          // 2B. FIREWALL WARNING BANNER (Visible only when UFW/Nftables blocks 53317)
-          // -----------------------------------------------------------------
+          // Status line for pairing / unpair / errors
+          Text {
+            visible: root.statusMsg !== ""
+            width: parent.width
+            textFormat: Text.PlainText
+            text: root.statusMsg
+            color: root.statusError ? root.urgent : Color.accent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+
+          // ---------------------------------------------------------------
+          // FIREWALL WARNING
+          // ---------------------------------------------------------------
           BorderSurface {
             visible: root.firewallStatus.indexOf("UFW_ACTIVE_CHECK") === 0 || root.firewallStatus.indexOf("UFW_BLOCKED") === 0 || root.firewallStatus.indexOf("NFT_BLOCKED") === 0
             width: parent.width
-            implicitHeight: fwWarnRow.implicitHeight + Style.space(12)
+            implicitHeight: fwRow.implicitHeight + Style.space(12)
             color: Style.normalFillFor(root.foreground, root.urgent)
             borderSpec: Border.controlSpec("normal", root.foreground, root.urgent)
             radius: Style.cornerRadius
 
             RowLayout {
-              id: fwWarnRow
+              id: fwRow
               anchors.left: parent.left
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
@@ -1302,7 +998,6 @@ Panel {
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
               }
-
               Text {
                 Layout.fillWidth: true
                 textFormat: Text.PlainText
@@ -1315,16 +1010,15 @@ Panel {
             }
           }
 
-          // -----------------------------------------------------------------
-          // 3. INCOMING TRANSFER GATEKEEPER (Only visible when foreign OmaID sends)
-          // -----------------------------------------------------------------
+          // ---------------------------------------------------------------
+          // INCOMING TRANSFER (needs a decision)
+          // ---------------------------------------------------------------
           Column {
-            visible: root.p2pPendingTransfer !== null && root.p2pPendingTransfer.status === "PENDING"
+            visible: root.pendingTransfer !== null && root.pendingTransfer.status === "PENDING"
             width: parent.width
             spacing: Style.space(8)
 
             PanelSeparator { foreground: root.foreground }
-
             PanelSectionHeader {
               text: root.t("incoming_transfer_header")
               foreground: root.foreground
@@ -1335,10 +1029,10 @@ Panel {
               width: parent.width
               current: true
               foreground: root.foreground
-              implicitHeight: pendingRowLayout.implicitHeight + Style.spacing.rowPaddingX
+              implicitHeight: pendingRow.implicitHeight + Style.spacing.rowPaddingX
 
               RowLayout {
-                id: pendingRowLayout
+                id: pendingRow
                 anchors.left: parent.left
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
@@ -1362,19 +1056,21 @@ Panel {
                   Text {
                     textFormat: Text.PlainText
                     Layout.fillWidth: true
-                    text: root.p2pPendingTransfer ? String(root.p2pPendingTransfer.sender_name || "") : ""
+                    text: root.pendingTransfer ? String(root.pendingTransfer.sender_name || "") : ""
                     color: root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.body
                     elide: Text.ElideRight
                   }
-
                   Text {
                     textFormat: Text.PlainText
                     Layout.fillWidth: true
-                    text: root.p2pPendingTransfer
-                          ? (String(root.p2pPendingTransfer.sender_id || "") + " · " + (root.p2pPendingTransfer.file_names || []).join(", "))
-                          : ""
+                    text: {
+                      if (!root.pendingTransfer) return ""
+                      var enc = root.pendingTransfer.transport === "quic"
+                      return (enc ? "󰌾 " + root.t("encrypted") : "󰌿 " + root.t("not_encrypted"))
+                        + " · " + (root.pendingTransfer.file_names || []).join(", ")
+                    }
                     color: root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
@@ -1387,31 +1083,29 @@ Panel {
                   tooltipText: root.t("accept_btn")
                   foreground: Color.accent
                   fontFamily: root.fontFamily
-                  onClicked: if (root.p2pPendingTransfer) root.acceptTransfer(root.p2pPendingTransfer.token)
+                  onClicked: if (root.pendingTransfer) root.acceptTransfer(root.pendingTransfer.token)
                 }
-
                 PanelActionButton {
                   iconText: "󰅖"
                   tooltipText: root.t("reject_btn")
                   foreground: root.urgent
                   hoverColor: root.urgent
                   fontFamily: root.fontFamily
-                  onClicked: if (root.p2pPendingTransfer) root.rejectTransfer(root.p2pPendingTransfer.token)
+                  onClicked: if (root.pendingTransfer) root.rejectTransfer(root.pendingTransfer.token)
                 }
               }
             }
           }
 
-          // -----------------------------------------------------------------
-          // 3B. ACTIVE TRANSFER PROGRESS & CANCEL CARD
-          // -----------------------------------------------------------------
+          // ---------------------------------------------------------------
+          // ACTIVE TRANSFER
+          // ---------------------------------------------------------------
           Column {
-            visible: root.p2pTransferProgress !== null
+            visible: root.transferProgress !== null
             width: parent.width
             spacing: Style.space(8)
 
             PanelSeparator { foreground: root.foreground }
-
             PanelSectionHeader {
               text: root.t("active_transfer_header")
               foreground: root.foreground
@@ -1422,10 +1116,10 @@ Panel {
               width: parent.width
               current: true
               foreground: root.foreground
-              implicitHeight: activeTransferCol.implicitHeight + Style.space(14)
+              implicitHeight: progressCol.implicitHeight + Style.space(14)
 
               ColumnLayout {
-                id: activeTransferCol
+                id: progressCol
                 anchors.left: parent.left
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
@@ -1439,17 +1133,16 @@ Panel {
 
                   Text {
                     textFormat: Text.PlainText
-                    text: (root.p2pTransferProgress && root.p2pTransferProgress.direction === "sending") ? "" : "󰇚"
+                    text: (root.transferProgress && String(root.transferProgress.direction || "").indexOf("send") === 0) ? "" : "󰇚"
                     color: Color.accent
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.body
                   }
-
                   Text {
                     Layout.fillWidth: true
                     textFormat: Text.PlainText
-                    text: root.p2pTransferProgress
-                          ? (String(root.p2pTransferProgress.file_name || "") + " (" + Number(root.p2pTransferProgress.percent || 0) + "%)")
+                    text: root.transferProgress
+                          ? (String(root.transferProgress.file_name || "") + " (" + Number(root.transferProgress.percent || 0) + "%)")
                           : ""
                     color: root.foreground
                     font.family: root.fontFamily
@@ -1457,7 +1150,6 @@ Panel {
                     font.bold: true
                     elide: Text.ElideRight
                   }
-
                   PanelActionButton {
                     iconText: "󰅖"
                     tooltipText: root.t("cancel_btn")
@@ -1475,7 +1167,7 @@ Panel {
                   color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.14)
 
                   Rectangle {
-                    width: parent.width * Math.max(0.02, Math.min(1.0, (root.p2pTransferProgress ? Number(root.p2pTransferProgress.percent || 0) : 0) / 100.0))
+                    width: parent.width * Math.max(0.02, Math.min(1.0, (root.transferProgress ? Number(root.transferProgress.percent || 0) : 0) / 100.0))
                     height: parent.height
                     radius: parent.radius
                     color: Color.accent
@@ -1485,146 +1177,9 @@ Panel {
             }
           }
 
-          // -----------------------------------------------------------------
-          // 4. KENDİ CİHAZLARIM (Same OmaID, Different Device ID — Zero-Click)
-          //    Exact Omarchy "KNOWN NETWORKS" visual structure
-          // -----------------------------------------------------------------
-          PanelSeparator { foreground: root.foreground }
-
-          Column {
-            width: parent.width
-            spacing: Style.space(6)
-
-            Item {
-              width: parent.width
-              implicitHeight: ownHeader.implicitHeight
-
-              PanelSectionHeader {
-                id: ownHeader
-                text: root.t("own_devices_header")
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                anchors.left: parent.left
-                anchors.verticalCenter: parent.verticalCenter
-              }
-
-              Text {
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                textFormat: Text.PlainText
-                text: root.showSyncSection ? root.t("close_action") : root.t("sync_omaid_action")
-                color: root.showSyncSection ? Color.accent : root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-
-                MouseArea {
-                  anchors.fill: parent
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: {
-                    root.showSyncSection = !root.showSyncSection
-                    root.syncInputOmaId = root.formatInputOmaId(root.omaId)
-                    root.syncStatusMsg = ""
-                    if (root.showSyncSection) {
-                      Qt.callLater(function() { syncField.forceActiveFocus() })
-                    }
-                  }
-                }
-              }
-            }
-
-            // Inline "OmaID Eşitle" Input (Only visible when "OmaID Eşitle" clicked)
-            Column {
-              visible: root.showSyncSection
-              width: parent.width
-              spacing: Style.space(6)
-
-              RowLayout {
-                width: parent.width
-                spacing: Style.space(6)
-
-                TextField {
-                  id: syncField
-                  Layout.fillWidth: true
-                  foreground: root.foreground
-                  placeholderText: root.t("own_omaid_placeholder")
-                  text: root.syncInputOmaId
-                  maximumLength: 19
-                  onTextChanged: {
-                    var formatted = root.formatInputOmaId(text)
-                    if (formatted !== text) text = formatted
-                    root.syncInputOmaId = text
-                  }
-                  onAccepted: root.syncOwnOmaId(root.syncInputOmaId)
-                }
-
-                PanelActionButton {
-                  iconText: "󰅍"
-                  tooltipText: root.t("paste_clipboard_tooltip")
-                  foreground: root.foreground
-                  fontFamily: root.fontFamily
-                  onClicked: root.pasteOmaIdFromClipboard("sync")
-                }
-
-                PanelActionButton {
-                  iconText: "󰑓"
-                  tooltipText: root.t("generate_new_omaid_tooltip")
-                  foreground: root.foreground
-                  fontFamily: root.fontFamily
-                  onClicked: root.generateNewOwnOmaId()
-                }
-
-                PanelActionButton {
-                  iconText: "󰄬"
-                  tooltipText: root.t("save_sync_omaid_tooltip")
-                  foreground: Color.accent
-                  bordered: true
-                  fontFamily: root.fontFamily
-                  onClicked: root.syncOwnOmaId(root.syncInputOmaId)
-                }
-              }
-
-              Text {
-                visible: root.syncStatusMsg !== ""
-                width: parent.width
-                textFormat: Text.PlainText
-                text: root.syncStatusMsg
-                color: root.syncStatusError ? root.urgent : Color.accent
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
-              }
-            }
-
-            Repeater {
-              model: root.ownPeers
-
-              PeerRow {
-                required property var modelData
-                required property int index
-                width: parent.width
-                peer: modelData
-                rowIndex: index
-                isOwnDevice: true
-              }
-            }
-
-            Text {
-              visible: root.ownPeers.length === 0
-              width: parent.width
-              textFormat: Text.PlainText
-              text: root.t("no_own_devices")
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-            }
-          }
-
-          // -----------------------------------------------------------------
-          // 5. YABANCI OMAID (Foreign OmaID Input + Discovered Foreign Peers)
-          //    Exact Omarchy "OTHER NETWORKS" visual structure
-          // -----------------------------------------------------------------
+          // ---------------------------------------------------------------
+          // MY DEVICES (QR-paired keys, end-to-end encrypted)
+          // ---------------------------------------------------------------
           PanelSeparator { foreground: root.foreground }
 
           Column {
@@ -1632,172 +1187,93 @@ Panel {
             spacing: Style.space(6)
 
             PanelSectionHeader {
-              text: root.t("foreign_omaid_header")
+              text: root.t("my_devices_header")
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
 
-            RowLayout {
-              width: parent.width
-              spacing: Style.space(6)
+            Repeater {
+              model: root.pairedDevices
 
-              TextField {
-                id: directSendField
-                Layout.fillWidth: true
-                foreground: root.foreground
-                placeholderText: "XXXX-XXXX-XXXX-XXXX"
-                text: root.directTargetInput
-                maximumLength: 19
-                onTextChanged: {
-                  var formatted = root.formatInputOmaId(text)
-                  if (formatted !== text) text = formatted
-                  root.directTargetInput = text
-                }
-                onAccepted: root.sendToDirectTarget(root.directTargetInput)
-              }
-
-              PanelActionButton {
-                iconText: "󰅍"
-                tooltipText: root.t("paste_clipboard_tooltip")
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                onClicked: root.pasteOmaIdFromClipboard("direct")
-              }
-
-              PanelActionButton {
-                iconText: "󰄳"
-                tooltipText: root.t("scan_screen_qr_tooltip")
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                onClicked: root.scanFromScreen(false)
-              }
-
-              PanelActionButton {
-                iconText: ""
-                tooltipText: root.t("select_file_send_tooltip")
-                foreground: Color.accent
-                bordered: true
-                fontFamily: root.fontFamily
-                onClicked: root.sendToDirectTarget(root.directTargetInput)
+              DeviceRow {
+                required property var modelData
+                required property int index
+                width: parent.width
+                rowIndex: index
+                kind: "paired"
+                name: String(modelData.name || "")
+                address: String(modelData.device_id || "")
+                online: Boolean(modelData.online)
+                own: Boolean(modelData.own_device)
+                detail: (Boolean(modelData.online) ? (root.t("online") + " · " + String(modelData.ip || "")) : root.t("not_seen"))
+                        + " · " + root.shortId(modelData.device_id)
               }
             }
 
             Text {
-              visible: root.directStatusMsg !== ""
+              visible: root.pairedDevices.length === 0
               width: parent.width
               textFormat: Text.PlainText
-              text: root.directStatusMsg
-              color: root.directStatusError ? root.urgent : Color.accent
+              text: root.t("no_paired_devices")
+              color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               wrapMode: Text.WordWrap
             }
+          }
+
+          // ---------------------------------------------------------------
+          // NEARBY (not paired: legacy transport, receiver approves)
+          // ---------------------------------------------------------------
+          PanelSeparator { foreground: root.foreground }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(6)
+
+            PanelSectionHeader {
+              text: root.t("nearby_header")
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
 
             Repeater {
-              model: root.otherPeers
+              model: root.nearby
 
-              PeerRow {
+              DeviceRow {
                 required property var modelData
                 required property int index
                 width: parent.width
-                peer: modelData
-                rowIndex: root.ownPeers.length + index
-                isOwnDevice: false
+                rowIndex: root.pairedDevices.length + index
+                kind: "nearby"
+                name: String(modelData.name || "")
+                address: String(modelData.ip || "")
+                online: true
+                own: false
+                detail: String(modelData.ip || "") + " · " + root.t("needs_approval")
               }
             }
-          }
 
-          // -----------------------------------------------------------------
-          // 7. INFO / HAKKINDA BÖLÜMÜ (Auto-scrolls into view when Info clicked)
-          // -----------------------------------------------------------------
-          BorderSurface {
-            id: aboutCard
-            visible: root.showAboutSection
-            width: parent.width
-            implicitHeight: aboutInlineCol.implicitHeight + Style.space(18)
-            color: Style.normalFillFor(root.foreground, Color.accent)
-            borderSpec: Border.controlSpec("normal", root.foreground, Color.accent)
-            radius: Style.cornerRadius
-
-            Column {
-              id: aboutInlineCol
-              anchors.centerIn: parent
-              width: parent.width - Style.space(20)
-              spacing: Style.space(6)
-
-              RowLayout {
-                width: parent.width
-                spacing: Style.space(8)
-
-                Text {
-                  textFormat: Text.PlainText
-                  text: ""
-                  color: Color.accent
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                }
-
-                Text {
-                  Layout.fillWidth: true
-                  textFormat: Text.PlainText
-                  text: "OmaSend v" + root.pluginVersion + " · " + root.t("about_subtitle")
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.bodySmall
-                  font.bold: true
-                  elide: Text.ElideRight
-                }
-
-                PanelActionButton {
-                  iconText: "󰅖"
-                  tooltipText: root.t("close_action")
-                  foreground: root.dim
-                  fontFamily: root.fontFamily
-                  onClicked: root.showAboutSection = false
-                }
-              }
-
-              PanelSeparator { foreground: root.foreground }
-
-              Text {
-                width: parent.width
-                textFormat: Text.PlainText
-                text: root.t("about_identity_prefix") + " (" + root.formatOmaId(root.omaId, true) + " / " + root.formatShortDeviceId(root.deviceId) + ")"
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                elide: Text.ElideRight
-              }
-
-              Text {
-                width: parent.width
-                textFormat: Text.PlainText
-                text: root.t("about_security_line")
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                elide: Text.ElideRight
-              }
-
-              Text {
-                width: parent.width
-                textFormat: Text.PlainText
-                text: root.t("about_author_prefix") + ": " + root.pluginAuthor + " · " + root.t("about_save_prefix") + ": " + root.savePath
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                elide: Text.ElideRight
-              }
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: root.nearby.length === 0
+                    ? (root.serviceOn ? root.t("nearby_empty") : root.t("service_disabled_sub"))
+                    : root.t("nearby_footnote")
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
             }
           }
         }
       }
 
       // -----------------------------------------------------------------
-      // 8. STICKY FOOTER MENU (Always Fixed at Bottom While Scrolling)
+      // FOOTER
       // -----------------------------------------------------------------
       Column {
-        id: stickyFooter
+        id: footer
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: parent.bottom
@@ -1808,7 +1284,7 @@ Panel {
         CursorSurface {
           width: parent.width
           foreground: root.foreground
-          implicitHeight: utilityRowLayout.implicitHeight + Style.spacing.rowPaddingX
+          implicitHeight: footerRow.implicitHeight + Style.spacing.rowPaddingX
 
           MouseArea {
             anchors.fill: parent
@@ -1818,7 +1294,7 @@ Panel {
           }
 
           RowLayout {
-            id: utilityRowLayout
+            id: footerRow
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
@@ -1833,17 +1309,15 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.font.icon
             }
-
             Text {
               Layout.fillWidth: true
               textFormat: Text.PlainText
-              text: root.t("downloads_footer") + " (" + root.totalReceived + " " + root.t("files_unit") + ")"
+              text: root.t("downloads_footer") + (root.pluginVersion ? ("  ·  v" + root.pluginVersion) : "")
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
               elide: Text.ElideRight
             }
-
             PanelActionButton {
               iconText: root.soundEnabled ? "󰕾" : "󰖁"
               tooltipText: root.soundEnabled ? root.t("sound_on_tooltip") : root.t("sound_off_tooltip")
@@ -1851,15 +1325,6 @@ Panel {
               fontFamily: root.fontFamily
               onClicked: root.toggleSound()
             }
-
-            PanelActionButton {
-              iconText: "󰉋"
-              tooltipText: root.t("open_downloads_tooltip")
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              onClicked: root.openFolder()
-            }
-
             PanelActionButton {
               iconText: "󰑐"
               tooltipText: root.t("refresh_scan_tooltip")
@@ -1867,21 +1332,12 @@ Panel {
               fontFamily: root.fontFamily
               onClicked: root.forceScan()
             }
-
             PanelActionButton {
               iconText: "󰋽"
               tooltipText: root.t("about_tooltip")
-              foreground: root.showAboutSection ? Color.accent : root.foreground
-              bordered: root.showAboutSection
+              foreground: root.foreground
               fontFamily: root.fontFamily
-              onClicked: {
-                root.showAboutSection = !root.showAboutSection
-                if (root.showAboutSection) {
-                  Qt.callLater(function() {
-                    panelFlick.contentY = Math.max(0, panelFlick.contentHeight - panelFlick.height)
-                  })
-                }
-              }
+              onClicked: root.setStatus(root.t("about_line"), false)
             }
           }
         }
@@ -1890,31 +1346,35 @@ Panel {
   }
 
   // =========================================================================
-  // 4. REUSABLE COMPONENTS (Exact Omarchy Network Panel Components)
+  // COMPONENTS
   // =========================================================================
   component ScopePill: Button {
-    id: pill
     required property string label
-    required property string scopeKey
-
+    property bool activeWhen: false
     text: label
-    fontSize: Style.font.bodySmall
+    fontSize: Style.font.caption
     foreground: root.foreground
     fontFamily: root.fontFamily
     horizontalPadding: Style.spacing.controlPaddingX
-    verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
+    verticalPadding: Style.spacing.controlPaddingY
     bordered: true
-    active: root.targetScope === scopeKey
+    active: activeWhen
   }
 
-  component PeerRow: CursorSurface {
+  component DeviceRow: CursorSurface {
     id: row
-    required property var peer
     required property int rowIndex
-    required property bool isOwnDevice
+    property string kind: "nearby"
+    property string name: ""
+    property string address: ""
+    property string detail: ""
+    property bool online: false
+    property bool own: false
+    readonly property bool paired: kind === "paired"
+    readonly property bool armed: paired && root.armedUnpair === address
 
-    current: isOwnDevice
-    hasCursor: root.cursorActive && root.selectedPeerIndex === rowIndex
+    current: paired && online
+    hasCursor: root.cursorActive && root.selectedIndex === rowIndex
     foreground: root.foreground
     fill: root.hoverFill
     currentFill: root.selectedFill
@@ -1927,17 +1387,12 @@ Panel {
       cursorShape: Qt.PointingHandCursor
       onEntered: {
         root.cursorActive = true
-        root.selectedPeerIndex = row.rowIndex
+        root.selectedIndex = row.rowIndex
       }
       onClicked: function(mouse) {
-        if (!row.peer) return
-        var target = row.peer.ip || row.peer.oma_id
-        if (!target) return
-        if (mouse.button === Qt.RightButton) {
-          root.syncClipboardTo(target)
-        } else {
-          root.sendFileTo(target)
-        }
+        if (!row.address) return
+        if (mouse.button === Qt.RightButton) root.syncClipboardTo(row.address)
+        else root.sendFileTo(row.address)
       }
     }
 
@@ -1947,57 +1402,77 @@ Panel {
       anchors.right: parent.right
       anchors.top: parent.top
       anchors.leftMargin: Style.space(10)
-      anchors.rightMargin: Style.space(10)
-      implicitHeight: Math.max(peerIcon.implicitHeight, peerInfo.implicitHeight, rightGlyph.implicitHeight) + Style.spacing.rowPaddingX
+      anchors.rightMargin: Style.space(6)
+      implicitHeight: Math.max(rowIcon.implicitHeight, rowInfo.implicitHeight, rowActions.implicitHeight) + Style.spacing.rowPaddingX
 
       Text {
-        id: peerIcon
+        id: rowIcon
         textFormat: Text.PlainText
-        text: (row.peer && row.peer.name && String(row.peer.name).toLowerCase().indexOf("android") !== -1) ? "󰏲" : "󰌢"
-        color: row.isOwnDevice ? root.foreground : Qt.darker(root.foreground, 1.4)
+        text: /android|phone|pixel|galaxy|sdk_gphone|samsung|xiaomi/i.test(row.name) ? "󰏲" : "󰌢"
+        color: (row.paired && row.online) ? root.foreground : Qt.darker(root.foreground, 1.4)
         font.family: root.fontFamily
         font.pixelSize: Style.font.title
         anchors.left: parent.left
         anchors.verticalCenter: parent.verticalCenter
       }
 
-      Text {
-        id: rightGlyph
-        textFormat: Text.PlainText
-        text: row.isOwnDevice ? "" : "󰌾"
-        color: row.isOwnDevice ? root.foreground : Qt.darker(root.foreground, 1.4)
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.subtitle
+      RowLayout {
+        id: rowActions
         anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
+        spacing: Style.space(2)
+
+        Text {
+          textFormat: Text.PlainText
+          text: row.paired ? "󰌾" : "󰌿"
+          color: row.paired ? Color.accent : Qt.darker(root.foreground, 1.4)
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          Layout.rightMargin: Style.space(4)
+        }
+        PanelActionButton {
+          visible: row.paired
+          iconText: "󰅍"
+          tooltipText: root.t("send_clipboard_tooltip")
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          onClicked: root.syncClipboardTo(row.address)
+        }
+        PanelActionButton {
+          visible: row.paired
+          iconText: "󰅖"
+          tooltipText: row.armed ? root.t("unpair_confirm_tooltip") : root.t("unpair_tooltip")
+          foreground: row.armed ? root.urgent : root.dim
+          hoverColor: root.urgent
+          bordered: row.armed
+          fontFamily: root.fontFamily
+          onClicked: root.requestUnpair(row.address)
+        }
       }
 
       Column {
-        id: peerInfo
+        id: rowInfo
         spacing: Style.space(1)
-        anchors.left: peerIcon.right
+        anchors.left: rowIcon.right
         anchors.leftMargin: Style.space(10)
-        anchors.right: rightGlyph.left
-        anchors.rightMargin: Style.space(8)
+        anchors.right: rowActions.left
+        anchors.rightMargin: Style.space(6)
         anchors.verticalCenter: parent.verticalCenter
 
         Text {
           width: parent.width
           textFormat: Text.PlainText
-          text: row.peer ? String(row.peer.name || "") : ""
+          text: row.name + (row.paired ? (row.own ? "  · " + root.t("badge_own") : "  · " + root.t("badge_paired")) : "")
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
           elide: Text.ElideRight
         }
-
         Text {
           width: parent.width
           textFormat: Text.PlainText
-          text: row.peer
-                ? (root.formatPeerIdentity(row.peer) + " · " + root.t("approval_send"))
-                : ""
-          color: row.isOwnDevice ? root.foreground : Qt.darker(root.foreground, 1.5)
+          text: row.armed ? root.t("unpair_armed") : row.detail
+          color: row.armed ? root.urgent : Qt.darker(root.foreground, 1.5)
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           elide: Text.ElideRight
@@ -2008,7 +1483,7 @@ Panel {
 
   component DetailValue: InfoValue {
     property bool copyable: false
-    property string tooltipText: "Kopyala"
+    property string tooltipText: ""
     signal clickedAction()
 
     Layout.fillWidth: true
@@ -2025,7 +1500,7 @@ Panel {
     }
 
     PanelToolTip {
-      visible: valueMouse.enabled && valueMouse.containsMouse
+      visible: valueMouse.enabled && valueMouse.containsMouse && parent.tooltipText !== ""
       text: parent.tooltipText
       fontFamily: root.fontFamily
     }

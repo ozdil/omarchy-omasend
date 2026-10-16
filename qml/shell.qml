@@ -8,11 +8,9 @@ ShellRoot {
 
     FloatingWindow {
         id: win
-        title: "OmaSend - Wireless AirBridge & Zero-Trust Transfer"
+        title: "OmaSend"
         implicitWidth: 920
         implicitHeight: 620
-        width: 920
-        height: 620
         color: Theme.bgBase
 
         MainWindow {

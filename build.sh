@@ -89,6 +89,14 @@ if [[ -d "${PLUGIN_TARGET_DIR}" && "${DIR}" != "${PLUGIN_TARGET_DIR}" ]]; then
         /usr/bin/mkdir -p "${PLUGIN_TARGET_DIR}/assets"
         /usr/bin/cp -rf "${DIR}/assets/"* "${PLUGIN_TARGET_DIR}/assets/"
     fi
+    # Standalone window (omasend-dashboard); qml/OmaI18n.js is a symlink to ../OmaI18n.js.
+    if [[ -d "${DIR}/qml" ]]; then
+        /usr/bin/rm -rf "${PLUGIN_TARGET_DIR}/qml"
+        /usr/bin/cp -R "${DIR}/qml" "${PLUGIN_TARGET_DIR}/qml"
+    fi
+    for f in omasend-dashboard omasend-status; do
+        [[ -f "${DIR}/${f}" ]] && /usr/bin/install -m 755 "${DIR}/${f}" "${PLUGIN_TARGET_DIR}/${f}"
+    done
 fi
 
 # Sync engine binary to ~/.local/bin/omasend-engine (used by Panel.qml)

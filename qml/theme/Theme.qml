@@ -91,6 +91,9 @@ QtObject {
         var acc = dict["accent"] || dict["color4"] || (root.isDarkTheme ? "#b8b8b8" : "#333333");
         var sel = dict["selection"] || dict["selection_background"] || "";
         var mut = dict["muted"] || dict["color8"] || "";
+        // Color components need color values (the TOML gives strings).
+        var fgc = Qt.darker(fg, 1.0);
+        var accc = Qt.darker(acc, 1.0);
 
         root.bgBase = base;
 
@@ -99,21 +102,21 @@ QtObject {
             root.bgSurface = dict["lighter_background"] || (sel ? sel : Qt.lighter(base, 1.3));
             root.bgCard = (sel && sel !== base) ? sel : Qt.lighter(base, 1.5);
             root.bgCardHover = Qt.lighter(root.bgCard, 1.2);
-            root.border = mut ? mut : Qt.rgba(fg.r, fg.g, fg.b, 0.18);
-            root.borderLight = acc ? Qt.rgba(acc.r, acc.g, acc.b, 0.35) : Qt.rgba(fg.r, fg.g, fg.b, 0.25);
+            root.border = mut ? mut : Qt.rgba(fgc.r, fgc.g, fgc.b, 0.18);
+            root.borderLight = acc ? Qt.rgba(accc.r, accc.g, accc.b, 0.35) : Qt.rgba(fgc.r, fgc.g, fgc.b, 0.25);
             root.textMain = dict["bright_foreground"] || fg;
-            root.textMuted = dict["light_foreground"] || mut || Qt.rgba(fg.r, fg.g, fg.b, 0.65);
-            root.textDim = dict["dark_foreground"] || dict["color8"] || Qt.rgba(fg.r, fg.g, fg.b, 0.4);
+            root.textMuted = dict["light_foreground"] || mut || Qt.rgba(fgc.r, fgc.g, fgc.b, 0.65);
+            root.textDim = dict["dark_foreground"] || dict["color8"] || Qt.rgba(fgc.r, fgc.g, fgc.b, 0.4);
         } else {
             root.bgDark = dict["dark_background"] || Qt.darker(base, 1.08);
             root.bgSurface = dict["lighter_background"] || Qt.lighter(base, 1.03);
             root.bgCard = (sel && sel !== base) ? sel : Qt.darker(base, 1.05);
             root.bgCardHover = Qt.darker(root.bgCard, 1.06);
-            root.border = mut ? mut : Qt.rgba(fg.r, fg.g, fg.b, 0.18);
-            root.borderLight = acc ? Qt.rgba(acc.r, acc.g, acc.b, 0.35) : Qt.rgba(fg.r, fg.g, fg.b, 0.25);
+            root.border = mut ? mut : Qt.rgba(fgc.r, fgc.g, fgc.b, 0.18);
+            root.borderLight = acc ? Qt.rgba(accc.r, accc.g, accc.b, 0.35) : Qt.rgba(fgc.r, fgc.g, fgc.b, 0.25);
             root.textMain = dict["bright_foreground"] || fg;
-            root.textMuted = dict["light_foreground"] || mut || Qt.rgba(fg.r, fg.g, fg.b, 0.65);
-            root.textDim = dict["dark_foreground"] || dict["color8"] || Qt.rgba(fg.r, fg.g, fg.b, 0.4);
+            root.textMuted = dict["light_foreground"] || mut || Qt.rgba(fgc.r, fgc.g, fgc.b, 0.65);
+            root.textDim = dict["dark_foreground"] || dict["color8"] || Qt.rgba(fgc.r, fgc.g, fgc.b, 0.4);
         }
 
         root.accent = acc;
@@ -127,8 +130,8 @@ QtObject {
         themeWatcher.running = true;
     }
 
-    Process {
-        id: themeWatcher
+    // QtObject has no default property, so the reader is held in a property.
+    property Process themeWatcher: Process {
         command: ["/bin/cat", root.omarchyCurrentThemePath]
         stdout: StdioCollector {
             onDataChanged: {

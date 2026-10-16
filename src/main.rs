@@ -158,6 +158,12 @@ pub struct DiscoveredPeer {
     #[serde(default)]
     pub is_same_owner: bool,
     pub last_seen_secs: u64,
+    /// Device key advertised in the beacon (protocol v2), empty for older versions.
+    #[serde(default)]
+    pub pk: String,
+    /// "own" / "paired" when this peer is a QR-paired key, otherwise empty.
+    #[serde(default)]
+    pub key_trust: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -253,6 +259,10 @@ pub struct P2pBeaconPacket {
     pub port: u16,
     pub mode: String,
     pub fp: String,
+    /// Ed25519 device key (protocol v2). Only an address hint: every connection to a
+    /// paired key is authenticated by TLS, so a forged beacon cannot receive anything.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pk: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -295,6 +305,12 @@ pub struct ServerState {
     pub sound_enabled: bool,
     #[serde(default)]
     pub firewall_status: String,
+    /// Protocol v2 device id (XXXX-XXXX-XXXX-XXXX) of this machine.
+    #[serde(default)]
+    pub device_key_id: String,
+    /// QR-paired devices (trust store) with online state from discovery.
+    #[serde(default)]
+    pub paired_devices: Vec<serde_json::Value>,
 }
 
 fn get_local_ip() -> String {
@@ -1685,12 +1701,14 @@ fn resolve_omasend_asset_wav(filename: &str) -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
-fn play_samurai_send_sound() {
+/// Plays the first bundled sound that exists. Returns the player thread so short-lived CLI
+/// invocations can wait for it (otherwise the process exits before the sound starts).
+fn play_asset_sound(names: &'static [&'static str]) -> Option<thread::JoinHandle<()>> {
     if !is_sound_enabled() {
-        return;
+        return None;
     }
-    thread::spawn(|| {
-        if let Some(wav) = resolve_omasend_asset_wav("send_whoosh.wav").or_else(|| resolve_omasend_asset_wav("send.wav")) {
+    Some(thread::spawn(move || {
+        if let Some(wav) = names.iter().find_map(|n| resolve_omasend_asset_wav(n)) {
             let wav_str = wav.to_string_lossy().to_string();
             let env_store = get_desktop_gui_envs();
             let envs: Vec<(&str, &str)> = env_store.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -1701,34 +1719,35 @@ fn play_samurai_send_sound() {
                 }
             }
         }
-    });
+    }))
 }
 
-fn play_samurai_receive_sound() {
-    if !is_sound_enabled() {
-        return;
+/// "OMAKASE!" on send.
+fn play_samurai_send_sound() -> Option<thread::JoinHandle<()>> {
+    play_asset_sound(&["send_whoosh.wav", "send.wav"])
+}
+
+/// "ONEGAI SHIMASU!" on receive / accept.
+fn play_samurai_receive_sound() -> Option<thread::JoinHandle<()>> {
+    play_asset_sound(&["receive_whoosh.wav", "receive.wav"])
+}
+
+/// CLI paths exit right after their work: wait for the sound to finish playing.
+fn finish_sound(handle: Option<thread::JoinHandle<()>>) {
+    if let Some(h) = handle {
+        let _ = h.join();
     }
-    thread::spawn(|| {
-        if let Some(wav) = resolve_omasend_asset_wav("receive_whoosh.wav").or_else(|| resolve_omasend_asset_wav("receive.wav")) {
-            let wav_str = wav.to_string_lossy().to_string();
-            let env_store = get_desktop_gui_envs();
-            let envs: Vec<(&str, &str)> = env_store.iter().map(|(k, v)| (*k, v.as_str())).collect();
-            let deadline = Instant::now() + Duration::from_millis(5000);
-            for bin in ["/usr/bin/pw-play", "/usr/bin/paplay"] {
-                if Path::new(bin).exists() && run_cmd_bounded(bin, &[wav_str.as_str()], &envs, deadline, 1024).is_some() {
-                    break;
-                }
-            }
-        }
-    });
 }
 
+/// Addresses of paired devices (legacy and QR-paired) that receive unicast discovery beacons,
+/// so they see us even where broadcast is filtered. Clipboard pushes use
+/// `legacy_clipboard_ips` / `auto_push_clipboard_text` instead.
 fn get_active_paired_peer_ips() -> Vec<String> {
     let paired = load_paired_peers();
     let mut ips = Vec::new();
 
     for p in &paired {
-        // Only peers that completed the code-verified handshake receive pushes.
+        // Only peers that completed the code-verified handshake.
         if !p.is_active() {
             continue;
         }
@@ -1739,9 +1758,7 @@ fn get_active_paired_peer_ips() -> Vec<String> {
         }
     }
 
-    // V2-SEC-02 interim fix: same-owner status comes from unauthenticated UDP beacons and can be
-    // spoofed, so discovered "same-owner" devices no longer receive automatic clipboard pushes.
-    // Phase 1: devices paired with a verified key (QR pairing) do, at the IP of their last signed request.
+    // QR-paired keys, at the address of their last authenticated request.
     for k in trust_store().load() {
         if !k.ip.is_empty() && !ips.contains(&k.ip) {
             ips.push(k.ip);
@@ -1750,24 +1767,41 @@ fn get_active_paired_peer_ips() -> Vec<String> {
     ips
 }
 
-fn p2p_push_clipboard_silent(target_ip: &str, text: &str) {
-    if target_ip.is_empty() {
-        return;
+/// Legacy code-paired peers that receive automatic clipboard pushes over HTTP. Addresses that
+/// belong to a QR-paired key are excluded: those only ever get the encrypted channel.
+fn legacy_clipboard_ips() -> Vec<String> {
+    let keys = trust_store().load();
+    let mut ips = Vec::new();
+    for p in load_paired_peers() {
+        if !p.is_active() {
+            continue;
+        }
+        if let Some(ip) = p.ip.filter(|ip| !ip.is_empty()) {
+            if !ips.contains(&ip) && !keys.iter().any(|k| k.ip == ip) {
+                ips.push(ip);
+            }
+        }
     }
-    if let (Some(node), Some(key)) = (CORE_NODE.get().cloned(), trusted_key_for_ip(target_ip)) {
-        let text_owned = text.to_string();
-        let ip_owned = target_ip.to_string();
+    ips
+}
+
+/// Automatic clipboard sync: legacy paired peers (HTTP, as before) and the user's OWN
+/// QR-paired devices (encrypted QUIC). Devices paired as someone else's never get
+/// automatic pushes.
+fn auto_push_clipboard_text(text: &str) {
+    for ip in legacy_clipboard_ips() {
+        p2p_push_clipboard_http(&ip, text);
+    }
+    for key in trust_store().load().into_iter().filter(|k| k.own_device) {
+        let text = text.to_string();
         thread::spawn(move || {
-            if let Err(e) = node.send_clipboard(key.pk.clone(), core_addrs(&key), text_owned.clone()) {
-                if core_error_is_unavailable(&e.to_string()) {
-                    p2p_push_clipboard_http(&ip_owned, &text_owned);
-                }
+            if let Err((_, e)) = core_clipboard(&key, &text) {
+                eprintln!("Clipboard to {} not delivered: {}", key.name, e);
             }
         });
-        return;
     }
-    p2p_push_clipboard_http(target_ip, text);
 }
+
 
 fn p2p_push_clipboard_http(target_ip: &str, text: &str) {
     if target_ip.is_empty() {
@@ -2025,8 +2059,8 @@ pub fn start_clipboard_sentinel() {
                     let size = img_bytes.len() as u64;
                     let _ = stage_clipboard_image(&img_bytes, &ct);
 
-                    let target_ips = get_active_paired_peer_ips();
-                    for target_ip in target_ips {
+                    // Images go to legacy paired peers only (the encrypted channel carries text).
+                    for target_ip in legacy_clipboard_ips() {
                         p2p_push_image_clipboard_silent(
                             &target_ip,
                             &ct,
@@ -2062,10 +2096,7 @@ pub fn start_clipboard_sentinel() {
                 continue;
             }
 
-            let target_ips = get_active_paired_peer_ips();
-            for target_ip in target_ips {
-                p2p_push_clipboard_silent(&target_ip, &text);
-            }
+            auto_push_clipboard_text(&text);
         }
     });
 }
@@ -2328,6 +2359,7 @@ fn broadcast_offline_beacon() {
         port: PORT,
         mode: "OFF".to_string(),
         fp,
+        pk: device_identity().public_b64(),
     };
 
     if let Ok(bytes) = serde_json::to_vec(&packet) {
@@ -2395,19 +2427,96 @@ fn trust_of(pk: &str) -> omasend_core::Trust {
     }
 }
 
-fn trusted_key_for_ip(ip: &str) -> Option<devicekey::TrustedKey> {
-    trust_store().load().into_iter().find(|k| !k.ip.is_empty() && k.ip == ip)
+/// The paired key a discovered peer belongs to: by advertised key, or (older peers that
+/// do not advertise one) by the address the key last authenticated from.
+fn key_for_discovered<'a>(keys: &'a [devicekey::TrustedKey], p: &DiscoveredPeer) -> Option<&'a devicekey::TrustedKey> {
+    if !p.pk.is_empty() {
+        return keys.iter().find(|k| k.pk == p.pk);
+    }
+    keys.iter().find(|k| !k.ip.is_empty() && k.ip == p.ip)
 }
 
+/// Resolves a send/clipboard target to a QR-paired key. Accepts a device id
+/// (XXXX-XXXX-XXXX-XXXX), a public key, or an IP / host:port. For an address, what is
+/// currently discovered there wins over the key's last known address (DHCP reuse).
+fn trusted_key_for_target(target: &str) -> Option<devicekey::TrustedKey> {
+    let t = target.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let keys = trust_store().load();
+    if let Some(k) = keys.iter().find(|k| k.device_id.eq_ignore_ascii_case(t) || k.pk == t) {
+        return Some(k.clone());
+    }
+    let host = match t.rsplit_once(':') {
+        Some((h, p)) if !h.contains(':') && p.parse::<u16>().is_ok() => h,
+        _ => t,
+    };
+    if let Some(p) = get_discovered_peers().into_iter().find(|p| p.ip == host) {
+        return key_for_discovered(&keys, &p).cloned();
+    }
+    keys.into_iter().find(|k| !k.ip.is_empty() && k.ip == host)
+}
+
+/// Candidate QUIC addresses for a paired key: where discovery currently sees it, then the
+/// address it last authenticated from. TLS verifies the key, so extra candidates are safe.
 fn core_addrs(key: &devicekey::TrustedKey) -> Vec<String> {
     let port = if key.quic_port > 0 { key.quic_port } else { CORE_QUIC_PORT };
-    vec![format!("{}:{}", key.ip, port)]
+    let mut ips: Vec<String> = get_discovered_peers()
+        .into_iter()
+        .filter(|p| !p.pk.is_empty() && p.pk == key.pk && !p.ip.is_empty())
+        .map(|p| p.ip)
+        .collect();
+    if !key.ip.is_empty() && !ips.contains(&key.ip) {
+        ips.push(key.ip.clone());
+    }
+    ips.into_iter().map(|ip| format!("{}:{}", ip, port)).collect()
 }
 
-/// Errors that mean "this peer/route has no working QUIC core": callers fall back to HTTP.
+/// User-facing message for a failed transfer/clipboard push to a paired device.
+fn core_failure_message(name: &str, err: &str) -> String {
+    let m = err.to_lowercase();
+    if m.contains("declined") {
+        format!("{} declined the transfer.", name)
+    } else if m.contains("not paired") {
+        format!("{} does not recognize this device any more. Remove the pairing and pair again with a QR code.", name)
+    } else if core_error_is_unavailable(err) {
+        format!(
+            "{} is not reachable over the encrypted connection. Make sure OmaSend is running there and UDP {} is allowed by the firewall. ({})",
+            name, CORE_QUIC_PORT, err
+        )
+    } else {
+        err.to_string()
+    }
+}
+
+/// QR-paired devices for the panel / `--devices`, with online state from discovery.
+fn paired_devices_view() -> Vec<serde_json::Value> {
+    let discovered = get_discovered_peers();
+    trust_store()
+        .load()
+        .into_iter()
+        .map(|k| {
+            let seen = discovered.iter().find(|p| key_for_discovered(std::slice::from_ref(&k), p).is_some());
+            serde_json::json!({
+                "device_id": k.device_id,
+                "name": k.name,
+                "ip": seen.map(|p| p.ip.clone()).unwrap_or_else(|| k.ip.clone()),
+                "own_device": k.own_device,
+                "online": seen.is_some(),
+                "added_at": k.added_at,
+                "last_seen": k.last_seen,
+            })
+        })
+        .collect()
+}
+
+/// Errors that mean "the paired device could not be reached over the encrypted channel"
+/// (shown with a firewall hint). A TLS handshake/certificate failure means something else
+/// answered at that address: the key check did its job, the device itself was not reached.
 fn core_error_is_unavailable(msg: &str) -> bool {
     let m = msg.to_lowercase();
-    ["timed out", "connect", "not paired", "unreachable", "no such file", "permission denied", "core not running"]
+    ["timed out", "connect", "not paired", "unreachable", "no such file", "permission denied", "core not running", "handshake", "certificate", "no address"]
         .iter()
         .any(|p| m.contains(p))
 }
@@ -2554,7 +2663,7 @@ fn ensure_local_api_token() -> String {
     t
 }
 
-/// Sends through the daemon's QUIC endpoint. Err((unavailable, message)).
+/// Sends files through the daemon's QUIC endpoint. Err((unavailable, message)).
 fn core_send_via_daemon(key: &devicekey::TrustedKey, paths: &[String], names: &[String]) -> Result<(), (bool, String)> {
     if let Some(node) = CORE_NODE.get() {
         return node
@@ -2565,8 +2674,24 @@ fn core_send_via_daemon(key: &devicekey::TrustedKey, paths: &[String], names: &[
                 (core_error_is_unavailable(&m), m)
             });
     }
+    core_daemon_request(serde_json::json!({ "pk": key.pk, "addrs": core_addrs(key), "paths": paths, "names": names }))
+}
+
+/// Encrypted clipboard push to a paired key. Never downgraded to plaintext HTTP.
+fn core_clipboard(key: &devicekey::TrustedKey, text: &str) -> Result<(), (bool, String)> {
+    if let Some(node) = CORE_NODE.get() {
+        return node.send_clipboard(key.pk.clone(), core_addrs(key), text.to_string()).map_err(|e| {
+            let m = e.to_string();
+            (core_error_is_unavailable(&m), m)
+        });
+    }
+    core_daemon_request(serde_json::json!({ "pk": key.pk, "addrs": core_addrs(key), "text": text }))
+}
+
+/// CLI -> daemon request on the loopback-only, token-protected core endpoint.
+fn core_daemon_request(body: serde_json::Value) -> Result<(), (bool, String)> {
     let token = read_secure_file(&local_api_token_path()).map_err(|_| (true, "core not running (no local token)".to_string()))?;
-    let body = serde_json::json!({ "pk": key.pk, "addrs": core_addrs(key), "paths": paths, "names": names }).to_string();
+    let body = body.to_string();
     let mut stream = connect_peer_with_timeout(&format!("127.0.0.1:{}", PORT), Duration::from_secs(2))
         .map_err(|e| (true, format!("core not running: {}", e)))?;
     let _ = stream.set_read_timeout(None);
@@ -2785,12 +2910,16 @@ fn get_discovered_peers_unlocked() -> Vec<DiscoveredPeer> {
         }
     }
 
+    let keys = trust_store().load();
     for p in &mut peers {
         let peer_norm = rendezvous::normalize_oma_id(&p.oma_id);
         let same_owner = !peer_norm.is_empty() && peer_norm == my_norm;
         p.is_same_owner = same_owner;
         p.is_trusted = same_owner || is_peer_paired(&p.oma_id) || is_peer_trusted(&p.id);
         p.transport = "LAN".to_string();
+        p.key_trust = key_for_discovered(&keys, p)
+            .map(|k| if k.own_device { "own" } else { "paired" }.to_string())
+            .unwrap_or_default();
     }
 
     peers.retain(|p| rendezvous::validate_oma_id(&p.oma_id));
@@ -2880,6 +3009,7 @@ fn update_discovered_peer(packet: &P2pBeaconPacket) {
         existing.is_trusted = is_authenticated_paired;
         existing.is_same_owner = is_same_owner;
         existing.last_seen_secs = now;
+        existing.pk = packet.pk.clone();
     } else {
         peers.push(DiscoveredPeer {
             id: packet.id.clone(),
@@ -2892,6 +3022,8 @@ fn update_discovered_peer(packet: &P2pBeaconPacket) {
             is_trusted: is_authenticated_paired,
             is_same_owner,
             last_seen_secs: now,
+            pk: packet.pk.clone(),
+            key_trust: String::new(),
         });
     }
     save_discovered_peers_unlocked(&peers);
@@ -2974,6 +3106,7 @@ pub fn send_p2p_beacon_burst(burst_count: usize) {
         port: PORT,
         mode: vis,
         fp,
+        pk: device_identity().public_b64(),
     };
 
     if let Ok(bytes) = serde_json::to_vec(&packet) {
@@ -3227,10 +3360,10 @@ fn auto_send_target() -> Option<String> {
     let mut keys: Vec<_> = trust_store()
         .load()
         .into_iter()
-        .filter(|k| k.own_device && !k.ip.is_empty())
+        .filter(|k| k.own_device)
         .collect();
     keys.sort_by_key(|k| std::cmp::Reverse(k.last_seen));
-    keys.first().map(|k| format!("{}:{}", k.ip, if k.port > 0 { k.port } else { PORT }))
+    keys.first().map(|k| k.device_id.clone())
 }
 
 /// Creates a pairing offer, renders its QR code to PNG and returns the JSON the panel/CLI shows.
@@ -3244,22 +3377,14 @@ fn create_pair_offer_json(own_device: bool) -> serde_json::Value {
         own_device,
         CORE_NODE.get().map(|n| n.bound_port()).unwrap_or(CORE_QUIC_PORT),
     );
-    let png = get_state_dir().join("pair_offer_qr.png");
-    let png_str = png.to_string_lossy().to_string();
-    let _ = fs::remove_file(&png);
-    let _ = run_cmd_bounded(
-        "/usr/bin/qrencode",
-        &["-o", &png_str, "-t", "PNG", "-s", "8", "-m", "2", "--", &uri],
-        &[],
-        Instant::now() + Duration::from_secs(2),
-        1024,
-    );
-    if png.exists() {
-        let _ = fs::set_permissions(&png, fs::Permissions::from_mode(0o600));
-    }
+    // The offer secret is in the QR, so the image is written 0600 and replaced per offer.
+    let svg = get_state_dir().join("pair_offer_qr.svg");
+    let svg_str = svg.to_string_lossy().to_string();
+    let _ = fs::remove_file(get_state_dir().join("pair_offer_qr.png"));
+    let written = rendezvous::qr_svg(&uri).is_some_and(|data| write_secure_file(&svg, &data).is_ok());
     serde_json::json!({
         "uri": uri,
-        "qr_png": if png.exists() { png_str } else { String::new() },
+        "qr_svg": if written { svg_str } else { String::new() },
         "device_id": device_identity().device_id(),
         "own_device": own_device,
         "expires_in_secs": devicekey::PAIR_OFFER_TTL_SECS,
@@ -3338,10 +3463,6 @@ fn p2p_complete_pairing(peer_ip_str: &str, expected_oma_id: &str, code: &str, na
     rendezvous::store_completed_pairing(&expected_norm, name, peer_ip, token, &get_state_dir(), now)
 }
 
-fn p2p_send_file_to_peer(target_ip_or_omaid: &str, file_path: &Path) -> Result<(), String> {
-    p2p_send_files_to_peer(target_ip_or_omaid, &[file_path.to_path_buf()])
-}
-
 fn p2p_send_files_to_peer(target_ip_or_omaid: &str, file_paths: &[PathBuf]) -> Result<(), String> {
     if file_paths.is_empty() {
         return Err("No files specified for transfer".to_string());
@@ -3363,7 +3484,14 @@ fn p2p_send_files_to_peer(target_ip_or_omaid: &str, file_paths: &[PathBuf]) -> R
         temp_files: Vec::new(),
     };
 
-    let (resolved_ip, resolved_port, resolved_oma_id) = resolve_target_ip_or_omaid(target_ip_or_omaid)?;
+    // Phase 2: QR-paired devices only ever use the encrypted QUIC transport. There is no
+    // silent fallback to plaintext HTTP, so blocking UDP cannot downgrade a paired device.
+    let paired_key = trusted_key_for_target(target_ip_or_omaid);
+    let (resolved_ip, resolved_port, resolved_oma_id) = match resolve_target_ip_or_omaid(target_ip_or_omaid) {
+        Ok(v) => v,
+        Err(_) if paired_key.is_some() => (String::new(), PORT, None),
+        Err(e) => return Err(e),
+    };
     let target_ip = resolved_ip.as_str();
 
     struct PreparedFile {
@@ -3420,8 +3548,12 @@ fn p2p_send_files_to_peer(target_ip_or_omaid: &str, file_paths: &[PathBuf]) -> R
         let size_bytes = safe_verify_file(&effective_path)
             .map_err(|e| format!("Security check failed for {:?}: {}", effective_path, e))?;
         let file_name = effective_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-        let (blake3_hex, sha256_hex, md5_hex) = compute_file_military_hashes(&effective_path)
-            .map_err(|e| format!("Failed to compute file hashes: {}", e))?;
+        // The QUIC core hashes (BLAKE3) while streaming; only the legacy path needs these upfront.
+        let (blake3_hex, sha256_hex, md5_hex) = if paired_key.is_some() {
+            (String::new(), String::new(), String::new())
+        } else {
+            compute_file_military_hashes(&effective_path).map_err(|e| format!("Failed to compute file hashes: {}", e))?
+        };
         total_size_bytes = total_size_bytes.saturating_add(size_bytes);
         files_json.push(serde_json::json!({
             "name": file_name,
@@ -3441,24 +3573,22 @@ fn p2p_send_files_to_peer(target_ip_or_omaid: &str, file_paths: &[PathBuf]) -> R
         });
     }
 
-    // Phase 2: QR-paired devices get the encrypted, resumable QUIC transport. If the peer has
-    // no core endpoint (older app) or the daemon cannot reach it, fall back to signed HTTP.
-    if let Some(key) = trusted_key_for_ip(target_ip) {
+    if let Some(key) = paired_key {
         let paths: Vec<String> = prepared.iter().map(|p| p.path.to_string_lossy().to_string()).collect();
         let names: Vec<String> = prepared.iter().map(|p| p.name.clone()).collect();
         println!("Sending to {} over encrypted QUIC...", key.name);
-        match core_send_via_daemon(&key, &paths, &names) {
+        return match core_send_via_daemon(&key, &paths, &names) {
             Ok(()) => {
-                println!("Transfer successfully completed to {} (QUIC, BLAKE3 verified)!", target_ip);
+                println!("Transfer successfully completed to {} (QUIC, BLAKE3 verified)!", key.name);
                 notify_desktop("OmaSend AirBridge", &format!("{} file(s) sent to {} (end-to-end encrypted).", prepared.len(), key.name));
-                return Ok(());
+                Ok(())
             }
-            Err((true, e)) => eprintln!("QUIC unavailable ({}); falling back to HTTP.", e),
-            Err((false, e)) => {
-                notify_desktop("OmaSend AirBridge", &format!("Transfer to {} failed: {}", key.name, e));
-                return Err(e);
+            Err((_, e)) => {
+                let msg = core_failure_message(&key.name, &e);
+                notify_desktop("OmaSend AirBridge", &format!("Transfer to {} failed: {}", key.name, msg));
+                Err(msg)
             }
-        }
+        };
     }
 
     let (my_id, _) = get_or_create_device_id();
@@ -3656,6 +3786,25 @@ fn p2p_send_files_to_peer(target_ip_or_omaid: &str, file_paths: &[PathBuf]) -> R
 }
 
 fn p2p_sync_clipboard_to_peer(target_ip_or_omaid: &str) -> Result<(), String> {
+    if let Some(key) = trusted_key_for_target(target_ip_or_omaid) {
+        let text = get_pc_clipboard();
+        if text.trim().is_empty() {
+            let msg = "Clipboard has no text (images are only sent to legacy paired devices).".to_string();
+            notify_desktop("OmaSend AirBridge", &msg);
+            return Err(msg);
+        }
+        return match core_clipboard(&key, &text) {
+            Ok(()) => {
+                notify_desktop("OmaSend AirBridge", &format!("Clipboard sent to {} (end-to-end encrypted).", key.name));
+                Ok(())
+            }
+            Err((_, e)) => {
+                let msg = core_failure_message(&key.name, &e);
+                notify_desktop("OmaSend AirBridge", &msg);
+                Err(msg)
+            }
+        };
+    }
     let (resolved_ip, resolved_port, resolved_oma_id) = resolve_target_ip_or_omaid(target_ip_or_omaid)?;
     let target_ip = resolved_ip.as_str();
 
@@ -5131,7 +5280,11 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             (_, None) => serde_json::json!({ "ok": false, "unavailable": true, "error": "not paired" }),
             (Some(node), Some(_)) => {
                 let _ = stream.set_write_timeout(None);
-                match node.send_files(pk, strs("addrs"), strs("paths"), strs("names"), String::new()) {
+                let result = match val["text"].as_str() {
+                    Some(text) => node.send_clipboard(pk, strs("addrs"), text.to_string()).map(|_| String::new()),
+                    None => node.send_files(pk, strs("addrs"), strs("paths"), strs("names"), String::new()),
+                };
+                match result {
                     Ok(id) => serde_json::json!({ "ok": true, "transfer_id": id }),
                     Err(e) => {
                         let m = e.to_string();
@@ -6511,15 +6664,7 @@ fn main() {
         return;
     }
     if args.iter().any(|a| a == "--devices") {
-        let list: Vec<serde_json::Value> = trust_store()
-            .load()
-            .into_iter()
-            .map(|k| serde_json::json!({
-                "device_id": k.device_id, "name": k.name, "ip": k.ip,
-                "own_device": k.own_device, "added_at": k.added_at, "last_seen": k.last_seen
-            }))
-            .collect();
-        println!("{}", serde_json::json!({ "me": device_identity().device_id(), "devices": list }));
+        println!("{}", serde_json::json!({ "me": device_identity().device_id(), "devices": paired_devices_view() }));
         return;
     }
     if let Some(pos) = args.iter().position(|a| a == "--unpair") {
@@ -6783,9 +6928,10 @@ fn main() {
                     save_pending_transfer(&pending);
                     let _ = add_paired_peer(&pending.sender_id, &pending.sender_name, Some(&pending.sender_ip));
                     add_trusted_peer(&pending.sender_id, &pending.sender_name, "");
-                    play_samurai_receive_sound();
+                    let snd = play_samurai_receive_sound();
                     notify_desktop("OmaSend AirBridge", "Transfer accepted. Receiving files...");
                     println!("Transfer accepted");
+                    finish_sound(snd);
                     return;
                 }
             }
@@ -6813,38 +6959,40 @@ fn main() {
     if let Some(pos) = args.iter().position(|a| {
         a == "--send-p2p" || a == "--send" || a == "--send-to-omaid" || a == "--send-file"
     }) {
-        let target_arg = args.get(pos + 1);
-        let second_arg = args.get(pos + 2);
-
-        let (target, file_path_str) = match (target_arg, second_arg) {
-            (Some(t), Some(f)) if t != "auto" => (t.clone(), f.clone()),
-            (Some(f_or_auto), None) => {
-                // "auto" must never pick a peer from unauthenticated beacons (a spoofed
-                // "same owner" beacon would receive the file); only QR-paired own devices.
-                if let Some(t) = auto_send_target() {
-                    (t, f_or_auto.clone())
-                } else {
-                    eprintln!("Error: No QR-paired own device available for automatic send (pair with: --pair-offer --own)");
-                    return;
-                }
+        // --send <target|auto> <file> [file...]   or   --send <file>  (= auto)
+        // All files go in ONE transfer (one approval on the receiver).
+        let rest: Vec<String> = args.iter().skip(pos + 1).cloned().collect();
+        // "auto" must never pick a peer from unauthenticated beacons (a spoofed "same owner"
+        // beacon would receive the file); only QR-paired own devices.
+        let auto = || -> Option<String> {
+            let t = auto_send_target();
+            if t.is_none() {
+                eprintln!("Error: No QR-paired own device available for automatic send (pair with: --pair-offer --own)");
             }
-            (Some(t), Some(f)) if t == "auto" => {
-                if let Some(t) = auto_send_target() {
-                    (t, f.clone())
-                } else {
-                    eprintln!("Error: No QR-paired own device available for automatic send (pair with: --pair-offer --own)");
-                    return;
-                }
+            t
+        };
+        let (target, files): (String, Vec<String>) = match rest.as_slice() {
+            [] => {
+                eprintln!("Usage: omasend-engine --send [device-id|ip|auto] <file> [file...]");
+                std::process::exit(2);
             }
-            _ => {
-                eprintln!("Usage: omasend-engine --send [peer_ip|oma_id|auto] <file_path>");
-                return;
-            }
+            [only] => match auto() {
+                Some(t) => (t, vec![only.clone()]),
+                None => std::process::exit(1),
+            },
+            [t, files @ ..] if t == "auto" => match auto() {
+                Some(t) => (t, files.to_vec()),
+                None => std::process::exit(1),
+            },
+            [t, files @ ..] => (t.clone(), files.to_vec()),
         };
 
-        let path = Path::new(&file_path_str);
-        match p2p_send_file_to_peer(&target, path) {
-            Ok(()) => println!("File sent successfully to {}", target),
+        let paths: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
+        let snd = play_samurai_send_sound();
+        let result = p2p_send_files_to_peer(&target, &paths);
+        finish_sound(snd);
+        match result {
+            Ok(()) => println!("{} file(s) sent successfully to {}", paths.len(), target),
             Err(e) => {
                 eprintln!("Error sending file: {}", e);
                 std::process::exit(1);
@@ -6860,19 +7008,24 @@ fn main() {
             let deadline = Instant::now() + Duration::from_secs(120);
             if let Some(out) = run_cmd_bounded(
                 "/usr/bin/zenity",
-                &["--file-selection", "--title=OmaSend: Select File to Send via AirBridge"],
+                &["--file-selection", "--multiple", "--separator=\n", "--title=OmaSend: Select files to send"],
                 &envs,
                 deadline,
-                4096,
+                256 * 1024,
             ) {
-                let chosen = String::from_utf8_lossy(&out).trim().to_string();
-                if !chosen.is_empty() {
-                    play_samurai_send_sound();
-                    let path = Path::new(&chosen);
-                    match p2p_send_file_to_peer(target, path) {
-                        Ok(()) => println!("File successfully sent to {}", target),
+                let paths: Vec<PathBuf> = String::from_utf8_lossy(&out)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(PathBuf::from)
+                    .collect();
+                if !paths.is_empty() {
+                    let snd = play_samurai_send_sound();
+                    match p2p_send_files_to_peer(target, &paths) {
+                        Ok(()) => println!("{} file(s) sent to {}", paths.len(), target),
                         Err(e) => eprintln!("Error sending file: {}", e),
                     }
+                    finish_sound(snd);
                 }
             }
             return;
@@ -7017,6 +7170,8 @@ fn main() {
             stun_addr,
             sound_enabled: is_sound_enabled(),
             firewall_status: check_firewall_status(),
+            device_key_id: device_identity().device_id(),
+            paired_devices: paired_devices_view(),
         };
         if let Ok(s) = serde_json::to_string_pretty(&state) {
             println!("{}", s);
@@ -7183,6 +7338,7 @@ mod tests {
             port: 8844,
             mode: "KNOWN".to_string(),
             fp: "deadbeef".to_string(),
+            pk: String::new(),
         };
         let serialized = serde_json::to_string(&packet).expect("Must serialize");
         let deserialized: P2pBeaconPacket = serde_json::from_str(&serialized).expect("Must deserialize");
@@ -7982,6 +8138,8 @@ mod tests {
             stun_addr: Some("198.51.100.1:53317".to_string()),
             sound_enabled: true,
             firewall_status: "OK".to_string(),
+            device_key_id: String::new(),
+            paired_devices: vec![],
         };
 
         let json = serde_json::to_string(&state).expect("Serialize ServerState");
@@ -8132,6 +8290,8 @@ mod tests {
                 is_trusted: false,
                 is_same_owner: false,
                 last_seen_secs: now,
+                pk: String::new(),
+                key_trust: String::new(),
             },
             DiscoveredPeer {
                 id: "peer-expired".to_string(),
@@ -8144,6 +8304,8 @@ mod tests {
                 is_trusted: false,
                 is_same_owner: false,
                 last_seen_secs: now - 30, // 30 seconds old -> expired
+                pk: String::new(),
+                key_trust: String::new(),
             },
         ];
 
@@ -8909,6 +9071,8 @@ mod tests {
             is_trusted: false,
             is_same_owner: false,
             last_seen_secs: now,
+            pk: String::new(),
+            key_trust: String::new(),
         }];
         save_discovered_peers(&peers);
 
@@ -9103,5 +9267,87 @@ mod tests {
 
         assert!(resp.starts_with("HTTP/1.1 413"), "Oversized upload must be rejected: {}", resp);
         clear_pending_transfer();
+    }
+
+    #[test]
+    fn test_paired_target_resolution_and_addresses() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let pk = devicekey::DeviceIdentity::from_seed([42u8; 32]).public_b64();
+        let other_pk = devicekey::DeviceIdentity::from_seed([43u8; 32]).public_b64();
+        let key = devicekey::TrustedKey {
+            pk: pk.clone(),
+            device_id: devicekey::device_id_for_pk(&devicekey::decode_pk(&pk).unwrap().to_bytes()),
+            name: "Phone".into(),
+            ip: "192.168.1.20".into(),
+            port: PORT,
+            quic_port: 0,
+            own_device: true,
+            added_at: now,
+            last_seen: now,
+        };
+        trust_store().upsert(key.clone()).unwrap();
+        let peer_oma = rendezvous::format_oma_id(&rendezvous::generate_raw_oma_id());
+        let peer = |id: &str, ip: &str, pk: &str| DiscoveredPeer {
+            id: id.into(),
+            oma_id: peer_oma.clone(),
+            name: id.into(),
+            ip: ip.into(),
+            port: PORT,
+            transport: "LAN".into(),
+            fingerprint: String::new(),
+            is_trusted: false,
+            is_same_owner: false,
+            last_seen_secs: now,
+            pk: pk.into(),
+            key_trust: String::new(),
+        };
+
+        // By device id, public key and last authenticated address.
+        save_discovered_peers(&[]);
+        assert_eq!(trusted_key_for_target(&key.device_id).map(|k| k.pk), Some(pk.clone()));
+        assert_eq!(trusted_key_for_target(&key.device_id.to_lowercase()).map(|k| k.pk), Some(pk.clone()));
+        assert_eq!(trusted_key_for_target(&pk).map(|k| k.pk), Some(pk.clone()));
+        assert_eq!(trusted_key_for_target("192.168.1.20:53317").map(|k| k.pk), Some(pk.clone()));
+        assert!(trusted_key_for_target("192.168.1.99").is_none());
+        assert_eq!(core_addrs(&key), vec!["192.168.1.20:53318".to_string()]);
+
+        // DHCP: the key moved; discovery advertises it at a new address -> both are candidates.
+        save_discovered_peers(&[peer("phone", "192.168.1.31", &pk)]);
+        assert_eq!(trusted_key_for_target("192.168.1.31").map(|k| k.pk), Some(pk.clone()));
+        assert_eq!(core_addrs(&key), vec!["192.168.1.31:53318".to_string(), "192.168.1.20:53318".to_string()]);
+        assert_eq!(get_discovered_peers()[0].key_trust, "own");
+
+        // DHCP reuse: another device now sits at the key's old address -> not the paired key.
+        save_discovered_peers(&[peer("stranger", "192.168.1.20", &other_pk)]);
+        assert!(trusted_key_for_target("192.168.1.20").is_none());
+        assert_eq!(get_discovered_peers()[0].key_trust, "");
+
+        // Older peer without an advertised key at the key's address -> falls back to the address.
+        save_discovered_peers(&[peer("old", "192.168.1.20", "")]);
+        assert_eq!(trusted_key_for_target("192.168.1.20").map(|k| k.pk), Some(pk.clone()));
+
+        let view = paired_devices_view();
+        let me = view.iter().find(|v| v["device_id"] == key.device_id.as_str()).unwrap();
+        assert_eq!(me["online"], true);
+        assert_eq!(me["own_device"], true);
+
+        // Auto-send picks the own device by id, never a raw address.
+        assert_eq!(auto_send_target(), Some(key.device_id.clone()));
+
+        // Legacy clipboard targets never include an address owned by a paired key.
+        assert!(!legacy_clipboard_ips().contains(&"192.168.1.20".to_string()));
+
+        trust_store().remove(&pk).unwrap();
+        save_discovered_peers(&[]);
+    }
+
+    #[test]
+    fn test_beacon_pk_is_optional_on_the_wire() {
+        // Older beacons (no pk) still parse; empty pk is not serialized.
+        let old = r#"{"magic":"OMASEND_P2P","v":1,"id":"a","oma_id":"4829-1048-5729-1104","name":"n","ip":"1.2.3.4","port":53317,"mode":"KNOWN","fp":"f"}"#;
+        let p: P2pBeaconPacket = serde_json::from_str(old).unwrap();
+        assert!(p.pk.is_empty());
+        assert!(!serde_json::to_string(&p).unwrap().contains("\"pk\""));
     }
 }

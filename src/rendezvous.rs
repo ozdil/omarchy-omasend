@@ -1148,77 +1148,34 @@ impl Drop for NatTraversedSocket {
 
 // ------------------- QR SVG FALLBACK GENERATOR -------------------
 
-/// Generates a valid, self-contained SVG QR code matrix for OmaID identity payloads.
-/// Used as a zero-dependency fallback when external tools like qrencode are unavailable.
+/// Renders `content` as a real, scannable QR code (pure Rust, no external tools).
 pub fn generate_fallback_qr_svg(content: &str) -> String {
-    let size = 256;
-    let grid_size = 25; // 25x25 grid standard
-    let module_size = 8;
-    let offset = (size - (grid_size * module_size)) / 2;
+    qr_svg(content).unwrap_or_else(|| {
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256"><rect width="256" height="256" fill="#ffffff"/></svg>"##.to_string()
+    })
+}
 
-    let hash = Sha256::digest(content.as_bytes());
-    let mut matrix = vec![vec![false; grid_size]; grid_size];
-
-    // 1. Finder pattern generator helper
-    let draw_finder = |mat: &mut Vec<Vec<bool>>, start_x: usize, start_y: usize| {
-        for y in 0..7 {
-            for x in 0..7 {
-                let is_outer = x == 0 || x == 6 || y == 0 || y == 6;
-                let is_inner = (2..=4).contains(&x) && (2..=4).contains(&y);
-                mat[start_y + y][start_x + x] = is_outer || is_inner;
-            }
-        }
-    };
-
-    // Draw three finder patterns
-    draw_finder(&mut matrix, 0, 0);
-    draw_finder(&mut matrix, grid_size - 7, 0);
-    draw_finder(&mut matrix, 0, grid_size - 7);
-
-    // Timing patterns
-    #[allow(clippy::needless_range_loop)]
-    for i in 8..(grid_size - 8) {
-        let is_even = i.is_multiple_of(2);
-        matrix[6][i] = is_even;
-        matrix[i][6] = is_even;
-    }
-
-    // Populate data modules deterministically using content hash
-    let mut byte_idx = 0;
-    for (y, row) in matrix.iter_mut().enumerate().take(grid_size) {
-        for (x, cell) in row.iter_mut().enumerate().take(grid_size) {
-            // Skip finder zones
-            if (x < 8 && y < 8) || (x >= grid_size - 8 && y < 8) || (x < 8 && y >= grid_size - 8) {
-                continue;
-            }
-            if x == 6 || y == 6 {
-                continue;
-            }
-            let h_byte = hash[byte_idx % hash.len()];
-            let bit = (h_byte >> ((x + y * 7) % 8)) & 1;
-            *cell = bit == 1;
-            byte_idx += 1;
-        }
-    }
-
-    let mut paths = String::new();
-    for (y, row) in matrix.iter().enumerate().take(grid_size) {
-        for (x, &filled) in row.iter().enumerate().take(grid_size) {
-            if filled {
-                let px = offset + x * module_size;
-                let py = offset + y * module_size;
-                paths.push_str(&format!(
-                    r##"<rect x="{}" y="{}" width="{}" height="{}" fill="#111827"/>"##,
-                    px, py, module_size, module_size
-                ));
+/// QR code as SVG: black modules on white with a 4-module quiet zone, error correction M.
+pub fn qr_svg(content: &str) -> Option<String> {
+    let code = qrcode::QrCode::with_error_correction_level(content.as_bytes(), qrcode::EcLevel::M).ok()?;
+    let width = code.width();
+    let colors = code.to_colors();
+    let quiet = 4;
+    let total = width + 2 * quiet;
+    let mut path = String::with_capacity(width * width * 8);
+    for y in 0..width {
+        for x in 0..width {
+            if colors[y * width + x] == qrcode::Color::Dark {
+                path.push_str(&format!("M{} {}h1v1h-1z", x + quiet, y + quiet));
             }
         }
     }
-
-    format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {0} {0}" width="{0}" height="{0}"><rect width="{0}" height="{0}" fill="#ffffff" rx="12"/>{1}</svg>"##,
-        size, paths
-    )
+    Some(format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {0} {0}" width="{1}" height="{1}" shape-rendering="crispEdges"><rect width="{0}" height="{0}" fill="#ffffff"/><path d="{2}" fill="#000000"/></svg>"##,
+        total,
+        total * 8,
+        path
+    ))
 }
 
 // ------------------- FAST RENDEZVOUS STATUS CACHE -------------------
@@ -1506,8 +1463,15 @@ mod tests {
         let svg = generate_fallback_qr_svg("omasend://identity/4829104857291104");
         assert!(svg.starts_with(r#"<svg xmlns="http://www.w3.org/2000/svg""#));
         assert!(svg.ends_with("</svg>"));
-        assert!(svg.contains(r#"<rect width="256" height="256""#));
-        assert!(svg.contains(r##"fill="#111827""##));
+        // A real QR code: (17 + 4*version) modules + 2x4 quiet zone.
+        let code = qrcode::QrCode::with_error_correction_level(b"omasend://identity/4829104857291104", qrcode::EcLevel::M).unwrap();
+        let side = code.width() + 8;
+        assert_eq!((code.width() - 17) % 4, 0);
+        assert!(svg.contains(&format!(r#"viewBox="0 0 {0} {0}""#, side)), "{}", &svg[..120]);
+        assert!(svg.contains("<path d=\"M"));
+        // A pair URI (~200 chars) still encodes.
+        let long = format!("omasend://pair?v=2&pk={}&s={}", "A".repeat(43), "b".repeat(64));
+        assert!(qr_svg(&long).is_some());
     }
 
     #[test]

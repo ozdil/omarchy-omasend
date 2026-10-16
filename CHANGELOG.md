@@ -4,6 +4,21 @@ Bu belgede OmaSend masaüstü ve Android uygulamaları için yapılan tüm sür�
 
 ---
 
+## [2.0.0] - 2026-10-15
+
+### Protokol v2: cihaz anahtarları, QR eşleşme ve şifreli aktarım
+- **Cihaz anahtarları ve QR eşleşme:** Her cihazın kendi Ed25519 anahtarı var. Cihazlar tek kullanımlık, 5 dakika geçerli QR kodla eşleştirilir (HMAC + imzalı karşılıklı doğrulama). OmaID artık güven vermiyor; yalnızca eski sürümlerle uyumluluk için duruyor.
+- **Şifreli aktarım (omasend-core):** Masaüstü ve Android'in paylaştığı Rust çekirdeği (iroh 1.3, QUIC + TLS 1.3, UDP 53318). Uç kimliği cihaz anahtarının kendisi; dosyalar BLAKE3 ile doğrulanıyor ve yarıda kalırsa kaldığı yerden devam ediyor. Android'e UniFFI ile bağlandı.
+- **Sessiz düşürme yok:** Eşleşmiş bir cihaza şifreli bağlantı kurulamazsa aktarım şifresiz HTTP'ye düşmüyor, anlaşılır bir hata veriliyor.
+- **Güvenli otomatik pano:** Pano yalnızca "benim cihazım" olarak eşleştirilen cihazlarla ve yalnızca şifreli kanaldan otomatik eşitleniyor.
+- **Adres keşfi:** İşaretçiler cihaz anahtarını da taşıyor; IP değişse bile eşleşmiş cihaz bulunuyor (TLS anahtarı doğruladığı için sahte işaretçi veri alamaz).
+- **Gerçek QR kodlar:** Taranamayan "yedek QR" üreticisi kaldırıldı, saf Rust QR kodlayıcı kullanılıyor (qrencode gerekmiyor).
+- **Yeni arayüz (masaüstü paneli, bağımsız pencere ve Android):** Sadeleştirilmiş yapı: Cihazlarım (şifreli) ve Yakındakiler (şifresiz, onaylı). QR ile eşleştirme, eşleşme kaldırma, şifreli/şifresiz göstergeleri, çoklu dosya gönderimi tek aktarımda.
+- **Düzeltmeler:** Bağımsız pencere (Theme.qml) hiç yüklenmiyordu; PKGBUILD olmayan ses dosyalarını kuruyordu; sürüklenen dosyalar ayrı ayrı gönderilip birbirini iptal ediyordu.
+- Testler: çekirdek 8/8, masaüstü 97/97, Android birim + lint + release derlemesi; emülatörde masaüstü→telefon şifreli dosya ve pano doğrulandı.
+
+---
+
 ## [1.8.6] - 2026-10-15 (Android Build: 57)
 
 ### Anonim Numaralı Kimlik (Sıfır Kayıt OmaID) & Zero-Click Kendi Cihazlarım Ağı
