@@ -56,10 +56,11 @@ elif [[ -x "${HOME}/.cargo/bin/cargo" ]]; then
     CARGO_BIN="${HOME}/.cargo/bin/cargo"
 fi
 
-# Calculate expected source tree provenance hash (manifests, lockfile, and all Rust source files)
+# Calculate expected source tree provenance hash (manifests, lockfiles, and all Rust source files,
+# including the omasend-core crate in core/ that is compiled into the engine)
 SOURCE_HASH=""
 if [[ -d "${DIR}/src" && -f "${DIR}/Cargo.toml" && -f "${DIR}/Cargo.lock" ]]; then
-    SOURCE_HASH="$(/usr/bin/find "${DIR}/src" "${DIR}/Cargo.toml" "${DIR}/Cargo.lock" -type f 2>/dev/null | /usr/bin/sort | /usr/bin/xargs /usr/bin/sha256sum 2>/dev/null | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')"
+    SOURCE_HASH="$(/usr/bin/find "${DIR}/src" "${DIR}/Cargo.toml" "${DIR}/Cargo.lock" "${DIR}/core/src" "${DIR}/core/Cargo.toml" "${DIR}/core/Cargo.lock" -type f 2>/dev/null | /usr/bin/sort | /usr/bin/xargs /usr/bin/sha256sum 2>/dev/null | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')"
 fi
 
 NEEDS_BUILD=1

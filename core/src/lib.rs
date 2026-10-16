@@ -39,6 +39,8 @@ const MAX_CLIPBOARD: usize = 512 * 1024;
 const DECISION_TIMEOUT: Duration = Duration::from_secs(120);
 const CHUNK: usize = 256 * 1024;
 const PARTIAL_DIR: &str = ".omasend-partial";
+/// Partial files untouched for this long are deleted when the node starts.
+const PARTIAL_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 
 // ------------------------------------------------------------------ public FFI types
 
@@ -194,21 +196,46 @@ pub fn sanitize_name(name: &str) -> String {
     out
 }
 
-fn unique_path(dir: &Path, name: &str) -> PathBuf {
-    let first = dir.join(name);
-    if !first.exists() {
-        return first;
-    }
+/// Picks a free name in `dir` and reserves it by creating an empty file with `create_new`, so
+/// two files with the same name arriving at once cannot both pick (and overwrite) one path.
+/// The caller then renames the finished data over the reserved, empty file.
+fn reserve_unique_path(dir: &Path, name: &str) -> std::io::Result<PathBuf> {
     let p = Path::new(name);
     let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
     let ext = p.extension().and_then(|s| s.to_str()).map(|e| format!(".{}", e)).unwrap_or_default();
-    for i in 1..10_000 {
-        let cand = dir.join(format!("{} ({}){}", stem, i, ext));
-        if !cand.exists() {
-            return cand;
+    let candidates = std::iter::once(dir.join(name))
+        .chain((1..10_000).map(|i| dir.join(format!("{} ({}){}", stem, i, ext))))
+        .chain(std::iter::repeat_with(|| dir.join(format!("{}-{}{}", stem, uuid_like(), ext))).take(16));
+    for cand in candidates {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&cand) {
+            Ok(_) => return Ok(cand),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
         }
     }
-    dir.join(format!("{}-{}{}", stem, uuid_like(), ext))
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free file name"))
+}
+
+/// Deletes `.part` files in the partial directory that have not been written for
+/// `PARTIAL_MAX_AGE` (declined or abandoned transfers would otherwise pile up). Best effort.
+fn remove_stale_partials(download_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(download_dir.join(PARTIAL_DIR)) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("part") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .ok()
+            .filter(|m| m.is_file())
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > PARTIAL_MAX_AGE);
+        if stale {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 fn uuid_like() -> String {
@@ -360,20 +387,30 @@ async fn receive_transfer(
     let total: u64 = files.iter().map(|f| f.size).sum();
     let partial_dir = inner.download_dir.join(PARTIAL_DIR);
     tokio::fs::create_dir_all(&partial_dir).await?;
+    // Data already received for a resumable file does not need space again.
+    let mut needed = 0u64;
+    for f in &files {
+        let have = partial_len(&partial_dir, f).await;
+        needed = needed.saturating_add(f.size - have);
+    }
     if let Some(avail) = available_space(&inner.download_dir) {
-        if total.saturating_add(64 << 20) > avail {
+        if needed.saturating_add(64 << 20) > avail {
             write_msg(&mut send, &reject("insufficient storage")).await?;
             return linger(&conn, send).await;
         }
     }
 
+    // The sender picks `transfer_id`; it is only used to match this transfer's wire frames.
+    // Everything keyed locally (approval, cancel, host callbacks) uses an id generated here,
+    // so one peer cannot hijack or overwrite another transfer by reusing its id (C1).
+    let local_id = uuid_like();
     let accepted = if trust == Trust::Own {
         true
     } else {
         let (tx, rx) = oneshot::channel();
-        inner.pending.lock().unwrap().insert(transfer_id.clone(), tx);
+        inner.pending.lock().unwrap().insert(local_id.clone(), tx);
         inner.cb.incoming_offer(IncomingOffer {
-            transfer_id: transfer_id.clone(),
+            transfer_id: local_id.clone(),
             peer_pk: peer.clone(),
             peer_name: peer_name.clone(),
             files: files.iter().map(|f| OfferedFile { name: sanitize_name(&f.name), size: f.size }).collect(),
@@ -383,7 +420,7 @@ async fn receive_transfer(
             r = tokio::time::timeout(DECISION_TIMEOUT, rx) => matches!(r, Ok(Ok(true))),
             _ = conn.closed() => false,
         };
-        inner.pending.lock().unwrap().remove(&transfer_id);
+        inner.pending.lock().unwrap().remove(&local_id);
         decision
     };
     if !accepted {
@@ -394,13 +431,11 @@ async fn receive_transfer(
     // Resume: partial data is stored by content hash, so a retried transfer continues.
     let mut resume = Vec::with_capacity(files.len());
     for f in &files {
-        let part = partial_dir.join(format!("{}.part", f.blake3.to_lowercase()));
-        let len = tokio::fs::metadata(&part).await.map(|m| m.len()).unwrap_or(0);
-        resume.push(if len <= f.size { len } else { 0 });
+        resume.push(partial_len(&partial_dir, f).await);
     }
     write_msg(&mut send, &Msg::Decision { accepted: true, resume: resume.clone(), reason: None }).await?;
 
-    let cancel = inner.cancel_token(&transfer_id);
+    let cancel = inner.cancel_token(&local_id);
     let result = async {
         for (index, f) in files.iter().enumerate() {
             let mut uni = tokio::select! {
@@ -411,7 +446,7 @@ async fn receive_transfer(
                 Msg::FileHeader { transfer_id: tid, index: i, offset } if tid == transfer_id && i as usize == index && offset == resume[index] => {}
                 _ => return Err(fail("unexpected file header")),
             }
-            let outcome = receive_file(&inner, &cancel, &mut uni, &partial_dir, &transfer_id, f, resume[index], &peer).await;
+            let outcome = receive_file(&inner, &cancel, &mut uni, &partial_dir, &local_id, f, resume[index], &peer).await;
             let (ok, error) = match &outcome {
                 Ok(_) => (true, None),
                 Err(e) => (false, Some(e.to_string())),
@@ -422,15 +457,26 @@ async fn receive_transfer(
         Ok(())
     }
     .await;
-    inner.drop_token(&transfer_id);
+    inner.drop_token(&local_id);
     let (ok, err) = match &result {
         Ok(_) => (true, None),
         Err(e) => (false, Some(e.to_string())),
     };
-    inner.cb.transfer_finished(transfer_id, Direction::Receive, ok, err);
+    inner.cb.transfer_finished(local_id, Direction::Receive, ok, err);
     // Give the sender time to read our final FileDone frame before the connection drops.
     let _ = linger(&conn, send).await;
     result
+}
+
+/// Length of the resumable partial data for `f` (0 if none, or if it is longer than the file).
+async fn partial_len(partial_dir: &Path, f: &WireFile) -> u64 {
+    let part = partial_dir.join(format!("{}.part", f.blake3.to_lowercase()));
+    let len = tokio::fs::metadata(&part).await.map(|m| m.len()).unwrap_or(0);
+    if len <= f.size {
+        len
+    } else {
+        0
+    }
 }
 
 /// Finishes our side and waits (bounded) for the peer to close, so the last frame we sent
@@ -479,8 +525,15 @@ async fn receive_file(
         let _ = tokio::fs::remove_file(&part).await;
         return Err(fail(format!("integrity check failed for {}", name)));
     }
-    let dest = unique_path(&inner.download_dir, &name);
-    tokio::fs::rename(&part, &dest).await?;
+    let dir = inner.download_dir.clone();
+    let reserve_name = name.clone();
+    let dest = tokio::task::spawn_blocking(move || reserve_unique_path(&dir, &reserve_name))
+        .await
+        .map_err(|e| fail(e.to_string()))??;
+    if let Err(e) = tokio::fs::rename(&part, &dest).await {
+        let _ = tokio::fs::remove_file(&dest).await;
+        return Err(e.into());
+    }
     inner.cb.file_received(transfer_id.to_string(), peer.to_string(), dest.to_string_lossy().to_string());
     Ok(())
 }
@@ -511,6 +564,7 @@ impl OmaNode {
         let seed: [u8; 32] = seed.try_into().map_err(|_| fail("seed must be 32 bytes"))?;
         let download_dir = PathBuf::from(download_dir);
         std::fs::create_dir_all(&download_dir)?;
+        remove_stale_partials(&download_dir);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
