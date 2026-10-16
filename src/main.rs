@@ -711,6 +711,22 @@ fn is_process_alive(pid: i32) -> bool {
     Path::new(&format!("/proc/{}", pid)).exists()
 }
 
+/// True if `pid` is a live process of the current user whose name (`/proc/<pid>/comm`) is
+/// `name`. Stale pid files can point at a reused pid; never signal anything else (M16).
+fn pid_is(pid: i32, name: &str) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    let owned = fs::metadata(format!("/proc/{}", pid)).is_ok_and(|m| m.uid() == get_current_uid());
+    let comm = fs::read_to_string(format!("/proc/{}/comm", pid)).unwrap_or_default();
+    // comm is truncated to 15 bytes by the kernel.
+    let expected: String = name.chars().take(15).collect();
+    owned && comm.trim_end() == expected
+}
+
+const CLOUDFLARED_COMM: &str = "cloudflared";
+const ENGINE_COMM: &str = "omasend-engine";
+
 fn get_wan_provider() -> Option<String> {
     let provider_file = get_state_dir().join("wan_provider.txt");
     read_secure_file(&provider_file).ok().map(|s| s.trim().to_string())
@@ -746,7 +762,7 @@ fn get_wan_status() -> (bool, bool, Option<String>) {
 
     if let Ok(pid_str) = read_secure_file(&pid_file) {
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            if is_process_alive(pid) {
+            if is_process_alive(pid) && pid_is(pid, CLOUDFLARED_COMM) {
                 // If URL is already recorded, return immediately
                 if let Ok(url) = read_secure_file(&url_file) {
                     let u = url.trim().to_string();
@@ -795,7 +811,9 @@ fn stop_wan_tunnel() {
 
     if let Ok(pid_str) = read_secure_file(&pid_file) {
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            kill_process_group(pid);
+            if pid_is(pid, CLOUDFLARED_COMM) {
+                kill_process_group(pid);
+            }
         }
     }
 
@@ -831,7 +849,9 @@ fn start_wan_tunnel() -> Result<String, String> {
     // Stop any dangling previous process
     if let Ok(pid_str) = read_secure_file(&pid_file) {
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            kill_process_group(pid);
+            if pid_is(pid, CLOUDFLARED_COMM) {
+                kill_process_group(pid);
+            }
         }
     }
 
@@ -878,6 +898,99 @@ fn start_wan_tunnel() -> Result<String, String> {
 
 // ------------------- QR CODE & URLS -------------------
 
+fn qr_modules(content: &str) -> Option<(usize, Vec<bool>)> {
+    let code = qrcode::QrCode::with_error_correction_level(content.as_bytes(), qrcode::EcLevel::M).ok()?;
+    let width = code.width();
+    Some((width, code.to_colors().into_iter().map(|c| c == qrcode::Color::Dark).collect()))
+}
+
+fn png_crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
+fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    let start = out.len();
+    out.extend_from_slice(kind);
+    out.extend_from_slice(data);
+    let crc = png_crc32(&out[start..]);
+    out.extend_from_slice(&crc.to_be_bytes());
+}
+
+/// Minimal PNG encoder for a QR code: 8-bit grayscale, zlib stream of stored (uncompressed)
+/// deflate blocks. Black modules on white, `scale` pixels per module, `margin` modules of
+/// quiet zone. Avoids depending on qrencode or an image crate.
+fn qr_png(content: &str, scale: usize, margin: usize) -> Option<Vec<u8>> {
+    let (width, dark) = qr_modules(content)?;
+    let side = (width + 2 * margin) * scale;
+    let mut raw = Vec::with_capacity(side * (side + 1));
+    for py in 0..side {
+        raw.push(0u8); // filter: none
+        let my = (py / scale).checked_sub(margin).filter(|&y| y < width);
+        for px in 0..side {
+            let mx = (px / scale).checked_sub(margin).filter(|&x| x < width);
+            let is_dark = matches!((mx, my), (Some(x), Some(y)) if dark[y * width + x]);
+            raw.push(if is_dark { 0 } else { 255 });
+        }
+    }
+    let mut z = vec![0x78, 0x01];
+    let mut chunks = raw.chunks(65_535).peekable();
+    while let Some(block) = chunks.next() {
+        z.push(if chunks.peek().is_none() { 1 } else { 0 });
+        let len = block.len() as u16;
+        z.extend_from_slice(&len.to_le_bytes());
+        z.extend_from_slice(&(!len).to_le_bytes());
+        z.extend_from_slice(block);
+    }
+    let (mut a, mut b) = (1u32, 0u32);
+    for &byte in &raw {
+        a = (a + byte as u32) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    z.extend_from_slice(&((b << 16) | a).to_be_bytes());
+
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&(side as u32).to_be_bytes());
+    ihdr.extend_from_slice(&(side as u32).to_be_bytes());
+    ihdr.extend_from_slice(&[8, 0, 0, 0, 0]); // 8-bit, grayscale, deflate, no filter, no interlace
+    png_chunk(&mut out, b"IHDR", &ihdr);
+    png_chunk(&mut out, b"IDAT", &z);
+    png_chunk(&mut out, b"IEND", &[]);
+    Some(out)
+}
+
+/// QR code for a terminal: two module rows per line with half blocks, black on white.
+fn qr_ansi(content: &str) -> Option<String> {
+    let (width, dark) = qr_modules(content)?;
+    let margin = 2;
+    let side = width + 2 * margin;
+    let at = |x: usize, y: usize| -> bool {
+        x >= margin && y >= margin && x - margin < width && y - margin < width && dark[(y - margin) * width + (x - margin)]
+    };
+    let mut out = String::new();
+    for y in (0..side).step_by(2) {
+        out.push_str("\x1b[30;47m");
+        for x in 0..side {
+            out.push(match (at(x, y), y + 1 < side && at(x, y + 1)) {
+                (true, true) => '█',
+                (true, false) => '▀',
+                (false, true) => '▄',
+                (false, false) => ' ',
+            });
+        }
+        out.push_str("\x1b[0m\n");
+    }
+    Some(out)
+}
+
 pub fn update_oma_id_qr() -> (String, String) {
     let state_dir = get_state_dir();
     let oma_id = get_or_create_oma_id();
@@ -900,45 +1013,11 @@ pub fn update_oma_id_qr() -> (String, String) {
         return (svg_path, png_path);
     }
 
-    let deadline = Instant::now() + Duration::from_secs(2);
-    // Generate SVG via qrencode
-    let svg_ok = run_cmd_bounded(
-        "/usr/bin/qrencode",
-        &["-o", &svg_path, "-t", "SVG", "--", &qr_content],
-        &[],
-        deadline,
-        1024,
-    ).is_some();
-
-    if svg_file.exists() {
-        #[cfg(unix)]
-        let _ = fs::set_permissions(&svg_file, fs::Permissions::from_mode(0o600));
-    }
-
-    // Fallback internal SVG generator if qrencode fails or is absent
-    if !svg_ok || !svg_file.exists() {
-        let svg_data = rendezvous::generate_fallback_qr_svg(&qr_content);
-        let _ = write_secure_file(&svg_file, &svg_data);
-    }
-
-    // Sync legacy omaid_qr.svg path if needed
-    if let Ok(svg_bytes) = fs::read(&svg_file) {
-        let _ = write_secure_bytes(&legacy_svg_file, &svg_bytes);
-    }
-
-    // Generate PNG via qrencode
-    let deadline_png = Instant::now() + Duration::from_secs(2);
-    let _ = run_cmd_bounded(
-        "/usr/bin/qrencode",
-        &["-o", &png_path, "-t", "PNG", "-s", "8", "-m", "2", "--", &qr_content],
-        &[],
-        deadline_png,
-        1024,
-    );
-
-    if png_file.exists() {
-        #[cfg(unix)]
-        let _ = fs::set_permissions(&png_file, fs::Permissions::from_mode(0o600));
+    // Rendered in Rust: qrencode is not a dependency any more (M8).
+    let _ = write_secure_file(&svg_file, &rendezvous::generate_fallback_qr_svg(&qr_content));
+    let _ = write_secure_file(&legacy_svg_file, &rendezvous::generate_fallback_qr_svg(&qr_content));
+    if let Some(png) = qr_png(&qr_content, 8, 2) {
+        let _ = write_secure_bytes(&png_file, &png);
     }
 
     let _ = write_secure_file(&last_content_file, &qr_content);
@@ -968,18 +1047,9 @@ fn update_all_qr() {
     let qr_file = get_state_dir().join("qr.svg");
 
     if !qr_file.exists() || read_secure_file(&last_qr_file).map(|s| s.trim() != full_url).unwrap_or(true) {
-        let qr_path = qr_file.to_string_lossy().to_string();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let _ = run_cmd_bounded(
-            "/usr/bin/qrencode",
-            &["-o", &qr_path, "-t", "SVG", "--", &full_url],
-            &[],
-            deadline,
-            1024,
-        );
-        if qr_file.exists() {
-            #[cfg(unix)]
-            let _ = fs::set_permissions(&qr_file, fs::Permissions::from_mode(0o600));
+        // The URL carries the PIN, so the file is written 0600.
+        if let Some(svg) = rendezvous::qr_svg(&full_url) {
+            let _ = write_secure_file(&qr_file, &svg);
         }
         let _ = write_secure_file(&last_qr_file, &full_url);
     }
@@ -1036,7 +1106,37 @@ fn get_desktop_gui_envs() -> Vec<(&'static str, String)> {
     envs
 }
 
+/// Escapes text for HTML (and Pango/notification body markup): `& < > " '`.
+fn html_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Notification bodies contain names chosen by remote devices. Notification daemons (mako,
+/// dunst) interpret body markup, so escape it, and never let the text start with '-' where a
+/// helper could read it as an option.
+fn notification_text(text: &str) -> String {
+    let escaped = text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    if escaped.starts_with('-') {
+        format!("\u{2060}{}", escaped)
+    } else {
+        escaped
+    }
+}
+
 fn notify_desktop(title: &str, body: &str) {
+    let title = &notification_text(title);
+    let body = &notification_text(body);
     let env_store = get_desktop_gui_envs();
     let envs: Vec<(&str, &str)> = env_store.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let deadline = Instant::now() + Duration::from_millis(1500);
@@ -1191,7 +1291,7 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
         return Err("Invalid Base64 length".to_string());
     }
     let mut out = Vec::with_capacity(clean.len() / 4 * 3);
-    #[allow(clippy::chunks_exact_to_as_chunks)]
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
     for chunk in clean.chunks_exact(4) {
         let mut buf = [0u8; 4];
         let mut pad_count = 0;
@@ -1767,31 +1867,11 @@ fn get_active_paired_peer_ips() -> Vec<String> {
     ips
 }
 
-/// Legacy code-paired peers that receive automatic clipboard pushes over HTTP. Addresses that
-/// belong to a QR-paired key are excluded: those only ever get the encrypted channel.
-fn legacy_clipboard_ips() -> Vec<String> {
-    let keys = trust_store().load();
-    let mut ips = Vec::new();
-    for p in load_paired_peers() {
-        if !p.is_active() {
-            continue;
-        }
-        if let Some(ip) = p.ip.filter(|ip| !ip.is_empty()) {
-            if !ips.contains(&ip) && !keys.iter().any(|k| k.ip == ip) {
-                ips.push(ip);
-            }
-        }
-    }
-    ips
-}
-
-/// Automatic clipboard sync: legacy paired peers (HTTP, as before) and the user's OWN
-/// QR-paired devices (encrypted QUIC). Devices paired as someone else's never get
-/// automatic pushes.
+/// Automatic clipboard sync goes only to the user's OWN QR-paired devices, over the encrypted
+/// QUIC channel. Legacy (OmaID) peers and devices paired as someone else's never get automatic
+/// pushes: the legacy HTTP path is plaintext on the LAN (M6). `--sync-clipboard <peer>` still
+/// sends to a legacy peer when the user asks for it explicitly.
 fn auto_push_clipboard_text(text: &str) {
-    for ip in legacy_clipboard_ips() {
-        p2p_push_clipboard_http(&ip, text);
-    }
     for key in trust_store().load().into_iter().filter(|k| k.own_device) {
         let text = text.to_string();
         thread::spawn(move || {
@@ -1800,77 +1880,6 @@ fn auto_push_clipboard_text(text: &str) {
             }
         });
     }
-}
-
-
-fn p2p_push_clipboard_http(target_ip: &str, text: &str) {
-    if target_ip.is_empty() {
-        return;
-    }
-    let (my_id, _) = get_or_create_device_id();
-    let my_oma_id = get_or_create_oma_id();
-    let my_name = get_system_hostname();
-
-    let paired = load_paired_peers();
-    let matched_peer = paired.iter().find(|p| p.is_active() && p.ip.as_deref() == Some(target_ip));
-    let auth_token = matched_peer.and_then(|p| p.auth_token.clone()).unwrap_or_default();
-
-    let inner_json = serde_json::json!({
-        "sender_id": my_oma_id,
-        "oma_id": my_oma_id,
-        "device_id": my_id,
-        "sender_name": my_name,
-        "content_type": "text",
-        "text": text,
-        "auth_token": auth_token
-    });
-
-    let target_oma_id = matched_peer
-        .map(|p| p.oma_id.clone())
-        .or_else(|| {
-            get_discovered_peers()
-                .into_iter()
-                .find(|dp| dp.ip == target_ip && !dp.oma_id.is_empty())
-                .map(|dp| dp.oma_id)
-        })
-        .unwrap_or_default();
-    let final_payload = if !target_oma_id.is_empty() {
-        if let Ok(env) = encrypt_p2p_payload(&my_oma_id, &target_oma_id, inner_json.to_string().as_bytes()) {
-            serde_json::json!({
-                "encrypted_envelope": env,
-                "oma_id": my_oma_id,
-                "sender_id": my_oma_id,
-                "device_id": my_id,
-                "sender_name": my_name,
-                "content_type": "text",
-                "text": text,
-                "auth_token": auth_token
-            })
-        } else {
-            inner_json
-        }
-    } else {
-        inner_json
-    };
-
-    let addr = resolve_peer_addr(target_ip);
-    let req_bytes = final_payload.to_string().into_bytes();
-    let oma_id_hdr = my_oma_id.clone();
-    let auth_hdr = auth_token.clone();
-    thread::spawn(move || {
-        if let Ok(mut stream) = connect_peer_with_timeout(&addr, Duration::from_millis(1500)) {
-            let http_req = format!(
-                "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-OmaSend-OmaID: {}\r\nX-OmaSend-Auth-Token: {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
-                addr, oma_id_hdr, auth_hdr,
-                v2_auth_lines("POST", "/api/p2p/clipboard", &devicekey::body_tag_json(&req_bytes)),
-                req_bytes.len()
-            );
-            let _ = stream.write_all(http_req.as_bytes());
-            let _ = stream.write_all(&req_bytes);
-            let mut resp = Vec::new();
-            let _ = (&mut stream).take(64 * 1024).read_to_end(&mut resp);
-        }
-    });
 }
 
 pub fn p2p_push_image_clipboard_silent(
@@ -2000,13 +2009,19 @@ pub fn p2p_fetch_image_clipboard_and_apply(sender_ip: &str, hash: &str, _content
     let ip = sender_ip.to_string();
     let h = hash.to_string();
     let my_oma_id = get_or_create_oma_id();
+    // Legacy peers authorize the fetch with the token from the code-verified pairing.
+    let auth_token = load_paired_peers()
+        .into_iter()
+        .find(|p| p.is_active() && p.ip.as_deref() == Some(sender_ip))
+        .and_then(|p| p.auth_token)
+        .unwrap_or_default();
     thread::spawn(move || {
         let addr = resolve_peer_addr(&ip);
         if let Ok(mut stream) = connect_peer_with_timeout(&addr, Duration::from_secs(5)) {
             let pq = format!("/api/p2p/clipboard/image?hash={}", h);
             let http_req = format!(
-                "GET {} HTTP/1.1\r\nHost: {}\r\nX-OmaSend-OmaID: {}\r\n{}Connection: close\r\n\r\n",
-                pq, addr, my_oma_id, v2_auth_lines("GET", &pq, &devicekey::body_tag_json(b""))
+                "GET {} HTTP/1.1\r\nHost: {}\r\nX-OmaSend-OmaID: {}\r\nX-OmaSend-Auth-Token: {}\r\n{}Connection: close\r\n\r\n",
+                pq, addr, my_oma_id, auth_token, v2_auth_lines("GET", &pq, &devicekey::body_tag_json(b""))
             );
             if stream.write_all(http_req.as_bytes()).is_ok() {
                 let max_resp_bytes = (MAX_IMAGE_CLIP_SIZE + 65536) as u64;
@@ -2041,40 +2056,14 @@ pub fn start_clipboard_sentinel() {
         if !initial_text.trim().is_empty() {
             let initial_hash = compute_clipboard_hash(&initial_text);
             set_last_synced_clipboard_hash(&initial_hash);
-        } else if let Some((img_bytes, _, _, _)) = get_pc_image_clipboard() {
-            let initial_hash = compute_image_clipboard_hash(&img_bytes);
-            set_last_synced_clipboard_hash(&initial_hash);
         }
 
         loop {
             thread::sleep(Duration::from_millis(250));
 
-            // Check image clipboard first
-            if let Some((img_bytes, ct, w, h)) = get_pc_image_clipboard() {
-                let img_hash = compute_image_clipboard_hash(&img_bytes);
-                let last_hash = get_last_synced_clipboard_hash();
-
-                if last_hash.as_deref() != Some(&img_hash) {
-                    set_last_synced_clipboard_hash(&img_hash);
-                    let size = img_bytes.len() as u64;
-                    let _ = stage_clipboard_image(&img_bytes, &ct);
-
-                    // Images go to legacy paired peers only (the encrypted channel carries text).
-                    for target_ip in legacy_clipboard_ips() {
-                        p2p_push_image_clipboard_silent(
-                            &target_ip,
-                            &ct,
-                            &img_hash,
-                            size,
-                            w,
-                            h,
-                            Some(&img_bytes),
-                        );
-                    }
-                    continue;
-                }
-            }
-
+            // Images are not synced automatically: the encrypted channel carries text only, and
+            // images used to go to legacy peers over plaintext HTTP (M6). Image clipboards are
+            // not valid text (see is_valid_text_clipboard), so they are skipped below.
 
             // Check text clipboard
             let text = get_pc_clipboard();
@@ -2201,11 +2190,9 @@ fn sanitize_filename(raw: &str) -> String {
     if trimmed.is_empty() || trimmed.starts_with('.') || trimmed.contains("..") {
         format!("file_{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
     } else {
-        if trimmed.len() > 180 {
-            trimmed[..180].to_string()
-        } else {
-            trimmed.to_string()
-        }
+        // Truncate by characters, never by bytes: a byte index can land inside a multibyte
+        // character and panic (with panic = "abort" that kills the daemon).
+        trimmed.chars().take(180).collect::<String>().trim_end().to_string()
     }
 }
 
@@ -2536,13 +2523,6 @@ impl omasend_core::NodeCallbacks for DesktopCoreCallbacks {
 
     fn incoming_offer(&self, offer: omasend_core::IncomingOffer) {
         let node = CORE_NODE.get().cloned();
-        // Single pending slot (V2-FUNC-01): refuse while another transfer is live.
-        if get_pending_transfer().is_some_and(|p| p.status == "PENDING" || p.status == "ACCEPTED") {
-            if let Some(n) = node {
-                n.respond(offer.transfer_id, false);
-            }
-            return;
-        }
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let files: Vec<TransferFileInfo> = offer
             .files
@@ -2550,7 +2530,9 @@ impl omasend_core::NodeCallbacks for DesktopCoreCallbacks {
             .map(|f| TransferFileInfo { name: f.name.clone(), size_bytes: f.size, blake3: None, sha256: None, md5: None })
             .collect();
         let size_mb = (offer.total_size as f64) / 1024.0 / 1024.0;
-        save_pending_transfer(&PendingFileTransfer {
+        // Single pending slot (V2-FUNC-01): refuse while another transfer is live. The core only
+        // offers from paired keys, so this counts as a verified sender (M9).
+        let claimed = claim_pending_slot(&PendingFileTransfer {
             token: offer.transfer_id.clone(),
             sender_id: offer.peer_pk.clone(),
             sender_name: offer.peer_name.clone(),
@@ -2564,7 +2546,13 @@ impl omasend_core::NodeCallbacks for DesktopCoreCallbacks {
             status: "PENDING".to_string(),
             sender_pk: Some(offer.peer_pk.clone()),
             transport: Some("quic".to_string()),
-        });
+        }, true);
+        if !claimed {
+            if let Some(n) = node {
+                n.respond(offer.transfer_id, false);
+            }
+            return;
+        }
         notify_desktop(
             "OmaSend AirBridge: Transfer Request",
             &format!("'{}' wants to send {} file(s) ({:.1} MB), end-to-end encrypted.\nOpen OmaSend panel to Accept or Decline.", offer.peer_name, offer.files.len(), size_mb),
@@ -2663,6 +2651,38 @@ fn ensure_local_api_token() -> String {
     t
 }
 
+/// Headers a reverse proxy (cloudflared for the WAN tunnel) adds. A loopback connection that
+/// carries one of them came from the internet, not from a process on this machine.
+const TUNNEL_HEADERS: &[&str] = &["cf-connecting-ip", "cf-ray", "x-forwarded-for", "x-real-ip", "forwarded", "cdn-loop"];
+
+fn has_tunnel_headers(req: &HttpRequest) -> bool {
+    TUNNEL_HEADERS.iter().any(|h| req.get_header(h).is_some())
+}
+
+fn local_token_matches(req: &HttpRequest) -> bool {
+    req.get_header("x-omasend-local")
+        .is_some_and(|t| constant_time_eq_str(t.trim(), &ensure_local_api_token()))
+}
+
+/// True only for a request from a local process that can read the 0600 local API token (the
+/// CLI and the panel through it). Loopback alone proves nothing: the WAN tunnel connects
+/// from 127.0.0.1.
+fn is_local_control(req: &HttpRequest, client_ip: IpAddr) -> bool {
+    client_ip.to_canonical().is_loopback() && !has_tunnel_headers(req) && local_token_matches(req)
+}
+
+/// The address rate limiters key on. WAN tunnel clients all arrive from loopback, so use the
+/// client address cloudflared reports for them instead of one shared bucket.
+fn rate_limit_ip(req: &HttpRequest, client_ip: IpAddr) -> IpAddr {
+    let ip = client_ip.to_canonical();
+    if ip.is_loopback() {
+        if let Some(real) = req.get_header("cf-connecting-ip").and_then(|v| v.trim().parse::<IpAddr>().ok()) {
+            return real.to_canonical();
+        }
+    }
+    ip
+}
+
 /// Sends files through the daemon's QUIC endpoint. Err((unavailable, message)).
 fn core_send_via_daemon(key: &devicekey::TrustedKey, paths: &[String], names: &[String]) -> Result<(), (bool, String)> {
     if let Some(node) = CORE_NODE.get() {
@@ -2688,27 +2708,34 @@ fn core_clipboard(key: &devicekey::TrustedKey, text: &str) -> Result<(), (bool, 
     core_daemon_request(serde_json::json!({ "pk": key.pk, "addrs": core_addrs(key), "text": text }))
 }
 
-/// CLI -> daemon request on the loopback-only, token-protected core endpoint.
-fn core_daemon_request(body: serde_json::Value) -> Result<(), (bool, String)> {
-    let token = read_secure_file(&local_api_token_path()).map_err(|_| (true, "core not running (no local token)".to_string()))?;
+/// CLI -> daemon request on a loopback-only, token-protected endpoint. Returns the JSON body.
+/// Err means the daemon could not be reached.
+fn local_api_request(path: &str, body: &serde_json::Value, timeout: Option<Duration>) -> Result<serde_json::Value, String> {
+    let token = read_secure_file(&local_api_token_path()).map_err(|_| "daemon not running (no local token)".to_string())?;
     let body = body.to_string();
     let mut stream = connect_peer_with_timeout(&format!("127.0.0.1:{}", PORT), Duration::from_secs(2))
-        .map_err(|e| (true, format!("core not running: {}", e)))?;
-    let _ = stream.set_read_timeout(None);
+        .map_err(|e| format!("daemon not running: {}", e))?;
+    let _ = stream.set_read_timeout(timeout);
     let head = format!(
-        "POST /api/local/core-send HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nX-OmaSend-Local: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nX-OmaSend-Local: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        path,
         token.trim(),
         body.len()
     );
-    stream.write_all(head.as_bytes()).map_err(|e| (true, e.to_string()))?;
-    stream.write_all(body.as_bytes()).map_err(|e| (true, e.to_string()))?;
+    stream.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
+    stream.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
     let mut resp = String::new();
-    (&mut stream).take(64 * 1024).read_to_string(&mut resp).map_err(|e| (true, e.to_string()))?;
-    let json: serde_json::Value = resp
+    (&mut stream).take(64 * 1024).read_to_string(&mut resp).map_err(|e| e.to_string())?;
+    Ok(resp
         .split("\r\n\r\n")
         .nth(1)
         .and_then(|b| serde_json::from_str(b).ok())
-        .unwrap_or_default();
+        .unwrap_or_default())
+}
+
+/// CLI -> daemon request on the loopback-only, token-protected core endpoint.
+fn core_daemon_request(body: serde_json::Value) -> Result<(), (bool, String)> {
+    let json = local_api_request("/api/local/core-send", &body, None).map_err(|e| (true, format!("core not running: {}", e)))?;
     if json["ok"].as_bool() == Some(true) {
         Ok(())
     } else {
@@ -2756,7 +2783,10 @@ fn v2_verify(req: &HttpRequest, body_tag: &str, client_ip: &str) -> devicekey::A
     match devicekey::verify_request(&store, &h, &req.method, &pq, body_tag) {
         devicekey::AuthResult::Rejected("Unknown device key") => devicekey::AuthResult::Absent,
         devicekey::AuthResult::Trusted(k) => {
-            store.touch(&k.pk, client_ip);
+            // A loopback source is the WAN tunnel (or this machine), not the peer's LAN address:
+            // storing it would make later QUIC sends dial ourselves (M14).
+            let is_loopback = client_ip.parse::<IpAddr>().is_ok_and(|ip| ip.to_canonical().is_loopback());
+            store.touch(&k.pk, if is_loopback { "" } else { client_ip });
             devicekey::AuthResult::Trusted(k)
         }
         other => other,
@@ -2794,6 +2824,22 @@ fn is_peer_confirmed(oma_id: &str) -> bool {
         return false;
     }
     load_paired_peers().iter().any(|p| p.confirmed && rendezvous::normalize_oma_id(&p.oma_id) == norm)
+}
+
+/// Legacy (OmaID) authorization: a pairing that completed the code-verified handshake, and,
+/// when that pairing stored an auth token, the same token (compared in constant time).
+fn legacy_peer_authorized(oma_id: &str, provided_token: &str) -> bool {
+    let norm = rendezvous::normalize_oma_id(oma_id);
+    if norm.len() != 16 {
+        return false;
+    }
+    load_paired_peers()
+        .into_iter()
+        .find(|p| p.confirmed && rendezvous::normalize_oma_id(&p.oma_id) == norm)
+        .is_some_and(|p| match p.auth_token.as_deref() {
+            Some(expected) if !expected.is_empty() => !provided_token.is_empty() && constant_time_eq_str(expected, provided_token),
+            _ => true,
+        })
 }
 
 fn is_peer_trusted(peer_id: &str) -> bool {
@@ -2851,32 +2897,124 @@ fn lock_state_files() -> StateFileGuard<'static> {
     }
 }
 
-fn get_pending_transfer() -> Option<PendingFileTransfer> {
-    let _guard = lock_state_files();
-    let path = get_state_dir().join("pending_transfer.json");
-    if let Ok(content) = read_secure_file(&path) {
-        if let Ok(t) = serde_json::from_str::<PendingFileTransfer>(&content) {
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-            if now <= t.expires_at {
-                return Some(t);
-            }
-        }
-    }
-    None
+/// How long an accepted HTTP transfer may sit idle between uploads before it expires.
+const PENDING_IDLE_SECS: u64 = 600;
+
+fn pending_transfer_path() -> PathBuf {
+    get_state_dir().join("pending_transfer.json")
 }
 
+/// Reads the pending transfer without taking the state lock. `include_expired` also returns
+/// an expired record (so pollers can be told EXPIRED instead of NOT_FOUND).
+fn read_pending_transfer_unlocked(include_expired: bool) -> Option<PendingFileTransfer> {
+    let content = read_secure_file(&pending_transfer_path()).ok()?;
+    let t = serde_json::from_str::<PendingFileTransfer>(&content).ok()?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    (include_expired || now <= t.expires_at).then_some(t)
+}
+
+fn write_pending_transfer_unlocked(t: &PendingFileTransfer) {
+    if let Ok(s) = serde_json::to_string(t) {
+        let _ = write_secure_file(&pending_transfer_path(), &s);
+    }
+}
+
+fn get_pending_transfer() -> Option<PendingFileTransfer> {
+    let _guard = lock_state_files();
+    read_pending_transfer_unlocked(false)
+}
+
+#[cfg(test)]
 fn save_pending_transfer(t: &PendingFileTransfer) {
     let _guard = lock_state_files();
-    let path = get_state_dir().join("pending_transfer.json");
-    if let Ok(s) = serde_json::to_string(t) {
-        let _ = write_secure_file(&path, &s);
-    }
+    write_pending_transfer_unlocked(t);
 }
 
 fn clear_pending_transfer() {
     let _guard = lock_state_files();
-    let path = get_state_dir().join("pending_transfer.json");
-    let _ = fs::remove_file(path);
+    let _ = fs::remove_file(pending_transfer_path());
+}
+
+/// Runs `f` on the pending transfer (expired ones included) under a single state lock, so a
+/// read-modify-write cannot interleave with another thread or process.
+fn with_pending_transfer<R>(f: impl FnOnce(&mut Option<PendingFileTransfer>) -> R) -> R {
+    let _guard = lock_state_files();
+    let mut cur = read_pending_transfer_unlocked(true);
+    let before = cur.as_ref().and_then(|t| serde_json::to_string(t).ok());
+    let out = f(&mut cur);
+    let after = cur.as_ref().and_then(|t| serde_json::to_string(t).ok());
+    if before != after {
+        match cur {
+            Some(ref t) => write_pending_transfer_unlocked(t),
+            None => {
+                let _ = fs::remove_file(pending_transfer_path());
+            }
+        }
+    }
+    out
+}
+
+/// Atomically takes the single pending-transfer slot for `t` (V2-FUNC-01, M10). A live PENDING
+/// or ACCEPTED transfer keeps the slot, except that a cryptographically verified sender (v2
+/// signature or QUIC offer from a paired key) may displace a request from an unverified
+/// sender that is still only PENDING, so anonymous LAN requests cannot block paired devices (M9).
+fn claim_pending_slot(t: &PendingFileTransfer, verified: bool) -> bool {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    with_pending_transfer(|slot| {
+        if let Some(cur) = slot.as_ref() {
+            let live = now <= cur.expires_at && (cur.status == "PENDING" || cur.status == "ACCEPTED");
+            let unverified_pending = cur.status == "PENDING" && cur.sender_pk.is_none() && cur.transport.is_none();
+            if live && !(verified && unverified_pending) {
+                return false;
+            }
+        }
+        *slot = Some(t.clone());
+        true
+    })
+}
+
+/// Applies the local user's accept/reject to the pending transfer. Only a live PENDING request
+/// can be decided. Runs in the daemon: QUIC offers are answered through the core node, HTTP
+/// transfers get a fresh idle window for their uploads.
+fn decide_pending_transfer(token: &str, accept: bool) -> Result<&'static str, String> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let quic = with_pending_transfer(|slot| {
+        let p = slot.as_mut().filter(|p| !token.is_empty() && constant_time_eq_str(&p.token, token));
+        let Some(p) = p else {
+            return Err("Invalid or expired transfer token".to_string());
+        };
+        if now > p.expires_at {
+            return Err("Transfer request expired".to_string());
+        }
+        if p.status != "PENDING" {
+            return Err(format!("Transfer is already {}", p.status.to_lowercase()));
+        }
+        let quic = p.transport.as_deref() == Some("quic");
+        if accept {
+            p.status = "ACCEPTED".to_string();
+            p.expires_at = now.saturating_add(PENDING_IDLE_SECS);
+        } else if quic {
+            *slot = None;
+        } else {
+            // Keep the record briefly so the polling sender sees REJECTED.
+            p.status = "REJECTED".to_string();
+            p.expires_at = p.expires_at.max(now.saturating_add(30));
+        }
+        Ok(quic)
+    })?;
+    if quic {
+        match CORE_NODE.get() {
+            Some(node) => node.respond(token.to_string(), accept),
+            None => return Err("core not running".to_string()),
+        }
+    }
+    if accept {
+        notify_desktop("OmaSend AirBridge", if quic { "Transfer accepted. Receiving files (encrypted)..." } else { "Transfer accepted. Receiving files..." });
+        Ok("ACCEPTED")
+    } else {
+        notify_desktop("OmaSend AirBridge", "Transfer declined.");
+        Ok("REJECTED")
+    }
 }
 
 fn get_discovered_peers_unlocked() -> Vec<DiscoveredPeer> {
@@ -2953,7 +3091,13 @@ fn save_discovered_peers(peers: &[DiscoveredPeer]) {
     save_discovered_peers_unlocked(peers);
 }
 
-fn update_discovered_peer(packet: &P2pBeaconPacket) {
+/// Upper bound on remembered discovered peers; the oldest are evicted first (M13).
+const MAX_DISCOVERED_PEERS: usize = 256;
+
+/// Records a beacon. `src` is the UDP source address: it is used instead of the packet's
+/// self-reported `ip`, which any host can fill with someone else's address (M13).
+fn update_discovered_peer(packet: &P2pBeaconPacket, src: IpAddr) {
+    let src_ip = src.to_canonical().to_string();
     let _guard = lock_state_files();
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let (my_id, _) = get_or_create_device_id();
@@ -2965,9 +3109,10 @@ fn update_discovered_peer(packet: &P2pBeaconPacket) {
 
     // Instant offline handling when remote peer turns discovery OFF
     if packet.mode == "OFF" || packet.mode == "STOP" {
+        // Only the device itself (same id, same source address) can take itself off the list.
         let mut peers = get_discovered_peers_unlocked();
         let initial_len = peers.len();
-        peers.retain(|p| p.id != packet.id && p.ip != packet.ip);
+        peers.retain(|p| !(p.id == packet.id && p.ip == src_ip));
         if peers.len() != initial_len {
             save_discovered_peers_unlocked(&peers);
         }
@@ -2992,7 +3137,7 @@ fn update_discovered_peer(packet: &P2pBeaconPacket) {
         true
     } else if is_paired {
         let paired = load_paired_peers();
-        paired.iter().any(|p| p.is_active() && rendezvous::normalize_oma_id(&p.oma_id) == packet_norm && p.ip.as_deref() == Some(&packet.ip))
+        paired.iter().any(|p| p.is_active() && rendezvous::normalize_oma_id(&p.oma_id) == packet_norm && p.ip.as_deref() == Some(src_ip.as_str()))
     } else {
         false
     };
@@ -3002,7 +3147,7 @@ fn update_discovered_peer(packet: &P2pBeaconPacket) {
         existing.id = packet.id.clone();
         existing.oma_id = packet.oma_id.clone();
         existing.name = packet.name.clone();
-        existing.ip = packet.ip.clone();
+        existing.ip = src_ip.clone();
         existing.port = packet.port;
         existing.transport = "LAN".to_string();
         existing.fingerprint = packet.fp.clone();
@@ -3015,7 +3160,7 @@ fn update_discovered_peer(packet: &P2pBeaconPacket) {
             id: packet.id.clone(),
             oma_id: packet.oma_id.clone(),
             name: packet.name.clone(),
-            ip: packet.ip.clone(),
+            ip: src_ip.clone(),
             port: packet.port,
             transport: "LAN".to_string(),
             fingerprint: packet.fp.clone(),
@@ -3025,6 +3170,10 @@ fn update_discovered_peer(packet: &P2pBeaconPacket) {
             pk: packet.pk.clone(),
             key_trust: String::new(),
         });
+        if peers.len() > MAX_DISCOVERED_PEERS {
+            peers.sort_by_key(|p| std::cmp::Reverse(p.last_seen_secs));
+            peers.truncate(MAX_DISCOVERED_PEERS);
+        }
     }
     save_discovered_peers_unlocked(&peers);
 }
@@ -3177,11 +3326,11 @@ fn run_p2p_discovery_listener() {
     let mut buf = [0u8; 2048];
     loop {
         match socket.recv_from(&mut buf) {
-            Ok((amt, _src)) => {
+            Ok((amt, src)) => {
                 if amt > 0 && amt <= 2048 {
                     if let Ok(packet) = serde_json::from_slice::<P2pBeaconPacket>(&buf[..amt]) {
                         if packet.magic == "OMASEND_P2P" {
-                            update_discovered_peer(&packet);
+                            update_discovered_peer(&packet, src.ip());
                         }
                     }
                 }
@@ -3301,11 +3450,26 @@ fn resolve_peer_addr(target_ip_or_omaid: &str) -> String {
 
 const MAX_PAIR_RESPONSE_BYTES: u64 = 64 * 1024;
 
+/// Parses a pairing link and checks that it points at a private / link-local address on this
+/// network (a QR from a web page or chat must not make us connect anywhere else, M4).
+fn inspect_pair_uri(uri: &str) -> Result<(devicekey::ParsedOffer, String), String> {
+    let offer = devicekey::parse_pair_uri(uri)?;
+    let ip: IpAddr = offer.host.trim().parse().map_err(|_| "Invalid host in pairing link".to_string())?;
+    let ip = ip.to_canonical();
+    if !rendezvous::is_local_network_ip(&ip) || ip.is_loopback() {
+        return Err("Pairing link must point to a private (RFC 1918) or link-local address".to_string());
+    }
+    let vk = devicekey::decode_pk(&offer.pk).ok_or("Invalid responder key")?;
+    let device_id = devicekey::device_id_for_pk(vk.as_bytes());
+    Ok((offer, device_id))
+}
+
 /// Phase 1 initiator: scan/paste an `omasend://pair?...` link shown by the other device.
 /// The responder's key is pinned from the link, so a LAN attacker cannot impersonate it.
-fn p2p_pair_v2(uri: &str) -> Result<devicekey::TrustedKey, String> {
-    let offer = devicekey::parse_pair_uri(uri)?;
-    let _: IpAddr = offer.host.trim().parse().map_err(|_| "Invalid host in pairing link".to_string())?;
+/// The trust level is chosen here, by the user of this device (`own_device`); the link's
+/// `o=` flag only describes how the responder will trust us (M4).
+fn p2p_pair_v2(uri: &str, own_device: bool) -> Result<devicekey::TrustedKey, String> {
+    let (offer, _) = inspect_pair_uri(uri)?;
     let body = devicekey::build_pair_request(device_identity(), &offer, &get_system_hostname(), CORE_NODE.get().map(|n| n.bound_port()).unwrap_or(CORE_QUIC_PORT))
         .to_string()
         .into_bytes();
@@ -3347,7 +3511,7 @@ fn p2p_pair_v2(uri: &str) -> Result<devicekey::TrustedKey, String> {
         ip: offer.host.clone(),
         port: offer.port,
         quic_port: json["quic_port"].as_u64().and_then(|p| u16::try_from(p).ok()).unwrap_or(offer.quic_port),
-        own_device: offer.own_device,
+        own_device,
         added_at: now,
         last_seen: now,
     };
@@ -3772,8 +3936,25 @@ fn p2p_send_files_to_peer(target_ip_or_omaid: &str, file_paths: &[PathBuf]) -> R
         save_transfer_progress("send", &pf.name, cumulative_sent, total_size_bytes);
         upload_stream.flush().map_err(|e| format!("Failed to flush upload stream: {}", e))?;
 
-        let mut final_resp = String::new();
-        let _ = (&mut upload_stream).take(64 * 1024).read_to_string(&mut final_resp);
+        let mut final_resp = Vec::new();
+        let _ = (&mut upload_stream).take(64 * 1024).read_to_end(&mut final_resp);
+        let resp_text = String::from_utf8_lossy(&final_resp);
+        let status_ok = resp_text
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .is_some_and(|code| code.starts_with('2'));
+        if !status_ok {
+            let reason = resp_text
+                .split("\r\n\r\n")
+                .nth(1)
+                .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                .and_then(|v| v["error"].as_str().map(String::from))
+                .unwrap_or_else(|| resp_text.lines().next().unwrap_or("no response").to_string());
+            let msg = format!("Upload of '{}' was not accepted by {}: {}", pf.name, target_ip, reason);
+            notify_desktop("OmaSend AirBridge", &msg);
+            return Err(msg);
+        }
     }
 
     println!("Transfer successfully completed to {}!", target_ip);
@@ -4509,10 +4690,22 @@ struct PinAttemptState {
     blocked_until: Option<Instant>,
 }
 
-static PIN_RATE_LIMITER: Mutex<Option<HashMap<IpAddr, PinAttemptState>>> = Mutex::new(None);
+type AttemptLimiter = Mutex<Option<HashMap<IpAddr, PinAttemptState>>>;
+
+static PIN_RATE_LIMITER: AttemptLimiter = Mutex::new(None);
+/// Failed /api/v2/pair attempts per source address (M17).
+static PAIR_RATE_LIMITER: AttemptLimiter = Mutex::new(None);
 
 pub fn is_pin_rate_limited(ip: IpAddr) -> bool {
-    let mut guard = match PIN_RATE_LIMITER.lock() {
+    is_rate_limited(&PIN_RATE_LIMITER, ip)
+}
+
+pub fn record_pin_attempt(ip: IpAddr, success: bool) -> bool {
+    record_attempt(&PIN_RATE_LIMITER, ip, success)
+}
+
+fn is_rate_limited(limiter: &AttemptLimiter, ip: IpAddr) -> bool {
+    let mut guard = match limiter.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -4528,8 +4721,9 @@ pub fn is_pin_rate_limited(ip: IpAddr) -> bool {
     false
 }
 
-pub fn record_pin_attempt(ip: IpAddr, success: bool) -> bool {
-    let mut guard = match PIN_RATE_LIMITER.lock() {
+/// Records an attempt; returns false once `ip` is blocked (5 failures within 60 s -> 60 s).
+fn record_attempt(limiter: &AttemptLimiter, ip: IpAddr, success: bool) -> bool {
+    let mut guard = match limiter.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -4566,12 +4760,14 @@ pub fn record_pin_attempt(ip: IpAddr, success: bool) -> bool {
 
 #[cfg(test)]
 pub fn reset_pin_rate_limiter() {
-    let mut guard = match PIN_RATE_LIMITER.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    if let Some(ref mut map) = *guard {
-        map.clear();
+    for limiter in [&PIN_RATE_LIMITER, &PAIR_RATE_LIMITER] {
+        let mut guard = match limiter.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(ref mut map) = *guard {
+            map.clear();
+        }
     }
 }
 
@@ -4588,17 +4784,23 @@ fn extract_provided_pin(req: &HttpRequest) -> Option<String> {
             return Some(h.to_string());
         }
     }
-    if let Some(cookie_val) = req.get_header("cookie") {
-        for c in cookie_val.split(';') {
-            let ct = c.trim();
-            if let Some(val) = ct.strip_prefix("pin=") {
-                if !val.is_empty() {
-                    return Some(val.to_string());
-                }
-            }
-        }
-    }
     None
+}
+
+const WEB_SESSION_COOKIE: &str = "omasend_session";
+
+/// Portal session cookie value: HMAC(session key, PIN). It changes whenever the PIN or the
+/// session key is rotated and does not reveal the PIN.
+fn web_session_value(pin: &str, key_hex: &str) -> String {
+    hex::encode(rendezvous::hmac_sha256(key_hex.as_bytes(), format!("omasend-web-session|{}", pin).as_bytes()))
+}
+
+fn web_session_cookie(req: &HttpRequest) -> Option<&str> {
+    req.get_header("cookie")?
+        .split(';')
+        .filter_map(|c| c.trim().split_once('='))
+        .find(|(k, v)| *k == WEB_SESSION_COOKIE && !v.is_empty())
+        .map(|(_, v)| v)
 }
 
 fn is_trusted_origin(origin: &str, local_ip: &str) -> bool {
@@ -4795,12 +4997,17 @@ fn render_web_app(active_endpoint: &str, shared_files: &[FileInfo]) -> String {
         files_html.push_str("<div class='empty'>No files shared from PC.<br><small style='color:#6e7681;'>Add files to ~/Downloads/omasend/shared.</small></div>");
     } else {
         for f in shared_files {
+            // File names are arbitrary: escape them, and pass the name to JS through a data
+            // attribute instead of splicing it into a JS string literal.
+            let name = html_escape(&f.name);
             files_html.push_str(&format!(
                 r#"<div class="file-item">
 <div class="file-info"><div class="file-name">{}</div><div class="file-size">{}</div></div>
-<button onclick="downloadFile('{}')" class="btn-sm">Download</button>
+<button data-name="{}" onclick="downloadFile(this.dataset.name)" class="btn-sm">Download</button>
 </div>"#,
-                f.name, f.size_str, f.name
+                name,
+                html_escape(&f.size_str),
+                name
             ));
         }
     }
@@ -5158,6 +5365,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
     let origin = req.get_header("origin");
     let allowed_cors = origin.filter(|&o| is_trusted_origin(o, ip));
+    let local_ctl = is_local_control(&req, client_ip);
 
     let respond = |s: &TcpStream, status: &str, content_type: &str, body: &[u8], cookie: Option<&str>, extra: Option<&[(&str, &str)]>| {
         send_response(s, status, content_type, body, cookie, extra, allowed_cors);
@@ -5178,7 +5386,9 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         return;
     }
 
-    if is_pin_rate_limited(client_ip) {
+    // The local CLI/panel is never locked out by someone else's wrong PINs (M5).
+    let rl_ip = rate_limit_ip(&req, client_ip);
+    if !local_ctl && is_pin_rate_limited(rl_ip) {
         let err = b"{\"error\":\"Too many failed PIN attempts. Please wait 60 seconds.\"}";
         respond(
             &stream,
@@ -5191,14 +5401,15 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         return;
     }
 
+    let web_session = web_session_value(pin, key_hex);
     let maybe_pin = extract_provided_pin(&req);
     let authorized = match maybe_pin {
-        Some(ref p) if p == pin => {
-            record_pin_attempt(client_ip, true);
+        Some(ref p) if constant_time_eq_str(p, pin) => {
+            record_pin_attempt(rl_ip, true);
             true
         }
-        Some(_) => {
-            let not_blocked = record_pin_attempt(client_ip, false);
+        Some(_) if !local_ctl => {
+            let not_blocked = record_pin_attempt(rl_ip, false);
             if !not_blocked {
                 let err = b"{\"error\":\"Too many failed PIN attempts. Please wait 60 seconds.\"}";
                 respond(
@@ -5213,7 +5424,8 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             }
             false
         }
-        None => false,
+        Some(_) => false,
+        None => web_session_cookie(&req).is_some_and(|c| constant_time_eq_str(c, &web_session)),
     };
 
     if req.path == "/api/status" {
@@ -5258,10 +5470,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
     }
 
     if req.method == "POST" && req.path == "/api/local/core-send" {
-        let token_ok = req
-            .get_header("x-omasend-local")
-            .is_some_and(|t| constant_time_eq_str(t.trim(), &ensure_local_api_token()));
-        if !client_ip.to_canonical().is_loopback() || !token_ok {
+        if !local_ctl {
             respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Forbidden\"}", None, None);
             return;
         }
@@ -5298,6 +5507,16 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
     }
 
     if req.method == "POST" && req.path == "/api/v2/pair" {
+        if get_visibility().0 == "OFF" {
+            respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Recipient AirBridge visibility is turned Off\"}", None, None);
+            return;
+        }
+        // Offer secrets are 256-bit, so guessing is hopeless; the per-address limit only stops
+        // one host from hammering the endpoint. Failures no longer burn everyone's offers (M17).
+        if is_rate_limited(&PAIR_RATE_LIMITER, rl_ip) {
+            respond(&stream, "429 Too Many Requests", "application/json", b"{\"error\":\"Too many pairing attempts\"}", None, Some(&[("Retry-After", "60")]));
+            return;
+        }
         if content_length > MAX_CONTROL_BODY {
             respond(&stream, "413 Payload Too Large", "application/json", b"{\"error\":\"Request payload exceeds limit\"}", None, None);
             return;
@@ -5314,10 +5533,12 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                 return;
             }
         };
-        let peer_ip = client_ip.to_canonical().to_string();
+        // Through the WAN tunnel the source is loopback, which is not the peer's address (M14).
+        let peer_ip = if client_ip.to_canonical().is_loopback() { String::new() } else { client_ip.to_canonical().to_string() };
         let my_quic = CORE_NODE.get().map(|n| n.bound_port()).unwrap_or(CORE_QUIC_PORT);
         match devicekey::accept_pair_request(device_identity(), &get_state_dir(), &get_system_hostname(), &val, &peer_ip, my_quic) {
             Ok((resp, key)) => {
+                record_attempt(&PAIR_RATE_LIMITER, rl_ip, true);
                 let label = format!("{} ({})", key.name, key.device_id);
                 let own = key.own_device;
                 if trust_store().upsert(key).is_err() {
@@ -5331,6 +5552,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                 respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
             }
             Err(e) => {
+                record_attempt(&PAIR_RATE_LIMITER, rl_ip, false);
                 let err = serde_json::json!({ "error": e });
                 respond(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
             }
@@ -5416,6 +5638,12 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
     }
 
     if req.method == "GET" && req.path == "/api/p2p/peers" {
+        // The discovered-device list is for the local user only (it is reachable from the
+        // internet when the WAN tunnel is on). The panel and CLI read it via --json (M12).
+        if !local_ctl && !authorized {
+            respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Forbidden\"}", None, None);
+            return;
+        }
         let peers = get_discovered_peers();
         let (vis, remaining) = get_visibility();
         let resp = serde_json::json!({
@@ -5526,6 +5754,15 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
 
         let is_trusted = is_same_owner;
 
+        // Visibility KNOWN (the default) accepts only paired senders: a verified device key, or
+        // a legacy pairing that completed the code-verified handshake (its token was checked
+        // above). EVERYONE is the time-limited opt-in for strangers (M9).
+        if vis == "KNOWN" && v2_key.is_none() && !is_peer_confirmed(&sender_id) {
+            let err = serde_json::json!({ "error": "Recipient only accepts transfers from paired devices" });
+            respond(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
+            return;
+        }
+
         let mut file_names = Vec::new();
         let mut files_info = Vec::new();
         let mut total_size_bytes = 0u64;
@@ -5563,14 +5800,6 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             }
         }
 
-        // V2-FUNC-01: there is a single pending-transfer slot. Never overwrite a live request or an
-        // accepted transfer that is still uploading; the new sender must retry once it finishes/expires.
-        if get_pending_transfer().is_some_and(|p| p.status == "PENDING" || p.status == "ACCEPTED") {
-            let err = serde_json::json!({ "error": "Another transfer is in progress. Please retry shortly." });
-            respond(&stream, "409 Conflict", "application/json", err.to_string().as_bytes(), None, Some(&[("Retry-After", "30")]));
-            return;
-        }
-
         let mut token_bytes = [0u8; 16];
         let _ = getrandom::getrandom(&mut token_bytes);
         let token = hex::encode(token_bytes);
@@ -5604,7 +5833,12 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             sender_pk: v2_key.as_ref().map(|k| k.pk.clone()),
             transport: None,
         };
-        save_pending_transfer(&transfer);
+        // V2-FUNC-01: single pending slot; check and save under one lock (M10).
+        if !claim_pending_slot(&transfer, v2_key.is_some()) {
+            let err = serde_json::json!({ "error": "Another transfer is in progress. Please retry shortly." });
+            respond(&stream, "409 Conflict", "application/json", err.to_string().as_bytes(), None, Some(&[("Retry-After", "30")]));
+            return;
+        }
 
         let size_mb = (total_size_bytes as f64) / 1024.0 / 1024.0;
         if auto_accept {
@@ -5634,8 +5868,9 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         if req.method == "GET" {
             let token = req.get_param("token").unwrap_or_default();
-            if let Some(pending) = get_pending_transfer() {
-                if pending.token == token {
+            // Read expired records too, so a sender learns EXPIRED instead of NOT_FOUND (M10).
+            if let Some(pending) = with_pending_transfer(|p| p.clone()) {
+                if !token.is_empty() && constant_time_eq_str(&pending.token, &token) {
                     if now > pending.expires_at {
                         respond(&stream, "200 OK", "application/json", b"{\"status\":\"EXPIRED\"}", None, None);
                     } else {
@@ -5648,8 +5883,10 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             respond(&stream, "404 Not Found", "application/json", b"{\"status\":\"NOT_FOUND\"}", None, None);
             return;
         } else if req.method == "POST" {
-            // Security Gate: Only local user or authenticated web portal session can approve/reject a transfer
-            if !client_ip.to_canonical().is_loopback() && !authorized {
+            // Only the local user may decide: the CLI/panel with the local API token, or a
+            // PIN-authenticated portal session. Bare loopback is not enough, because the WAN
+            // tunnel delivers internet traffic from 127.0.0.1 (M2).
+            if !local_ctl && !authorized {
                 respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Only local user can approve or reject transfers\"}", None, None);
                 return;
             }
@@ -5663,56 +5900,21 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                 Some(b) => b,
                 None => return,
             };
-
-            let body_slice = match body.as_slice() {
-                Some(s) => s,
-                None => {
-                    respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid payload\"}", None, None);
+            let val: serde_json::Value = body.as_slice().and_then(|b| serde_json::from_slice(b).ok()).unwrap_or_default();
+            let token = val["token"].as_str().unwrap_or_default();
+            let accept = match val["action"].as_str() {
+                Some("accept") => true,
+                Some("reject") => false,
+                _ => {
+                    respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid token or action\"}", None, None);
                     return;
                 }
             };
-            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(body_slice) {
-                let token = val["token"].as_str().unwrap_or_default();
-                let action = val["action"].as_str().unwrap_or_default();
-                if let Some(mut pending) = get_pending_transfer() {
-                    if pending.token == token && pending.transport.as_deref() == Some("quic") && (action == "accept" || action == "reject") {
-                        let accept = action == "accept";
-                        if let Some(node) = CORE_NODE.get() {
-                            node.respond(token.to_string(), accept);
-                        }
-                        if accept {
-                            pending.status = "ACCEPTED".to_string();
-                            pending.expires_at = now.saturating_add(600);
-                            save_pending_transfer(&pending);
-                            notify_desktop("OmaSend AirBridge", "Transfer accepted. Receiving files (encrypted)...");
-                            respond(&stream, "200 OK", "application/json", b"{\"status\":\"ACCEPTED\"}", None, None);
-                        } else {
-                            clear_pending_transfer();
-                            notify_desktop("OmaSend AirBridge", "Transfer declined.");
-                            respond(&stream, "200 OK", "application/json", b"{\"status\":\"REJECTED\"}", None, None);
-                        }
-                        return;
-                    }
-                    if pending.token == token {
-                        if action == "accept" {
-                            pending.status = "ACCEPTED".to_string();
-                            pending.expires_at = now.saturating_add(600); // 10 minutes to complete file transfer
-                            save_pending_transfer(&pending);
-                            add_trusted_peer(&pending.sender_id, &pending.sender_name, "");
-                            notify_desktop("OmaSend AirBridge", "Transfer accepted. Receiving files...");
-                            respond(&stream, "200 OK", "application/json", b"{\"status\":\"ACCEPTED\"}", None, None);
-                            return;
-                        } else if action == "reject" {
-                            pending.status = "REJECTED".to_string();
-                            save_pending_transfer(&pending);
-                            notify_desktop("OmaSend AirBridge", "Transfer declined.");
-                            respond(&stream, "200 OK", "application/json", b"{\"status\":\"REJECTED\"}", None, None);
-                            return;
-                        }
-                    }
-                }
-            }
-            respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid token or action\"}", None, None);
+            let (status, out) = match decide_pending_transfer(token, accept) {
+                Ok(st) => ("200 OK", serde_json::json!({ "ok": true, "status": st })),
+                Err(e) => ("409 Conflict", serde_json::json!({ "ok": false, "error": e })),
+            };
+            respond(&stream, status, "application/json", out.to_string().as_bytes(), None, None);
             return;
         }
     }
@@ -5734,7 +5936,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             return;
         }
 
-        let Some(mut pending) = pending_opt else {
+        let Some(pending) = pending_opt else {
             return;
         };
         let matching_info = pending.files.iter().find(|f| f.name == clean_filename).cloned();
@@ -5769,6 +5971,12 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         }
 
         let upload_secs = (content_length as u64 / (512 * 1024)).clamp(30, MAX_UPLOAD_DURATION_SECS);
+        // Keep the transfer alive while this file streams, plus an idle window for the next one.
+        with_pending_transfer(|slot| {
+            if let Some(p) = slot.as_mut().filter(|p| p.token == token && p.status == "ACCEPTED") {
+                p.expires_at = p.expires_at.max(now.saturating_add(upload_secs).saturating_add(PENDING_IDLE_SECS));
+            }
+        });
         let body_deadline = Instant::now() + Duration::from_secs(upload_secs);
         let body = match read_http_body(&mut stream, content_length, &initial_body, body_deadline, true, MAX_P2P_UPLOAD_SIZE) {
             Some(b) => b,
@@ -5835,17 +6043,24 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         };
         if write_res.is_ok() {
             RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
-            if let Some(pos) = pending.file_names.iter().position(|f| f == &clean_filename) {
-                pending.file_names.remove(pos);
-            }
-            if let Some(pos) = pending.files.iter().position(|f| f.name == clean_filename) {
-                pending.files.remove(pos);
-            }
-            if pending.file_names.is_empty() && pending.files.is_empty() {
-                clear_pending_transfer();
-            } else {
-                save_pending_transfer(&pending);
-            }
+            // Re-read under the lock: the record may have changed while this file streamed.
+            let done_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            with_pending_transfer(|slot| {
+                let Some(p) = slot.as_mut().filter(|p| p.token == pending.token) else {
+                    return;
+                };
+                if let Some(pos) = p.file_names.iter().position(|f| f == &clean_filename) {
+                    p.file_names.remove(pos);
+                }
+                if let Some(pos) = p.files.iter().position(|f| f.name == clean_filename) {
+                    p.files.remove(pos);
+                }
+                if p.file_names.is_empty() && p.files.is_empty() {
+                    *slot = None;
+                } else {
+                    p.expires_at = done_at.saturating_add(PENDING_IDLE_SECS);
+                }
+            });
             let final_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
             record_notified_file(&final_name);
             play_samurai_receive_sound();
@@ -5872,6 +6087,25 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         let (vis, _) = get_visibility();
         if vis == "OFF" {
             respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Visibility is Off\"}", None, None);
+            return;
+        }
+        // Staged clipboard images can be screenshots: serve them only to the peers that may
+        // receive the clipboard, with the same rules as POST /api/p2p/clipboard (a paired
+        // device key, or a confirmed legacy pairing with its token), or to the local user (M12).
+        let peer_ok = match v2_verify(&req, &devicekey::body_tag_json(b""), &client_ip.to_canonical().to_string()) {
+            devicekey::AuthResult::Trusted(_) => true,
+            devicekey::AuthResult::Rejected(why) => {
+                let err = serde_json::json!({ "error": format!("Signature rejected: {}", why) });
+                respond(&stream, "401 Unauthorized", "application/json", err.to_string().as_bytes(), None, None);
+                return;
+            }
+            devicekey::AuthResult::Absent => legacy_peer_authorized(
+                req.get_header("x-omasend-omaid").unwrap_or_default(),
+                req.get_header("x-omasend-auth-token").unwrap_or_default(),
+            ),
+        };
+        if !peer_ok && !local_ctl && !authorized {
+            respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Peer is not paired\"}", None, None);
             return;
         }
         let raw_hash = req.get_param("hash").unwrap_or_else(|| {
@@ -6103,7 +6337,8 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         return;
     }
 
-    let set_cookie = Some(format!("pin={}", pin));
+    // The cookie holds a value derived from the PIN and the session key, never the PIN itself.
+    let set_cookie = Some(format!("{}={}", WEB_SESSION_COOKIE, web_session));
 
     if req.method == "GET" && req.path == "/" {
         let shared_files = get_directory_files(&get_shared_dir());
@@ -6406,79 +6641,59 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         };
 
         let ddir = get_download_dir();
-        let mut saved_name = format!("transfer_{}.bin", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs());
         let mut success = false;
+        let content_type = req.get_header("content-type").map(str::to_string);
 
-        match body {
-            HttpBody::Memory(bytes) => {
-                let body_str = String::from_utf8_lossy(&bytes);
-                if let Some(pos) = body_str.find("filename=\"") {
-                    if let Some(end) = body_str[pos + 10..].find('"') {
-                        saved_name = sanitize_filename(&body_str[pos + 10..pos + 10 + end]);
-                    }
-                }
-                let data_start = bytes.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(0);
-                let data_slice = if data_start < bytes.len() { &bytes[data_start..] } else { &bytes[..] };
-
-                if let Some(avail) = get_available_disk_space(&ddir) {
-                    if (data_slice.len() as u64).saturating_add(10 * 1024 * 1024) > avail {
-                        respond(&stream, "507 Insufficient Storage", "text/plain", b"Insufficient disk space to save file", None, None);
-                        return;
-                    }
-                }
-
-                let file_path = get_unique_filepath(&ddir, &saved_name);
-                if write_secure_bytes(&file_path, data_slice).is_ok() {
-                    let final_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                    record_notified_file(&final_name);
-                    success = true;
-                    RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
-                    notify_desktop(
-                        "OmaSend: File Received",
-                        &format!("'{}' saved to Downloads/omasend.", final_name),
-                    );
-                }
+        // Single-file multipart/form-data body (the portal's FormData upload). Only the file
+        // part's bytes are saved: not the part headers, not the closing boundary (M7).
+        let located = match body {
+            HttpBody::Memory(ref bytes) => {
+                locate_multipart_file(&mut std::io::Cursor::new(bytes.as_slice()), bytes.len() as u64, content_type.as_deref())
+                    .map(|loc| (loc, None))
             }
-            HttpBody::Staged(staged) => {
-                if let Ok(mut sf) = File::open(&staged.path) {
-                    let mut head_buf = [0u8; 4096];
-                    let n = sf.read(&mut head_buf).unwrap_or(0);
-                    let head_str = String::from_utf8_lossy(&head_buf[..n]);
-                    if let Some(pos) = head_str.find("filename=\"") {
-                        if let Some(end) = head_str[pos + 10..].find('"') {
-                            saved_name = sanitize_filename(&head_str[pos + 10..pos + 10 + end]);
-                        }
-                    }
-                    let dstart = head_buf[..n].windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(0) as u64;
-                    let dlen = staged.size.saturating_sub(dstart);
-
-                    let file_path = get_unique_filepath(&ddir, &saved_name);
-                    if let Ok(mut src) = File::open(&staged.path) {
-                        if src.seek(SeekFrom::Start(dstart)).is_ok() {
-                            let mut opts = OpenOptions::new();
-                            opts.write(true).create_new(true);
-                            #[cfg(unix)]
-                            {
-                                opts.mode(0o600);
-                            }
-                            if let Ok(mut dest) = opts.open(&file_path) {
-                                let mut take = src.take(dlen);
-                                if std::io::copy(&mut take, &mut dest).is_ok() {
-                                    let final_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                                    record_notified_file(&final_name);
-                                    success = true;
-                                    RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
-                                    notify_desktop(
-                                        "OmaSend: File Received",
-                                        &format!("'{}' saved to Downloads/omasend.", final_name),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
+            HttpBody::Staged(ref staged) => File::open(&staged.path)
+                .ok()
+                .and_then(|mut f| locate_multipart_file(&mut f, staged.size, content_type.as_deref()).map(|loc| (loc, Some(staged.path.clone())))),
+        };
+        let Some(((dstart, dend, raw_name), staged_path)) = located else {
+            respond(&stream, "400 Bad Request", "text/plain", b"Expected a multipart/form-data file upload", None, None);
+            return;
+        };
+        let saved_name = if raw_name.is_empty() {
+            format!("transfer_{}.bin", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
+        } else {
+            sanitize_filename(&raw_name)
+        };
+        let dlen = dend - dstart;
+        if let Some(avail) = get_available_disk_space(&ddir) {
+            if dlen.saturating_add(10 * 1024 * 1024) > avail {
+                respond(&stream, "507 Insufficient Storage", "text/plain", b"Insufficient disk space to save file", None, None);
+                return;
             }
         }
+
+        let file_path = get_unique_filepath(&ddir, &saved_name);
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true).mode(0o600);
+        let copied = opts.open(&file_path).ok().and_then(|mut dest| match (&body, staged_path) {
+            (HttpBody::Memory(bytes), _) => dest.write_all(&bytes[dstart as usize..dend as usize]).ok(),
+            (_, Some(path)) => {
+                let mut src = File::open(path).ok()?;
+                src.seek(SeekFrom::Start(dstart)).ok()?;
+                std::io::copy(&mut src.take(dlen), &mut dest).ok().filter(|n| *n == dlen).map(|_| ())
+            }
+            _ => None,
+        });
+        if copied.is_some() {
+            let final_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            record_notified_file(&final_name);
+            success = true;
+            RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
+            notify_desktop("OmaSend: File Received", &format!("'{}' saved to Downloads/omasend.", final_name));
+        } else {
+            let _ = fs::remove_file(&file_path);
+        }
+        drop(body);
 
         if success {
             let resp = "{\"status\":\"OK\"}";
@@ -6489,6 +6704,75 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
     } else {
         respond(&stream, "404 Not Found", "text/plain", b"Not Found", None, None);
     }
+}
+
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+fn rfind_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).rposition(|w| w == needle)
+}
+
+/// Locates the first file part of a multipart/form-data body of `total` bytes. Returns the
+/// byte range of the file data (part headers and the closing `\r\n--boundary--` excluded) and
+/// the part's filename (may be empty). The boundary comes from the Content-Type header, or,
+/// if that is missing, from the body's first line.
+fn locate_multipart_file<R: Read + Seek>(r: &mut R, total: u64, content_type: Option<&str>) -> Option<(u64, u64, String)> {
+    let mut head = vec![0u8; total.min(16 * 1024) as usize];
+    r.seek(SeekFrom::Start(0)).ok()?;
+    r.read_exact(&mut head).ok()?;
+
+    let from_header = content_type.and_then(|ct| {
+        ct.split(';')
+            .map(str::trim)
+            .find_map(|p| p.strip_prefix("boundary="))
+            .map(|b| b.trim_matches('"').to_string())
+    });
+    let boundary = match from_header.filter(|b| !b.is_empty() && b.len() <= 200) {
+        Some(b) => b,
+        None => {
+            let line_end = find_bytes(&head, b"\r\n")?;
+            let first = std::str::from_utf8(&head[..line_end]).ok()?;
+            first.strip_prefix("--").filter(|b| !b.is_empty() && b.len() <= 200)?.to_string()
+        }
+    };
+    let delim = format!("--{}", boundary);
+
+    let first = find_bytes(&head, delim.as_bytes())?;
+    let hdr_start = first + delim.len() + 2; // delimiter line ends with CRLF
+    if hdr_start > head.len() {
+        return None;
+    }
+    let hdr_end = hdr_start + find_bytes(&head[hdr_start..], b"\r\n\r\n")?;
+    let part_headers = String::from_utf8_lossy(&head[hdr_start..hdr_end]);
+    let filename = part_headers
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("content-disposition:"))
+        .and_then(|l| {
+            let lower = l.to_ascii_lowercase();
+            let pos = lower.find("filename=\"")? + "filename=\"".len();
+            let rest = &l[pos..];
+            rest.find('"').map(|end| rest[..end].to_string())
+        })
+        .unwrap_or_default();
+    let data_start = (hdr_end + 4) as u64;
+
+    // The file data ends right before the last "\r\n--boundary" (the closing delimiter).
+    let closing = format!("\r\n{}", delim);
+    let tail_len = total.min(4096 + closing.len() as u64);
+    let tail_off = total - tail_len;
+    let mut tail = vec![0u8; tail_len as usize];
+    r.seek(SeekFrom::Start(tail_off)).ok()?;
+    r.read_exact(&mut tail).ok()?;
+    let data_end = tail_off + rfind_bytes(&tail, closing.as_bytes())? as u64;
+    (data_end >= data_start).then_some((data_start, data_end, filename))
 }
 
 fn urlencoding_decode(input: &str) -> String {
@@ -6557,7 +6841,7 @@ fn run_server() {
     let exe_dir = env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
     let read_paths = sandbox_read_paths(&home_dir, exe_dir.as_deref());
     let read_refs: Vec<&Path> = read_paths.iter().map(PathBuf::as_path).collect();
-    let _ = military::enable_landlock_sandbox(
+    let sandboxed = military::enable_landlock_sandbox(
         &read_refs,
         &[
             &state_dir,
@@ -6568,6 +6852,11 @@ fn run_server() {
             Path::new("/run"),
         ],
     );
+    if sandboxed {
+        println!("Landlock sandbox enabled");
+    } else {
+        eprintln!("Landlock sandbox NOT enabled (kernel without Landlock, or setup failed); running unsandboxed");
+    }
 
     ensure_local_api_token();
     start_core_node();
@@ -6576,7 +6865,7 @@ fn run_server() {
     if let Ok(old_pid_str) = read_secure_file(&pid_file) {
         if let Ok(old_pid) = old_pid_str.trim().parse::<i32>() {
             let my_pid = std::process::id() as i32;
-            if old_pid != my_pid {
+            if old_pid != my_pid && pid_is(old_pid, ENGINE_COMM) {
                 kill_process_group(old_pid);
                 thread::sleep(Duration::from_millis(60));
             }
@@ -6597,7 +6886,8 @@ fn run_server() {
             return;
         }
     };
-    println!("OmaSend listening on http://{}:{} [PIN: {}]", local_ip, PORT, pin);
+    // The PIN is not logged: daemon stdout ends up in the journal.
+    println!("OmaSend listening on http://{}:{}", local_ip, PORT);
 
     // Spawn P2P AirBridge discovery threads
     thread::spawn(run_p2p_discovery_listener);
@@ -6664,19 +6954,39 @@ fn main() {
             println!("{}", out);
         } else {
             let uri = out["uri"].as_str().unwrap_or_default().to_string();
-            let _ = Command::new("/usr/bin/qrencode").args(["-t", "ANSIUTF8", "--", &uri]).status();
+            if let Some(qr) = qr_ansi(&uri) {
+                print!("{}", qr);
+            }
             println!("Scan this QR code with OmaSend on the other device (valid for {} minutes, single use).", devicekey::PAIR_OFFER_TTL_SECS / 60);
-            println!("Or paste on another Omarchy desktop:  omasend-engine --pair-with '{}'", uri);
+            println!("Or paste on another Omarchy desktop:  omasend-engine --pair-with '{}' [--own]", uri);
             println!("This device: {}{}", device_identity().device_id(), if own { "  (new device will be trusted as YOUR device)" } else { "" });
+        }
+        return;
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--pair-inspect") {
+        let Some(uri) = args.get(pos + 1) else {
+            eprintln!("Usage: --pair-inspect 'omasend://pair?...'");
+            std::process::exit(2);
+        };
+        match inspect_pair_uri(uri) {
+            Ok((offer, device_id)) => {
+                println!("{}", serde_json::json!({ "name": offer.name, "device_id": device_id, "host": offer.host, "port": offer.port }));
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
         }
         return;
     }
     if let Some(pos) = args.iter().position(|a| a == "--pair-with") {
         let Some(uri) = args.get(pos + 1) else {
-            eprintln!("Usage: --pair-with 'omasend://pair?...'");
+            eprintln!("Usage: --pair-with 'omasend://pair?...' [--own]");
             std::process::exit(2);
         };
-        match p2p_pair_v2(uri) {
+        // Trusting the other device as "mine" (auto-accept) is the local user's explicit choice.
+        let own = args.iter().any(|a| a == "--own");
+        match p2p_pair_v2(uri, own) {
             Ok(k) => {
                 println!("Paired with {} ({}){}", k.name, k.device_id, if k.own_device { " as one of your devices" } else { "" });
                 notify_desktop("OmaSend: Device paired", &format!("{} ({})", k.name, k.device_id));
@@ -6945,38 +7255,34 @@ fn main() {
         }
     }
 
-    if let Some(pos) = args.iter().position(|a| a == "--accept-transfer") {
-        if let Some(token) = args.get(pos + 1) {
-            if let Some(mut pending) = get_pending_transfer() {
-                if pending.token == *token {
-                    pending.status = "ACCEPTED".to_string();
-                    save_pending_transfer(&pending);
-                    let _ = add_paired_peer(&pending.sender_id, &pending.sender_name, Some(&pending.sender_ip));
-                    add_trusted_peer(&pending.sender_id, &pending.sender_name, "");
-                    let snd = play_samurai_receive_sound();
-                    notify_desktop("OmaSend AirBridge", "Transfer accepted. Receiving files...");
-                    println!("Transfer accepted");
-                    finish_sound(snd);
-                    return;
+    // Accept/decline go through the running daemon: it owns the QUIC node that must answer
+    // encrypted offers, and it is the only writer that can safely extend the upload window.
+    for (flag, accept) in [("--accept-transfer", true), ("--reject-transfer", false)] {
+        if let Some(pos) = args.iter().position(|a| a == flag) {
+            let Some(token) = args.get(pos + 1) else {
+                eprintln!("Usage: omasend-engine {} <token>", flag);
+                std::process::exit(2);
+            };
+            let body = serde_json::json!({ "token": token, "action": if accept { "accept" } else { "reject" } });
+            match local_api_request("/api/p2p/decision", &body, Some(Duration::from_secs(15))) {
+                Ok(v) if v["ok"].as_bool() == Some(true) => {
+                    if accept {
+                        let snd = play_samurai_receive_sound();
+                        println!("Transfer accepted");
+                        finish_sound(snd);
+                    } else {
+                        println!("Transfer declined");
+                    }
+                }
+                Ok(v) => {
+                    eprintln!("{}", v["error"].as_str().unwrap_or("Invalid or expired transfer token"));
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("OmaSend daemon is not reachable: {}", e);
+                    std::process::exit(1);
                 }
             }
-            eprintln!("Invalid or expired transfer token");
-            return;
-        }
-    }
-
-    if let Some(pos) = args.iter().position(|a| a == "--reject-transfer") {
-        if let Some(token) = args.get(pos + 1) {
-            if let Some(mut pending) = get_pending_transfer() {
-                if pending.token == *token {
-                    pending.status = "REJECTED".to_string();
-                    save_pending_transfer(&pending);
-                    notify_desktop("OmaSend AirBridge", "Transfer declined.");
-                    println!("Transfer declined");
-                    return;
-                }
-            }
-            eprintln!("Invalid or expired transfer token");
             return;
         }
     }
@@ -7321,6 +7627,22 @@ mod tests {
         assert!(hidden.starts_with("file_"));
     }
 
+    /// M1: a long name made of multibyte characters must not panic (byte-index truncation
+    /// used to split a character and abort the daemon).
+    #[test]
+    fn test_sanitize_filename_long_multibyte_name() {
+        for unit in ["ğ", "Ж", "日本", "😀", "aç"] {
+            let name = format!("{}.txt", unit.repeat(200));
+            let clean = sanitize_filename(&name);
+            assert!(clean.chars().count() <= 180, "{} chars", clean.chars().count());
+            assert!(!clean.is_empty());
+        }
+        // Offset by one ASCII byte so the 180-byte boundary falls inside a character.
+        let clean = sanitize_filename(&format!("a{}", "ğ".repeat(120)));
+        assert!(clean.starts_with('a') && clean.chars().count() == 120 + 1);
+        assert_eq!(urlencoding_decode("%aç%41"), "%aç%41".replace("%41", "A"));
+    }
+
     #[test]
     fn test_visibility_modes() {
         let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
@@ -7485,11 +7807,17 @@ mod tests {
         };
         assert_eq!(extract_provided_pin(&req_header), Some("9988".to_string()));
 
+        // The raw PIN is no longer accepted from (or stored in) a cookie.
         let req_cookie = HttpRequest {
-            headers: vec![("cookie".to_string(), "session=abc; pin=1122; test=1".to_string())],
+            headers: vec![("cookie".to_string(), "session=abc; pin=1122; omasend_session=deadbeef".to_string())],
             ..Default::default()
         };
-        assert_eq!(extract_provided_pin(&req_cookie), Some("1122".to_string()));
+        assert_eq!(extract_provided_pin(&req_cookie), None);
+        assert_eq!(web_session_cookie(&req_cookie), Some("deadbeef"));
+        let v = web_session_value("1122", "k");
+        assert_eq!(v.len(), 64);
+        assert!(!v.contains("1122"));
+        assert_ne!(v, web_session_value("1123", "k"));
 
         let req_empty = HttpRequest::default();
         assert_eq!(extract_provided_pin(&req_empty), None);
@@ -8307,6 +8635,10 @@ mod tests {
 
         assert!(svg_file.exists(), "oma_id_qr.svg must exist");
         assert!(png_file.exists(), "oma_id_qr.png must exist");
+        let png = fs::read(png_file).expect("Read oma_id_qr.png");
+        let (ct, w, h) = validate_image_header(&png).expect("valid PNG header");
+        assert_eq!(ct, "image_png");
+        assert_eq!(w, h);
 
         let svg_content = fs::read_to_string(svg_file).expect("Read oma_id_qr.svg");
         assert!(svg_content.contains("<svg"), "SVG must contain valid xml root tag");
@@ -8635,6 +8967,9 @@ mod tests {
 
             let (stream, _) = listener.accept().expect("Accept client 3");
             handle_connection(stream, "127.0.0.1", "1234", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+
+            let (stream, _) = listener.accept().expect("Accept client 4");
+            handle_connection(stream, "127.0.0.1", "1234", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
         });
 
         // 1. Post image clipboard
@@ -8674,11 +9009,19 @@ mod tests {
         client1.read_to_string(&mut resp1).unwrap();
         assert!(resp1.starts_with("HTTP/1.1 200 OK"), "POST /api/p2p/clipboard must return 200 OK: {}", resp1);
 
-        // 2. Fetch image via /api/p2p/clipboard/image/<hash>
+        // 2a. Fetching without pairing credentials is refused (M12).
+        let mut client_anon = TcpStream::connect(local_addr).expect("Connect anonymous client");
+        let req_anon = format!("GET /api/p2p/clipboard/image?hash={} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", img_hash, local_addr);
+        client_anon.write_all(req_anon.as_bytes()).unwrap();
+        let mut resp_anon = String::new();
+        client_anon.read_to_string(&mut resp_anon).unwrap();
+        assert!(resp_anon.starts_with("HTTP/1.1 403"), "Unauthenticated image fetch must be refused: {}", resp_anon);
+
+        // 2b. Fetch image via /api/p2p/clipboard/image/<hash> as the paired legacy peer
         let mut client2 = TcpStream::connect(local_addr).expect("Connect client 2");
         let req2 = format!(
-            "GET /api/p2p/clipboard/image/{} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-            img_hash, local_addr
+            "GET /api/p2p/clipboard/image/{} HTTP/1.1\r\nHost: {}\r\nX-OmaSend-OmaID: {}\r\nX-OmaSend-Auth-Token: {}\r\nConnection: close\r\n\r\n",
+            img_hash, local_addr, valid_peer_oma_id, auth_token
         );
         client2.write_all(req2.as_bytes()).unwrap();
         let mut resp2 = Vec::new();
@@ -9035,7 +9378,8 @@ mod tests {
         // V2-SEC-01: OmaID is public (broadcast in beacons), so claiming our own OmaID must NOT
         // auto-accept transfers or authorize clipboard writes.
         clear_pending_transfer();
-        set_visibility("KNOWN");
+        // EVERYONE: under KNOWN an unpaired sender is refused outright (see the test below).
+        set_visibility("EVERYONE");
         let my_oma_id = get_or_create_oma_id();
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
@@ -9153,10 +9497,12 @@ mod tests {
     fn raw_http(addr: std::net::SocketAddr, head: &str, body: &[u8]) -> String {
         let mut c = TcpStream::connect(addr).expect("Connect test client");
         c.write_all(head.as_bytes()).unwrap();
-        c.write_all(body).unwrap();
-        let mut resp = String::new();
-        c.read_to_string(&mut resp).unwrap();
-        resp
+        // The server may answer (e.g. 401) and close before reading the body; a reset while
+        // writing or reading the rest is expected then, the status line is what matters.
+        let _ = c.write_all(body);
+        let mut resp = Vec::new();
+        let _ = c.read_to_end(&mut resp);
+        String::from_utf8_lossy(&resp).to_string()
     }
 
     #[test]
@@ -9378,9 +9724,6 @@ mod tests {
         // Auto-send picks the own device by id, never a raw address.
         assert_eq!(auto_send_target(), Some(key.device_id.clone()));
 
-        // Legacy clipboard targets never include an address owned by a paired key.
-        assert!(!legacy_clipboard_ips().contains(&"192.168.1.20".to_string()));
-
         trust_store().remove(&pk).unwrap();
         save_discovered_peers(&[]);
     }
@@ -9392,5 +9735,348 @@ mod tests {
         let p: P2pBeaconPacket = serde_json::from_str(old).unwrap();
         assert!(p.pk.is_empty());
         assert!(!serde_json::to_string(&p).unwrap().contains("\"pk\""));
+    }
+
+    fn serve_one(listener: TcpListener) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let (s, _) = listener.accept().expect("Accept");
+            handle_connection(s, "127.0.0.1", "1234", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+        })
+    }
+
+    fn post_once(path: &str, headers: &str, body: &serde_json::Value) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
+        let addr = listener.local_addr().unwrap();
+        let server = serve_one(listener);
+        let r = post_json(addr, path, headers, body);
+        server.join().unwrap();
+        r
+    }
+
+    fn get_once(path: &str, headers: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
+        let addr = listener.local_addr().unwrap();
+        let server = serve_one(listener);
+        let mut c = TcpStream::connect(addr).expect("Connect test client");
+        let req = format!("GET {} HTTP/1.1\r\nHost: {}\r\n{}Connection: close\r\n\r\n", path, addr, headers);
+        c.write_all(req.as_bytes()).unwrap();
+        let mut resp = String::new();
+        let _ = c.read_to_string(&mut resp);
+        server.join().unwrap();
+        resp
+    }
+
+    fn test_pending(token: &str, status: &str, expires_in: u64, sender_pk: Option<&str>) -> PendingFileTransfer {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        PendingFileTransfer {
+            token: token.to_string(),
+            sender_id: "0000-0000-0000-0000".to_string(),
+            sender_name: "Test".to_string(),
+            sender_ip: String::new(),
+            file_names: vec!["a.txt".to_string(), "b.txt".to_string()],
+            files: Vec::new(),
+            remaining_files: 2,
+            total_size_bytes: 2,
+            created_at: now,
+            expires_at: now + expires_in,
+            status: status.to_string(),
+            sender_pk: sender_pk.map(String::from),
+            transport: None,
+        }
+    }
+
+    /// M2: the WAN tunnel connects from loopback, so loopback alone must not approve transfers.
+    #[test]
+    fn test_decision_requires_local_token_not_bare_loopback() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        reset_pin_rate_limiter();
+        save_pending_transfer(&test_pending("tok-m2", "PENDING", 30, None));
+        let body = serde_json::json!({ "token": "tok-m2", "action": "accept" });
+
+        let r = post_once("/api/p2p/decision", "", &body);
+        assert!(r.starts_with("HTTP/1.1 403"), "bare loopback must be refused: {}", r);
+
+        let local = format!("X-OmaSend-Local: {}\r\n", ensure_local_api_token());
+        let tunneled = format!("{}Cf-Connecting-Ip: 203.0.113.9\r\n", local);
+        let r = post_once("/api/p2p/decision", &tunneled, &body);
+        assert!(r.starts_with("HTTP/1.1 403"), "tunnelled request must be refused even with a token: {}", r);
+        assert_eq!(get_pending_transfer().unwrap().status, "PENDING");
+
+        let r = post_once("/api/p2p/decision", &local, &body);
+        assert!(r.starts_with("HTTP/1.1 200") && r.contains("ACCEPTED"), "{}", r);
+        let p = get_pending_transfer().unwrap();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        assert_eq!(p.status, "ACCEPTED");
+        assert!(p.expires_at >= now + PENDING_IDLE_SECS - 5, "accept must extend the upload window");
+
+        // A decided transfer cannot be decided again.
+        let r = post_once("/api/p2p/decision", &local, &serde_json::json!({ "token": "tok-m2", "action": "reject" }));
+        assert!(r.starts_with("HTTP/1.1 409"), "{}", r);
+        clear_pending_transfer();
+    }
+
+    /// M10: an expired request reports EXPIRED, not NOT_FOUND.
+    #[test]
+    fn test_decision_poll_reports_expired() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let mut p = test_pending("tok-exp", "PENDING", 0, None);
+        p.expires_at -= 5;
+        save_pending_transfer(&p);
+        let r = get_once("/api/p2p/decision?token=tok-exp", "");
+        assert!(r.contains("EXPIRED"), "{}", r);
+        let r = get_once("/api/p2p/decision?token=other", "");
+        assert!(r.starts_with("HTTP/1.1 404"), "{}", r);
+        clear_pending_transfer();
+    }
+
+    /// M5: WAN clients (all loopback) are rate limited by their real address, and the local
+    /// CLI with the local token is never locked out by them.
+    #[test]
+    fn test_pin_lockout_does_not_block_local_control() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        reset_pin_rate_limiter();
+        for _ in 0..6 {
+            let _ = get_once("/api/status?pin=0000", "Cf-Connecting-Ip: 198.51.100.7\r\n");
+        }
+        let r = get_once("/api/status", "Cf-Connecting-Ip: 198.51.100.7\r\n");
+        assert!(r.starts_with("HTTP/1.1 429"), "attacker bucket must be blocked: {}", r);
+        let r = get_once("/api/status", "Cf-Connecting-Ip: 198.51.100.8\r\n");
+        assert!(r.starts_with("HTTP/1.1 200"), "other WAN clients keep working: {}", r);
+        let r = get_once("/api/status", "");
+        assert!(r.starts_with("HTTP/1.1 200"), "plain loopback keeps working: {}", r);
+
+        // Wrong PINs sent together with the local token are not counted, so they never lock out
+        // loopback. (Asserting this without locking out 127.0.0.1 keeps parallel tests safe.)
+        let local = format!("X-OmaSend-Local: {}\r\n", ensure_local_api_token());
+        for _ in 0..6 {
+            let r = get_once("/api/status?pin=0000", &local);
+            assert!(r.starts_with("HTTP/1.1 200"), "{}", r);
+        }
+        let r = get_once("/api/status", "");
+        assert!(r.starts_with("HTTP/1.1 200"), "loopback must not be locked out: {}", r);
+        reset_pin_rate_limiter();
+    }
+
+    /// M9: visibility KNOWN refuses unpaired HTTP senders (even with our own, public, OmaID).
+    #[test]
+    fn test_known_visibility_refuses_unpaired_sender() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        clear_pending_transfer();
+        set_visibility("KNOWN");
+        let my_oma_id = get_or_create_oma_id();
+        let r = post_once("/api/p2p/request", &format!("X-OmaSend-OmaID: {}\r\n", my_oma_id), &serde_json::json!({
+            "oma_id": my_oma_id, "sender_name": "Stranger", "files": [{"name": "x.txt", "size_bytes": 1}]
+        }));
+        assert!(r.starts_with("HTTP/1.1 403"), "{}", r);
+        assert!(get_pending_transfer().is_none());
+        set_visibility("ALL");
+    }
+
+    /// M9/M10: an unverified PENDING request does not block a verified sender, but a verified
+    /// or accepted transfer is never displaced.
+    #[test]
+    fn test_pending_slot_preemption_rules() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        clear_pending_transfer();
+        assert!(claim_pending_slot(&test_pending("anon-1", "PENDING", 30, None), false));
+        assert!(!claim_pending_slot(&test_pending("anon-2", "PENDING", 30, None), false), "unverified cannot displace");
+        assert!(claim_pending_slot(&test_pending("v2-1", "PENDING", 30, Some("pk1")), true), "verified displaces unverified");
+        assert!(!claim_pending_slot(&test_pending("v2-2", "PENDING", 30, Some("pk2")), true), "verified is not displaced");
+        assert_eq!(get_pending_transfer().unwrap().token, "v2-1");
+        clear_pending_transfer();
+        assert!(claim_pending_slot(&test_pending("anon-acc", "ACCEPTED", 30, None), false));
+        assert!(!claim_pending_slot(&test_pending("v2-3", "PENDING", 30, Some("pk3")), true), "accepted transfer is not displaced");
+        clear_pending_transfer();
+        let mut old = test_pending("old", "PENDING", 0, None);
+        old.expires_at -= 5;
+        save_pending_transfer(&old);
+        assert!(claim_pending_slot(&test_pending("new", "PENDING", 30, None), false), "expired record frees the slot");
+        clear_pending_transfer();
+    }
+
+    /// M12: the discovered-peer list is local-only.
+    #[test]
+    fn test_peers_endpoint_requires_local_token() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        reset_pin_rate_limiter();
+        let r = get_once("/api/p2p/peers", "");
+        assert!(r.starts_with("HTTP/1.1 403"), "{}", r);
+        let r = get_once("/api/p2p/peers", &format!("X-OmaSend-Local: {}\r\n", ensure_local_api_token()));
+        assert!(r.starts_with("HTTP/1.1 200") && r.contains("\"peers\""), "{}", r);
+    }
+
+    /// M4: a pairing link must point into the local network.
+    #[test]
+    fn test_inspect_pair_uri_requires_private_host() {
+        use base64::Engine as _;
+        let id = devicekey::DeviceIdentity::from_seed([7u8; 32]);
+        let secret = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([9u8; 32]);
+        let mk = |h: &str| format!("omasend://pair?v=2&pk={}&s={}&h={}&p=53317&n=Desk&o=1&q=53318", id.public_b64(), secret, h);
+        let (offer, dev) = inspect_pair_uri(&mk("192.168.1.20")).expect("private host is fine");
+        assert_eq!(dev, "FE81-2C12-F3AB-4CE6");
+        assert_eq!(offer.name, "Desk");
+        assert!(inspect_pair_uri(&mk("fe80::1")).is_ok());
+        for bad in ["8.8.8.8", "127.0.0.1", "203.0.113.5", "example.com"] {
+            assert!(inspect_pair_uri(&mk(bad)).is_err(), "{} must be refused", bad);
+        }
+    }
+
+    fn multipart_body(boundary: &str, filename: &str, data: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(format!("--{}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\nContent-Type: application/octet-stream\r\n\r\n", boundary, filename).as_bytes());
+        b.extend_from_slice(data);
+        b.extend_from_slice(format!("\r\n--{}--\r\n", boundary).as_bytes());
+        b
+    }
+
+    /// M7: only the file bytes are saved, not the closing boundary.
+    #[test]
+    fn test_locate_multipart_file_strips_closing_boundary() {
+        let boundary = "----WebKitFormBoundaryAbC123";
+        // Data that itself contains CRLFs and a boundary-like line must survive intact.
+        let data = b"line1\r\n--not-the-boundary\r\n\r\nend\r\n".to_vec();
+        let body = multipart_body(boundary, "résumé.txt", &data);
+        let ct = format!("multipart/form-data; boundary={}", boundary);
+        let (start, end, name) = locate_multipart_file(&mut std::io::Cursor::new(&body), body.len() as u64, Some(&ct)).unwrap();
+        assert_eq!(&body[start as usize..end as usize], data.as_slice());
+        assert_eq!(name, "résumé.txt");
+        // Without a Content-Type header the boundary is taken from the first line.
+        let (s2, e2, _) = locate_multipart_file(&mut std::io::Cursor::new(&body), body.len() as u64, None).unwrap();
+        assert_eq!((s2, e2), (start, end));
+        // Empty file.
+        let empty = multipart_body(boundary, "e.bin", b"");
+        let (s3, e3, _) = locate_multipart_file(&mut std::io::Cursor::new(&empty), empty.len() as u64, Some(&ct)).unwrap();
+        assert_eq!(s3, e3);
+        // Not multipart.
+        assert!(locate_multipart_file(&mut std::io::Cursor::new(b"hello"), 5, None).is_none());
+    }
+
+    #[test]
+    fn test_portal_upload_saves_exact_file_bytes() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        reset_pin_rate_limiter();
+        // In-memory body, and one above IN_MEMORY_BODY_LIMIT that is staged to disk.
+        for size in [5000u32, 1_600_000] {
+            let boundary = "xYzBoundary42";
+            let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let name = format!("m7_upload_{}_{}.bin", std::process::id(), size);
+            let body = multipart_body(boundary, &name, &data);
+
+            let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
+            let addr = listener.local_addr().unwrap();
+            let server = serve_one(listener);
+            let mut c = TcpStream::connect(addr).unwrap();
+            let head = format!(
+                "POST /upload?pin=1234 HTTP/1.1\r\nHost: {}\r\nContent-Type: multipart/form-data; boundary={}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                addr, boundary, body.len()
+            );
+            c.write_all(head.as_bytes()).unwrap();
+            c.write_all(&body).unwrap();
+            let mut resp = String::new();
+            c.read_to_string(&mut resp).unwrap();
+            server.join().unwrap();
+            assert!(resp.starts_with("HTTP/1.1 200"), "{}", resp);
+            let saved = get_download_dir().join(&name);
+            assert_eq!(fs::read(&saved).unwrap(), data);
+            let _ = fs::remove_file(saved);
+        }
+    }
+
+    /// M17: failed pairing attempts are limited per address and no longer burn the real offer.
+    #[test]
+    fn test_v2_pair_failures_limited_per_ip_and_offer_survives() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        reset_pin_rate_limiter();
+        set_visibility("ALL");
+        let uri = create_pair_offer_json(false)["uri"].as_str().unwrap().to_string();
+        let offer = devicekey::parse_pair_uri(&uri).unwrap();
+        let attacker = devicekey::DeviceIdentity::from_seed([3u8; 32]);
+        let bogus = serde_json::json!({ "pk": attacker.public_b64(), "name": "x", "mac": "00", "sig": "AA" });
+        let hdr = "Cf-Connecting-Ip: 198.51.100.20\r\n";
+        for _ in 0..5 {
+            let r = post_once("/api/v2/pair", hdr, &bogus);
+            assert!(r.starts_with("HTTP/1.1 403"), "{}", r);
+        }
+        let r = post_once("/api/v2/pair", hdr, &bogus);
+        assert!(r.starts_with("HTTP/1.1 429"), "same address is now limited: {}", r);
+
+        // The genuine initiator (another address) still pairs with the same QR code.
+        let phone = devicekey::DeviceIdentity::from_seed([4u8; 32]);
+        let body = devicekey::build_pair_request(&phone, &offer, "Phone", 53318);
+        let r = post_once("/api/v2/pair", "Cf-Connecting-Ip: 198.51.100.21\r\n", &body);
+        assert!(r.starts_with("HTTP/1.1 200"), "{}", r);
+        let stored = trust_store().get(&phone.public_b64()).expect("paired");
+        assert!(!stored.own_device);
+        assert!(stored.ip.is_empty(), "a tunnel (loopback) source is not stored as the peer address");
+        trust_store().remove(&stored.pk).unwrap();
+
+        set_visibility("OFF");
+        let r = post_once("/api/v2/pair", "", &bogus);
+        assert!(r.starts_with("HTTP/1.1 403") && r.contains("Off"), "{}", r);
+        set_visibility("ALL");
+        reset_pin_rate_limiter();
+    }
+
+    /// M13: beacons are attributed to their UDP source, OFF only removes the sender itself,
+    /// and the list is capped.
+    #[test]
+    fn test_beacons_use_source_address_and_are_capped() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        set_visibility("ALL");
+        save_discovered_peers(&[]);
+        let beacon = |id: &str, ip: &str, mode: &str| P2pBeaconPacket {
+            magic: "OMASEND_P2P".to_string(),
+            v: 1,
+            id: id.to_string(),
+            oma_id: rendezvous::format_oma_id(&rendezvous::generate_raw_oma_id()),
+            name: id.to_string(),
+            ip: ip.to_string(),
+            port: PORT,
+            mode: mode.to_string(),
+            fp: String::new(),
+            pk: String::new(),
+        };
+        let a: IpAddr = "192.168.7.10".parse().unwrap();
+        let b: IpAddr = "192.168.7.11".parse().unwrap();
+        // Claims another host's address: the source address wins.
+        update_discovered_peer(&beacon("dev-a", "192.168.7.99", "KNOWN"), a);
+        let peers = get_discovered_peers();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].ip, "192.168.7.10");
+        // OFF from a different source does not remove dev-a.
+        update_discovered_peer(&beacon("dev-a", "192.168.7.10", "OFF"), b);
+        assert_eq!(get_discovered_peers().len(), 1);
+        // OFF from dev-a itself does.
+        update_discovered_peer(&beacon("dev-a", "", "OFF"), a);
+        assert!(get_discovered_peers().is_empty());
+        // Random ids cannot grow the list without bound.
+        for i in 0..(MAX_DISCOVERED_PEERS + 20) {
+            update_discovered_peer(&beacon(&format!("flood-{}", i), "", "KNOWN"), b);
+        }
+        assert!(get_discovered_peers().len() <= MAX_DISCOVERED_PEERS);
+        save_discovered_peers(&[]);
+    }
+
+    /// M16: a stale pid file must not make us signal an unrelated process.
+    #[test]
+    fn test_pid_is_checks_process_name() {
+        let me = std::process::id() as i32;
+        let my_comm = fs::read_to_string(format!("/proc/{}/comm", me)).unwrap();
+        assert!(pid_is(me, my_comm.trim_end()));
+        assert!(!pid_is(me, CLOUDFLARED_COMM));
+        assert!(!pid_is(1, "systemd"));
+        assert!(!pid_is(i32::MAX, ENGINE_COMM));
+    }
+
+    #[test]
+    fn test_portal_and_notification_escaping() {
+        assert_eq!(html_escape(r#"a<b>&"c'.txt"#), "a&lt;b&gt;&amp;&quot;c&#39;.txt");
+        let files = vec![FileInfo { name: "x');alert(1);('<img>.txt".to_string(), size_str: "1 B".to_string(), size_bytes: 1 }];
+        let html = render_web_app("127.0.0.1", &files);
+        assert!(!html.contains("<img>.txt"));
+        assert!(!html.contains("downloadFile('x')"));
+        assert!(html.contains("data-name=\"x&#39;);alert(1);(&#39;&lt;img&gt;.txt\""));
+        assert_eq!(notification_text("<b>evil</b> & co"), "&lt;b&gt;evil&lt;/b&gt; &amp; co");
+        assert!(notification_text("-u critical").starts_with('\u{2060}'));
     }
 }
