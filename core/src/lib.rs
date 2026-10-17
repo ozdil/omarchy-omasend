@@ -177,11 +177,63 @@ pub fn pk_from_string(s: &str) -> Result<PublicKey, CoreError> {
 
 /// Makes a received file name safe: no directories, no hidden/relative tricks, no control
 /// characters, bounded length.
+/// Characters that change how text is displayed without being visible themselves: bidi
+/// controls (U+202E turns `invoice\u{202E}fdp.sh` into what reads as "invoicehs.pdf"),
+/// zero-width and joiner characters, the BOM, line/paragraph separators, soft hyphen and
+/// fillers that render as blanks. They are never needed in a file or device name.
+pub fn is_deceptive_char(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}'
+            | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{206F}'
+            | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{FFA0}' | '\u{FFF9}'..='\u{FFFB}')
+}
+
+/// Cleans a name another device chose for itself before it is stored or shown: deceptive
+/// characters are removed, whitespace runs collapse to one space, and the result is cut to
+/// `max` characters. Returns "" when nothing printable is left.
+pub fn sanitize_label(name: &str, max: usize) -> String {
+    let cleaned: String = name.chars().map(|c| if c.is_whitespace() { ' ' } else { c }).filter(|c| !is_deceptive_char(*c)).collect();
+    cleaned.split(' ').filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ").chars().take(max).collect::<String>().trim_end().to_string()
+}
+
+/// Extensions of files that run code when opened (Linux, Windows, macOS, Android).
+const RISKY_EXTENSIONS: &[&str] = &[
+    "sh", "bash", "zsh", "fish", "csh", "ksh", "run", "bin", "elf", "appimage", "desktop", "py", "pyw", "pl", "rb",
+    "php", "jar", "deb", "rpm", "pkg", "flatpakref", "snap", "exe", "com", "scr", "bat", "cmd", "msi", "msix",
+    "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf", "hta", "lnk", "reg", "cpl", "apk", "apks", "xapk", "aab",
+    "dmg", "app", "command", "workflow",
+];
+
+/// Extensions people expect to be harmless, used to spot `photo.jpg.exe`-style names.
+const DOCUMENT_EXTENSIONS: &[&str] = &[
+    "pdf", "jpg", "jpeg", "png", "gif", "webp", "heic", "mp3", "mp4", "mov", "mkv", "txt", "doc", "docx", "xls",
+    "xlsx", "ppt", "pptx", "odt", "ods", "zip",
+];
+
+/// Why a received file deserves a warning before it is opened, or `None`.
+/// `"executable"`: the file runs code when opened. `"double_extension"`: the name hides its
+/// real type behind a harmless-looking one (`invoice.pdf.desktop`).
+#[uniffi::export]
+pub fn risky_file_kind(name: String) -> Option<String> {
+    let lower = name.to_lowercase();
+    let mut parts = lower.rsplit('.');
+    let ext = parts.next().filter(|_| lower.contains('.'))?.trim();
+    if !RISKY_EXTENSIONS.contains(&ext) {
+        return None;
+    }
+    let previous = parts.next().filter(|_| lower.matches('.').count() >= 2).map(str::trim);
+    if previous.is_some_and(|p| DOCUMENT_EXTENSIONS.contains(&p)) {
+        return Some("double_extension".into());
+    }
+    Some("executable".into())
+}
+
 pub fn sanitize_name(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or("");
     let mut out: String = base
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !is_deceptive_char(*c))
         .map(|c| if matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
         .collect();
     out = out.trim().trim_start_matches('.').to_string();
@@ -341,11 +393,11 @@ impl std::fmt::Debug for Inner {
 async fn serve_connection(inner: Arc<Inner>, conn: Connection, peer: String, trust: Trust) -> Result<(), CoreError> {
     let (mut send, mut recv) = conn.accept_bi().await.map_err(|e| fail(chain(&e)))?;
     let peer_name = match read_msg(&mut recv).await? {
-        Msg::Hello { v: 2, name } => name.chars().take(64).collect::<String>(),
+        Msg::Hello { v: 2, name } => name,
         _ => return Err(fail("expected hello")),
     };
     let known_name = inner.cb.peer_name(peer.clone());
-    let peer_name = if known_name.is_empty() { peer_name } else { known_name };
+    let peer_name = sanitize_label(if known_name.is_empty() { &peer_name } else { &known_name }, 64);
     match read_msg(&mut recv).await? {
         Msg::Clipboard { text } => {
             if text.len() > MAX_CLIPBOARD {
@@ -573,7 +625,7 @@ impl OmaNode {
         let inner = Arc::new(Inner {
             cb: callbacks,
             download_dir,
-            my_name: my_name.chars().take(64).collect(),
+            my_name: sanitize_label(&my_name, 64),
             pending: Mutex::new(HashMap::new()),
             cancels: Mutex::new(HashMap::new()),
         });

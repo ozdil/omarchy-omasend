@@ -201,6 +201,34 @@ fn file_names_are_sanitized() {
 }
 
 #[test]
+fn deceptive_characters_are_removed_from_names() {
+    // U+202E would display "fatura\u{202E}fdp.sh" as "faturahs.pdf".
+    assert_eq!(sanitize_name("fatura\u{202E}fdp.sh"), "faturafdp.sh");
+    assert_eq!(sanitize_name("a\u{200B}b\u{2066}c\u{FEFF}.txt"), "abc.txt");
+    assert_eq!(sanitize_name("\u{200F}.bashrc"), "bashrc");
+    assert_eq!(sanitize_name("\u{202E}\u{200B}"), "file");
+    assert_eq!(sanitize_label("Ozan\u{202E}'s\n  phone\u{2028}x", 64), "Ozan's phone x");
+    assert_eq!(sanitize_label("\u{3164}\u{115F}", 64), "");
+    assert_eq!(sanitize_label("Türkçe 📱 cihaz", 64), "Türkçe 📱 cihaz");
+    assert_eq!(sanitize_label(&"ş".repeat(100), 64).chars().count(), 64);
+}
+
+#[test]
+fn risky_files_are_flagged() {
+    let kind = |n: &str| risky_file_kind(n.to_string());
+    assert_eq!(kind("install.sh").as_deref(), Some("executable"));
+    assert_eq!(kind("App.AppImage").as_deref(), Some("executable"));
+    assert_eq!(kind("omasend.apk").as_deref(), Some("executable"));
+    assert_eq!(kind("notes.desktop").as_deref(), Some("executable"));
+    assert_eq!(kind("fatura.pdf.desktop").as_deref(), Some("double_extension"));
+    assert_eq!(kind("photo.JPG.exe").as_deref(), Some("double_extension"));
+    assert_eq!(kind("photo.jpg"), None);
+    assert_eq!(kind("report.pdf"), None);
+    assert_eq!(kind("sh"), None);
+    assert_eq!(kind("archive.tar.gz"), None);
+}
+
+#[test]
 fn endpoint_id_matches_protocol_v2_device_key() {
     // Same seed as the protocol v2 cross-language vector.
     let cb = TestCb::new();

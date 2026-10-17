@@ -248,6 +248,10 @@ pub struct PendingFileTransfer {
     /// "quic" when the offer came through omasend-core; decisions are forwarded to the core.
     #[serde(default)]
     pub transport: Option<String>,
+    /// Names of offered files that run code when opened or hide their real type
+    /// (`omasend_core::risky_file_kind`), so the panel can warn before they are accepted.
+    #[serde(default)]
+    pub risky_files: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -2199,6 +2203,20 @@ fn sanitize_filename(raw: &str) -> String {
     }
 }
 
+/// Offered file names that deserve a warning before they are accepted or opened.
+fn risky_file_names(names: &[String]) -> Vec<String> {
+    names.iter().filter(|n| omasend_core::risky_file_kind((*n).clone()).is_some()).cloned().collect()
+}
+
+/// Extra notification line for `risky_file_names`, or "".
+fn risky_files_warning(risky: &[String]) -> String {
+    match risky {
+        [] => String::new(),
+        [one] => format!("\n⚠ '{}' is a program or hides its file type. Don't open it unless you expected it.", one),
+        many => format!("\n⚠ {} files are programs or hide their file type. Don't open them unless you expected them.", many.len()),
+    }
+}
+
 fn get_unique_filepath(dir: &Path, filename: &str) -> PathBuf {
     let target = dir.join(filename);
     if !target.exists() {
@@ -2568,6 +2586,7 @@ impl omasend_core::NodeCallbacks for DesktopCoreCallbacks {
             status: "PENDING".to_string(),
             sender_pk: Some(offer.peer_pk.clone()),
             transport: Some("quic".to_string()),
+            risky_files: risky_file_names(&offer.files.iter().map(|f| f.name.clone()).collect::<Vec<_>>()),
         }, true);
         if !claimed {
             if let Some(n) = node {
@@ -2577,7 +2596,13 @@ impl omasend_core::NodeCallbacks for DesktopCoreCallbacks {
         }
         notify_desktop(
             "OmaSend AirBridge: Transfer Request",
-            &format!("'{}' wants to send {} file(s) ({:.1} MB), end-to-end encrypted.\nOpen OmaSend panel to Accept or Decline.", offer.peer_name, offer.files.len(), size_mb),
+            &format!(
+                "'{}' wants to send {} file(s) ({:.1} MB), end-to-end encrypted.\nOpen OmaSend panel to Accept or Decline.{}",
+                offer.peer_name,
+                offer.files.len(),
+                size_mb,
+                risky_files_warning(&risky_file_names(&offer.files.iter().map(|f| f.name.clone()).collect::<Vec<_>>()))
+            ),
         );
     }
 
@@ -5861,7 +5886,10 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             .or_else(|| req.get_header("x-omasend-omaid"))
             .unwrap_or("unknown")
             .to_string();
-        let sender_name = req_data["sender_name"].as_str().unwrap_or("Unknown Omarchy Device").to_string();
+        let sender_name = match omasend_core::sanitize_label(req_data["sender_name"].as_str().unwrap_or(""), 64) {
+            n if n.is_empty() => "Unknown Omarchy Device".to_string(),
+            n => n,
+        };
         let sender_ip = req_data["sender_ip"].as_str().unwrap_or("").to_string();
 
         let norm_sender = rendezvous::normalize_oma_id(&sender_id);
@@ -5980,6 +6008,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             status: initial_status.to_string(),
             sender_pk: v2_key.as_ref().map(|k| k.pk.clone()),
             transport: None,
+            risky_files: risky_file_names(&file_names),
         };
         // V2-FUNC-01: single pending slot; check and save under one lock (M10).
         if !claim_pending_slot(&transfer, v2_key.is_some()) {
@@ -5992,12 +6021,12 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         if auto_accept {
             notify_desktop(
                 "OmaSend AirBridge",
-                &format!("Receiving {} file(s) ({:.1} MB) from your device '{}' (verified key).", file_names.len(), size_mb, sender_name),
+                &format!("Receiving {} file(s) ({:.1} MB) from your device '{}' (verified key).{}", file_names.len(), size_mb, sender_name, risky_files_warning(&transfer.risky_files)),
             );
         } else {
             notify_desktop(
                 "OmaSend AirBridge: Transfer Request",
-                &format!("'{}' wants to send {} file(s) ({:.1} MB).\nOpen OmaSend panel to Accept or Decline.", sender_name, file_names.len(), size_mb),
+                &format!("'{}' wants to send {} file(s) ({:.1} MB).\nOpen OmaSend panel to Accept or Decline.{}", sender_name, file_names.len(), size_mb, risky_files_warning(&transfer.risky_files)),
             );
         }
 
@@ -7959,6 +7988,16 @@ mod tests {
     }
 
     #[test]
+    fn test_risky_offered_files_are_flagged_for_the_prompt() {
+        let names: Vec<String> = ["photo.jpg", "fatura.pdf.desktop", "setup.sh"].iter().map(|s| s.to_string()).collect();
+        let risky = risky_file_names(&names);
+        assert_eq!(risky, vec!["fatura.pdf.desktop".to_string(), "setup.sh".to_string()]);
+        assert!(risky_files_warning(&risky).contains("2 files"));
+        assert!(risky_files_warning(&risky[..1]).contains("'fatura.pdf.desktop'"));
+        assert_eq!(risky_files_warning(&[]), "");
+    }
+
+    #[test]
     fn test_extract_provided_pin() {
         let req_query = HttpRequest {
             query: "foo=bar&pin=4321&baz=1".to_string(),
@@ -8468,6 +8507,7 @@ mod tests {
             status: "ACCEPTED".to_string(),
             sender_pk: None,
             transport: None,
+            risky_files: Vec::new(),
         };
 
         // File listed in approved files
@@ -9799,6 +9839,7 @@ mod tests {
             status: "ACCEPTED".to_string(),
             sender_pk: None,
             transport: None,
+            risky_files: Vec::new(),
         });
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
@@ -9949,6 +9990,7 @@ mod tests {
             status: status.to_string(),
             sender_pk: sender_pk.map(String::from),
             transport: None,
+            risky_files: Vec::new(),
         }
     }
 
