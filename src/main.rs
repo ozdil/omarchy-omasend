@@ -3,6 +3,7 @@ pub mod devicekey;
 pub mod military;
 pub mod rendezvous;
 pub mod webclient;
+pub mod webe2e;
 
 pub use rendezvous::{
     build_github_anchor_payload, compute_rendezvous_topic, create_stun_binding_request,
@@ -2852,6 +2853,46 @@ fn v2_verify(req: &HttpRequest, body_tag: &str, client_ip: &str) -> devicekey::A
     }
 }
 
+/// Keys and file list of the browser transfer that holds the pending slot (webe2e). In memory
+/// only: the daemon is the one process that serves uploads, and a restart drops the transfer.
+struct WebE2eTransfer {
+    token: String,
+    sender_pk: String,
+    key: zeroize::Zeroizing<[u8; 32]>,
+    /// Offered files in request order (sanitized name, plaintext size).
+    files: Vec<(String, u64)>,
+    done: Vec<bool>,
+}
+
+static WEB_E2E_TRANSFER: Mutex<Option<WebE2eTransfer>> = Mutex::new(None);
+
+fn web_e2e_lock() -> std::sync::MutexGuard<'static, Option<WebE2eTransfer>> {
+    match WEB_E2E_TRANSFER.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Message key plus the decrypted JSON of a browser request.
+type WebE2eOpened = (zeroize::Zeroizing<[u8; 32]>, serde_json::Value);
+
+/// A browser key must send everything end-to-end encrypted (PROTOCOL_V2.md, "Browser
+/// end-to-end encryption"). For a browser key this returns the message key and the decrypted
+/// JSON of `body["e2e"]`; for any other sender it returns `None` and the body is used as is.
+fn open_web_e2e(
+    key: Option<&devicekey::TrustedKey>,
+    body: &serde_json::Value,
+    label: &str,
+) -> Result<Option<WebE2eOpened>, &'static str> {
+    let Some(k) = key.filter(|k| k.is_web()) else {
+        return Ok(None);
+    };
+    let env = body.get("e2e").ok_or("This browser page is out of date: reload it to send encrypted")?;
+    let (mk, pt) = webe2e::open_envelope(device_identity(), env, &k.pk, label)?;
+    let inner = serde_json::from_slice::<serde_json::Value>(&pt).map_err(|_| "Invalid encrypted payload")?;
+    Ok(Some((mk, inner)))
+}
+
 pub fn constant_time_eq_str(a: &str, b: &str) -> bool {
     let a_bytes = a.as_bytes();
     let b_bytes = b.as_bytes();
@@ -4910,6 +4951,134 @@ fn is_trusted_origin(origin: &str, local_ip: &str) -> bool {
     false
 }
 
+/// `POST /api/p2p/upload?token=..&index=..` from a browser key: the body is the file encrypted
+/// with webe2e. The file name and size come from the encrypted transfer request, never from the
+/// query, so they do not travel in clear text.
+fn web_e2e_upload(
+    stream: &mut TcpStream,
+    req: &HttpRequest,
+    pending: &PendingFileTransfer,
+    content_length: usize,
+    initial_body: &[u8],
+    client_ip: IpAddr,
+) {
+    let fail = |stream: &TcpStream, status: &str, msg: &str| {
+        let err = serde_json::json!({ "error": msg });
+        send_response(stream, status, "application/json", err.to_string().as_bytes(), None, None, None);
+    };
+    let index: Option<usize> = req.get_param("index").and_then(|i| i.parse().ok());
+    let entry = {
+        let guard = web_e2e_lock();
+        guard.as_ref().filter(|t| t.token == pending.token).and_then(|t| {
+            let i = index?;
+            let (name, size) = t.files.get(i)?.clone();
+            (!t.done[i]).then(|| (i, name, size, t.key.clone(), t.sender_pk.clone()))
+        })
+    };
+    let Some((index, name, size, key, sender_pk)) = entry else {
+        fail(stream, "403 Forbidden", "File not listed in approved transfer request");
+        return;
+    };
+    if pending.sender_pk.as_deref() != Some(sender_pk.as_str()) || !pending.files.iter().any(|f| f.name == name) {
+        fail(stream, "403 Forbidden", "File not listed in approved transfer request");
+        return;
+    }
+    let ok = matches!(
+        v2_verify(req, &devicekey::body_tag_stream(content_length), &client_ip.to_canonical().to_string()),
+        devicekey::AuthResult::Trusted(ref k) if k.pk == sender_pk
+    );
+    if !ok {
+        fail(stream, "401 Unauthorized", "Upload must be signed by the device that requested the transfer");
+        return;
+    }
+    if content_length as u64 != webe2e::ciphertext_len(size) || content_length > MAX_P2P_UPLOAD_SIZE {
+        fail(stream, "413 Payload Too Large", "Upload size does not match the approved transfer request");
+        return;
+    }
+
+    let ddir = get_download_dir();
+    if let Some(avail) = get_available_disk_space(&ddir) {
+        // The encrypted body is staged first, then decrypted next to its final place.
+        if size.saturating_mul(2).saturating_add(25 * 1024 * 1024) > avail {
+            fail(stream, "507 Insufficient Storage", "Insufficient disk space to save file");
+            return;
+        }
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let upload_secs = (content_length as u64 / (512 * 1024)).clamp(30, MAX_UPLOAD_DURATION_SECS);
+    with_pending_transfer(|slot| {
+        if let Some(p) = slot.as_mut().filter(|p| p.token == pending.token && p.status == "ACCEPTED") {
+            p.expires_at = p.expires_at.max(now.saturating_add(upload_secs).saturating_add(PENDING_IDLE_SECS));
+        }
+    });
+    let body_deadline = Instant::now() + Duration::from_secs(upload_secs);
+    let Some(body) = read_http_body(stream, content_length, initial_body, body_deadline, true, MAX_P2P_UPLOAD_SIZE) else {
+        return;
+    };
+
+    let _ = fs::create_dir_all(&ddir);
+    let mut rnd = [0u8; 8];
+    let _ = getrandom::getrandom(&mut rnd);
+    let part = ddir.join(format!(".omasend-web-{}.part", hex::encode(rnd)));
+    let decrypted = (|| -> Result<String, String> {
+        let out = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&part).map_err(|e| e.to_string())?;
+        let out = std::io::BufWriter::new(out);
+        match &body {
+            HttpBody::Memory(bytes) => webe2e::decrypt_file(&key, index, size, &bytes[..], out),
+            HttpBody::Staged(staged) => {
+                let f = File::open(&staged.path).map_err(|e| e.to_string())?;
+                webe2e::decrypt_file(&key, index, size, std::io::BufReader::new(f), out)
+            }
+        }
+    })();
+    drop(body);
+    let sha256 = match decrypted {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = fs::remove_file(&part);
+            fail(stream, "422 Unprocessable Entity", &e);
+            return;
+        }
+    };
+    let file_path = get_unique_filepath(&ddir, &name);
+    if fs::rename(&part, &file_path).is_err() {
+        let _ = fs::remove_file(&part);
+        send_response(stream, "500 Internal Server Error", "text/plain", b"Failed to write file to disk", None, None, None);
+        return;
+    }
+
+    RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
+    if let Some(t) = web_e2e_lock().as_mut().filter(|t| t.token == pending.token) {
+        t.done[index] = true;
+    }
+    let done_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    with_pending_transfer(|slot| {
+        let Some(p) = slot.as_mut().filter(|p| p.token == pending.token) else {
+            return;
+        };
+        if let Some(pos) = p.file_names.iter().position(|f| f == &name) {
+            p.file_names.remove(pos);
+        }
+        if let Some(pos) = p.files.iter().position(|f| f.name == name) {
+            p.files.remove(pos);
+        }
+        if p.file_names.is_empty() && p.files.is_empty() {
+            *slot = None;
+        } else {
+            p.expires_at = done_at.saturating_add(PENDING_IDLE_SECS);
+        }
+    });
+    let final_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    record_notified_file(&final_name);
+    play_samurai_receive_sound();
+    notify_desktop(
+        "OmaSend: AirBridge Transfer Complete",
+        &format!("'{}' ({} bytes) decrypted, verified [SHA256: {}] and saved to Downloads/omasend.", final_name, size, &sha256[..8]),
+    );
+    let resp = serde_json::json!({ "status": "OK", "filename": final_name, "size": size, "sha256": sha256 });
+    send_response(stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None, None);
+}
+
 fn send_response(
     mut stream: &TcpStream,
     status: &str,
@@ -5681,6 +5850,19 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         return;
     }
 
+    if req.method == "GET" && req.path == "/api/v2/e2e" {
+        // The desktop's X25519 key for browsers paired before webe2e existed. Signed by the
+        // desktop's Ed25519 key, which the browser pinned at pairing.
+        match v2_verify(&req, &devicekey::body_tag_json(b""), &client_ip.to_canonical().to_string()) {
+            devicekey::AuthResult::Trusted(_) => {
+                let resp = webe2e::advert(device_identity());
+                respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
+            }
+            _ => respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Peer is not paired\"}", None, None),
+        }
+        return;
+    }
+
     if req.method == "POST" && req.path == "/api/v2/pair" {
         if get_visibility().0 == "OFF" {
             respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Recipient AirBridge visibility is turned Off\"}", None, None);
@@ -5716,6 +5898,10 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                 record_attempt(&PAIR_RATE_LIMITER, rl_ip, true);
                 let label = format!("{} ({})", key.name, key.device_id);
                 let own = key.own_device;
+                let mut resp = resp;
+                if key.is_web() {
+                    resp["e2e"] = webe2e::advert(device_identity());
+                }
                 let code = pairing_code_with(&key.pk);
                 if trust_store().upsert(key).is_err() {
                     respond(&stream, "500 Internal Server Error", "application/json", b"{\"error\":\"Failed to store device key\"}", None, None);
@@ -5880,6 +6066,16 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             }
         };
 
+        let (web_e2e_key, req_data) = match open_web_e2e(v2_key.as_ref(), &req_data, webe2e::LABEL_REQUEST) {
+            Ok(Some((k, inner))) => (Some(k), inner),
+            Ok(None) => (None, req_data),
+            Err(why) => {
+                let err = serde_json::json!({ "error": why, "e2e_required": true });
+                respond(&stream, "400 Bad Request", "application/json", err.to_string().as_bytes(), None, None);
+                return;
+            }
+        };
+
         let my_oma_id = get_or_create_oma_id();
         let my_norm = rendezvous::normalize_oma_id(&my_oma_id);
         let mut resolved_req_data = req_data.clone();
@@ -6025,12 +6221,24 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             transport: None,
             risky_files: risky_file_names(&file_names),
         };
+        let web_files: Vec<(String, u64)> = transfer.files.iter().map(|f| (f.name.clone(), f.size_bytes)).collect();
         // V2-FUNC-01: single pending slot; check and save under one lock (M10).
         if !claim_pending_slot(&transfer, v2_key.is_some()) {
             let err = serde_json::json!({ "error": "Another transfer is in progress. Please retry shortly." });
             respond(&stream, "409 Conflict", "application/json", err.to_string().as_bytes(), None, Some(&[("Retry-After", "30")]));
             return;
         }
+        // The slot changed hands, so keys of an earlier browser transfer are dropped either way.
+        *web_e2e_lock() = match (web_e2e_key, v2_key.as_ref()) {
+            (Some(key), Some(k)) => Some(WebE2eTransfer {
+                token: token.clone(),
+                sender_pk: k.pk.clone(),
+                key,
+                done: vec![false; web_files.len()],
+                files: web_files,
+            }),
+            _ => None,
+        };
 
         let size_mb = (total_size_bytes as f64) / 1024.0 / 1024.0;
         if auto_accept {
@@ -6050,6 +6258,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             "is_trusted": is_trusted || v2_key.is_some(),
             "verified_device": v2_key.is_some(),
             "is_same_owner": is_same_owner,
+            "e2e": web_e2e_lock().as_ref().is_some_and(|t| t.token == token),
             "token": token
         });
         respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
@@ -6131,6 +6340,11 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         let Some(pending) = pending_opt else {
             return;
         };
+        let sender_is_web = pending.sender_pk.as_deref().and_then(|pk| trust_store().get(pk)).is_some_and(|k| k.is_web());
+        if sender_is_web {
+            web_e2e_upload(&mut stream, &req, &pending, content_length, &initial_body, client_ip);
+            return;
+        }
         let matching_info = pending.files.iter().find(|f| f.name == clean_filename).cloned();
         let is_in_pending = matching_info.is_some() || pending.file_names.iter().any(|n| n == &clean_filename);
         if !is_in_pending {
@@ -6387,6 +6601,15 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             }
         };
         if let Ok(raw_val) = serde_json::from_slice::<serde_json::Value>(body_slice) {
+            let raw_val = match open_web_e2e(v2_key.as_ref(), &raw_val, webe2e::LABEL_CLIPBOARD) {
+                Ok(Some((_, inner))) => inner,
+                Ok(None) => raw_val,
+                Err(why) => {
+                    let err = serde_json::json!({ "error": why, "e2e_required": true });
+                    respond(&stream, "400 Bad Request", "application/json", err.to_string().as_bytes(), None, None);
+                    return;
+                }
+            };
             let my_oma_id = get_or_create_oma_id();
             let my_norm = rendezvous::normalize_oma_id(&my_oma_id);
             let mut resolved_val = raw_val.clone();
@@ -10439,7 +10662,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            for _ in 0..4 {
+            for _ in 0..10 {
                 let (s, _) = listener.accept().expect("Accept client");
                 handle_connection(s, "127.0.0.1", "1234", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
             }
@@ -10466,40 +10689,86 @@ mod tests {
         assert_eq!(row["client"], "web");
         assert_eq!(row["can_receive"], false);
 
-        // 2. Signed clipboard (paired, not own: allowed without a prompt).
-        let clip = br#"{"content_type":"text","text":"hello from the browser"}"#;
-        let sig = devicekey::auth_header_lines(&browser, "POST", "/api/p2p/clipboard", &devicekey::body_tag_json(clip));
-        let head = format!("POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\n{}Content-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n", addr, origin, sig, clip.len());
-        let r = raw_http(addr, &head, clip);
-        assert!(r.starts_with("HTTP/1.1 200"), "signed browser clipboard must be accepted: {}", r);
+        // The pair response carries the desktop's X25519 key, signed by the pinned Ed25519 key.
+        let e2e = &resp["e2e"];
+        let x_pk = e2e["x25519"].as_str().expect("e2e key in pair response").to_string();
+        let vk = devicekey::decode_pk(&offer.pk).unwrap();
+        assert!(devicekey::verify_b64(&vk, webe2e::advert_transcript(&offer.pk, &x_pk).as_bytes(), e2e["sig"].as_str().unwrap()));
+        let my_pk = browser.public_b64();
+        let seal = |label: &str, pt: &[u8]| -> ([u8; 32], serde_json::Value) {
+            let mut eph = [0u8; 32];
+            getrandom::getrandom(&mut eph).unwrap();
+            let (k, epk) = webe2e::browser_message_key(&x_pk, eph, &my_pk);
+            let ct = webe2e::seal_message(&k, label, pt);
+            (k, serde_json::json!({ "e2e": { "v": 1, "epk": epk, "ct": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(ct) } }))
+        };
+        use base64::Engine;
+        let signed_json = |path: &str, body: &[u8]| -> String {
+            let sig = devicekey::auth_header_lines(&browser, "POST", path, &devicekey::body_tag_json(body));
+            let head = format!("POST {} HTTP/1.1\r\nHost: {}\r\n{}Content-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n", path, addr, origin, sig, body.len());
+            raw_http(addr, &head, body)
+        };
 
-        // 3. Signed transfer request without any OmaID: needs the user's approval.
-        let req_body = serde_json::json!({
+        // 2. A browser key may not send in clear text any more.
+        let clip = br#"{"content_type":"text","text":"hello from the browser"}"#;
+        let r = signed_json("/api/p2p/clipboard", clip);
+        assert!(r.starts_with("HTTP/1.1 400") && r.contains("e2e_required"), "plaintext from a browser must be refused: {}", r);
+
+        // 3. Encrypted clipboard (paired, not own: allowed without a prompt).
+        let (_, env) = seal(webe2e::LABEL_CLIPBOARD, clip);
+        let r = signed_json("/api/p2p/clipboard", env.to_string().as_bytes());
+        assert!(r.starts_with("HTTP/1.1 200"), "encrypted browser clipboard must be accepted: {}", r);
+
+        // 4. Encrypted transfer request without any OmaID: needs the user's approval.
+        let meta = serde_json::json!({
             "sender_name": "Firefox on Android",
-            "files": [{"name": "çay (1).txt", "size_bytes": 5}]
-        }).to_string().into_bytes();
-        let sig = devicekey::auth_header_lines(&browser, "POST", "/api/p2p/request", &devicekey::body_tag_json(&req_body));
-        let head = format!("POST /api/p2p/request HTTP/1.1\r\nHost: {}\r\n{}Content-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n", addr, origin, sig, req_body.len());
-        let r = raw_http(addr, &head, &req_body);
+            "files": [{"name": "çay (1).txt", "size_bytes": 5}, {"name": "b.bin", "size_bytes": 70000}]
+        }).to_string();
+        let (k, env) = seal(webe2e::LABEL_REQUEST, meta.as_bytes());
+        let r = signed_json("/api/p2p/request", env.to_string().as_bytes());
         assert!(r.contains("\"status\":\"PENDING\""), "paired (not own) browser needs approval: {}", r);
-        assert!(r.contains("\"verified_device\":true"), "{}", r);
+        assert!(r.contains("\"verified_device\":true") && r.contains("\"e2e\":true"), "{}", r);
         let token = serde_json::from_str::<serde_json::Value>(r.split("\r\n\r\n").nth(1).unwrap()).unwrap()["token"].as_str().unwrap().to_string();
         let pending = get_pending_transfer().unwrap();
         assert_eq!(pending.sender_id, stored.device_id);
-        assert_eq!(pending.sender_pk.as_deref(), Some(browser.public_b64().as_str()));
+        assert_eq!(pending.sender_pk.as_deref(), Some(my_pk.as_str()));
+        assert_eq!(pending.file_names, vec![sanitize_filename("çay (1).txt"), "b.bin".to_string()]);
         decide_pending_transfer(&token, true).unwrap();
 
-        // 4. Upload with a percent-encoded name, signed over the path+query exactly as sent.
-        let pq = format!("/api/p2p/upload?token={}&filename=%C3%A7ay%20(1).txt", token);
-        assert_eq!(urlencoding_decode("%C3%A7ay%20(1).txt"), "çay (1).txt");
-        let sig = devicekey::auth_header_lines(&browser, "POST", &pq, &devicekey::body_tag_stream(5));
-        let head = format!("POST {} HTTP/1.1\r\nHost: {}\r\n{}Content-Type: application/octet-stream\r\n{}Content-Length: 5\r\nConnection: close\r\n\r\n", pq, addr, origin, sig);
-        let r = raw_http(addr, &head, b"hello");
-        assert!(r.starts_with("HTTP/1.1 200"), "signed browser upload must succeed: {}", r);
+        let upload = |index: usize, body: &[u8]| -> String {
+            let pq = format!("/api/p2p/upload?token={}&index={}", token, index);
+            let sig = devicekey::auth_header_lines(&browser, "POST", &pq, &devicekey::body_tag_stream(body.len()));
+            let head = format!("POST {} HTTP/1.1\r\nHost: {}\r\n{}Content-Type: application/octet-stream\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n", pq, addr, origin, sig, body.len());
+            raw_http(addr, &head, body)
+        };
+
+        // 5. A tampered body is refused and nothing is saved; a plaintext body has the wrong size.
+        let mut bad = webe2e::seal_file(&k, 0, b"hello");
+        bad[2] ^= 1;
+        let r = upload(0, &bad);
+        assert!(r.starts_with("HTTP/1.1 422"), "tampered upload must fail: {}", r);
+        assert!(upload(0, b"hello").starts_with("HTTP/1.1 413"));
+        // Ciphertext of file 1 sent as file 0 has the wrong size; sealed with file 0's... key of file 1 fails.
+        let r = upload(0, &webe2e::seal_file(&k, 1, b"hello"));
+        assert!(r.starts_with("HTTP/1.1 422"), "{}", r);
+
+        // 6. Encrypted uploads, addressed by index: no file name in the URL.
+        let r = upload(0, &webe2e::seal_file(&k, 0, b"hello"));
+        assert!(r.starts_with("HTTP/1.1 200"), "encrypted browser upload must succeed: {}", r);
         let saved = serde_json::from_str::<serde_json::Value>(r.split("\r\n\r\n").nth(1).unwrap()).unwrap()["filename"].as_str().unwrap().to_string();
         // The engine's file-name policy drops parentheses (see sanitize_filename).
         assert_eq!(saved, sanitize_filename("çay (1).txt"));
         assert_eq!(fs::read(get_download_dir().join(&saved)).unwrap(), b"hello");
+        // A file is accepted once.
+        assert!(upload(0, &webe2e::seal_file(&k, 0, b"hello")).starts_with("HTTP/1.1 403"));
+        let big: Vec<u8> = (0..70000u32).map(|i| (i % 251) as u8).collect();
+        let r = upload(1, &webe2e::seal_file(&k, 1, &big));
+        assert!(r.starts_with("HTTP/1.1 200"), "{}", r);
+        assert_eq!(fs::read(get_download_dir().join("b.bin")).unwrap(), big);
+        assert!(get_pending_transfer().is_none(), "transfer completes after the last file");
+        let leftovers: Vec<_> = fs::read_dir(get_download_dir()).unwrap().flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".omasend-web-")).collect();
+        assert!(leftovers.is_empty(), "no partial files left behind");
         server.join().unwrap();
 
         // 5. Browsers are send-only: sending to the key fails fast.
@@ -10512,6 +10781,7 @@ mod tests {
 
         let _ = fs::remove_file(&f);
         let _ = fs::remove_file(get_download_dir().join(&saved));
+        let _ = fs::remove_file(get_download_dir().join("b.bin"));
         clear_pending_transfer();
         let _ = trust_store().remove(&browser.public_b64());
     }
