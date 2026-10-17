@@ -309,6 +309,10 @@ pub struct ServerState {
     /// QR-paired devices (trust store) with online state from discovery.
     #[serde(default)]
     pub paired_devices: Vec<serde_json::Value>,
+    /// Landlock state the daemon reported at startup: false = running unsandboxed (kernel
+    /// without Landlock, or setup failed), null = no daemon has reported yet.
+    #[serde(default)]
+    pub sandbox: Option<bool>,
 }
 
 fn get_local_ip() -> String {
@@ -7138,6 +7142,35 @@ fn sandbox_read_paths(home: &Path, exe_dir: Option<&Path>) -> Vec<PathBuf> {
     paths
 }
 
+/// Written by the daemon at startup: "1" when Landlock is active, "0" when it runs unsandboxed.
+fn sandbox_status_path() -> PathBuf {
+    get_state_dir().join("sandbox_status.txt")
+}
+
+/// Last sandbox state the daemon reported; None if no daemon has reported one yet.
+fn read_sandbox_status() -> Option<bool> {
+    match read_secure_file(&sandbox_status_path()).ok()?.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// True for clients the HTTP server talks to at all: loopback, private (RFC 1918 / ULA) and
+/// link-local addresses, plus Tailscale's 100.64.0.0/10 when this machine is on a tailnet.
+/// Public addresses are dropped before a request is read. (The WAN tunnel arrives from
+/// loopback and is limited to the portal in handle_connection.)
+fn is_allowed_client_ip(ip: IpAddr, allow_cgnat: bool) -> bool {
+    let ip = ip.to_canonical();
+    if rendezvous::is_local_network_ip(&ip) {
+        return true;
+    }
+    match ip {
+        IpAddr::V4(v4) => allow_cgnat && v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64,
+        IpAddr::V6(_) => false,
+    }
+}
+
 fn run_server() {
     // Enforce military-grade defense: anti-forensics memory protection + Landlock LSM
     military::enable_anti_forensics();
@@ -7162,8 +7195,10 @@ fn run_server() {
     if sandboxed {
         println!("Landlock sandbox enabled");
     } else {
-        eprintln!("Landlock sandbox NOT enabled (kernel without Landlock, or setup failed); running unsandboxed");
+        eprintln!("WARNING: Landlock sandbox NOT enabled (kernel without Landlock, or setup failed); running unsandboxed");
     }
+    // Reported as "sandbox" in --json, so an unsandboxed daemon is visible, not just logged.
+    let _ = write_secure_file(&sandbox_status_path(), if sandboxed { "1" } else { "0" });
 
     ensure_local_api_token();
     clean_stale_outgoing();
@@ -7196,6 +7231,7 @@ fn run_server() {
     };
     // The PIN is not logged: daemon stdout ends up in the journal.
     println!("OmaSend listening on http://{}:{}", local_ip, PORT);
+    let allow_cgnat = get_tailscale_ip().is_some();
 
     // Spawn P2P AirBridge discovery threads
     thread::spawn(run_p2p_discovery_listener);
@@ -7209,8 +7245,12 @@ fn run_server() {
     start_clipboard_sentinel();
 
     for mut s in listener.incoming().flatten() {
+        // Unknown peer address: refuse rather than assume loopback.
+        let Ok(client_ip) = s.peer_addr().map(|a| a.ip()) else { continue };
+        if !is_allowed_client_ip(client_ip, allow_cgnat) {
+            continue; // dropping `s` closes the connection without reading anything
+        }
         let _ = s.set_nodelay(true);
-        let client_ip = s.peer_addr().map(|a| a.ip()).unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
         let guard = match try_acquire_connection(client_ip) {
             Some(g) => g,
             None => {
@@ -7280,6 +7320,7 @@ fn build_server_state(ip: &str) -> ServerState {
         firewall_status: check_firewall_status(),
         device_key_id: device_identity().device_id(),
         paired_devices: paired_devices_view(),
+        sandbox: read_sandbox_status(),
     }
 }
 
@@ -8865,12 +8906,14 @@ mod tests {
             firewall_status: "OK".to_string(),
             device_key_id: String::new(),
             paired_devices: vec![],
+            sandbox: Some(false),
         };
 
         let json = serde_json::to_string(&state).expect("Serialize ServerState");
         assert!(json.contains("\"oma_id\":\"4829-1048-5729-1104\""));
         assert!(json.contains("\"wan_mode\":\"LAN\""));
         assert!(json.contains("\"stun_addr\":\"198.51.100.1:53317\""));
+        assert!(json.contains("\"sandbox\":false"));
     }
 
     #[test]
@@ -10530,5 +10573,20 @@ mod tests {
         let claimer = peers.iter().find(|p| p.id == "claims-my-omaid").expect("listed");
         assert!(!claimer.is_same_owner && !claimer.is_trusted);
         save_discovered_peers(&peers.into_iter().filter(|p| p.ip != "192.168.200.7").collect::<Vec<_>>());
+    }
+
+    /// Only loopback, private and link-local clients reach the HTTP server; Tailscale's CGNAT
+    /// range only when this machine is on a tailnet.
+    #[test]
+    fn test_public_client_ips_are_rejected() {
+        for ok in ["127.0.0.1", "192.168.1.20", "10.0.0.5", "172.16.3.4", "169.254.10.1", "::1", "fe80::1", "fd12::1", "::ffff:192.168.1.20"] {
+            assert!(is_allowed_client_ip(ok.parse().unwrap(), false), "{} should be allowed", ok);
+        }
+        for bad in ["8.8.8.8", "1.1.1.1", "203.0.113.9", "100.64.0.1", "2001:4860::8888", "::ffff:8.8.8.8"] {
+            assert!(!is_allowed_client_ip(bad.parse().unwrap(), false), "{} must be rejected", bad);
+        }
+        assert!(is_allowed_client_ip("100.101.102.103".parse().unwrap(), true));
+        assert!(!is_allowed_client_ip("100.128.0.1".parse().unwrap(), true));
+        assert!(!is_allowed_client_ip("8.8.8.8".parse().unwrap(), true));
     }
 }
