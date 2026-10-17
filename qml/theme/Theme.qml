@@ -88,12 +88,10 @@ QtObject {
 
         var base = dict["background"] || dict["bg"] || (root.isDarkTheme ? "#111111" : "#f4f4f4");
         var fg = dict["foreground"] || dict["fg"] || (root.isDarkTheme ? "#e5e5e5" : "#1a1a1a");
-        var acc = dict["accent"] || dict["color4"] || (root.isDarkTheme ? "#b8b8b8" : "#333333");
         var sel = dict["selection"] || dict["selection_background"] || "";
         var mut = dict["muted"] || dict["color8"] || "";
         // Color components need color values (the TOML gives strings).
         var fgc = Qt.darker(fg, 1.0);
-        var accc = Qt.darker(acc, 1.0);
 
         root.bgBase = base;
 
@@ -103,7 +101,7 @@ QtObject {
             root.bgCard = (sel && sel !== base) ? sel : Qt.lighter(base, 1.5);
             root.bgCardHover = Qt.lighter(root.bgCard, 1.2);
             root.border = mut ? mut : Qt.rgba(fgc.r, fgc.g, fgc.b, 0.18);
-            root.borderLight = acc ? Qt.rgba(accc.r, accc.g, accc.b, 0.35) : Qt.rgba(fgc.r, fgc.g, fgc.b, 0.25);
+            root.borderLight = Qt.rgba(fgc.r, fgc.g, fgc.b, 0.3);
             root.textMain = dict["bright_foreground"] || fg;
             root.textMuted = dict["light_foreground"] || mut || Qt.rgba(fgc.r, fgc.g, fgc.b, 0.65);
             root.textDim = dict["dark_foreground"] || dict["color8"] || Qt.rgba(fgc.r, fgc.g, fgc.b, 0.4);
@@ -113,17 +111,19 @@ QtObject {
             root.bgCard = (sel && sel !== base) ? sel : Qt.darker(base, 1.05);
             root.bgCardHover = Qt.darker(root.bgCard, 1.06);
             root.border = mut ? mut : Qt.rgba(fgc.r, fgc.g, fgc.b, 0.18);
-            root.borderLight = acc ? Qt.rgba(accc.r, accc.g, accc.b, 0.35) : Qt.rgba(fgc.r, fgc.g, fgc.b, 0.25);
+            root.borderLight = Qt.rgba(fgc.r, fgc.g, fgc.b, 0.3);
             root.textMain = dict["bright_foreground"] || fg;
             root.textMuted = dict["light_foreground"] || mut || Qt.rgba(fgc.r, fgc.g, fgc.b, 0.65);
             root.textDim = dict["dark_foreground"] || dict["color8"] || Qt.rgba(fgc.r, fgc.g, fgc.b, 0.4);
         }
 
-        root.accent = acc;
-        root.accentHover = Qt.lighter(acc, 1.15);
-        root.accentSuccess = dict["bright_green"] || dict["green"] || dict["color2"] || "#a6a6a6";
-        root.accentWarning = dict["bright_yellow"] || dict["yellow"] || dict["color3"] || "#8c8c8c";
-        root.accentDanger = dict["bright_red"] || dict["red"] || dict["color1"] || "#666666";
+        // Monochrome: the accent and every status tone are the theme's own ink, so the
+        // window follows each Omarchy theme without adding a second hue.
+        root.accent = fgc;
+        root.accentHover = Qt.rgba(fgc.r, fgc.g, fgc.b, 0.85);
+        root.accentSuccess = fgc;
+        root.accentWarning = Qt.rgba(fgc.r, fgc.g, fgc.b, 0.8);
+        root.accentDanger = fgc;
     }
 
     Component.onCompleted: {

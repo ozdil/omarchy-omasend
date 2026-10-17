@@ -96,11 +96,14 @@ Panel {
   property bool showNearby: false
   property bool showDetails: false
 
+  // Monochrome: one ink, the theme's foreground, follows every Omarchy theme change.
+  // States are told apart by glyph, weight and opacity, never by a second hue.
   readonly property color foreground: bar ? bar.foreground : Color.foreground
-  readonly property color urgent: bar ? bar.urgent : Color.urgent
-  readonly property color dim: Qt.darker(foreground, 1.55)
-  readonly property color hoverFill: bar ? Style.hoverFillFor(bar.foreground, Color.accent) : "transparent"
-  readonly property color selectedFill: bar ? Style.selectedFillFor(bar.foreground, Color.accent) : "transparent"
+  readonly property color ink: foreground
+  readonly property color urgent: foreground
+  readonly property color dim: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.55)
+  readonly property color hoverFill: bar ? Style.hoverFillFor(bar.foreground, root.ink) : "transparent"
+  readonly property color selectedFill: bar ? Style.selectedFillFor(bar.foreground, root.ink) : "transparent"
   readonly property string fontFamily: (root.bar && root.bar.fontFamily)
     ? root.bar.fontFamily
     : ((typeof Style !== "undefined" && Style.font && Style.font.family)
@@ -134,7 +137,7 @@ Panel {
     if (fw.indexOf("UFW_ACTIVE_CHECK") === 0 || fw.indexOf("UFW_BLOCKED") === 0 || fw.indexOf("NFT_BLOCKED") === 0) return "blocked"
     return "secure"
   }
-  readonly property color securityColor: root.securityState === "secure" ? Color.accent
+  readonly property color securityColor: root.securityState === "secure" ? root.ink
                                        : (root.securityState === "blocked" ? root.urgent : root.dim)
 
   readonly property int onlineCount: {
@@ -663,7 +666,7 @@ Panel {
     text: root.dropBlasting ? "󰄬" : ""
     active: root.dropActive || root.dropBlasting
     useActiveColor: false
-    foreground: root.dropBlasting ? Color.accent : "transparent"
+    foreground: root.dropBlasting ? root.ink : "transparent"
     tooltipText: "OmaSend · " + root.tf("tooltip_devices", root.onlineCount, root.pairedDevices.length)
     onPressed: function(b) {
       if (b === Qt.RightButton) root.forceScan()
@@ -674,7 +677,7 @@ Panel {
       anchors.centerIn: parent
       visible: !root.dropBlasting
       size: Math.round(Math.min(parent.width, parent.height) * 0.66)
-      color: root.dropActive ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
+      color: root.dropActive ? root.ink : (root.bar ? root.bar.foreground : Color.foreground)
     }
 
     DropArea {
@@ -761,7 +764,7 @@ Panel {
     bar: root.bar
     triggerMode: "hover"
     open: (root.dropActive || root.dropBlasting) && !root.opened
-    borderColor: (root.dropProximity > 0.72 || root.dropBlasting) ? Color.accent : Color.popups.border
+    borderColor: (root.dropProximity > 0.72 || root.dropBlasting) ? root.ink : Color.popups.border
     contentWidth: dropHud.fittedContentWidth(Style.space(276))
     contentHeight: dropHud.fittedContentHeight(Style.space(68))
 
@@ -816,7 +819,7 @@ Panel {
           }
           ShapePath {
             strokeWidth: Style.space(3)
-            strokeColor: Color.accent
+            strokeColor: root.ink
             fillColor: "transparent"
             capStyle: ShapePath.RoundCap
             PathAngleArc {
@@ -832,7 +835,7 @@ Panel {
           visible: root.dropBlasting
           textFormat: Text.PlainText
           text: "󰄬"
-          color: Color.accent
+          color: root.ink
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
         }
@@ -840,7 +843,7 @@ Panel {
           anchors.centerIn: parent
           visible: !root.dropBlasting
           size: Style.space(20)
-          color: Color.accent
+          color: root.ink
         }
       }
 
@@ -853,7 +856,7 @@ Panel {
           Layout.fillWidth: true
           textFormat: Text.PlainText
           text: root.dropBlasting ? root.t("drop_transfer_started") : "OMASEND"
-          color: Color.accent
+          color: root.ink
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           font.bold: true
@@ -1073,7 +1076,7 @@ Panel {
           BorderSurface {
             id: incomingCard
             readonly property bool encrypted: root.pendingTransfer !== null && root.pendingTransfer.transport === "quic"
-            readonly property color tone: encrypted ? Color.accent : root.urgent
+            readonly property color tone: encrypted ? root.ink : root.urgent
             visible: root.pendingTransfer !== null && root.pendingTransfer.status === "PENDING"
             width: parent.width
             implicitHeight: inCol.implicitHeight + Style.space(20)
@@ -1118,6 +1121,7 @@ Panel {
                 color: incomingCard.tone
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
+                font.bold: !incomingCard.encrypted
                 wrapMode: Text.WordWrap
               }
               RowLayout {
@@ -1139,7 +1143,7 @@ Panel {
                 Button {
                   text: root.t("accept_btn")
                   fontSize: Style.font.bodySmall
-                  foreground: Color.accent
+                  foreground: root.ink
                   fontFamily: root.fontFamily
                   horizontalPadding: Style.space(14)
                   verticalPadding: Style.spacing.controlPaddingY
@@ -1158,8 +1162,8 @@ Panel {
             visible: root.transferProgress !== null
             width: parent.width
             implicitHeight: progressCol.implicitHeight + Style.space(18)
-            color: Style.normalFillFor(root.foreground, Color.accent)
-            borderSpec: Border.controlSpec("normal", root.foreground, Color.accent)
+            color: Style.normalFillFor(root.foreground, root.ink)
+            borderSpec: Border.controlSpec("normal", root.foreground, root.ink)
             radius: Style.cornerRadius
 
             ColumnLayout {
@@ -1178,7 +1182,7 @@ Panel {
                 Text {
                   textFormat: Text.PlainText
                   text: (root.transferProgress && String(root.transferProgress.direction || "").indexOf("send") === 0) ? "󰕒" : "󰇚"
-                  color: Color.accent
+                  color: root.ink
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
                 }
@@ -1219,7 +1223,7 @@ Panel {
                   width: parent.width * Math.max(0.02, Math.min(1.0, (root.transferProgress ? Number(root.transferProgress.percent || 0) : 0) / 100.0))
                   height: parent.height
                   radius: parent.radius
-                  color: Color.accent
+                  color: root.ink
                 }
               }
             }
@@ -1232,8 +1236,8 @@ Panel {
             visible: root.showPair
             width: parent.width
             implicitHeight: pairCol.implicitHeight + Style.space(20)
-            color: Style.normalFillFor(root.foreground, Color.accent)
-            borderSpec: Border.controlSpec("normal", root.foreground, Color.accent)
+            color: Style.normalFillFor(root.foreground, root.ink)
+            borderSpec: Border.controlSpec("normal", root.foreground, root.ink)
             radius: Style.cornerRadius
 
             Column {
@@ -1249,7 +1253,7 @@ Panel {
                   Layout.fillWidth: true
                   textFormat: Text.PlainText
                   text: root.t("pair_title")
-                  color: Color.accent
+                  color: root.ink
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   font.bold: true
@@ -1473,7 +1477,7 @@ Panel {
                     Layout.fillWidth: true
                     implicitHeight: linkInput.implicitHeight + Style.space(12)
                     color: "transparent"
-                    borderSpec: Border.controlSpec("normal", root.foreground, linkInput.activeFocus ? Color.accent : root.foreground)
+                    borderSpec: Border.controlSpec("normal", root.foreground, linkInput.activeFocus ? root.ink : root.foreground)
                     radius: Style.cornerRadius
 
                     TextInput {
@@ -1484,7 +1488,7 @@ Panel {
                       anchors.leftMargin: Style.space(8)
                       anchors.rightMargin: Style.space(8)
                       color: root.foreground
-                      selectionColor: Color.accent
+                      selectionColor: root.ink
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body
                       font.letterSpacing: 1.0
@@ -1509,7 +1513,7 @@ Panel {
                   Button {
                     text: linkProc.running ? root.t("link_working") : root.t("link_btn")
                     fontSize: Style.font.bodySmall
-                    foreground: Color.accent
+                    foreground: root.ink
                     fontFamily: root.fontFamily
                     horizontalPadding: Style.space(12)
                     verticalPadding: Style.spacing.controlPaddingY
@@ -1536,7 +1540,7 @@ Panel {
                 width: parent.width
                 textFormat: Text.PlainText
                 text: root.tf("pair_scan_confirm", root.scannedPairName, root.scannedPairId)
-                color: Color.accent
+                color: root.ink
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 wrapMode: Text.WordWrap
@@ -1561,7 +1565,7 @@ Panel {
                 PanelActionButton {
                   iconText: "󰄬"
                   tooltipText: root.t("pair_scan_confirm_btn")
-                  foreground: Color.accent
+                  foreground: root.ink
                   fontFamily: root.fontFamily
                   onClicked: root.confirmScannedPair()
                 }
@@ -1593,10 +1597,11 @@ Panel {
             visible: root.statusMsg !== ""
             width: parent.width
             textFormat: Text.PlainText
-            text: root.statusMsg
-            color: root.statusError ? root.urgent : Color.accent
+            text: (root.statusError ? "󰀦 " : "") + root.statusMsg
+            color: root.ink
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
+            font.bold: root.statusError
             wrapMode: Text.WordWrap
           }
 
@@ -1977,7 +1982,7 @@ Panel {
           color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, tile.online ? 0.10 : 0.04)
           border.width: Math.max(1, Style.space(1.5))
           border.color: tile.armed ? root.urgent
-                       : (tile.paired && tile.online ? Color.accent
+                       : (tile.paired && tile.online ? root.ink
                        : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.18))
         }
         Text {
@@ -2007,7 +2012,7 @@ Panel {
         text: tile.armed ? root.t("tile_unpair_armed")
               : (tile.paired ? ("󰌾 " + (tile.online ? (tile.own ? root.t("badge_own_short") : root.t("online")) : root.t("not_seen")))
                              : ("󰌿 " + root.t("not_encrypted")))
-        color: tile.armed ? root.urgent : (tile.paired ? (tile.online ? Color.accent : root.dim) : root.urgent)
+        color: tile.armed ? root.urgent : (tile.paired ? (tile.online ? root.ink : root.dim) : root.urgent)
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         horizontalAlignment: Text.AlignHCenter
@@ -2076,13 +2081,13 @@ Panel {
           radius: width / 2
           color: "transparent"
           border.width: Math.max(1, Style.space(1.5))
-          border.color: root.showPair ? Color.accent : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.28)
+          border.color: root.showPair ? root.ink : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.28)
         }
         Text {
           anchors.centerIn: parent
           textFormat: Text.PlainText
           text: "󰐕"
-          color: root.showPair ? Color.accent : root.foreground
+          color: root.showPair ? root.ink : root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.title
         }
