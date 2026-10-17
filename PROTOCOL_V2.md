@@ -238,8 +238,45 @@ clients have no `client` field, so older trust stores load unchanged. `--devices
 The browser uses the signed-HTTP endpoints above (`/api/p2p/request`, `GET /api/p2p/decision`,
 `/api/p2p/upload`, `/api/p2p/clipboard`) with the same headers and canonical string. The
 signed path is the path and query exactly as the browser sends them, percent-encoding
-included (for example `/api/p2p/upload?token=…&filename=%C3%A7ay%20(1).txt`). Body tags do not
-change. A signed request does not need an OmaID; the desktop labels it with the device ID.
+included. Body tags do not change. A signed request does not need an OmaID; the desktop labels
+it with the device ID. Everything a browser key sends is end-to-end encrypted (next section);
+a plaintext request from a browser key gets `400 {"e2e_required": true}`.
+
+### Browser end-to-end encryption (`omasend-web-e2e-v1`)
+
+Implemented in `src/webe2e.rs` (engine) and `src/core/protocol/e2e.ts` (omasend-web); both
+check the same test vector. A browser has no QUIC and, on `http://<lan-ip>`, no secure
+context, so instead of a new transport the signed-HTTP bodies are encrypted for the desktop:
+
+- **Desktop key.** A static X25519 key derived from the device seed:
+  `x_sk = HKDF-SHA256(salt = "omasend-web-e2e-v1 static", ikm = seed, info = "x25519")`.
+  It is published as `{"v": 1, "x25519": b64url(x_pk), "sig": b64url(Ed25519_R(
+  "omasend-web-e2e-v1|" + R_pk + "|" + x_pk))}` inside the pair response (`e2e`) and by
+  `GET /api/v2/e2e` (signed request from a paired key; `403` otherwise). The browser accepts the
+  key only if `sig` verifies with the Ed25519 key it pinned at pairing.
+- **Message key.** For every request the browser draws an ephemeral X25519 key `e` and sends
+  `epk`. `K = HKDF-SHA256(salt = epk || x_pk, ikm = X25519(e, x_pk),
+  info = "omasend-web-e2e-v1|" + browser_pk)`, so the key is bound to the Ed25519 key that
+  signs the request. A low-order `epk` (all-zero shared secret) is refused.
+  Subkeys: `K_label = HMAC-SHA256(K, "omasend-web-e2e-v1|" + label)`, labels `request`,
+  `clipboard`, `file|<index>`.
+- **Envelope.** The signed JSON body is `{"client": "web", "e2e": {"v": 1, "epk": …,
+  "ct": b64url(ChaCha20-Poly1305(K_label, nonce = 0¹², aad = label, plaintext))}}`; the
+  plaintext is the usual request JSON (`sender_name`, `files[{name,size_bytes}]`,
+  `total_size_bytes`, or `text`, `content_type`, `sender_name`). Each subkey encrypts one
+  message, so the zero nonce is never reused. `POST /api/p2p/request` answers with
+  `"e2e": true` when it decrypted the envelope; the browser refuses to upload otherwise.
+- **Files.** `POST /api/p2p/upload?token=<token>&index=<i>`: no file name in the URL. The body
+  is the file in 64 KiB plaintext chunks, each sealed with `K_file|i`, nonce =
+  `00 00 00 <last: 0|1> || u64_be(chunk index)`, no AAD. Its length is exactly
+  `size + 16 × max(1, ceil(size / 65536))` and is what `stream:<len>` signs, so the desktop
+  checks the length before reading. The final-chunk flag and the counter make truncation,
+  reordering and splicing fail. The desktop decrypts chunk by chunk into a `0600` partial file
+  next to the download directory, moves it into place only after the last tag verified, and
+  accepts each index once. The keys live in the daemon's memory for the pending transfer only.
+- **What a listener sees:** that a transfer is requested, the number and sizes of the files
+  (from the upload lengths) and the browser's device key. Names, contents and clipboard text
+  are hidden. The page itself is still loaded over plain HTTP; see below.
 
 The usual trust rules apply: a browser paired as "not mine" needs approval for each transfer,
 and its clipboard text is accepted. With `--own`, its transfers are auto-accepted.
@@ -250,11 +287,11 @@ address, never gets automatic clipboard pushes and is never picked by `--send au
 
 ### Security of the browser client
 
-- Requests are **authenticated but not encrypted**. They travel as plain HTTP on the LAN, so
-  anyone on the network can read the files and clipboard text a browser sends. They cannot
-  forge, change or replay requests: the signature covers the JSON body, and an upload must
-  match the signed request (size, and hashes when the page sends them).
-- The page itself is also served over plain HTTP. An active attacker on the LAN could serve a
+- Requests are authenticated (signed) and their contents are **end-to-end encrypted** for the
+  desktop as described above. A passive listener learns sizes and timing; it cannot read, forge,
+  change or replay anything. A browser key is never allowed to send in clear text, and a browser
+  never falls back to clear text when the desktop offers no key.
+- The page itself is served over plain HTTP. An active attacker on the LAN could serve a
   modified page to a browser that loads it while the attacker is present. Load the page and
   pair only on a network you trust.
 - The browser keeps its private key in its own site storage. Clearing site data loses the key;
