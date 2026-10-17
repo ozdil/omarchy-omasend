@@ -17,6 +17,9 @@ optdepends=(
     'cloudflared: for the optional WAN tunnel'
 )
 makedepends=('cargo' 'rust')
+# Browser client (optional, not built here): the engine serves it at /web/ from
+# /usr/share/omasend/web if that directory exists (built omasend-web dist/). Users of build.sh
+# get it in ~/.local/share/omarchy/omasend/web instead.
 
 build() {
     cd "${startdir}"

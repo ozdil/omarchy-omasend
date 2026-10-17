@@ -2,6 +2,7 @@ mod subproc;
 pub mod devicekey;
 pub mod military;
 pub mod rendezvous;
+pub mod webclient;
 
 pub use rendezvous::{
     build_github_anchor_payload, compute_rendezvous_topic, create_stun_binding_request,
@@ -44,7 +45,9 @@ static RECEIVED_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 // Global and per-peer connection concurrency limits to protect against thread & memory exhaustion DOS
 pub const MAX_GLOBAL_CONNECTIONS: usize = 32;
-pub const MAX_PEER_CONNECTIONS: usize = 4;
+/// Browsers open up to 6 parallel HTTP/1.1 connections per host when loading the web client
+/// (every response here is `Connection: close`), plus API calls; 8 leaves room for both.
+pub const MAX_PEER_CONNECTIONS: usize = 8;
 static GLOBAL_ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 static PEER_CONNECTION_TRACKER: Mutex<Option<HashMap<IpAddr, usize>>> = Mutex::new(None);
 static RECENTLY_NOTIFIED_FILES: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
@@ -1872,7 +1875,7 @@ fn get_active_paired_peer_ips() -> Vec<String> {
 /// pushes: the legacy HTTP path is plaintext on the LAN (M6). `--sync-clipboard <peer>` still
 /// sends to a legacy peer when the user asks for it explicitly.
 fn auto_push_clipboard_text(text: &str) {
-    for key in trust_store().load().into_iter().filter(|k| k.own_device) {
+    for key in trust_store().load().into_iter().filter(|k| k.own_device && !k.is_web()) {
         let text = text.to_string();
         thread::spawn(move || {
             if let Err((_, e)) = core_clipboard(&key, &text) {
@@ -2420,7 +2423,8 @@ fn key_for_discovered<'a>(keys: &'a [devicekey::TrustedKey], p: &DiscoveredPeer)
     if !p.pk.is_empty() {
         return keys.iter().find(|k| k.pk == p.pk);
     }
-    keys.iter().find(|k| !k.ip.is_empty() && k.ip == p.ip)
+    // A browser key never answers beacons; a native app on the same phone shares its IP.
+    keys.iter().find(|k| !k.is_web() && !k.ip.is_empty() && k.ip == p.ip)
 }
 
 /// Resolves a send/clipboard target to a QR-paired key. Accepts a device id
@@ -2442,7 +2446,23 @@ fn trusted_key_for_target(target: &str) -> Option<devicekey::TrustedKey> {
     if let Some(p) = get_discovered_peers().into_iter().find(|p| p.ip == host) {
         return key_for_discovered(&keys, &p).cloned();
     }
-    keys.into_iter().find(|k| !k.ip.is_empty() && k.ip == host)
+    keys.into_iter().find(|k| !k.is_web() && !k.ip.is_empty() && k.ip == host)
+}
+
+/// Error shown when the user tries to send to a browser key.
+const WEB_CANNOT_RECEIVE: &str = "Browser devices can't receive files";
+
+/// Why a paired key cannot receive anything, if it cannot: browser clients have no server and
+/// no QUIC endpoint, so they are send-only. A key without any address and without a QUIC port
+/// is treated the same way instead of waiting for a connection timeout.
+fn receive_blocker(key: &devicekey::TrustedKey) -> Option<String> {
+    if key.is_web() {
+        return Some(WEB_CANNOT_RECEIVE.to_string());
+    }
+    if key.quic_port == 0 && core_addrs(key).is_empty() {
+        return Some(format!("{} has no known address. {}.", key.name, WEB_CANNOT_RECEIVE));
+    }
+    None
 }
 
 /// Candidate QUIC addresses for a paired key: where discovery currently sees it, then the
@@ -2490,6 +2510,8 @@ fn paired_devices_view() -> Vec<serde_json::Value> {
                 "name": k.name,
                 "ip": seen.map(|p| p.ip.clone()).unwrap_or_else(|| k.ip.clone()),
                 "own_device": k.own_device,
+                "client": k.client,
+                "can_receive": receive_blocker(&k).is_none(),
                 "online": seen.is_some(),
                 "added_at": k.added_at,
                 "last_seen": k.last_seen,
@@ -2685,6 +2707,9 @@ fn rate_limit_ip(req: &HttpRequest, client_ip: IpAddr) -> IpAddr {
 
 /// Sends files through the daemon's QUIC endpoint. Err((unavailable, message)).
 fn core_send_via_daemon(key: &devicekey::TrustedKey, paths: &[String], names: &[String]) -> Result<(), (bool, String)> {
+    if let Some(why) = receive_blocker(key) {
+        return Err((false, why));
+    }
     if let Some(node) = CORE_NODE.get() {
         return node
             .send_files(key.pk.clone(), core_addrs(key), paths.to_vec(), names.to_vec(), String::new())
@@ -2699,6 +2724,9 @@ fn core_send_via_daemon(key: &devicekey::TrustedKey, paths: &[String], names: &[
 
 /// Encrypted clipboard push to a paired key. Never downgraded to plaintext HTTP.
 fn core_clipboard(key: &devicekey::TrustedKey, text: &str) -> Result<(), (bool, String)> {
+    if let Some(why) = receive_blocker(key) {
+        return Err((false, why));
+    }
     if let Some(node) = CORE_NODE.get() {
         return node.send_clipboard(key.pk.clone(), core_addrs(key), text.to_string()).map_err(|e| {
             let m = e.to_string();
@@ -3514,6 +3542,7 @@ fn p2p_pair_v2(uri: &str, own_device: bool) -> Result<devicekey::TrustedKey, Str
         own_device,
         added_at: now,
         last_seen: now,
+        client: String::new(),
     };
     trust_store().upsert(key.clone())?;
     Ok(key)
@@ -3524,23 +3553,28 @@ fn auto_send_target() -> Option<String> {
     let mut keys: Vec<_> = trust_store()
         .load()
         .into_iter()
-        .filter(|k| k.own_device)
+        .filter(|k| k.own_device && !k.is_web())
         .collect();
     keys.sort_by_key(|k| std::cmp::Reverse(k.last_seen));
     keys.first().map(|k| k.device_id.clone())
 }
 
 /// Creates a pairing offer, renders its QR code to PNG and returns the JSON the panel/CLI shows.
-fn create_pair_offer_json(own_device: bool) -> serde_json::Value {
-    let uri = devicekey::create_pair_offer(
+/// Registers a single-use pairing offer (5 minutes) and returns its `omasend://pair` link.
+fn new_pair_offer_uri(host: &str, own_device: bool) -> String {
+    devicekey::create_pair_offer(
         device_identity(),
         &get_state_dir(),
         &get_system_hostname(),
-        &get_local_ip(),
+        host,
         PORT,
         own_device,
         CORE_NODE.get().map(|n| n.bound_port()).unwrap_or(CORE_QUIC_PORT),
-    );
+    )
+}
+
+fn create_pair_offer_json(own_device: bool) -> serde_json::Value {
+    let uri = new_pair_offer_uri(&get_local_ip(), own_device);
     // The offer secret is in the QR, so the image is written 0600 and replaced per offer.
     let svg = get_state_dir().join("pair_offer_qr.svg");
     let svg_str = svg.to_string_lossy().to_string();
@@ -3552,6 +3586,28 @@ fn create_pair_offer_json(own_device: bool) -> serde_json::Value {
         "device_id": device_identity().device_id(),
         "own_device": own_device,
         "expires_in_secs": devicekey::PAIR_OFFER_TTL_SECS,
+    })
+}
+
+/// Pairing offer for the browser client: the same single-use offer, wrapped in a link to this
+/// engine's `/web/` page (`#pair=<link>`), so a phone camera can open it directly.
+fn create_pair_offer_web_json(own_device: bool) -> serde_json::Value {
+    let ip = get_local_ip();
+    let uri = new_pair_offer_uri(&ip, own_device);
+    let expires_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() + devicekey::PAIR_OFFER_TTL_SECS;
+    let web_url = webclient::pair_web_url(&ip, PORT, &uri);
+    // Contains the offer secret: 0600, replaced per offer (like pair_offer_qr.svg).
+    let svg = get_state_dir().join("pair_offer_web_qr.svg");
+    let written = rendezvous::qr_svg(&web_url).is_some_and(|data| write_secure_file(&svg, &data).is_ok());
+    serde_json::json!({
+        "uri": uri,
+        "web_url": web_url,
+        "qr_svg": if written { svg.to_string_lossy().to_string() } else { String::new() },
+        "expires_at": expires_at,
+        "expires_in_secs": devicekey::PAIR_OFFER_TTL_SECS,
+        "device_id": device_identity().device_id(),
+        "own_device": own_device,
+        "web_installed": webclient::web_root().is_some(),
     })
 }
 
@@ -3651,6 +3707,10 @@ fn p2p_send_files_to_peer(target_ip_or_omaid: &str, file_paths: &[PathBuf]) -> R
     // Phase 2: QR-paired devices only ever use the encrypted QUIC transport. There is no
     // silent fallback to plaintext HTTP, so blocking UDP cannot downgrade a paired device.
     let paired_key = trusted_key_for_target(target_ip_or_omaid);
+    // Fail before hashing/archiving anything: a browser cannot receive.
+    if let Some(why) = paired_key.as_ref().and_then(receive_blocker) {
+        return Err(why);
+    }
     let (resolved_ip, resolved_port, resolved_oma_id) = match resolve_target_ip_or_omaid(target_ip_or_omaid) {
         Ok(v) => v,
         Err(_) if paired_key.is_some() => (String::new(), PORT, None),
@@ -5346,6 +5406,80 @@ window.addEventListener('load', async function() {{
 
 // ------------------- CONNECTION HANDLER -------------------
 
+/// Writes a `/web` response: security headers always, body omitted for HEAD.
+fn send_web_response(mut stream: &TcpStream, head_only: bool, status: &str, content_type: &str, body: &[u8], extra: &[(&str, &str)]) {
+    let mut hdr = format!("HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n", status, content_type, body.len());
+    for (k, v) in webclient::SECURITY_HEADERS.iter().chain(extra.iter()) {
+        hdr.push_str(&format!("{}: {}\r\n", k, v));
+    }
+    hdr.push_str("Connection: close\r\n\r\n");
+    let _ = stream.write_all(hdr.as_bytes());
+    if !head_only {
+        let _ = stream.write_all(body);
+    }
+}
+
+/// Reads a resolved web-root file without following a symlink swapped in after resolution,
+/// bounded by MAX_WEB_FILE_BYTES.
+fn read_web_file(path: &Path) -> Result<Vec<u8>, bool> {
+    let f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| false)?;
+    let meta = f.metadata().map_err(|_| false)?;
+    if !meta.is_file() {
+        return Err(false);
+    }
+    if meta.len() > webclient::MAX_WEB_FILE_BYTES {
+        return Err(true);
+    }
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    f.take(webclient::MAX_WEB_FILE_BYTES + 1).read_to_end(&mut buf).map_err(|_| false)?;
+    if buf.len() as u64 > webclient::MAX_WEB_FILE_BYTES {
+        return Err(true);
+    }
+    Ok(buf)
+}
+
+/// `GET|HEAD /web[/...]`: the browser client, see `webclient`.
+fn serve_web_client(stream: &TcpStream, req: &HttpRequest) {
+    let head = req.method == "HEAD";
+    let text = "text/plain; charset=utf-8";
+    let no_cache = [("Cache-Control", "no-cache")];
+    if req.method != "GET" && !head {
+        send_web_response(stream, false, "405 Method Not Allowed", text, b"Method not allowed", &[("Allow", "GET, HEAD")]);
+        return;
+    }
+    // Harmless static files, but OFF means OFF for everything this port offers.
+    if get_visibility().0 == "OFF" {
+        send_web_response(stream, head, "403 Forbidden", text, b"OmaSend visibility is turned Off", &no_cache);
+        return;
+    }
+    match webclient::resolve(webclient::web_root().as_deref(), &req.path) {
+        Some(webclient::WebTarget::Redirect) => {
+            send_web_response(stream, head, "301 Moved Permanently", text, b"", &[("Location", "/web/"), ("Cache-Control", "no-cache")]);
+        }
+        Some(webclient::WebTarget::NotInstalled) => {
+            send_web_response(stream, head, "200 OK", "text/html; charset=utf-8", webclient::NOT_INSTALLED_HTML.as_bytes(), &no_cache);
+        }
+        Some(webclient::WebTarget::File { path, rel }) => match read_web_file(&path) {
+            Ok(body) => {
+                let extra = [("Cache-Control", webclient::cache_control(&rel))];
+                send_web_response(stream, head, "200 OK", webclient::content_type(&rel), &body, &extra);
+            }
+            Err(true) => send_web_response(stream, head, "413 Payload Too Large", text, b"File too large", &no_cache),
+            Err(false) => send_web_response(stream, head, "404 Not Found", text, b"Not found", &no_cache),
+        },
+        Some(webclient::WebTarget::BadRequest) => {
+            send_web_response(stream, head, "400 Bad Request", text, b"Bad request", &no_cache);
+        }
+        Some(webclient::WebTarget::NotFound) | None => {
+            send_web_response(stream, head, "404 Not Found", text, b"Not found", &no_cache);
+        }
+    }
+}
+
 pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) {
     let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
     let header_deadline = Instant::now() + Duration::from_secs(HEADER_READ_TIMEOUT_SECS);
@@ -5383,6 +5517,13 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                 ("Access-Control-Allow-Headers", "Content-Type, X-OmaSend-PIN, X-OmaSend-IV, X-OmaSend-Filename"),
             ]),
         );
+        return;
+    }
+
+    // Browser client (static files, same origin as the API). No PIN: it is a public app,
+    // pairing and every request it makes are authorized separately.
+    if req.path == webclient::WEB_PREFIX || req.path.starts_with("/web/") {
+        serve_web_client(&stream, &req);
         return;
     }
 
@@ -5713,7 +5854,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         }
         let req_data = resolved_req_data;
 
-        let sender_id = req_data.get("oma_id")
+        let mut sender_id = req_data.get("oma_id")
             .or_else(|| req_data.get("sender_oma_id"))
             .or_else(|| req_data.get("sender_id"))
             .and_then(|v| v.as_str())
@@ -5727,13 +5868,20 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         let is_valid_sender_omaid = rendezvous::validate_oma_id(&norm_sender);
         let is_same_owner = is_valid_sender_omaid && constant_time_eq_str(&norm_sender, &my_norm);
 
+        // A verified device key identifies the sender by itself; clients without an OmaID
+        // (the browser client) are labelled with their device id.
         if !is_valid_sender_omaid {
+            if let Some(k) = v2_key.as_ref() {
+                sender_id = k.device_id.clone();
+            }
+        }
+        if !is_valid_sender_omaid && v2_key.is_none() {
             let err = serde_json::json!({ "error": "Valid 16-digit OmaID required to send files" });
             respond(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
             return;
         }
 
-        if !is_same_owner {
+        if is_valid_sender_omaid && !is_same_owner {
             // Foreign OmaID: if paired and confirmed with an auth_token, require valid token
             let paired = load_paired_peers();
             if let Some(peer_record) = paired.iter().find(|p| rendezvous::normalize_oma_id(&p.oma_id) == norm_sender) {
@@ -6821,6 +6969,17 @@ fn sandbox_read_paths(home: &Path, exe_dir: Option<&Path>) -> Vec<PathBuf> {
     ] {
         paths.push(home.join(rel));
     }
+    // Browser client web roots (see webclient::web_root); /usr/share is covered by /usr.
+    // The parent of the user web root is granted, not the root itself: build.sh replaces the
+    // web dir by rename, and Landlock rules follow the directory present at startup.
+    paths.push(home.join(webclient::USER_WEB_PARENT));
+    if let Some(d) = env::var_os("OMASEND_WEB_DIR").filter(|d| !d.is_empty()) {
+        let d = PathBuf::from(d);
+        // Never let the variable re-grant $HOME (or a parent of it).
+        if d.is_absolute() && !home.starts_with(&d) {
+            paths.push(d);
+        }
+    }
     if let Some(dir) = exe_dir {
         // Dev builds run from the source tree and read ./assets next to the binary.
         // Skip it if it is $HOME or one of its parents, which would re-grant all of $HOME.
@@ -6839,6 +6998,8 @@ fn run_server() {
     let shared_dir = get_shared_dir();
     let home_dir = env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/tmp"));
     let exe_dir = env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
+    // Must exist before Landlock starts, so a web client installed later is readable.
+    let _ = fs::create_dir_all(home_dir.join(webclient::USER_WEB_PARENT));
     let read_paths = sandbox_read_paths(&home_dir, exe_dir.as_deref());
     let read_refs: Vec<&Path> = read_paths.iter().map(PathBuf::as_path).collect();
     let sandboxed = military::enable_landlock_sandbox(
@@ -6945,6 +7106,10 @@ fn main() {
     // ---- Phase 1: device keys & QR pairing ----
     if args.iter().any(|a| a == "--device-id") {
         println!("{}", device_identity().device_id());
+        return;
+    }
+    if args.iter().any(|a| a == "--pair-offer-web") {
+        println!("{}", create_pair_offer_web_json(args.iter().any(|a| a == "--own")));
         return;
     }
     if args.iter().any(|a| a == "--pair-offer") {
@@ -7895,7 +8060,7 @@ mod tests {
         let peer_a = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
         let peer_b = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20));
 
-        // 1. Peer A acquires up to MAX_PEER_CONNECTIONS (4)
+        // 1. Peer A acquires up to MAX_PEER_CONNECTIONS
         let mut guards_a = Vec::new();
         for _ in 0..MAX_PEER_CONNECTIONS {
             let g = try_acquire_connection(peer_a);
@@ -8346,6 +8511,7 @@ mod tests {
         assert!(paths
             .iter()
             .any(|p| p == Path::new("/home/alice/.local/share/omarchy/plugins/ozdil.omasend")));
+        assert!(paths.iter().any(|p| p == Path::new("/home/alice/.local/share/omarchy/omasend")), "web client root parent");
 
         // A binary sitting in $HOME (or above it) must not re-grant the whole home dir.
         for exe_dir in ["/home/alice", "/home", "/"] {
@@ -9674,6 +9840,7 @@ mod tests {
             own_device: true,
             added_at: now,
             last_seen: now,
+            client: String::new(),
         };
         trust_store().upsert(key.clone()).unwrap();
         let peer_oma = rendezvous::format_oma_id(&rendezvous::generate_raw_oma_id());
@@ -10078,5 +10245,212 @@ mod tests {
         assert!(html.contains("data-name=\"x&#39;);alert(1);(&#39;&lt;img&gt;.txt\""));
         assert_eq!(notification_text("<b>evil</b> & co"), "&lt;b&gt;evil&lt;/b&gt; &amp; co");
         assert!(notification_text("-u critical").starts_with('\u{2060}'));
+    }
+
+    fn http_raw_once(req: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
+        let addr = listener.local_addr().unwrap();
+        let server = serve_one(listener);
+        let r = raw_http(addr, &req.replace("{addr}", &addr.to_string()), b"");
+        server.join().unwrap();
+        r
+    }
+
+    fn header_of<'a>(resp: &'a str, name: &str) -> Option<&'a str> {
+        let head = resp.split("\r\n\r\n").next().unwrap_or("");
+        head.lines().find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+        })
+    }
+
+    #[test]
+    fn test_web_client_static_serving_over_http() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        reset_connection_tracker();
+        let base = std::env::temp_dir().join(format!("omasend_test_webroot_{}", std::process::id()));
+        let root = base.join("web");
+        fs::create_dir_all(root.join("assets")).unwrap();
+        fs::write(root.join("index.html"), "<!doctype html><title>OmaSend</title>").unwrap();
+        fs::write(root.join("sw.js"), "self.addEventListener('fetch',()=>{})").unwrap();
+        fs::write(root.join("manifest.webmanifest"), "{}").unwrap();
+        fs::write(root.join("assets/index-abc123.js"), "console.log(1)").unwrap();
+        fs::write(base.join("secret.txt"), "outside").unwrap();
+        std::env::set_var("OMASEND_WEB_DIR", &root);
+        set_visibility("KNOWN");
+
+        let get = |p: &str| http_raw_once(&format!("GET {} HTTP/1.1\r\nHost: {{addr}}\r\nConnection: close\r\n\r\n", p));
+
+        let r = get("/web");
+        assert!(r.starts_with("HTTP/1.1 301"), "{}", r);
+        assert_eq!(header_of(&r, "Location"), Some("/web/"));
+
+        for p in ["/web/", "/web/index.html", "/web/?utm=x"] {
+            let r = get(p);
+            assert!(r.starts_with("HTTP/1.1 200"), "{}: {}", p, r);
+            assert_eq!(header_of(&r, "Content-Type"), Some("text/html; charset=utf-8"));
+            assert_eq!(header_of(&r, "Cache-Control"), Some("no-cache"));
+            assert_eq!(header_of(&r, "X-Content-Type-Options"), Some("nosniff"));
+            assert_eq!(header_of(&r, "Referrer-Policy"), Some("no-referrer"));
+            assert_eq!(header_of(&r, "X-Frame-Options"), Some("DENY"));
+            assert!(r.ends_with("<!doctype html><title>OmaSend</title>"), "{}", r);
+        }
+        let r = get("/web/assets/index-abc123.js");
+        assert_eq!(header_of(&r, "Content-Type"), Some("text/javascript; charset=utf-8"));
+        assert_eq!(header_of(&r, "Cache-Control"), Some("public, max-age=31536000, immutable"));
+        let r = get("/web/sw.js");
+        assert_eq!(header_of(&r, "Cache-Control"), Some("no-cache"));
+        let r = get("/web/manifest.webmanifest");
+        assert_eq!(header_of(&r, "Content-Type"), Some("application/manifest+json"));
+        assert_eq!(header_of(&r, "Cache-Control"), Some("no-cache"));
+
+        // HEAD: same headers, no body.
+        let r = http_raw_once("HEAD /web/sw.js HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        assert!(r.starts_with("HTTP/1.1 200"), "{}", r);
+        assert!(r.ends_with("\r\n\r\n"), "HEAD must not carry a body: {:?}", r);
+
+        for p in ["/web/../secret.txt", "/web/%2e%2e/secret.txt", "/web/%252e%252e/secret.txt", "/web/assets/..%2f..%2fsecret.txt"] {
+            let r = get(p);
+            assert!(r.starts_with("HTTP/1.1 400") || r.starts_with("HTTP/1.1 404"), "{}: {}", p, r);
+            assert!(!r.contains("outside"), "{}", p);
+        }
+        assert!(get("/web/nope.js").starts_with("HTTP/1.1 404"));
+
+        let r = http_raw_once("POST /web/ HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        assert!(r.starts_with("HTTP/1.1 405"), "{}", r);
+        assert_eq!(header_of(&r, "Allow"), Some("GET, HEAD"));
+
+        set_visibility("OFF");
+        assert!(get("/web/").starts_with("HTTP/1.1 403"));
+        set_visibility("KNOWN");
+
+        // Without any web root the page explains that the client is not installed.
+        if webclient::find_web_root(None, env::var("HOME").ok().as_deref().map(Path::new)).is_none() {
+            std::env::set_var("OMASEND_WEB_DIR", base.join("missing"));
+            let r = get("/web/");
+            assert!(r.starts_with("HTTP/1.1 200") && r.contains("not installed"), "{}", r);
+        }
+
+        std::env::remove_var("OMASEND_WEB_DIR");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_pair_offer_web_json_shape() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let out = create_pair_offer_web_json(false);
+        let uri = out["uri"].as_str().unwrap();
+        let web_url = out["web_url"].as_str().unwrap();
+        assert!(uri.starts_with("omasend://pair?v=2&"), "{}", uri);
+        let prefix = format!("http://{}:{}/web/#pair=", get_local_ip(), PORT);
+        assert!(web_url.starts_with(&prefix), "{}", web_url);
+        let frag = &web_url[prefix.len()..];
+        assert_eq!(frag, webclient::encode_uri_component(uri));
+        assert_eq!(webclient::percent_decode_strict(frag).as_deref(), Some(uri));
+        let exp = out["expires_at"].as_u64().unwrap();
+        assert!(exp >= now + devicekey::PAIR_OFFER_TTL_SECS && exp <= now + devicekey::PAIR_OFFER_TTL_SECS + 5);
+        let svg_path = out["qr_svg"].as_str().unwrap();
+        let svg = fs::read_to_string(svg_path).unwrap();
+        assert!(svg.contains("<svg"), "{}", svg);
+        let mode = fs::metadata(svg_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(out["own_device"], false);
+        assert!(out["web_installed"].is_boolean());
+        devicekey::parse_pair_uri(uri).expect("embedded link parses");
+    }
+
+    /// A browser: fresh Ed25519 key, pairs through the web_url's embedded link with
+    /// `client: "web"`, then uses signed HTTP exactly the way fetch() sends it.
+    #[test]
+    fn test_web_client_pairs_and_sends_with_signed_http() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        reset_connection_tracker();
+        reset_pin_rate_limiter();
+        clear_pending_transfer();
+        set_visibility("KNOWN");
+
+        let mut seed = [0u8; 32];
+        getrandom::getrandom(&mut seed).unwrap();
+        let browser = devicekey::DeviceIdentity::from_seed(seed);
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for _ in 0..4 {
+                let (s, _) = listener.accept().expect("Accept client");
+                handle_connection(s, "127.0.0.1", "1234", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+            }
+        });
+        let origin = format!("Origin: http://{}\r\nSec-Fetch-Site: same-origin\r\n", addr);
+
+        // 1. Pair: the page reads #pair=, decodes it and posts {pk,name,mac,sig,client}.
+        let offer_out = create_pair_offer_web_json(false);
+        let web_url = offer_out["web_url"].as_str().unwrap();
+        let uri = webclient::percent_decode_strict(web_url.split_once("#pair=").unwrap().1).unwrap();
+        let offer = devicekey::parse_pair_uri(&uri).unwrap();
+        let mut body = devicekey::build_pair_request(&browser, &offer, "Firefox on Android", 0);
+        body.as_object_mut().unwrap().remove("quic_port");
+        body["client"] = serde_json::json!("web");
+        let r = post_json(addr, "/api/v2/pair", &origin, &body);
+        assert!(r.starts_with("HTTP/1.1 200"), "web pairing must succeed: {}", r);
+        let resp: serde_json::Value = serde_json::from_str(r.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        devicekey::verify_pair_response(&browser, &offer, &resp).expect("desktop signature verifies");
+        let stored = trust_store().get(&browser.public_b64()).expect("key stored");
+        assert!(stored.is_web());
+        assert_eq!((stored.port, stored.quic_port, stored.own_device), (0, 0, false));
+        let view = paired_devices_view();
+        let row = view.iter().find(|v| v["device_id"] == stored.device_id.as_str()).unwrap();
+        assert_eq!(row["client"], "web");
+        assert_eq!(row["can_receive"], false);
+
+        // 2. Signed clipboard (paired, not own: allowed without a prompt).
+        let clip = br#"{"content_type":"text","text":"hello from the browser"}"#;
+        let sig = devicekey::auth_header_lines(&browser, "POST", "/api/p2p/clipboard", &devicekey::body_tag_json(clip));
+        let head = format!("POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\n{}Content-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n", addr, origin, sig, clip.len());
+        let r = raw_http(addr, &head, clip);
+        assert!(r.starts_with("HTTP/1.1 200"), "signed browser clipboard must be accepted: {}", r);
+
+        // 3. Signed transfer request without any OmaID: needs the user's approval.
+        let req_body = serde_json::json!({
+            "sender_name": "Firefox on Android",
+            "files": [{"name": "çay (1).txt", "size_bytes": 5}]
+        }).to_string().into_bytes();
+        let sig = devicekey::auth_header_lines(&browser, "POST", "/api/p2p/request", &devicekey::body_tag_json(&req_body));
+        let head = format!("POST /api/p2p/request HTTP/1.1\r\nHost: {}\r\n{}Content-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n", addr, origin, sig, req_body.len());
+        let r = raw_http(addr, &head, &req_body);
+        assert!(r.contains("\"status\":\"PENDING\""), "paired (not own) browser needs approval: {}", r);
+        assert!(r.contains("\"verified_device\":true"), "{}", r);
+        let token = serde_json::from_str::<serde_json::Value>(r.split("\r\n\r\n").nth(1).unwrap()).unwrap()["token"].as_str().unwrap().to_string();
+        let pending = get_pending_transfer().unwrap();
+        assert_eq!(pending.sender_id, stored.device_id);
+        assert_eq!(pending.sender_pk.as_deref(), Some(browser.public_b64().as_str()));
+        decide_pending_transfer(&token, true).unwrap();
+
+        // 4. Upload with a percent-encoded name, signed over the path+query exactly as sent.
+        let pq = format!("/api/p2p/upload?token={}&filename=%C3%A7ay%20(1).txt", token);
+        assert_eq!(urlencoding_decode("%C3%A7ay%20(1).txt"), "çay (1).txt");
+        let sig = devicekey::auth_header_lines(&browser, "POST", &pq, &devicekey::body_tag_stream(5));
+        let head = format!("POST {} HTTP/1.1\r\nHost: {}\r\n{}Content-Type: application/octet-stream\r\n{}Content-Length: 5\r\nConnection: close\r\n\r\n", pq, addr, origin, sig);
+        let r = raw_http(addr, &head, b"hello");
+        assert!(r.starts_with("HTTP/1.1 200"), "signed browser upload must succeed: {}", r);
+        let saved = serde_json::from_str::<serde_json::Value>(r.split("\r\n\r\n").nth(1).unwrap()).unwrap()["filename"].as_str().unwrap().to_string();
+        // The engine's file-name policy drops parentheses (see sanitize_filename).
+        assert_eq!(saved, sanitize_filename("çay (1).txt"));
+        assert_eq!(fs::read(get_download_dir().join(&saved)).unwrap(), b"hello");
+        server.join().unwrap();
+
+        // 5. Browsers are send-only: sending to the key fails fast.
+        let f = get_state_dir().join("web_send_probe.txt");
+        fs::write(&f, "x").unwrap();
+        assert_eq!(p2p_send_files_to_peer(&stored.device_id, std::slice::from_ref(&f)), Err(WEB_CANNOT_RECEIVE.to_string()));
+        assert_eq!(core_clipboard(&stored, "x"), Err((false, WEB_CANNOT_RECEIVE.to_string())));
+        // An address match never resolves to the browser key (a native app may share the IP).
+        assert!(trusted_key_for_target(&stored.ip).is_none_or(|k| !k.is_web()));
+
+        let _ = fs::remove_file(&f);
+        let _ = fs::remove_file(get_download_dir().join(&saved));
+        clear_pending_transfer();
+        let _ = trust_store().remove(&browser.public_b64());
     }
 }

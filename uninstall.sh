@@ -19,6 +19,16 @@ fi
 
 MANIFEST_FILE="${HOME}/.local/state/omarchy/omasend/install_manifest.json"
 
+# Browser client installed by build.sh (served at /web/).
+WEB_DEST="${HOME}/.local/share/omarchy/omasend/web"
+if [[ -L "${WEB_DEST}" ]]; then
+    /usr/bin/rm -f "${WEB_DEST}"
+elif [[ -d "${WEB_DEST}" ]]; then
+    /usr/bin/rm -rf --one-file-system "${WEB_DEST}"
+    echo "Removed browser client: ${WEB_DEST}"
+fi
+/usr/bin/rmdir "${HOME}/.local/share/omarchy/omasend" 2>/dev/null || true
+
 if [[ ! -f "${MANIFEST_FILE}" || -L "${MANIFEST_FILE}" ]]; then
     echo "No verified install manifest found at ${MANIFEST_FILE}; skipping file removal."
     exit 0
