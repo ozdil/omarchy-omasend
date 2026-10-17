@@ -1,6 +1,6 @@
 [package]
 name = "omasend-engine"
-version = "2.0.0"
+version = "2.0.9"
 edition = "2021"
 authors = ["Ozan Özdil <ozan@pm.me>"]
 description = "File and clipboard sharing daemon for Omarchy: QR-paired devices over encrypted QUIC (TLS 1.3)"

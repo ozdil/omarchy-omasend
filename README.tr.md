@@ -1,13 +1,13 @@
 # OmaSend - Omarchy Linux İçin Eşler Arası AirBridge ve Pano Senkronu
 
 [![Omarchy Onaylı Eklenti](https://img.shields.io/badge/Omarchy-Verified_Plugin-22c55e?style=for-the-badge&logo=omarchy)](https://github.com/ozdil)
-[![Sürüm v2.0.0](https://img.shields.io/badge/S%C3%BCr%C3%BCm-v2.0.0-38BDF8?style=for-the-badge&logo=rust)](https://github.com/ozdil/omarchy-omasend/releases)
+[![Sürüm v2.0.9](https://img.shields.io/badge/S%C3%BCr%C3%BCm-v2.0.9-38BDF8?style=for-the-badge&logo=rust)](https://github.com/ozdil/omarchy-omasend/releases)
 [![Kahve Ismarla](https://img.shields.io/badge/Buy_Me_A_Coffee-Geli%C5%9Ftiriciye_Destek-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/ozdil)
 [![Lisans: MIT](https://img.shields.io/badge/Lisans-MIT-blue?style=for-the-badge)](LICENSE)
 
 ![OmaSend Önizleme](preview.png)
 
-> **Yerel ağınızda Omarchy Linux ile Android arasında doğrudan dosya aktarımı ve pano senkronu. Cihazları bir kez QR kodla eşleştirin; sonrasında aralarındaki her şey uçtan uca şifrelenir. Hesap yok, bulut yok.**
+> **Omarchy Linux, Android ve tarayıcı arasında doğrudan dosya aktarımı ve pano senkronu. Cihazları bir kez QR kodla eşleştirin; sonrasında aralarındaki her şey uçtan uca şifrelenir. İsteğe bağlı anonim OmaID ile kendi cihazlarınız internet üzerinden de buluşur. Kayıt yok, e-posta yok, takip yok.**
 
 > [!IMPORTANT]
 > **Güvenlik durumu:** QR kodla eşleştirilen cihazlar (`omasend-engine --pair-offer`) cihaz başına Ed25519 anahtarları ve şifreli, karşılıklı kimlik doğrulamalı QUIC/TLS 1.3 aktarımı kullanır; transferler BLAKE3 ile doğrulanır ve kaldığı yerden devam eder. QR ile eşleştirilmemiş cihazlar hâlâ eski HTTP yolunu kullanır ve bu yol **şifreli değildir** — yalnızca güvendiğiniz ağlarda kullanın. Kendi eşleştirilmiş cihazlarınız dışındaki tüm gelen transferler onayınızı bekler. Protokol ayrıntıları: [PROTOCOL_V2.md](PROTOCOL_V2.md).
@@ -15,8 +15,35 @@
 - **Geliştirici:** Ozan Özdil (ozdil)  
 - **Lisans:** MIT  
 - **Eklenti Kimliği:** `ozdil.omasend`  
-- **Sürüm:** `2.0.0`  
+- **Sürüm:** `2.0.9`  
 - **Varsayılan Yazı Tipi:** `JetBrainsMono Nerd Font`
+
+---
+
+## 2.0.9 ile gelenler
+
+Masaüstü, Android (2.0.9, versionCode 109) ve web istemcisi artık aynı sürüm numarasını taşıyor.
+
+**Yeni**
+- **OmaID: tüm cihazlarınız için tek anonim numara.** Mullvad tarzı 16 haneli bir numara: e-posta, ad ya da telefon numarası yok. Numaranın kendisi hiçbir yere gönderilmez; `id.omaid.app` kayıt sunucusu yalnızca Argon2id ile türetilmiş bir kimlik ve uçtan uca şifreli, Ed25519 imzalı cihaz listesini saklar. Yeni cihaz, numara ve cihazlarınızdan birindeki tek seferlik onayla (iki cihaz da aynı 6 haneli kodu gösterir) ya da katılım QR'ını (`https://omaid.app/j#…`) okutarak eklenir. Motor: `--account`, `--account-create`, `--account-join`, `--account-approve`, `--account-invite`, `--account-remove`, `--account-leave`.
+- **Kendi cihazlarınız internet üzerinden.** OmaID varsa aynı ağda olmayan cihazlar iroh röleleri (n0) üzerinden bağlanır, ağlar izin verdiğinde doğrudan bağlantıya geçer. Röleler yalnızca uçtan uca şifreli QUIC/TLS 1.3 trafiği taşır. 4 GiB'tan büyük aktarımlar doğrudan bağlantıyı bekler.
+- **Ortak pano, son kopya kazanır.** Kendi cihazlarınız arasındaki kopyalar kopyalanma zamanını taşır; 2 dakikadan eski ya da görülen en yeni kopyadan eski bir kopya atılır, yani geciken bir kopya yenisinin üzerine yazamaz. Sessizdir: her kopya için bildirim ya da ses yok. Android'de Hızlı Ayarlar kutucuğu var ("Pano").
+- **Tarayıcı eşleştirme.** Eşleştirme kartında Tarayıcı sekmesi var (`--pair-offer-web`); motor web istemcisini `http://<masaüstü>:53317/web/` adresinde sunar. Tarayıcılar dosya ve metin gönderebilir, alamaz.
+- **Altı haneli eşleşme kodu.** QR eşleşmesinden sonra iki cihaz da iki anahtardan türetilen aynı kodu gösterir. Yanlış ya da değiştirilmiş bir QR iki farklı kod gösterir. `--devices` çıktısında da listelenir.
+- **Tek renk, temanızı izler.** Panel, pano ve başlatıcı simgesi Omarchy temasının ön plan rengini kullanır (logo seçeneği B); Android uygulaması telefonun açık/koyu temasını, web istemcisi tarayıcınınkini izler. İkincil metinler her Omarchy temasında WCAG AA kontrastını korur.
+
+**Geliştirmeler**
+- Diğer cihazlardan gelen adlardaki yön değiştirme (bidi) ve sıfır genişlikli karakterler temizlenir (`fatura<RLO>fdp.sh` artık `faturahs.pdf` gibi görünemez).
+- Gelen çalıştırılabilir dosyalar ve çift uzantılar aktarım isteğinde ve bildiriminde riskli dosya olarak işaretlenir.
+- Herkese açık OmaID artık kimlik bilgisi ya da anahtar olarak kullanılmaz; motor herkese açık istemci adreslerini reddeder ve gizli bilgileri durum çıktısına koymaz.
+- Pano ve İndirilenler izleyicileri olay tabanlı çalışır.
+
+**Hata düzeltmeleri**
+- Telefondan PC'ye gönderim "Permission denied (os error 13)" hatasıyla düşüyordu: çekirdek seçilen dosyaları açık tanımlayıcı üzerinden okuyor, korumalı (sandbox) daemon da giden dosyaları okuyabildiği yere hazırlıyor.
+- Reddedilen bir aktarım artık zaman aşımını beklemeden reddi bildiriyor.
+- Android: "Galeriden" seçeneği resim olarak kaydedilmiş eşleştirme QR'ıyla eşleşiyor; Hızlı Ayarlar kutucuğunun adı artık kesilmiyor; "1 cihaz" doğru yazılıyor.
+
+Tam liste: [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
@@ -46,7 +73,7 @@
 - **Çoklu Platform Ekosistemi:**
   - **Linux Masaüstü Eklentisi:** Yerel Quickshell QML widget'ı ve sertleştirilmiş Rust arka plan motoru (`omasend-engine`).
   - **Android Yerel Uygulaması:** Kotlin ve Jetpack Compose ile sıfır GMS bağımlılıklı CameraX QR/Barkod vizörü ve dokunsal titreşim desteği ([ozdil/omasend-android](https://github.com/ozdil/omasend-android)).
-  - **Web PWA İstemcisi:** Web Crypto API ve çevrimdışı Service Worker önbelleklemesi sunan kurulumsuz web istemcisi ([ozdil/omasend-web](https://github.com/ozdil/omasend-web)).
+  - **Web İstemcisi:** Motorun `/web/` adresinde sunduğu kurulumsuz tarayıcı istemcisi; QR ile eşleşir, dosya ve metin gönderir (yalnızca gönderir, yerel ağda şifresiz HTTP) ([ozdil/omasend-web](https://github.com/ozdil/omasend-web)).
 - **Sertleştirilmiş HANCORE Rust Motoru:**
   - Omarchy Linux Güvenlik Standartları ile tam uyum: Ayrı süreç grupları (`process_group(0)`), monoton yürütme sınırları, atomik geçici dosya yazımları (0600), `prctl(PR_SET_DUMPABLE, 0)` ve bellek sıfırlama (`Zeroize`).
 
@@ -101,7 +128,7 @@ omarchy-restart-shell
 ## Çoklu Platform Bağlantıları
 
 - **Android Uygulaması:** [ozdil/omasend-android](https://github.com/ozdil/omasend-android)
-- **Web PWA İstemcisi:** [ozdil/omasend-web](https://github.com/ozdil/omasend-web)
+- **Web İstemcisi:** [ozdil/omasend-web](https://github.com/ozdil/omasend-web)
 - **Google Play Kapalı Beta:** [Google Grubuna Katıl](https://groups.google.com/g/omasend-testers) & [Google Play Test Programına Katıl](https://play.google.com/apps/testing/io.omarchy.omasend)
 
 ---

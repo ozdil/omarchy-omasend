@@ -34,6 +34,7 @@ Rectangle {
     property string deviceKeyId: ""
     property string hostname: "Omarchy"
     property int refreshNonce: 0
+    property string appVersion: ""
 
     property bool showPair: false
     property bool pairOwn: true
@@ -67,6 +68,15 @@ Rectangle {
         return home ? (home + "/.local/bin/omasend-engine") : Qt.resolvedUrl("../omasend-engine").toString().replace(/^file:\/\//, "")
     }
     function engine() { return root.enginePath }
+    // Version for the About line, from the plugin's manifest one level up.
+    FileView {
+        path: Qt.resolvedUrl("../manifest.json").toString().replace(/^file:\/\//, "")
+        printErrors: false
+        onLoaded: {
+            try { root.appVersion = String(JSON.parse(text()).version || "") } catch (e) {}
+        }
+    }
+
     Process {
         id: engineLocator
         running: true
@@ -350,7 +360,7 @@ Rectangle {
                 Text {
                     Layout.fillWidth: true
                     visible: !root.showPair
-                    text: root.t("about_line")
+                    text: OmaI18n.aboutWithVersion(root.t("about_line"), root.appVersion)
                     font.family: Theme.fontFamily
                     font.pixelSize: 10
                     color: Theme.textDim

@@ -1,13 +1,13 @@
 # OmaSend - Peer-to-Peer AirBridge and Clipboard Sync for Omarchy Linux
 
 [![Omarchy Verified Plugin](https://img.shields.io/badge/Omarchy-Verified_Plugin-22c55e?style=for-the-badge&logo=omarchy)](https://github.com/ozdil)
-[![Release v2.0.0](https://img.shields.io/badge/Release-v2.0.0-38BDF8?style=for-the-badge&logo=rust)](https://github.com/ozdil/omarchy-omasend/releases)
+[![Release v2.0.9](https://img.shields.io/badge/Release-v2.0.9-38BDF8?style=for-the-badge&logo=rust)](https://github.com/ozdil/omarchy-omasend/releases)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy_Me_A_Coffee-Support_Development-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/ozdil)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](LICENSE)
 
 ![omasend Preview](preview.png)
 
-> **Direct file transfer and clipboard sync between Omarchy Linux and Android on your local network. Pair once with a QR code; after that everything between your devices is end-to-end encrypted. No accounts, no cloud.**
+> **Direct file transfer and clipboard sync between Omarchy Linux, Android and the browser. Pair once with a QR code; after that everything between your devices is end-to-end encrypted. With an optional anonymous OmaID your own devices also find each other over the internet. No sign-up, no e-mail, no tracking.**
 
 > [!IMPORTANT]
 > **Security status:** Devices paired by QR code (`omasend-engine --pair-offer`) use per-device Ed25519 keys and an encrypted, mutually authenticated QUIC/TLS 1.3 transport with BLAKE3-verified, resumable transfers. Devices that are *not* QR-paired still use the legacy HTTP path, which is **not encrypted** — use it only on networks you trust. Incoming transfers from anything other than your own paired devices always need your approval. Protocol details: [PROTOCOL_V2.md](PROTOCOL_V2.md).
@@ -15,8 +15,35 @@
 - **Author:** Ozan Özdil (ozdil)  
 - **License:** MIT  
 - **Plugin ID:** `ozdil.omasend`  
-- **Version:** `2.0.0`  
+- **Version:** `2.0.9`  
 - **Default Font:** `JetBrainsMono Nerd Font`
+
+---
+
+## What's new in 2.0.9
+
+The desktop, Android (2.0.9, versionCode 109) and web clients now share one version number.
+
+**New**
+- **OmaID, one anonymous number for all your devices.** A 16-digit number in the Mullvad style: no e-mail, no name, no phone number. The number itself is never sent; the registry at `id.omaid.app` only stores an Argon2id-derived id and an end-to-end encrypted, Ed25519-signed device list. A new device joins with the number plus a one-time approval on one of your devices (both show the same 6-digit code), or by scanning a join QR (`https://omaid.app/j#…`). Engine: `--account`, `--account-create`, `--account-join`, `--account-approve`, `--account-invite`, `--account-remove`, `--account-leave`.
+- **Your own devices over the internet.** With an OmaID, devices that are not on the same network connect through iroh relays (n0) and switch to a direct connection when the networks allow it. Relays only carry end-to-end encrypted QUIC/TLS 1.3 traffic. A transfer over 4 GiB waits for a direct connection.
+- **Shared clipboard, last copy wins.** Copies between your own devices carry their copy time; a copy older than 2 minutes, or older than the newest one already seen, is dropped, so a slow copy never overwrites a newer one. It is silent: no pop-up or sound per copy. On Android there is a Quick Settings tile ("Clipboard").
+- **Pair a browser.** The pairing card has a Browser tab (`--pair-offer-web`); the engine serves the web client at `http://<desktop>:53317/web/`. Browsers can send files and text, not receive.
+- **Six-digit pairing code.** After QR pairing both devices show the same code, derived from both keys. A wrong or swapped QR code shows two different codes. Also listed in `--devices`.
+- **One ink, follows your theme.** Panel, dashboard and launcher icon use the Omarchy theme's foreground (logo option B); the Android app follows the phone's light/dark theme and the web client the browser's. Secondary text keeps WCAG AA contrast on every Omarchy theme.
+
+**Improvements**
+- Names from other devices are cleaned of bidi overrides and zero-width characters (`invoice<RLO>fdp.sh` can no longer look like `invoicehs.pdf`).
+- Incoming executables and double extensions are flagged as risky files in the transfer request and its notification.
+- The public OmaID is no longer used as a credential or key; the engine refuses public client addresses and keeps secrets out of status output.
+- Clipboard and Downloads watchers are event driven.
+
+**Bug fixes**
+- Phone to PC sends failed with "Permission denied (os error 13)": the core now reads picked files through the open descriptor, and the sandboxed daemon stages outgoing files where it can read them.
+- A refused transfer now reports the refusal instead of waiting until it times out.
+- Android: "From gallery" pairs with a pairing QR saved as an image; the Quick Settings tile label is no longer cut off; "1 device" instead of "1 devices".
+
+Full list: [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
@@ -46,7 +73,7 @@
 - **Multi-Platform Ecosystem:**
   - **Linux Desktop Plugin:** Native Quickshell QML widget and hardened Rust daemon (`omasend-engine`).
   - **Android Native App:** Kotlin & Jetpack Compose app with CameraX zero-GMS QR/Barcode scanner and tactile haptic feedback ([ozdil/omasend-android](https://github.com/ozdil/omasend-android)).
-  - **Web PWA Client:** Zero-install web client with Web Crypto API and offline service worker caching ([ozdil/omasend-web](https://github.com/ozdil/omasend-web)).
+  - **Web Client:** Zero-install browser client served by the engine at `/web/`; pairs by QR and sends files and text (send-only, plain HTTP on the LAN) ([ozdil/omasend-web](https://github.com/ozdil/omasend-web)).
 - **Hardened HANCORE Rust Engine:**
   - Compliant with Omarchy Linux Security Standards: isolated process groups (`process_group(0)`), monotonic execution deadlines, atomic temporary file operations (mode 0600), `prctl(PR_SET_DUMPABLE, 0)`, and RAM zeroization (`Zeroize`).
 
@@ -103,7 +130,7 @@ omarchy-restart-shell
 ## Multi-Platform Ecosystem Links
 
 - **Android Companion App:** [ozdil/omasend-android](https://github.com/ozdil/omasend-android)
-- **Web PWA Client:** [ozdil/omasend-web](https://github.com/ozdil/omasend-web)
+- **Web Client:** [ozdil/omasend-web](https://github.com/ozdil/omasend-web)
 - **Google Play Closed Beta:** [Join Google Group](https://groups.google.com/g/omasend-testers) & [Opt-in on Google Play](https://play.google.com/apps/testing/io.omarchy.omasend)
 
 ---

@@ -1,6 +1,6 @@
 # Maintainer: Ozan Özdil <ozan@pm.me>
 pkgname=omarchy-omasend
-pkgver=2.0.0
+pkgver=2.0.9
 pkgrel=1
 pkgdesc="Local file and clipboard sharing between Omarchy and Android: QR pairing, end-to-end encrypted QUIC between paired devices"
 arch=('x86_64')
