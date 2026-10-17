@@ -1157,7 +1157,9 @@ pub fn generate_fallback_qr_svg(content: &str) -> String {
 
 /// QR code as SVG: black modules on white with a 4-module quiet zone, error correction M.
 pub fn qr_svg(content: &str) -> Option<String> {
-    let code = qrcode::QrCode::with_error_correction_level(content.as_bytes(), qrcode::EcLevel::M).ok()?;
+    // Level L: the codes are only ever shown on a clean screen, and the lower density
+    // (pairing link: 53 -> 45 modules) lets phone cameras decode them from further away.
+    let code = qrcode::QrCode::with_error_correction_level(content.as_bytes(), qrcode::EcLevel::L).ok()?;
     let width = code.width();
     let colors = code.to_colors();
     let quiet = 4;
@@ -1464,7 +1466,7 @@ mod tests {
         assert!(svg.starts_with(r#"<svg xmlns="http://www.w3.org/2000/svg""#));
         assert!(svg.ends_with("</svg>"));
         // A real QR code: (17 + 4*version) modules + 2x4 quiet zone.
-        let code = qrcode::QrCode::with_error_correction_level(b"omasend://identity/4829104857291104", qrcode::EcLevel::M).unwrap();
+        let code = qrcode::QrCode::with_error_correction_level(b"omasend://identity/4829104857291104", qrcode::EcLevel::L).unwrap();
         let side = code.width() + 8;
         assert_eq!((code.width() - 17) % 4, 0);
         assert!(svg.contains(&format!(r#"viewBox="0 0 {0} {0}""#, side)), "{}", &svg[..120]);
@@ -1472,6 +1474,15 @@ mod tests {
         // A pair URI (~200 chars) still encodes.
         let long = format!("omasend://pair?v=2&pk={}&s={}", "A".repeat(43), "b".repeat(64));
         assert!(qr_svg(&long).is_some());
+        // A real pairing link stays at version 7 (45 modules) so phones can scan it from the panel.
+        let pair = format!(
+            "omasend://pair?v=2&pk={}&s={}&h=192.168.100.200&p=53317&n={}&o=1&q=53318",
+            "A".repeat(43),
+            "b".repeat(43),
+            "desktop-name"
+        );
+        let svg = qr_svg(&pair).unwrap();
+        assert!(svg.contains(r#"viewBox="0 0 53 53""#), "{}", &svg[..120]);
     }
 
     #[test]
