@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/omasend-lockup-dark.svg">
+    <img src="assets/brand/omasend-lockup-light.svg" alt="OmaSend" width="420">
+  </picture>
+</p>
+
 # OmaSend - Omarchy Linux İçin Eşler Arası AirBridge ve Pano Senkronu
 
 [![Omarchy Onaylı Eklenti](https://img.shields.io/badge/Omarchy-Verified_Plugin-22c55e?style=for-the-badge&logo=omarchy)](https://github.com/ozdil)
