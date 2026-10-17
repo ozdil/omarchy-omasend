@@ -26,3 +26,10 @@ test("assetlinks only with valid fingerprints", () => {
 test("join page never puts the invite in markup", () => {
   assert.doesNotMatch(join(), /fetch\(|XMLHttpRequest|sendBeacon/);
 });
+
+test("pages follow the device theme without script", () => {
+  const html = join();
+  assert.match(html, /prefers-color-scheme:dark/);
+  assert.match(html, /<meta name="color-scheme" content="light dark">/);
+  assert.match(html, /theme-color" media="\(prefers-color-scheme: dark\)/);
+});
