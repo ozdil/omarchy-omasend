@@ -5016,10 +5016,14 @@ fn web_e2e_upload(
         return;
     };
 
-    let _ = fs::create_dir_all(&ddir);
+    // Same directory as the core's partials, so its 7-day sweep also removes a part file an
+    // engine crash left behind.
+    let part_dir = ddir.join(".omasend-partial");
+    let _ = fs::create_dir_all(&part_dir);
+    let _ = fs::set_permissions(&part_dir, fs::Permissions::from_mode(0o700));
     let mut rnd = [0u8; 8];
     let _ = getrandom::getrandom(&mut rnd);
-    let part = ddir.join(format!(".omasend-web-{}.part", hex::encode(rnd)));
+    let part = part_dir.join(format!("web-{}.part", hex::encode(rnd)));
     let decrypted = (|| -> Result<String, String> {
         let out = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&part).map_err(|e| e.to_string())?;
         let out = std::io::BufWriter::new(out);
@@ -10766,8 +10770,8 @@ mod tests {
         assert!(r.starts_with("HTTP/1.1 200"), "{}", r);
         assert_eq!(fs::read(get_download_dir().join("b.bin")).unwrap(), big);
         assert!(get_pending_transfer().is_none(), "transfer completes after the last file");
-        let leftovers: Vec<_> = fs::read_dir(get_download_dir()).unwrap().flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with(".omasend-web-")).collect();
+        let leftovers: Vec<_> = fs::read_dir(get_download_dir().join(".omasend-partial")).map(|d| d.flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("web-")).collect()).unwrap_or_default();
         assert!(leftovers.is_empty(), "no partial files left behind");
         server.join().unwrap();
 
