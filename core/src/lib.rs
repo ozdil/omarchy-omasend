@@ -7,7 +7,9 @@
 //! * Access control: connections from keys that are not paired are closed immediately.
 //! * Transfers: BLAKE3-verified, resumable (partial files are kept by content hash and
 //!   continued from their current length), cancellable, with progress callbacks.
-//! * LAN-only by default (no relays, no address publishing). WAN via n0 relays is opt-in.
+//! * LAN-only by default. With `wan`, connections can also go through n0's relays (with hole
+//!   punching); addresses are never published (no pkarr/DNS), a device's relay URL is only
+//!   shared inside the end-to-end encrypted account record.
 //!
 //! Wire protocol (ALPN `omasend/2`): length-prefixed JSON frames on one bi-directional
 //! control stream, raw file bytes on one uni-directional stream per file. See PROTOCOL_V2.md.
@@ -39,6 +41,10 @@ const MAX_CLIPBOARD: usize = 512 * 1024;
 const DECISION_TIMEOUT: Duration = Duration::from_secs(120);
 const CHUNK: usize = 256 * 1024;
 const PARTIAL_DIR: &str = ".omasend-partial";
+/// Largest transfer accepted while the connection only runs through a relay.
+const RELAY_MAX_BYTES: u64 = 4 << 30;
+/// How long an offer waits for hole punching before the relay limit applies.
+const DIRECT_PATH_GRACE: Duration = Duration::from_secs(3);
 /// Partial files untouched for this long are deleted when the node starts.
 const PARTIAL_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 
@@ -384,6 +390,24 @@ async fn serve_connection(inner: Arc<Inner>, conn: Connection, peer: String, tru
     }
 }
 
+/// True when, after a short grace period for hole punching, the connection still has no
+/// direct path. Relayed traffic stays end-to-end encrypted; the limit only protects the
+/// shared relay and the user's data plan from very large transfers.
+async fn relay_only(conn: &Connection) -> bool {
+    let deadline = tokio::time::Instant::now() + DIRECT_PATH_GRACE;
+    loop {
+        let paths = conn.paths();
+        let mut iter = paths.iter().peekable();
+        if iter.peek().is_none() || paths.iter().any(|p| p.is_ip()) {
+            return false;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn receive_transfer(
     inner: Arc<Inner>,
@@ -406,6 +430,10 @@ async fn receive_transfer(
         return linger(&conn, send).await;
     }
     let total: u64 = files.iter().map(|f| f.size).sum();
+    if total > RELAY_MAX_BYTES && relay_only(&conn).await {
+        write_msg(&mut send, &reject("too large for a relayed connection")).await?;
+        return linger(&conn, send).await;
+    }
     let partial_dir = inner.download_dir.join(PARTIAL_DIR);
     tokio::fs::create_dir_all(&partial_dir).await?;
     // Data already received for a resumable file does not need space again.
@@ -559,12 +587,18 @@ async fn receive_file(
     Ok(())
 }
 
+/// `addrs` holds "ip:port" hints and relay URLs ("https://...").
 fn endpoint_addr(peer_pk: &str, addrs: &[String]) -> Result<EndpointAddr, CoreError> {
     let pk = pk_from_string(peer_pk)?;
     let parsed: Vec<TransportAddr> = addrs
         .iter()
-        .filter_map(|a| a.parse::<SocketAddr>().ok())
-        .map(TransportAddr::Ip)
+        .filter_map(|a| {
+            if a.starts_with("https://") {
+                a.parse::<iroh::RelayUrl>().ok().map(TransportAddr::Relay)
+            } else {
+                a.parse::<SocketAddr>().ok().map(TransportAddr::Ip)
+            }
+        })
         .collect();
     Ok(EndpointAddr::from_parts(pk, parsed))
 }
@@ -602,7 +636,8 @@ impl OmaNode {
             let secret = SecretKey::from_bytes(&seed);
             let make = |p: u16| {
                 let b = if wan {
-                    Endpoint::builder(presets::N0)
+                    // Relays only: no address lookup, so nothing about this device is published.
+                    Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Default)
                 } else {
                     Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled)
                 };
@@ -643,6 +678,11 @@ impl OmaNode {
     /// Local UDP socket addresses (ip:port) other devices can dial.
     pub fn local_addrs(&self) -> Vec<String> {
         self.endpoint.bound_sockets().iter().map(|a| a.to_string()).collect()
+    }
+
+    /// The relay this node is reachable through ("" without `wan` or before it connects).
+    pub fn relay_url(&self) -> String {
+        self.endpoint.addr().relay_urls().next().map(|u| u.to_string()).unwrap_or_default()
     }
 
     pub fn bound_port(&self) -> u16 {
