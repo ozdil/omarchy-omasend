@@ -261,8 +261,29 @@ pub fn available_space(_dir: &Path) -> Option<u64> {
     None
 }
 
+/// Opens a file to read. Android hands content URIs over as `/proc/self/fd/N` of a descriptor
+/// it keeps open: re-opening that path goes back through the storage layer, which refuses an
+/// app without storage permission (EACCES), so duplicate the descriptor instead.
+async fn open_source(path: &Path) -> std::io::Result<tokio::fs::File> {
+    #[cfg(unix)]
+    if let Some(fd) = path
+        .to_str()
+        .and_then(|s| s.strip_prefix("/proc/self/fd/"))
+        .and_then(|n| n.parse::<std::os::fd::RawFd>().ok())
+    {
+        use std::os::fd::BorrowedFd;
+        // SAFETY: the caller keeps the descriptor open until send_files returns.
+        let owned = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?;
+        let mut f = tokio::fs::File::from_std(std::fs::File::from(owned));
+        // A duplicate shares the file offset with the original: always start at 0.
+        f.seek(std::io::SeekFrom::Start(0)).await?;
+        return Ok(f);
+    }
+    tokio::fs::File::open(path).await
+}
+
 async fn blake3_file(path: &Path, limit: Option<u64>) -> Result<(blake3::Hasher, u64), CoreError> {
-    let mut f = tokio::fs::File::open(path).await?;
+    let mut f = open_source(path).await?;
     let mut h = blake3::Hasher::new();
     let mut buf = vec![0u8; CHUNK];
     let mut total = 0u64;
@@ -721,7 +742,7 @@ async fn send_files_inner(
     let mut files = Vec::with_capacity(paths.len());
     for (i, p) in paths.iter().enumerate() {
         let path = PathBuf::from(p);
-        let meta = tokio::fs::metadata(&path).await?;
+        let meta = open_source(&path).await?.metadata().await?;
         if !meta.is_file() {
             return Err(fail(format!("not a regular file: {}", p)));
         }
@@ -757,7 +778,7 @@ async fn send_files_inner(
         let offset = resume[index].min(wf.size);
         let mut uni = conn.open_uni().await.map_err(|e| fail(chain(&e)))?;
         write_msg(&mut uni, &Msg::FileHeader { transfer_id: transfer_id.to_string(), index: index as u32, offset }).await?;
-        let mut f = tokio::fs::File::open(path).await?;
+        let mut f = open_source(path).await?;
         f.seek(std::io::SeekFrom::Start(offset)).await?;
         let mut done = offset;
         while done < wf.size {

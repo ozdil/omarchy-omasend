@@ -117,6 +117,29 @@ fn own_device_transfer_is_auto_accepted_and_verified() {
     p.b.shutdown();
 }
 
+/// Android passes content URIs as `/proc/self/fd/N`; re-opening that path is refused when the
+/// app has no storage permission. Simulated with a file the process may no longer open by path.
+#[cfg(unix)]
+#[test]
+fn send_from_proc_self_fd_without_reopening_the_path() {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
+    let p = pair(Trust::Own);
+    let src = tmp("fd");
+    let (f1, d1) = random_file(&src, "content-uri.bin", 300 * 1024 + 5);
+    let mut held = std::fs::File::open(&f1).unwrap();
+    let mut first = [0u8; 10];
+    held.read_exact(&mut first).unwrap(); // the shared offset must not leak into the send
+    std::fs::set_permissions(&f1, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let fd_path = format!("/proc/self/fd/{}", held.as_raw_fd());
+    p.a.send_files(p.b.endpoint_id(), p.b_addr.clone(), vec![fd_path], vec!["photo.bin".into()], String::new()).unwrap();
+    assert_eq!(std::fs::read(p.b_dir.join("photo.bin")).unwrap(), d1);
+    std::fs::set_permissions(&f1, std::fs::Permissions::from_mode(0o600)).unwrap();
+    p.a.shutdown();
+    p.b.shutdown();
+}
+
 #[test]
 fn paired_device_needs_approval() {
     let p = pair(Trust::Paired);
