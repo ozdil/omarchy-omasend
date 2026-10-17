@@ -8,8 +8,8 @@
 //! responder budgets those (see `RateLimiter`). Nothing derived from the
 //! number appears on the wire in a form that can be attacked offline.
 //!
-//! The legacy `oma_id` stays what beacons and v1 flows carry; it is now only a
-//! public label. Spec: PROTOCOL_V2.md, "Linking with an OmaID".
+//! The legacy `oma_id` is only a public label: the desktop no longer sends it in
+//! beacons or requests. Spec: PROTOCOL_V2.md, "Linking with an OmaID".
 
 use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
