@@ -1,6 +1,6 @@
 # Privacy Policy for OmaSend
 
-**Last Updated**: October 15, 2026
+**Last Updated**: October 17, 2026
 
 ## 1. Overview
 
@@ -26,6 +26,21 @@ All file transfers and clipboard synchronization events happen directly between 
 - Data between QR-paired devices streams directly over encrypted QUIC on UDP port `53318`; other peers use HTTP/TCP on port `53317` (or optional user-initiated Cloudflare WAN tunnels / STUN endpoint discovery when WAN mode is enabled).
 - No user files or clipboard contents are stored on any central cloud storage bucket operated by the developer.
 
+### 2.4 Optional OmaID Account
+An OmaID is an anonymous 16-digit account number that links your own devices. It is optional: nothing is sent to a server until you create or join an account. No email, phone number, name or password is ever asked for.
+
+When you use an account, the registry at `id.omaid.app` stores:
+- a lookup identifier derived from your number with Argon2id and HKDF (the number itself never leaves your devices);
+- an end-to-end encrypted record (AES-256-GCM) holding your devices' public keys, the names you gave them, and how to reach them. The key never leaves your devices, so the registry cannot read it;
+- per-device key boxes, each encrypted to one of your devices;
+- join requests from new devices, encrypted, until they are approved or expire after 15 minutes;
+- the record's version number and last update time.
+
+The registry keeps no IP addresses, user agents or request logs. Its hosting provider, Cloudflare, processes connection metadata (such as IP addresses) to deliver requests and to enforce rate limits. Deleting the account (leaving with your last device) removes the record immediately. Records that are not updated for a long time are removed automatically.
+
+### 2.5 Transfers over the Internet
+When your own devices are not on the same network, OmaSend connects them through public relay servers operated by n0 (the iroh project), and switches to a direct connection when the networks allow it. Everything that passes through a relay is end-to-end encrypted with QUIC/TLS 1.3 and bound to your devices' keys. The relay can see the two devices' IP addresses and public keys, and how much data passes and when; it cannot see file names, contents or clipboard text. Files over 4 GiB are only sent over a direct connection.
+
 ---
 
 ## 3. Permissions Used by the Application
@@ -45,13 +60,17 @@ OmaSend requests only the strictly minimum Android system permissions necessary 
 - **VIBRATE (`android.permission.VIBRATE`)**:
   Used to provide tactile haptic feedback during peer discovery and file transfer completion.
 - **CAMERA (`android.permission.CAMERA`)**:
-  Used solely when the user explicitly opens the QR code scanner to pair or sync an OmaID.
+  Used solely when the user explicitly opens the QR code scanner to pair a device or join an OmaID account.
 
 ---
 
 ## 4. Third-Party Services
 
 OmaSend does not integrate with advertising networks, analytics SDKs, or data brokers.
+
+Two services are used only for the optional features described above:
+- **Cloudflare** hosts the OmaID registry (`id.omaid.app`) and the `omaid.app` website.
+- **n0 relays** (iroh) forward end-to-end encrypted traffic between your own devices when they are on different networks.
 
 ---
 

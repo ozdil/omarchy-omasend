@@ -138,3 +138,17 @@ test("delete needs the account key; unknown routes", async () => {
   assert.equal((await handle(new Request("https://x/v1/account/xyz"), env, NOW)).status, 404);
   assert.equal((await handle(new Request(`https://x/v1/account/${ID}`, { method: "PUT" }), env, NOW)).status, 405);
 });
+
+test("reads keep an account alive, touched at most monthly", async () => {
+  const env = { DB: d1() };
+  const a = await key();
+  assert.equal((await put(env, a, 0)).status, 200);
+  const updated = () => env.DB.db.prepare("SELECT updated FROM accounts").get().updated;
+  const t0 = updated();
+  NOW += 10 * 24 * 3600;
+  await get(env);
+  assert.equal(updated(), t0, "recent accounts are not touched");
+  NOW += 30 * 24 * 3600;
+  await get(env);
+  assert.equal(updated(), NOW - (NOW % 86400), "touched, rounded to the day");
+});

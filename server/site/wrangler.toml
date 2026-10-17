@@ -1,0 +1,20 @@
+name = "omaid-site"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+workers_dev = false
+routes = [{ pattern = "omaid.app", custom_domain = true }]
+
+# Static pages only; no request logs.
+[observability]
+enabled = false
+
+[[rules]]
+type = "Text"
+globs = ["**/*.md"]
+fallthrough = true
+
+[vars]
+ANDROID_PACKAGE = "io.omarchy.omasend"
+# Comma-separated SHA-256 fingerprints of the Play app signing certificate
+# (Play Console > App integrity). Empty: no App Links file is served.
+ANDROID_CERT_SHA256 = ""

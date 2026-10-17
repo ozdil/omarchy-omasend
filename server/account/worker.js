@@ -11,6 +11,7 @@ export const MAX_KEYS = 64;
 export const MAX_KEY_BOX = 1024;
 export const MAX_JOINS = 8;
 export const MAX_JOIN_BLOB = 2048;
+export const TOUCH_EVERY = 30 * 24 * 3600;
 export const JOIN_TTL = 15 * 60;
 export const MAX_SKEW = 300;
 export const RESET_WAIT = 24 * 3600;
@@ -84,6 +85,12 @@ async function getRow(env, id) {
 async function getRecord(env, id, now) {
   const row = await getRow(env, id);
   if (!row) return null;
+  // Reads keep an account alive. Touch it at most monthly, rounded to the day, so the
+  // table does not record when members check in.
+  if (row.updated < now - TOUCH_EVERY) {
+    const day = now - (now % 86400);
+    await env.DB.prepare("UPDATE accounts SET updated = ? WHERE id = ? AND updated < ?").bind(day, id, now - TOUCH_EVERY).run();
+  }
   const { results } = await env.DB.prepare("SELECT rid, blob FROM joins WHERE id = ? AND created > ? ORDER BY created")
     .bind(id, now - JOIN_TTL)
     .all();
