@@ -204,6 +204,95 @@ shared Rust crate `core/` is used by the desktop engine directly and by Android 
   retried over plain HTTP, so blocking UDP cannot downgrade the transport. The signed-HTTP path
   above is for requests *to* this desktop from apps that do not speak QUIC yet.
 
+## Linking with an OmaID (`omasend-link-v1`)
+
+QR pairing needs both devices in hand. Linking lets a user add their *own* devices by typing
+one number, the way a Mullvad account number works, without that number ever being
+attackable offline.
+
+**Two numbers.** Every install now has:
+
+- the legacy `oma_id`: still carried in beacons and v1 requests, a public label only;
+- a secret **account OmaID** (`account_id` on desktop, mode 0600; Keystore-encrypted on
+  Android). Same format (16 digits, Luhn), generated randomly, **never sent anywhere**.
+  The user reads it in Settings and types it on another device.
+
+**Exchange.** The device where the user typed the number (initiator, I) runs SPAKE2 over
+P-256 against every nearby device whose beacon has a `pk` and is not trusted yet. Only a
+responder (R) holding the same account OmaID can complete it.
+
+- Points are SEC1 **compressed** (33 bytes); scalars are 32-byte big-endian.
+- `M`, `N`: for `seed` = `"omasend-link-v1 M"` / `"omasend-link-v1 N"`, the first
+  `ctr = 0, 1, …` for which `0x02 || SHA-256(seed || be32(ctr))` decodes to a curve point.
+- `w = SHA-256("omasend-link-v1|w|" || digits) mod n`, where `digits` is the 16 digits
+  without separators.
+- I: random `x`, `pA = x·G + w·M`. R: random `y`, `pB = y·G + w·N`.
+  `K = x·(pB − w·N) = y·(pA − w·M)`; the identity point is rejected everywhere.
+- `TT` = for each of `"omasend-link-v1"`, `pA`, `pB`, `K`, `w`: `le64(len) || bytes`.
+  `SHA-256(TT)` = `Ke` (first 16 bytes) `|| Ka` (last 16).
+- `KcA = HMAC(Ka, "omasend-link-v1 KcA")`, `KcB = HMAC(Ka, "omasend-link-v1 KcB")`,
+  `cA = HMAC(KcA, pA || pB)`, `cB = HMAC(KcB, pB || pA)`,
+  `box_key = HMAC(Ke, "omasend-link-v1 box")` (all HMAC-SHA256).
+- A **box** is `b64url(iv[12] || AES-256-GCM(box_key, iv, json, aad))` with
+  `aad = "omasend-link-v1 I"` (I → R) or `"omasend-link-v1 R"` (R → I).
+
+**HTTP** (plain JSON on the existing HTTP port; all binary fields `b64url`):
+
+1. `POST /api/v2/link/start {v:1, pA}` → `{sid, pB, cB}`.
+2. I checks `cB`. If it does not match, this device is on another account: I stops and
+   sends nothing more.
+3. `POST /api/v2/link/finish {sid, cA, box}`; I's box is
+   `{pk, name, quic_port, sig}` with `sig` = Ed25519 over `omasend-link-v1|pA|pB|I_pk`
+   (the b64url strings joined with `|`).
+4. R checks `cA`, opens the box, verifies `sig`, stores I as an **own** device and returns
+   `{box}`: `{pk, name, device_id, quic_port, sig}`, `sig` over
+   `omasend-link-v1|pA|pB|I_pk|R_pk`. I verifies it and stores R as own.
+5. On any success I adopts the typed number as its own account OmaID, so the next device
+   can link to either.
+
+**Responder limits.** Refused from loopback (the WAN tunnel) and while visibility is OFF.
+Every `start` is one online guess and is counted before any work: at most 5 per source IP
+and 20 in total per sliding 10 minutes, at most 32 open sessions. A session lives 30 s, is
+bound to the source IP and is consumed by its first `finish`. A successful `finish` gives
+its attempt back, so normal use never hits the limit. With 10^15 numbers and at most
+20 guesses per 10 minutes, finding a number online takes hundreds of millions of years.
+
+**Changing the number** (`--new-account-id`, "New number" on Android) affects future links
+only; devices already linked stay trusted until removed.
+
+### Own-device roster and removal
+
+Linked devices keep each other's list in step, so linking with any one of them joins you to
+all of them, and removing a device on one removes it everywhere.
+
+- `POST /api/v2/account/sync` with a **signed** v2 request (see "Signed requests") from a key
+  stored as an own device. Anything else is refused (401/403); loopback is refused.
+- Body: `{v:1, devices:[{pk, name, ip?, port, quic_port}], revoked:[pk]}`. `devices` holds the
+  sender itself plus its own devices (at most 64), `revoked` the removed keys (at most 256).
+- The receiver first applies `revoked`: each new key goes on its local revocation list and is
+  dropped from the trust store. If any key was new, the receiver also **replaces its account
+  OmaID** with a fresh random one, since the removed device knows the old number. If its own
+  key is on the list, it was removed: it forgets every own device and stops there.
+- Then every listed device that is not itself and not revoked is stored as an own device. The
+  sender's address is taken from the connection.
+- A device pushes its roster after a link (both sides), after removing an own device, and when
+  the engine or app starts. Pushes are best effort; a device that was off catches up on the next
+  push it receives.
+- Revoked keys can never link again (`/link/finish` and the initiator both refuse them).
+
+After a removal the remaining devices hold different account numbers. Each still works for
+linking a new device, and the roster then adds the new device to the rest.
+
+The roster carries no secrets: public keys, names and addresses, on the LAN.
+
+**Not covered yet:** WAN discovery still derives its topic from the legacy `oma_id`. Neither
+platform publishes those records anywhere today (desktop anchors are local files, the Android
+announcer has no caller), so nothing is exposed; the topic must move to a random account key
+before WAN discovery ships. The web client (`omasend-web`) is still v1 and cannot link.
+
+Desktop CLI: `--account-id [--json]`, `--new-account-id`, `--link <OmaID> [--json]`, and
+`--unpair <device-id>`, which removes an own device everywhere as above.
+
 ## Test vector (must match on both platforms)
 
 | Input | Value |
@@ -215,3 +304,18 @@ shared Rust crate `core/` is used by the desktop engine directly and by Android 
 | body_tag | `44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a` |
 | sig | `eFkLAbIm3RpexYvL_-DJ6IlojDwGoLd42QJ72_kyhpn7QA_GBOcYOOLoQPw7kI2GeNO0Bl0PZG60gJZvzI9oAA` |
 | mac | secret 32×`0x09`, R_pk = I_pk = pk → `58c09b0af9427c54894465e53a59c22480cb28449242df537932d4c659cd1fb7` |
+
+### `omasend-link-v1`
+
+Account OmaID `4539-1488-0343-6467`, `x = 7`, `y = 11` (all hex):
+
+| Value | |
+|---|---|
+| M | `02bf776f8c956317d2da49785228d6fd711af8a8ee32cb7aba70fd55925d94598e` |
+| N | `02eecd84e595f27077112ab183f037c87e132d36742eca41580dbfa80114b12f07` |
+| w | `8e139c2abae6f62f14b23470a7bc2e504ab4c23e00bc9e1361044ca4554d7a06` |
+| pA | `0230f5731715331f68be2bc69c91e0e3af2c416f559a571bcb6b9faa149e02cf1b` |
+| pB | `03ee51e9a4fcceb1b5a8900b4877dc7fc6d13bf10c9451c2e15a2eac27a39e9d18` |
+| cA | `b2977414cbce7c32aff0226f3a19c90d80e5e5b778b461f69e60242dbdcf56b0` |
+| cB | `0f52e972837c60c635948d111d5b2161d7119281d537c8bc89e6c36efdd01a44` |
+| box_key | `f28b858430952bdbde5c49716c49a9df60d6346e57bd7f042d2710ae5eb9b026` |

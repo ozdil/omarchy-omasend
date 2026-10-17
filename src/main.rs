@@ -2,6 +2,7 @@ mod subproc;
 pub mod devicekey;
 pub mod military;
 pub mod rendezvous;
+pub mod omalink;
 
 pub use rendezvous::{
     build_github_anchor_payload, compute_rendezvous_topic, create_stun_binding_request,
@@ -2694,7 +2695,63 @@ fn core_send_via_daemon(key: &devicekey::TrustedKey, paths: &[String], names: &[
                 (core_error_is_unavailable(&m), m)
             });
     }
-    core_daemon_request(serde_json::json!({ "pk": key.pk, "addrs": core_addrs(key), "paths": paths, "names": names }))
+    // The daemon runs under Landlock without read access to $HOME, so it cannot open the
+    // user's files itself (EACCES, "os error 13"). Hand it links or copies in a private
+    // directory it may read, and remove them once the (blocking) send has returned.
+    let stage = stage_outgoing_files(paths).map_err(|e| (false, format!("could not prepare files: {}", e)))?;
+    let staged: Vec<String> = stage.paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+    core_daemon_request(serde_json::json!({ "pk": key.pk, "addrs": core_addrs(key), "paths": staged, "names": names }))
+}
+
+fn outgoing_stage_root() -> PathBuf {
+    get_state_dir().join("outgoing")
+}
+
+/// Files handed to the sandboxed daemon for one send; the directory is removed on drop.
+struct OutgoingStage {
+    dir: PathBuf,
+    paths: Vec<PathBuf>,
+}
+
+impl Drop for OutgoingStage {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn stage_outgoing_files(paths: &[String]) -> std::io::Result<OutgoingStage> {
+    let mut rand_bytes = [0u8; 8];
+    let _ = getrandom::getrandom(&mut rand_bytes);
+    let dir = outgoing_stage_root().join(hex::encode(rand_bytes));
+    fs::create_dir_all(&dir)?;
+    let _ = fs::set_permissions(outgoing_stage_root(), fs::Permissions::from_mode(0o700));
+    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    let mut stage = OutgoingStage { dir, paths: Vec::with_capacity(paths.len()) };
+    for (i, src) in paths.iter().enumerate() {
+        // One subdirectory per file keeps the file name and avoids clashes between equal names.
+        let slot = stage.dir.join(i.to_string());
+        fs::create_dir(&slot)?;
+        let name = Path::new(src).file_name().map(|n| n.to_os_string()).unwrap_or_else(|| "file".into());
+        let dst = slot.join(name);
+        // A hard link is instant and costs no space; across file systems fall back to a copy.
+        if fs::hard_link(src, &dst).is_err() {
+            fs::copy(src, &dst)?;
+        }
+        stage.paths.push(dst);
+    }
+    Ok(stage)
+}
+
+/// Removes staging directories left behind by a CLI that was killed mid-send.
+fn clean_stale_outgoing() {
+    let Ok(entries) = fs::read_dir(outgoing_stage_root()) else { return };
+    let day = Duration::from_secs(24 * 3600);
+    for e in entries.flatten() {
+        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > day);
+        if old {
+            let _ = fs::remove_dir_all(e.path());
+        }
+    }
 }
 
 /// Encrypted clipboard push to a paired key. Never downgraded to plaintext HTTP.
@@ -3462,6 +3519,173 @@ fn inspect_pair_uri(uri: &str) -> Result<(devicekey::ParsedOffer, String), Strin
     let vk = devicekey::decode_pk(&offer.pk).ok_or("Invalid responder key")?;
     let device_id = devicekey::device_id_for_pk(vk.as_bytes());
     Ok((offer, device_id))
+}
+
+/// POSTs JSON to a peer's v2 HTTP API and returns the 200 body, or the peer's error.
+fn post_json_v2(addr: &str, path: &str, body: &serde_json::Value, timeout: Duration) -> Result<serde_json::Value, String> {
+    let body = body.to_string().into_bytes();
+    let mut stream = connect_peer_with_timeout(addr, timeout)?;
+    let _ = stream.set_read_timeout(Some(timeout));
+    let head = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        path,
+        addr,
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
+    stream.write_all(&body).map_err(|e| e.to_string())?;
+    let mut resp = Vec::new();
+    (&mut stream)
+        .take(MAX_PAIR_RESPONSE_BYTES + 1)
+        .read_to_end(&mut resp)
+        .map_err(|e| format!("Read failed: {}", e))?;
+    if resp.len() as u64 > MAX_PAIR_RESPONSE_BYTES {
+        return Err("Response exceeds size limit".to_string());
+    }
+    let header_end = resp.windows(4).position(|w| w == b"\r\n\r\n").ok_or("Malformed response")?;
+    let status_line = String::from_utf8_lossy(&resp[..header_end]).to_string();
+    let json: serde_json::Value = serde_json::from_slice(&resp[header_end + 4..]).map_err(|_| "Malformed response body".to_string())?;
+    if !status_line.starts_with("HTTP/1.1 200") {
+        return Err(json["error"].as_str().unwrap_or("Rejected by peer").to_string());
+    }
+    Ok(json)
+}
+
+/// Runs one "link with OmaID" exchange against a peer at `addr`.
+fn link_one(addr: &str, account_id: &str) -> Result<devicekey::TrustedKey, String> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let t = Duration::from_secs(4);
+    let ini = omalink::Initiator::new(account_id);
+    let pa_b64 = b64.encode(&ini.pa);
+    let start = post_json_v2(addr, "/api/v2/link/start", &serde_json::json!({ "v": 1, "pA": pa_b64 }), t)?;
+    let pb_b64 = start["pB"].as_str().ok_or("Missing pB")?.to_string();
+    let pb = b64.decode(&pb_b64).map_err(|_| "Invalid pB")?;
+    let c_b = b64.decode(start["cB"].as_str().ok_or("Missing cB")?).map_err(|_| "Invalid cB")?;
+    // Stops here for every device on another account; nothing more is sent.
+    let keys = ini.finish(&pb, &c_b)?;
+    let id = device_identity();
+    let my_quic = CORE_NODE.get().map(|n| n.bound_port()).unwrap_or(CORE_QUIC_PORT);
+    let finish = serde_json::json!({
+        "sid": start["sid"],
+        "cA": b64.encode(keys.c_a),
+        "box": omalink::initiator_box(id, &keys, &pa_b64, &pb_b64, &get_system_hostname(), my_quic),
+    });
+    let reply = post_json_v2(addr, "/api/v2/link/finish", &finish, t)?;
+    let peer = omalink::open_responder_box(&keys, &pa_b64, &pb_b64, &id.public_b64(), reply["box"].as_str().ok_or("Missing box")?)?;
+    if omalink::is_revoked(&get_state_dir(), &peer.pk) {
+        return Err("That device was removed from the account".into());
+    }
+    let vk = devicekey::decode_pk(&peer.pk).ok_or("Invalid responder key")?;
+    let (host, port) = addr.rsplit_once(':').unwrap_or((addr, "0"));
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let key = devicekey::TrustedKey {
+        pk: peer.pk,
+        device_id: devicekey::device_id_for_pk(vk.as_bytes()),
+        name: peer.name,
+        ip: host.trim_matches(|c| c == '[' || c == ']').to_string(),
+        port: port.parse().unwrap_or(0),
+        quic_port: peer.quic_port,
+        own_device: true,
+        added_at: now,
+        last_seen: now,
+    };
+    trust_store().upsert(key.clone())?;
+    Ok(key)
+}
+
+/// Links this device to every nearby device that holds `account_id`. On any
+/// success the number becomes this device's account OmaID too.
+fn link_with_account_id(account_id: &str) -> Result<Vec<devicekey::TrustedKey>, String> {
+    if !rendezvous::validate_oma_id(account_id) {
+        return Err("Invalid OmaID (16 digits, checksum mismatch)".into());
+    }
+    send_immediate_beacon_broadcast();
+    std::thread::sleep(Duration::from_millis(1500));
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let my_pk = device_identity().public_b64();
+    let known: Vec<String> = trust_store().load().into_iter().map(|k| k.pk).collect();
+    let targets: Vec<String> = get_discovered_peers()
+        .into_iter()
+        .filter(|p| !p.pk.is_empty() && p.pk != my_pk && !known.contains(&p.pk) && now.saturating_sub(p.last_seen_secs) < 120)
+        .filter(|p| !omalink::is_revoked(&get_state_dir(), &p.pk))
+        .filter_map(|p| p.ip.parse::<IpAddr>().ok().map(|ip| std::net::SocketAddr::new(ip, p.port).to_string()))
+        .collect();
+    if targets.is_empty() {
+        return Err("No new OmaSend devices nearby. Open OmaSend on the other device and keep it visible.".into());
+    }
+    let handles: Vec<_> = targets
+        .into_iter()
+        .map(|addr| {
+            let id = account_id.to_string();
+            std::thread::spawn(move || link_one(&addr, &id))
+        })
+        .collect();
+    let linked: Vec<devicekey::TrustedKey> = handles.into_iter().filter_map(|h| h.join().ok().and_then(Result::ok)).collect();
+    if linked.is_empty() {
+        return Err("No nearby device uses this OmaID".into());
+    }
+    omalink::set_account_id(&get_state_dir(), account_id)?;
+    for k in &linked {
+        notify_desktop("OmaSend: Device linked", &format!("{} ({}) is now one of your devices.", k.name, k.device_id));
+    }
+    push_roster();
+    Ok(linked)
+}
+
+/// Sends our own-device list and revocations to every own device we can address, so a
+/// link or removal on one device reaches all of them. Runs in the background.
+fn push_roster() {
+    std::thread::spawn(|| {
+        let state_dir = get_state_dir();
+        let store = trust_store();
+        let my_quic = CORE_NODE.get().map(|n| n.bound_port()).unwrap_or(CORE_QUIC_PORT);
+        let body = omalink::roster_body(&state_dir, &store, device_identity(), &get_system_hostname(), PORT, my_quic);
+        // The keys we just revoked get the list too, so they leave the account.
+        let revoked = omalink::load_revoked(&state_dir);
+        let discovered = get_discovered_peers();
+        let targets: Vec<String> = store
+            .load()
+            .into_iter()
+            .filter(|k| k.own_device)
+            .chain(discovered.iter().filter(|p| revoked.contains(&p.pk)).map(|p| devicekey::TrustedKey {
+                pk: p.pk.clone(),
+                device_id: String::new(),
+                name: p.name.clone(),
+                ip: p.ip.clone(),
+                port: p.port,
+                quic_port: 0,
+                own_device: true,
+                added_at: 0,
+                last_seen: 0,
+            }))
+            .filter_map(|k| {
+                let seen = discovered.iter().find(|p| p.pk == k.pk);
+                let ip = seen.map(|p| p.ip.clone()).unwrap_or(k.ip);
+                let port = seen.map(|p| p.port).filter(|p| *p != 0).unwrap_or(if k.port != 0 { k.port } else { PORT });
+                ip.parse::<IpAddr>().ok().map(|ip| std::net::SocketAddr::new(ip, port).to_string())
+            })
+            .collect();
+        let raw = body.to_string().into_bytes();
+        let auth = v2_auth_lines("POST", "/api/v2/account/sync", &devicekey::body_tag_json(&raw));
+        for addr in targets {
+            let raw = raw.clone();
+            let auth = auth.clone();
+            std::thread::spawn(move || {
+                let Ok(mut stream) = connect_peer_with_timeout(&addr, Duration::from_secs(3)) else { return };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+                let head = format!(
+                    "POST /api/v2/account/sync HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
+                    addr,
+                    raw.len(),
+                    auth
+                );
+                let _ = stream.write_all(head.as_bytes()).and_then(|_| stream.write_all(&raw));
+                let mut sink = Vec::new();
+                let _ = (&mut stream).take(4096).read_to_end(&mut sink);
+            });
+        }
+    });
 }
 
 /// Phase 1 initiator: scan/paste an `omasend://pair?...` link shown by the other device.
@@ -5506,6 +5730,125 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         return;
     }
 
+    if req.method == "POST" && req.path == "/api/v2/account/sync" {
+        if client_ip.to_canonical().is_loopback() {
+            respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Not available\"}", None, None);
+            return;
+        }
+        if content_length > MAX_CONTROL_BODY {
+            respond(&stream, "413 Payload Too Large", "application/json", b"{\"error\":\"Request payload exceeds limit\"}", None, None);
+            return;
+        }
+        let body_deadline = Instant::now() + Duration::from_secs(DEFAULT_BODY_TIMEOUT_SECS);
+        let Some(body) = read_http_body(&mut stream, content_length, &initial_body, body_deadline, false, MAX_CONTROL_BODY) else { return };
+        let Some(raw) = body.as_slice() else {
+            respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid request\"}", None, None);
+            return;
+        };
+        let ip = client_ip.to_canonical().to_string();
+        let devicekey::AuthResult::Trusted(sender) = v2_verify(&req, &devicekey::body_tag_json(raw), &ip) else {
+            respond(&stream, "401 Unauthorized", "application/json", b"{\"error\":\"Signed request from a linked device required\"}", None, None);
+            return;
+        };
+        let Ok(val) = serde_json::from_slice::<serde_json::Value>(raw) else {
+            respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid JSON\"}", None, None);
+            return;
+        };
+        match omalink::apply_roster(&get_state_dir(), &trust_store(), &device_identity().public_b64(), &sender, &ip, &val) {
+            Ok(out) => {
+                if out.self_revoked {
+                    notify_desktop("OmaSend", &format!("{} removed this device from your account.", sender.name));
+                } else if !out.added.is_empty() {
+                    notify_desktop("OmaSend: Devices linked", &format!("Now also linked: {}", out.added.join(", ")));
+                }
+                respond(&stream, "200 OK", "application/json", b"{\"ok\":true}", None, None);
+            }
+            Err(e) => respond(&stream, "403 Forbidden", "application/json", serde_json::json!({ "error": e }).to_string().as_bytes(), None, None),
+        }
+        return;
+    }
+
+    if req.method == "POST" && (req.path == "/api/v2/link/start" || req.path == "/api/v2/link/finish") {
+        // Linking is LAN-only: the WAN tunnel arrives from loopback, and a
+        // hidden device takes no guesses at all.
+        if client_ip.to_canonical().is_loopback() || get_visibility().0 == "OFF" {
+            respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Linking not available\"}", None, None);
+            return;
+        }
+        if content_length > MAX_CONTROL_BODY {
+            respond(&stream, "413 Payload Too Large", "application/json", b"{\"error\":\"Request payload exceeds limit\"}", None, None);
+            return;
+        }
+        let body_deadline = Instant::now() + Duration::from_secs(DEFAULT_BODY_TIMEOUT_SECS);
+        let body = match read_http_body(&mut stream, content_length, &initial_body, body_deadline, false, MAX_CONTROL_BODY) {
+            Some(b) => b,
+            None => return,
+        };
+        let val: serde_json::Value = match body.as_slice().and_then(|b| serde_json::from_slice(b).ok()) {
+            Some(v) => v,
+            None => {
+                respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid JSON\"}", None, None);
+                return;
+            }
+        };
+        let ip = client_ip.to_canonical();
+        let now = Instant::now();
+        if req.path == "/api/v2/link/start" {
+            let account = omalink::get_or_create_account_id(&get_state_dir());
+            let res = match (val["v"].as_u64(), val["pA"].as_str()) {
+                (Some(1), Some(pa)) => omalink::responder().lock().unwrap_or_else(|p| p.into_inner()).start(&account, ip, pa, now),
+                _ => Err(omalink::StartError::Bad("Unsupported link request".into())),
+            };
+            match res {
+                Ok(out) => respond(&stream, "200 OK", "application/json", out.to_string().as_bytes(), None, None),
+                Err(omalink::StartError::RateLimited) => {
+                    respond(&stream, "429 Too Many Requests", "application/json", b"{\"error\":\"Too many link attempts\"}", None, None)
+                }
+                Err(omalink::StartError::Bad(e)) => {
+                    respond(&stream, "400 Bad Request", "application/json", serde_json::json!({ "error": e }).to_string().as_bytes(), None, None)
+                }
+            }
+            return;
+        }
+        let my_quic = CORE_NODE.get().map(|n| n.bound_port()).unwrap_or(CORE_QUIC_PORT);
+        let res = omalink::responder()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .finish(device_identity(), &get_system_hostname(), my_quic, ip, &val, now);
+        match res {
+            Ok((peer, _)) if omalink::is_revoked(&get_state_dir(), &peer.pk) => {
+                respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"This device was removed from the account\"}", None, None);
+            }
+            Ok((peer, reply)) => {
+                let Some(vk) = devicekey::decode_pk(&peer.pk) else { return };
+                let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                let key = devicekey::TrustedKey {
+                    device_id: devicekey::device_id_for_pk(vk.as_bytes()),
+                    pk: peer.pk,
+                    name: peer.name,
+                    ip: ip.to_string(),
+                    port: 0,
+                    quic_port: peer.quic_port,
+                    own_device: true,
+                    added_at: ts,
+                    last_seen: ts,
+                };
+                let label = format!("{} ({})", key.name, key.device_id);
+                if trust_store().upsert(key).is_err() {
+                    respond(&stream, "500 Internal Server Error", "application/json", b"{\"error\":\"Failed to store device key\"}", None, None);
+                    return;
+                }
+                notify_desktop("OmaSend: Device linked", &format!("{} is now one of your devices.", label));
+                respond(&stream, "200 OK", "application/json", reply.to_string().as_bytes(), None, None);
+                push_roster();
+            }
+            Err(e) => {
+                respond(&stream, "403 Forbidden", "application/json", serde_json::json!({ "error": e }).to_string().as_bytes(), None, None);
+            }
+        }
+        return;
+    }
+
     if req.method == "POST" && req.path == "/api/v2/pair" {
         if get_visibility().0 == "OFF" {
             respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Recipient AirBridge visibility is turned Off\"}", None, None);
@@ -5658,13 +6001,13 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
     if req.method == "POST" && req.path == "/api/p2p/request" {
         let (vis, _) = get_visibility();
         if vis == "OFF" {
-            let err = serde_json::json!({ "error": "Recipient AirBridge visibility is turned Off" });
+            let err = serde_json::json!({ "status": "REJECTED", "error": "Recipient AirBridge visibility is turned Off" });
             respond(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
             return;
         }
 
         if content_length > MAX_CONTROL_BODY {
-            let err = serde_json::json!({ "error": "Request payload exceeds control limit" });
+            let err = serde_json::json!({ "status": "REJECTED", "error": "Request payload exceeds control limit" });
             respond(&stream, "413 Payload Too Large", "application/json", err.to_string().as_bytes(), None, None);
             return;
         }
@@ -5678,14 +6021,14 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         let body_slice = match body.as_slice() {
             Some(s) => s,
             None => {
-                respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid JSON request\"}", None, None);
+                respond(&stream, "400 Bad Request", "application/json", b"{\"status\":\"REJECTED\",\"error\":\"Invalid JSON request\"}", None, None);
                 return;
             }
         };
         let req_data: serde_json::Value = match serde_json::from_slice(body_slice) {
             Ok(v) => v,
             Err(_) => {
-                respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid JSON request\"}", None, None);
+                respond(&stream, "400 Bad Request", "application/json", b"{\"status\":\"REJECTED\",\"error\":\"Invalid JSON request\"}", None, None);
                 return;
             }
         };
@@ -5693,7 +6036,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             devicekey::AuthResult::Trusted(k) => Some(k),
             devicekey::AuthResult::Absent => None,
             devicekey::AuthResult::Rejected(why) => {
-                let err = serde_json::json!({ "error": format!("Signature rejected: {}", why) });
+                let err = serde_json::json!({ "status": "REJECTED", "error": format!("Signature rejected: {}", why) });
                 respond(&stream, "401 Unauthorized", "application/json", err.to_string().as_bytes(), None, None);
                 return;
             }
@@ -5728,7 +6071,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         let is_same_owner = is_valid_sender_omaid && constant_time_eq_str(&norm_sender, &my_norm);
 
         if !is_valid_sender_omaid {
-            let err = serde_json::json!({ "error": "Valid 16-digit OmaID required to send files" });
+            let err = serde_json::json!({ "status": "REJECTED", "error": "Valid 16-digit OmaID required to send files" });
             respond(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
             return;
         }
@@ -5743,7 +6086,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                         .unwrap_or_default();
                     if let Some(ref expected_tok) = peer_record.auth_token {
                         if !expected_tok.is_empty() && (provided_token.is_empty() || !constant_time_eq_str(expected_tok, provided_token)) {
-                            let err = serde_json::json!({ "error": "Invalid peer authentication token" });
+                            let err = serde_json::json!({ "status": "REJECTED", "error": "Invalid peer authentication token" });
                             respond(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
                             return;
                         }
@@ -5758,7 +6101,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         // a legacy pairing that completed the code-verified handshake (its token was checked
         // above). EVERYONE is the time-limited opt-in for strangers (M9).
         if vis == "KNOWN" && v2_key.is_none() && !is_peer_confirmed(&sender_id) {
-            let err = serde_json::json!({ "error": "Recipient only accepts transfers from paired devices" });
+            let err = serde_json::json!({ "status": "REJECTED", "error": "Recipient only accepts transfers from paired devices" });
             respond(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
             return;
         }
@@ -5835,7 +6178,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         };
         // V2-FUNC-01: single pending slot; check and save under one lock (M10).
         if !claim_pending_slot(&transfer, v2_key.is_some()) {
-            let err = serde_json::json!({ "error": "Another transfer is in progress. Please retry shortly." });
+            let err = serde_json::json!({ "status": "REJECTED", "error": "Another transfer is in progress. Please retry shortly." });
             respond(&stream, "409 Conflict", "application/json", err.to_string().as_bytes(), None, Some(&[("Retry-After", "30")]));
             return;
         }
@@ -6859,6 +7202,7 @@ fn run_server() {
     }
 
     ensure_local_api_token();
+    clean_stale_outgoing();
     start_core_node();
 
     let pid_file = state_dir.join("engine.pid");
@@ -6892,6 +7236,11 @@ fn run_server() {
     // Spawn P2P AirBridge discovery threads
     thread::spawn(run_p2p_discovery_listener);
     thread::spawn(run_p2p_beacon_broadcaster);
+    // Catch up own devices that missed a link or removal while we were off.
+    thread::spawn(|| {
+        thread::sleep(Duration::from_secs(10));
+        push_roster();
+    });
     start_download_dir_watcher(&get_download_dir());
     start_clipboard_sentinel();
 
@@ -6943,6 +7292,45 @@ fn main() {
     }
 
     // ---- Phase 1: device keys & QR pairing ----
+    if args.iter().any(|a| a == "--account-id") {
+        let id = omalink::get_or_create_account_id(&get_state_dir());
+        if args.iter().any(|a| a == "--json") {
+            println!("{}", serde_json::json!({ "account_id": id }));
+        } else {
+            println!("{}", id);
+        }
+        return;
+    }
+    if args.iter().any(|a| a == "--new-account-id") {
+        println!("{}", omalink::new_account_id(&get_state_dir()));
+        return;
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--link") {
+        let Some(id) = args.get(pos + 1) else {
+            eprintln!("Usage: --link <OmaID> [--json]");
+            std::process::exit(2);
+        };
+        let res = link_with_account_id(id);
+        if args.iter().any(|a| a == "--json") {
+            let out = match &res {
+                Ok(keys) => serde_json::json!({
+                    "ok": true,
+                    "linked": keys.iter().map(|k| serde_json::json!({ "name": k.name, "device_id": k.device_id })).collect::<Vec<_>>(),
+                }),
+                Err(e) => serde_json::json!({ "ok": false, "error": e }),
+            };
+            println!("{}", out);
+        } else {
+            match &res {
+                Ok(keys) => keys.iter().for_each(|k| println!("Linked {} ({})", k.name, k.device_id)),
+                Err(e) => eprintln!("Link failed: {}", e),
+            }
+        }
+        if res.is_err() {
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--device-id") {
         println!("{}", device_identity().device_id());
         return;
@@ -7007,7 +7395,23 @@ fn main() {
             eprintln!("Usage: --unpair <device-id>");
             std::process::exit(2);
         };
-        match trust_store().remove(id) {
+        let store = trust_store();
+        if let Some(k) = store.load().into_iter().find(|k| k.own_device && (k.pk == *id || k.device_id == *id)) {
+            match omalink::revoke_own_device(&get_state_dir(), &store, &k.pk) {
+                Ok(()) => {
+                    push_roster();
+                    // Give the background push a moment before the CLI process exits.
+                    std::thread::sleep(Duration::from_secs(4));
+                    println!("Removed {} from all your devices. Your account OmaID was replaced.", k.name);
+                }
+                Err(e) => {
+                    eprintln!("Failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        match store.remove(id) {
             Ok(true) => println!("Removed {}", id),
             Ok(false) => {
                 eprintln!("No paired device {}", id);
@@ -7832,7 +8236,7 @@ mod tests {
 
     #[test]
     fn test_p2p_request_and_clipboard_require_paired_oma_id() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         clear_pending_transfer();
         set_visibility("KNOWN");
 
@@ -8355,6 +8759,28 @@ mod tests {
     }
 
     #[test]
+    fn test_outgoing_stage_links_files_and_cleans_up() {
+        let src_dir = std::env::temp_dir().join(format!("omasend_stage_src_{}", std::process::id()));
+        fs::create_dir_all(&src_dir).unwrap();
+        let a = src_dir.join("photo.jpg");
+        let b = src_dir.join("sub_photo.jpg");
+        fs::write(&a, b"one").unwrap();
+        fs::write(&b, b"two").unwrap();
+        let paths = vec![a.to_string_lossy().to_string(), b.to_string_lossy().to_string()];
+        let dir;
+        {
+            let stage = stage_outgoing_files(&paths).unwrap();
+            dir = stage.dir.clone();
+            assert!(stage.paths[0].starts_with(get_state_dir()));
+            assert_eq!(stage.paths[0].file_name().unwrap(), "photo.jpg");
+            assert_eq!(fs::read(&stage.paths[1]).unwrap(), b"two");
+        }
+        assert!(!dir.exists());
+        assert!(a.exists() && b.exists());
+        let _ = fs::remove_dir_all(&src_dir);
+    }
+
+    #[test]
     fn test_military_landlock_and_anti_forensics_lifecycle() {
         use crate::military::{enable_anti_forensics, enable_landlock_sandbox};
 
@@ -8413,7 +8839,7 @@ mod tests {
 
     #[test]
     fn test_instant_clipboard_delivery_and_hash_tracking() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let test_text = format!("Unique test note {}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos());
         let expected_hash = compute_clipboard_hash(&test_text);
         assert_eq!(expected_hash.len(), 64);
@@ -8428,7 +8854,7 @@ mod tests {
 
     #[test]
     fn test_anti_echo_loop_and_sha256_hash_tracking() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let payload = "Secret Omnipresent Clipboard Sync Payload";
         let expected_hash = compute_clipboard_hash(payload);
         assert!(!expected_hash.is_empty());
@@ -8445,7 +8871,7 @@ mod tests {
 
     #[test]
     fn test_clipboard_vault_max_capacity_truncation() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let mut test_vault = ClipboardVault::default();
         for i in 0..30 {
             test_vault.items.insert(0, ClipboardItem {
@@ -8811,7 +9237,7 @@ mod tests {
 
     #[test]
     fn test_clip_staging_and_mode_0600_isolation() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
 
         let mut png_bytes = Vec::new();
         png_bytes.extend_from_slice(b"\x89PNG\r\n\x1a\n");
@@ -8841,7 +9267,7 @@ mod tests {
 
     #[test]
     fn test_clip_staging_lru_cleanup_policy() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let staging_dir = get_clip_staging_dir();
 
         // Create a dummy valid PNG template
@@ -8873,7 +9299,7 @@ mod tests {
 
     #[test]
     fn test_image_clipboard_hash_and_metadata_serialization() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let dummy_hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
         let item = ClipboardItem {
@@ -8902,7 +9328,7 @@ mod tests {
 
     #[test]
     fn test_http_p2p_instant_text_clipboard_sync() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         set_visibility("ALL");
         let valid_raw_oma_id = rendezvous::generate_raw_oma_id();
         let valid_peer_oma_id = rendezvous::format_oma_id(&valid_raw_oma_id);
@@ -8937,7 +9363,8 @@ mod tests {
         client.write_all(req.as_bytes()).unwrap();
         client.write_all(&post_bytes).unwrap();
         let mut resp = String::new();
-        client.read_to_string(&mut resp).unwrap();
+        // The server may close before reading the whole request; keep what it sent.
+        let _ = client.read_to_string(&mut resp);
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "POST /api/p2p/clipboard must return 200 OK: {}", resp);
 
         let last_synced = get_last_synced_clipboard_hash();
@@ -8948,7 +9375,7 @@ mod tests {
 
     #[test]
     fn test_http_p2p_image_and_vault_endpoints() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         set_visibility("ALL");
         let valid_raw_oma_id = rendezvous::generate_raw_oma_id();
         let valid_peer_oma_id = rendezvous::format_oma_id(&valid_raw_oma_id);
@@ -9048,7 +9475,7 @@ mod tests {
 
     #[test]
     fn test_p2p_clipboard_rejects_invalid_or_missing_auth_token() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         set_visibility("ALL");
         let valid_raw_oma_id = rendezvous::generate_raw_oma_id();
         let valid_peer_oma_id = rendezvous::format_oma_id(&valid_raw_oma_id);
@@ -9103,7 +9530,7 @@ mod tests {
 
     #[test]
     fn test_webp_thumbnail_generation_and_caching() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
 
         // Create valid 128x128 test PNG
         let mut png_bytes = Vec::new();
@@ -9142,7 +9569,7 @@ mod tests {
 
     #[test]
     fn test_webp_thumbnail_security_and_bounds() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let staging_dir = get_clip_staging_dir();
 
         // 1. Path traversal hash rejection
@@ -9179,7 +9606,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_clip_staging_with_thumbnails() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let staging_dir = get_clip_staging_dir();
 
         let mut png_template = Vec::new();
@@ -9219,7 +9646,8 @@ mod tests {
         c.write_all(req.as_bytes()).unwrap();
         c.write_all(&bytes).unwrap();
         let mut resp = String::new();
-        c.read_to_string(&mut resp).unwrap();
+        // The server may close before reading the whole request; keep what it sent.
+        let _ = c.read_to_string(&mut resp);
         resp
     }
 
@@ -9651,7 +10079,8 @@ mod tests {
         c.write_all(req.as_bytes()).unwrap();
         c.write_all(body).unwrap();
         let mut resp = String::new();
-        c.read_to_string(&mut resp).unwrap();
+        // The server may close before reading the whole request; keep what it sent.
+        let _ = c.read_to_string(&mut resp);
         server.join().unwrap();
 
         assert!(resp.starts_with("HTTP/1.1 413"), "Oversized upload must be rejected: {}", resp);
@@ -9973,7 +10402,8 @@ mod tests {
             c.write_all(head.as_bytes()).unwrap();
             c.write_all(&body).unwrap();
             let mut resp = String::new();
-            c.read_to_string(&mut resp).unwrap();
+            // The server may close before reading the whole request; keep what it sent.
+            let _ = c.read_to_string(&mut resp);
             server.join().unwrap();
             assert!(resp.starts_with("HTTP/1.1 200"), "{}", resp);
             let saved = get_download_dir().join(&name);
