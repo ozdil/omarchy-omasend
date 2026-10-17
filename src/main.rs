@@ -1216,68 +1216,164 @@ fn notify_desktop(title: &str, body: &str) {
     }
 }
 
+/// A file that appeared in Downloads is announced once it has been quiet this long, so a
+/// receive path that records the file itself (record_notified_file) right after its rename
+/// wins and there is no double notification.
+const DOWNLOAD_SETTLE: Duration = Duration::from_millis(1500);
+/// Fallback rescan interval when inotify is unavailable.
+const DOWNLOAD_RESCAN_FALLBACK: Duration = Duration::from_secs(15);
+
+fn is_ignored_download_name(fname: &str) -> bool {
+    fname.starts_with('.') || fname.ends_with(".part") || fname.ends_with(".crdownload")
+}
+
+/// Regular files currently in `dir` (names only).
+fn list_download_files(dir: &Path) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|ft| ft.is_file()) {
+                out.insert(entry.file_name().to_string_lossy().to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Notifies about `fname` unless it is already known or a receive path recorded it.
+fn announce_download(dir: &Path, fname: &str, known: &mut std::collections::HashSet<String>) {
+    if is_ignored_download_name(fname) || known.contains(fname) {
+        return;
+    }
+    known.insert(fname.to_string());
+    if is_recently_notified(fname) {
+        return;
+    }
+    let size = match fs::symlink_metadata(dir.join(fname)) {
+        Ok(m) if m.file_type().is_file() => m.len(),
+        _ => return,
+    };
+    if size == 0 {
+        known.remove(fname);
+        return;
+    }
+    record_notified_file(fname);
+    RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
+    notify_desktop(
+        "OmaSend: Dosya Alindi",
+        &format!("'{}' ({} bayt) Downloads/omasend dizinine kaydedildi.", fname, size),
+    );
+}
+
+/// Watches Downloads for files dropped in by other tools. Event-driven (inotify): the thread
+/// sleeps in poll(2) until something changes, instead of rescanning the directory every 1.5 s.
 fn start_download_dir_watcher(download_dir: &Path) {
     let dir = download_dir.to_path_buf();
     thread::spawn(move || {
-        let mut known_files: std::collections::HashSet<String> = std::collections::HashSet::new();
-        // Initial scan: record existing files so we don't send notifications for old files
-        if let Ok(entries) = fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                if let Ok(ft) = entry.file_type() {
-                    if ft.is_file() {
-                        let fname = entry.file_name().to_string_lossy().to_string();
-                        record_notified_file(&fname);
-                        known_files.insert(fname);
-                    }
-                }
-            }
+        // Files already there are not announced.
+        let mut known = list_download_files(&dir);
+        for f in &known {
+            record_notified_file(f);
         }
-
-        let mut previous_sizes: HashMap<String, u64> = HashMap::new();
-
         loop {
-            thread::sleep(Duration::from_millis(1500));
-            if let Ok(entries) = fs::read_dir(&dir) {
-                let mut current_files: std::collections::HashSet<String> = std::collections::HashSet::new();
-                for entry in entries.flatten() {
-                    if let Ok(ft) = entry.file_type() {
-                        if !ft.is_file() {
-                            continue;
-                        }
-                        let fname = entry.file_name().to_string_lossy().to_string();
-                        if fname.starts_with('.') || fname.ends_with(".part") || fname.ends_with(".crdownload") {
-                            continue;
-                        }
-                        current_files.insert(fname.clone());
-                        if known_files.contains(&fname) || is_recently_notified(&fname) {
-                            known_files.insert(fname.clone());
-                            previous_sizes.remove(&fname);
-                            continue;
-                        }
-
-                        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                        if let Some(&prev_size) = previous_sizes.get(&fname) {
-                            if prev_size == size && size > 0 {
-                                record_notified_file(&fname);
-                                known_files.insert(fname.clone());
-                                previous_sizes.remove(&fname);
-                                RECEIVED_COUNTER.fetch_add(1, Ordering::SeqCst);
-                                notify_desktop(
-                                    "OmaSend: Dosya Alindi",
-                                    &format!("'{}' ({} bayt) Downloads/omasend dizinine kaydedildi.", fname, size),
-                                );
-                            } else {
-                                previous_sizes.insert(fname, size);
-                            }
-                        } else {
-                            previous_sizes.insert(fname, size);
-                        }
-                    }
+            if !watch_downloads_inotify(&dir, &mut known) {
+                // No inotify (or the directory went away): slow rescan, then try again.
+                thread::sleep(DOWNLOAD_RESCAN_FALLBACK);
+                let current = list_download_files(&dir);
+                known.retain(|f| current.contains(f));
+                for f in current {
+                    announce_download(&dir, &f, &mut known);
                 }
-                known_files.retain(|f| current_files.contains(f));
             }
         }
     });
+}
+
+/// Runs until the watch ends (directory deleted or moved). Returns false if inotify could not
+/// be set up at all.
+fn watch_downloads_inotify(dir: &Path, known: &mut std::collections::HashSet<String>) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(cpath) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else { return false };
+    // SAFETY: plain syscalls on a descriptor owned by this function (closed below).
+    let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+    if fd < 0 {
+        return false;
+    }
+    let mask = libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO | libc::IN_MOVED_FROM | libc::IN_DELETE | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF;
+    // SAFETY: fd is a valid inotify descriptor and cpath a NUL-terminated path.
+    if unsafe { libc::inotify_add_watch(fd, cpath.as_ptr(), mask) } < 0 {
+        unsafe { libc::close(fd) };
+        return false;
+    }
+    // Catch anything that arrived between the initial listing and the watch.
+    let current = list_download_files(dir);
+    known.retain(|f| current.contains(f));
+    let mut pending: HashMap<String, Instant> = current.into_iter().filter(|f| !known.contains(f)).map(|f| (f, Instant::now())).collect();
+
+    let mut buf = [0u8; 8192];
+    'watch: loop {
+        // Block indefinitely when nothing is waiting to settle.
+        let timeout_ms = pending
+            .values()
+            .map(|t| DOWNLOAD_SETTLE.saturating_sub(t.elapsed()).as_millis() as i32 + 1)
+            .min()
+            .unwrap_or(-1);
+        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        // SAFETY: one valid pollfd.
+        let ready = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if ready < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            break;
+        }
+        if ready > 0 {
+            // SAFETY: reads into a buffer we own, at most its length.
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            let mut off = 0usize;
+            let n = n as usize;
+            // struct inotify_event { int wd; u32 mask; u32 cookie; u32 len; char name[len]; }
+            while off + 16 <= n {
+                let ev_mask = u32::from_ne_bytes([buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7]]);
+                let len = u32::from_ne_bytes([buf[off + 12], buf[off + 13], buf[off + 14], buf[off + 15]]) as usize;
+                let name_bytes = &buf[off + 16..(off + 16 + len).min(n)];
+                off += 16 + len;
+                let name = String::from_utf8_lossy(name_bytes.split(|b| *b == 0).next().unwrap_or_default()).to_string();
+                if ev_mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF | libc::IN_IGNORED) != 0 {
+                    break 'watch;
+                }
+                if ev_mask & libc::IN_Q_OVERFLOW != 0 {
+                    let current = list_download_files(dir);
+                    known.retain(|f| current.contains(f));
+                    for f in current.into_iter().filter(|f| !known.contains(f)) {
+                        pending.insert(f, Instant::now());
+                    }
+                    continue;
+                }
+                if name.is_empty() || is_ignored_download_name(&name) {
+                    continue;
+                }
+                if ev_mask & (libc::IN_DELETE | libc::IN_MOVED_FROM) != 0 {
+                    known.remove(&name);
+                    pending.remove(&name);
+                } else if ev_mask & (libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO) != 0 {
+                    // A rewrite of a known name is not a new file; one that was deleted and
+                    // created again is (it left `known` on delete).
+                    if !known.contains(&name) {
+                        pending.insert(name, Instant::now());
+                    }
+                }
+            }
+        }
+        let settled: Vec<String> = pending.iter().filter(|(_, t)| t.elapsed() >= DOWNLOAD_SETTLE).map(|(f, _)| f.clone()).collect();
+        for f in settled {
+            pending.remove(&f);
+            announce_download(dir, &f, known);
+        }
+    }
+    // SAFETY: closing the descriptor opened above.
+    unsafe { libc::close(fd) };
+    true
 }
 
 pub const MAX_CLIPBOARD_VAULT_ITEMS: usize = 20;
@@ -2050,6 +2146,61 @@ pub fn p2p_fetch_image_clipboard_and_apply(sender_ip: &str, hash: &str, _content
     });
 }
 
+/// Fallback poll interval when `wl-paste --watch` is not available (X11, old wl-clipboard).
+const CLIPBOARD_POLL_FALLBACK: Duration = Duration::from_secs(1);
+
+/// Checks the text clipboard once and pushes it to own devices if it changed.
+fn on_clipboard_maybe_changed() {
+    // Images are not synced automatically: the encrypted channel carries text only, and
+    // images used to go to legacy peers over plaintext HTTP (M6). Image clipboards are
+    // not valid text (see is_valid_text_clipboard), so they are skipped below.
+    let text = get_pc_clipboard();
+    if text.trim().is_empty() {
+        return;
+    }
+
+    let hash = compute_clipboard_hash(&text);
+    if get_last_synced_clipboard_hash().as_deref() == Some(&hash) {
+        return;
+    }
+    set_last_synced_clipboard_hash(&hash);
+
+    // Sensitive Clipboard Shield: Never broadcast passwords, secret keys, or credentials
+    if military::is_sensitive_clipboard_payload(&text) {
+        return;
+    }
+
+    auto_push_clipboard_text(&text);
+}
+
+/// One long-lived `wl-paste --watch` process. For every clipboard change it runs a tiny shell
+/// command that discards the content and prints one line, so the sentinel wakes only when the
+/// clipboard actually changes instead of spawning wl-paste four times a second.
+fn spawn_clipboard_watch() -> Option<std::process::Child> {
+    if !Path::new("/usr/bin/wl-paste").is_file() || !Path::new("/usr/bin/sh").is_file() {
+        return None;
+    }
+    let mut cmd = Command::new("/usr/bin/wl-paste");
+    cmd.args(["--watch", "/usr/bin/sh", "-c", "cat >/dev/null; echo"])
+        .env_clear()
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0);
+    for (k, v) in get_desktop_gui_envs() {
+        cmd.env(k, v);
+    }
+    // SAFETY: prctl is async-signal-safe; the watcher must not outlive the daemon.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            Ok(())
+        });
+    }
+    cmd.spawn().ok()
+}
+
 pub fn start_clipboard_sentinel() {
     thread::spawn(move || {
         let initial_text = get_pc_clipboard();
@@ -2059,33 +2210,32 @@ pub fn start_clipboard_sentinel() {
         }
 
         loop {
-            thread::sleep(Duration::from_millis(250));
-
-            // Images are not synced automatically: the encrypted channel carries text only, and
-            // images used to go to legacy peers over plaintext HTTP (M6). Image clipboards are
-            // not valid text (see is_valid_text_clipboard), so they are skipped below.
-
-            // Check text clipboard
-            let text = get_pc_clipboard();
-            if text.trim().is_empty() {
-                continue;
+            let started = Instant::now();
+            if let Some(mut child) = spawn_clipboard_watch() {
+                if let Some(out) = child.stdout.take() {
+                    use std::io::BufRead;
+                    // One line per clipboard change; ends when wl-paste exits.
+                    for line in std::io::BufReader::new(out).lines() {
+                        if line.is_err() {
+                            break;
+                        }
+                        on_clipboard_maybe_changed();
+                    }
+                }
+                let pid = child.id() as i32;
+                subproc::reap_process_group(&mut child, pid);
+                if started.elapsed() >= Duration::from_secs(10) {
+                    // It ran for a while (compositor restart, logout): start it again.
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
             }
-
-            let hash = compute_clipboard_hash(&text);
-            let last_hash = get_last_synced_clipboard_hash();
-
-            if last_hash.as_deref() == Some(&hash) {
-                continue;
+            // No working `wl-paste --watch`: poll for a minute, then try the watcher again.
+            let until = Instant::now() + Duration::from_secs(60);
+            while Instant::now() < until {
+                thread::sleep(CLIPBOARD_POLL_FALLBACK);
+                on_clipboard_maybe_changed();
             }
-
-            set_last_synced_clipboard_hash(&hash);
-
-            // Sensitive Clipboard Shield: Never broadcast passwords, secret keys, or credentials
-            if military::is_sensitive_clipboard_payload(&text) {
-                continue;
-            }
-
-            auto_push_clipboard_text(&text);
         }
     });
 }
@@ -10588,5 +10738,31 @@ mod tests {
         assert!(is_allowed_client_ip("100.101.102.103".parse().unwrap(), true));
         assert!(!is_allowed_client_ip("100.128.0.1".parse().unwrap(), true));
         assert!(!is_allowed_client_ip("8.8.8.8".parse().unwrap(), true));
+    }
+
+    /// Downloads are watched with inotify: a new file is announced once it settles, a hidden
+    /// or partial file is not, and nothing is rescanned on a timer.
+    #[test]
+    fn test_download_watcher_announces_new_files_via_inotify() {
+        let dir = env::temp_dir().join(format!("omasend_inotify_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let old = format!("old_{}.txt", std::process::id());
+        fs::write(dir.join(&old), b"old").unwrap();
+        start_download_dir_watcher(&dir);
+        thread::sleep(Duration::from_millis(300));
+
+        let fresh = format!("fresh_{}.bin", std::process::id());
+        let partial = format!("partial_{}.bin.part", std::process::id());
+        fs::write(dir.join(&fresh), b"hello").unwrap();
+        fs::write(dir.join(&partial), b"x").unwrap();
+        assert!(!is_recently_notified(&fresh), "must wait for the file to settle");
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while !is_recently_notified(&fresh) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(is_recently_notified(&fresh), "new file must be announced");
+        assert!(!is_recently_notified(&partial), "partial downloads are ignored");
+        let _ = fs::remove_dir_all(&dir);
     }
 }
