@@ -32,6 +32,14 @@ use tokio_util::sync::CancellationToken;
 
 uniffi::setup_scaffolding!();
 
+pub mod account;
+
+/// Constant-time string comparison for secrets and proofs.
+pub(crate) fn ct_eq_str(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 pub const ALPN: &[u8] = b"omasend/2";
 pub const DEFAULT_PORT: u16 = 53318;
 const MAX_FRAME: usize = 1 << 20;

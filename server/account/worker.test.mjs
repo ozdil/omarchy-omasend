@@ -1,36 +1,24 @@
-// node --test server/account/worker.test.mjs
+// node --test server/account/worker.test.mjs  (Node 22+, uses node:sqlite as D1)
 import test from "node:test";
 import assert from "node:assert/strict";
-import { webcrypto as crypto, createHash } from "node:crypto";
-import { handle, idForPk, PREFIX } from "./worker.js";
+import { readFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
+import { webcrypto as crypto } from "node:crypto";
+import { handle, PREFIX, RESET_WAIT, JOIN_TTL } from "./worker.js";
 
-// Minimal in-memory D1 with the three statements the worker uses.
-function fakeDb() {
-  const rows = new Map();
+function d1() {
+  const db = new DatabaseSync(":memory:");
+  db.exec(readFileSync(new URL("./schema.sql", import.meta.url), "utf8"));
   return {
-    rows,
+    db,
     prepare(sql) {
+      const st = db.prepare(sql);
       return {
         bind(...a) {
           return {
-            async first() {
-              const r = rows.get(a[0]);
-              return r ? { ...r } : null;
-            },
-            async run() {
-              let changes = 0;
-              if (sql.startsWith("INSERT OR IGNORE")) {
-                if (!rows.has(a[0])) { rows.set(a[0], { pk: a[1], ver: 1, blob: a[2], updated: a[3] }); changes = 1; }
-              } else if (sql.startsWith("UPDATE accounts SET ver")) {
-                const r = rows.get(a[2]);
-                if (r && r.ver === a[3]) { r.ver += 1; r.blob = a[0]; r.updated = a[1]; changes = 1; }
-              } else if (sql.startsWith("UPDATE accounts SET updated")) {
-                const r = rows.get(a[1]); if (r) { r.updated = a[0]; changes = 1; }
-              } else if (sql.startsWith("DELETE")) {
-                changes = rows.delete(a[0]) ? 1 : 0;
-              }
-              return { meta: { changes } };
-            },
+            first: async () => st.get(...a) ?? null,
+            all: async () => ({ results: st.all(...a) }),
+            run: async () => ({ meta: { changes: Number(st.run(...a).changes) } }),
           };
         },
       };
@@ -39,73 +27,114 @@ function fakeDb() {
 }
 
 const b64 = (u8) => Buffer.from(u8).toString("base64url");
-const NOW = 1_800_000_000;
+const ID = "ab".repeat(32);
+const VAULT = "V".repeat(60);
+const KEYS = { ["0".repeat(32)]: "K".repeat(80) };
+let NOW = 1_800_000_000;
 
-async function account() {
+async function key() {
   const kp = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
-  const pk = new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
-  const id = await idForPk(pk);
-  const sign = async (msg) => b64(new Uint8Array(await crypto.subtle.sign({ name: "Ed25519" }, kp.privateKey, new TextEncoder().encode(msg))));
-  return { pk, id, sign };
+  const pk = b64(new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey)));
+  return { pk, kp };
 }
 
-async function put(env, a, ver, blob, opts = {}) {
-  const ts = opts.ts ?? NOW;
-  const h = createHash("sha256").update(blob).digest("hex");
-  const sig = opts.sig ?? (await a.sign([PREFIX, "PUT", opts.signId ?? a.id, ver, h, ts].join("|")));
-  const req = new Request(`https://x/v1/account/${opts.id ?? a.id}`, { method: "PUT", body: JSON.stringify({ pk: b64(opts.pk ?? a.pk), ver, ts, blob, sig }) });
-  return handle(req, env, NOW);
+async function write(env, k, fields, opts = {}) {
+  const body = JSON.stringify({ id: opts.id ?? ID, ts: opts.ts ?? NOW, pk: k.pk, ...fields });
+  const sig = b64(new Uint8Array(await crypto.subtle.sign({ name: "Ed25519" }, k.kp.privateKey, new TextEncoder().encode(PREFIX + "|" + (opts.signed ?? body)))));
+  return handle(new Request(`https://x/v1/account/${ID}`, { method: "POST", body: JSON.stringify({ body, sig }) }), env, NOW);
 }
 
-const get = (env, id) => handle(new Request(`https://x/v1/account/${id}`), env, NOW);
-const BLOB = "A".repeat(60);
+const get = (env) => handle(new Request(`https://x/v1/account/${ID}`), env, NOW);
+const join = (env, blob = "J".repeat(60)) => handle(new Request(`https://x/v1/account/${ID}/join`, { method: "POST", body: JSON.stringify({ blob }) }), env, NOW);
+const put = (env, k, ver, extra = {}) => write(env, k, { op: "put", ver, vault: VAULT, keys: KEYS, ...extra });
 
-test("create, read, update with compare-and-swap", async () => {
-  const env = { DB: fakeDb() };
-  const a = await account();
-  assert.equal((await get(env, a.id)).status, 404);
-  let r = await put(env, a, 0, BLOB);
-  assert.equal(r.status, 200);
-  assert.deepEqual(await r.json(), { ver: 1 });
-  assert.deepEqual(await (await get(env, a.id)).json(), { ver: 1, blob: BLOB });
-  // Second create and stale writes conflict and return the current record.
-  r = await put(env, a, 0, "B".repeat(60));
-  assert.equal(r.status, 409);
-  assert.equal((await r.json()).blob, BLOB);
-  assert.equal((await put(env, a, 1, "C".repeat(60))).status, 200);
-  assert.equal((await put(env, a, 1, "D".repeat(60))).status, 409);
+test("create, read, compare-and-swap, rotate", async () => {
+  const env = { DB: d1() };
+  const a = await key();
+  assert.equal((await get(env)).status, 404);
+  assert.equal((await put(env, a, 0)).status, 200);
+  const rec = await (await get(env)).json();
+  assert.deepEqual(rec, { ver: 1, pk: a.pk, vault: VAULT, keys: KEYS, joins: [], reset: null });
+  assert.equal((await put(env, a, 0)).status, 409, "number already taken");
+  assert.equal((await put(env, a, 1)).status, 200);
+  assert.equal((await put(env, a, 1)).status, 409, "stale version");
+  // Rotation hands the account to a new key; the old one stops working.
+  const b = await key();
+  assert.equal((await put(env, a, 2, { new_pk: b.pk })).status, 200);
+  assert.equal((await put(env, a, 3)).status, 403);
+  assert.equal((await put(env, b, 3)).status, 200);
 });
 
-test("rejects forged, foreign, stale and oversized writes", async () => {
-  const env = { DB: fakeDb() };
-  const a = await account();
-  const b = await account();
-  // Someone else's key cannot write a's record.
-  assert.equal((await put(env, b, 0, BLOB, { id: a.id, signId: a.id })).status, 403);
-  // A signature over a different blob or id does not verify.
-  const sig = await a.sign([PREFIX, "PUT", a.id, 0, "00", NOW].join("|"));
-  assert.equal((await put(env, a, 0, BLOB, { sig })).status, 403);
-  // Replays outside the window are refused.
-  assert.equal((await put(env, a, 0, BLOB, { ts: NOW - 301 })).status, 403);
-  assert.equal((await put(env, a, 0, "A".repeat(64 * 1024 + 4))).status, 400);
-  assert.equal((await put(env, a, 0, "not base64!")).status, 400);
-  assert.equal(env.DB.rows.size, 0);
+test("forged, replayed, foreign and oversized writes are refused", async () => {
+  const env = { DB: d1() };
+  const a = await key();
+  const b = await key();
+  await put(env, a, 0);
+  assert.equal((await put(env, b, 1)).status, 403, "someone else's key");
+  assert.equal((await write(env, a, { op: "put", ver: 1, vault: VAULT, keys: KEYS }, { signed: "something else" })).status, 403);
+  assert.equal((await write(env, a, { op: "put", ver: 1, vault: VAULT, keys: KEYS }, { ts: NOW - 301 })).status, 403);
+  assert.equal((await write(env, a, { op: "put", ver: 1, vault: VAULT, keys: KEYS }, { id: "cd".repeat(32) })).status, 403);
+  assert.equal((await put(env, a, 1, { vault: "V".repeat(64 * 1024 + 1) })).status, 400);
+  assert.equal((await put(env, a, 1, { keys: {} })).status, 400);
+  assert.equal((await put(env, a, 1, { keys: { "not-hex": "K".repeat(80) } })).status, 400);
+  assert.equal((await write(env, a, { op: "nope" })).status, 400);
+  assert.equal((await (await get(env)).json()).ver, 1);
 });
 
-test("delete needs the account key", async () => {
-  const env = { DB: fakeDb() };
-  const a = await account();
-  const b = await account();
-  await put(env, a, 0, BLOB);
-  const del = async (who) =>
-    handle(new Request(`https://x/v1/account/${a.id}`, { method: "DELETE", body: JSON.stringify({ pk: b64(who.pk), ts: NOW, sig: await who.sign([PREFIX, "DELETE", a.id, NOW].join("|")) }) }), env, NOW);
-  assert.equal((await del(b)).status, 403);
-  assert.equal((await del(a)).status, 200);
-  assert.equal((await get(env, a.id)).status, 404);
+test("join requests: pending list, cap, expiry, drop", async () => {
+  const env = { DB: d1() };
+  const a = await key();
+  assert.equal((await join(env)).status, 404, "no account yet");
+  await put(env, a, 0);
+  assert.equal((await join(env, "bad blob!")).status, 400);
+  const rids = [];
+  for (let i = 0; i < 8; i++) rids.push((await (await join(env)).json()).rid);
+  assert.equal((await join(env)).status, 429);
+  assert.equal((await (await get(env)).json()).joins.length, 8);
+  assert.equal((await write(env, a, { op: "drop_joins", drop_joins: rids.slice(0, 3) })).status, 200);
+  assert.equal((await (await get(env)).json()).joins.length, 5);
+  // An approval (put with drop_joins) removes the handled request.
+  assert.equal((await put(env, a, 1, { drop_joins: [rids[3]] })).status, 200);
+  assert.equal((await (await get(env)).json()).joins.length, 4);
+  NOW += JOIN_TTL + 1;
+  assert.equal((await (await get(env)).json()).joins.length, 0, "expired requests are hidden");
+  assert.equal((await join(env)).status, 200, "and no longer count against the cap");
 });
 
-test("unknown paths and methods", async () => {
-  const env = { DB: fakeDb() };
+test("reset waits a day and members can cancel it", async () => {
+  const env = { DB: d1() };
+  const a = await key();
+  const r = await key();
+  await put(env, a, 0);
+  assert.equal((await write(env, r, { op: "reset" })).status, 200);
+  assert.equal((await write(env, r, { op: "reset" })).status, 409);
+  assert.deepEqual((await (await get(env)).json()).reset, { pk: r.pk, since: NOW });
+  const fresh = await key();
+  const finish = () => write(env, r, { op: "reset_finish", ver: 1, vault: VAULT, keys: KEYS, new_pk: fresh.pk });
+  assert.equal((await finish()).status, 403, "too early");
+  assert.equal((await write(env, r, { op: "cancel_reset" })).status, 403, "only the account key cancels");
+  assert.equal((await write(env, a, { op: "cancel_reset" })).status, 200);
+  assert.equal((await (await get(env)).json()).reset, null);
+
+  assert.equal((await write(env, r, { op: "reset" })).status, 200);
+  await join(env);
+  NOW += RESET_WAIT;
+  assert.equal((await finish()).status, 200);
+  const rec = await (await get(env)).json();
+  assert.equal(rec.pk, fresh.pk);
+  assert.equal(rec.reset, null);
+  assert.equal(rec.joins.length, 0);
+  assert.equal((await put(env, a, 2)).status, 403, "the old key is out");
+});
+
+test("delete needs the account key; unknown routes", async () => {
+  const env = { DB: d1() };
+  const a = await key();
+  const b = await key();
+  await put(env, a, 0);
+  assert.equal((await write(env, b, { op: "delete" })).status, 403);
+  assert.equal((await write(env, a, { op: "delete" })).status, 200);
+  assert.equal((await get(env)).status, 404);
   assert.equal((await handle(new Request("https://x/v1/account/xyz"), env, NOW)).status, 404);
-  assert.equal((await handle(new Request(`https://x/v1/account/${"a".repeat(64)}`, { method: "POST" }), env, NOW)).status, 405);
+  assert.equal((await handle(new Request(`https://x/v1/account/${ID}`, { method: "PUT" }), env, NOW)).status, 405);
 });

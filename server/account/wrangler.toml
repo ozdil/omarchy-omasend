@@ -1,7 +1,8 @@
-name = "omasend-account"
+name = "omaid-account"
 main = "worker.js"
 compatibility_date = "2026-10-01"
 workers_dev = true
+routes = [{ pattern = "id.omaid.app", custom_domain = true }]
 
 # No request logs: the registry keeps nothing about who asked.
 [observability]
@@ -9,8 +10,8 @@ enabled = false
 
 [[d1_databases]]
 binding = "DB"
-database_name = "omasend-account"
-database_id = "REPLACE_WITH_D1_ID"
+database_name = "omaid-account"
+database_id = "caffedc6-0f55-48a2-b392-495a0d4ea798"
 
 # Per-IP budgets, enforced in memory at the edge; IPs are never stored.
 [[ratelimits]]
