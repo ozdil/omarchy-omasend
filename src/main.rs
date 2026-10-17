@@ -6001,13 +6001,13 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
     if req.method == "POST" && req.path == "/api/p2p/request" {
         let (vis, _) = get_visibility();
         if vis == "OFF" {
-            let err = serde_json::json!({ "error": "Recipient AirBridge visibility is turned Off" });
+            let err = serde_json::json!({ "status": "REJECTED", "error": "Recipient AirBridge visibility is turned Off" });
             respond(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
             return;
         }
 
         if content_length > MAX_CONTROL_BODY {
-            let err = serde_json::json!({ "error": "Request payload exceeds control limit" });
+            let err = serde_json::json!({ "status": "REJECTED", "error": "Request payload exceeds control limit" });
             respond(&stream, "413 Payload Too Large", "application/json", err.to_string().as_bytes(), None, None);
             return;
         }
@@ -6021,14 +6021,14 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         let body_slice = match body.as_slice() {
             Some(s) => s,
             None => {
-                respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid JSON request\"}", None, None);
+                respond(&stream, "400 Bad Request", "application/json", b"{\"status\":\"REJECTED\",\"error\":\"Invalid JSON request\"}", None, None);
                 return;
             }
         };
         let req_data: serde_json::Value = match serde_json::from_slice(body_slice) {
             Ok(v) => v,
             Err(_) => {
-                respond(&stream, "400 Bad Request", "application/json", b"{\"error\":\"Invalid JSON request\"}", None, None);
+                respond(&stream, "400 Bad Request", "application/json", b"{\"status\":\"REJECTED\",\"error\":\"Invalid JSON request\"}", None, None);
                 return;
             }
         };
@@ -6036,7 +6036,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             devicekey::AuthResult::Trusted(k) => Some(k),
             devicekey::AuthResult::Absent => None,
             devicekey::AuthResult::Rejected(why) => {
-                let err = serde_json::json!({ "error": format!("Signature rejected: {}", why) });
+                let err = serde_json::json!({ "status": "REJECTED", "error": format!("Signature rejected: {}", why) });
                 respond(&stream, "401 Unauthorized", "application/json", err.to_string().as_bytes(), None, None);
                 return;
             }
@@ -6071,7 +6071,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         let is_same_owner = is_valid_sender_omaid && constant_time_eq_str(&norm_sender, &my_norm);
 
         if !is_valid_sender_omaid {
-            let err = serde_json::json!({ "error": "Valid 16-digit OmaID required to send files" });
+            let err = serde_json::json!({ "status": "REJECTED", "error": "Valid 16-digit OmaID required to send files" });
             respond(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
             return;
         }
@@ -6086,7 +6086,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                         .unwrap_or_default();
                     if let Some(ref expected_tok) = peer_record.auth_token {
                         if !expected_tok.is_empty() && (provided_token.is_empty() || !constant_time_eq_str(expected_tok, provided_token)) {
-                            let err = serde_json::json!({ "error": "Invalid peer authentication token" });
+                            let err = serde_json::json!({ "status": "REJECTED", "error": "Invalid peer authentication token" });
                             respond(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
                             return;
                         }
@@ -6101,7 +6101,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         // a legacy pairing that completed the code-verified handshake (its token was checked
         // above). EVERYONE is the time-limited opt-in for strangers (M9).
         if vis == "KNOWN" && v2_key.is_none() && !is_peer_confirmed(&sender_id) {
-            let err = serde_json::json!({ "error": "Recipient only accepts transfers from paired devices" });
+            let err = serde_json::json!({ "status": "REJECTED", "error": "Recipient only accepts transfers from paired devices" });
             respond(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
             return;
         }
@@ -6178,7 +6178,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         };
         // V2-FUNC-01: single pending slot; check and save under one lock (M10).
         if !claim_pending_slot(&transfer, v2_key.is_some()) {
-            let err = serde_json::json!({ "error": "Another transfer is in progress. Please retry shortly." });
+            let err = serde_json::json!({ "status": "REJECTED", "error": "Another transfer is in progress. Please retry shortly." });
             respond(&stream, "409 Conflict", "application/json", err.to_string().as_bytes(), None, Some(&[("Retry-After", "30")]));
             return;
         }
@@ -8236,7 +8236,7 @@ mod tests {
 
     #[test]
     fn test_p2p_request_and_clipboard_require_paired_oma_id() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         clear_pending_transfer();
         set_visibility("KNOWN");
 
@@ -8839,7 +8839,7 @@ mod tests {
 
     #[test]
     fn test_instant_clipboard_delivery_and_hash_tracking() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let test_text = format!("Unique test note {}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos());
         let expected_hash = compute_clipboard_hash(&test_text);
         assert_eq!(expected_hash.len(), 64);
@@ -8854,7 +8854,7 @@ mod tests {
 
     #[test]
     fn test_anti_echo_loop_and_sha256_hash_tracking() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let payload = "Secret Omnipresent Clipboard Sync Payload";
         let expected_hash = compute_clipboard_hash(payload);
         assert!(!expected_hash.is_empty());
@@ -8871,7 +8871,7 @@ mod tests {
 
     #[test]
     fn test_clipboard_vault_max_capacity_truncation() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let mut test_vault = ClipboardVault::default();
         for i in 0..30 {
             test_vault.items.insert(0, ClipboardItem {
@@ -9237,7 +9237,7 @@ mod tests {
 
     #[test]
     fn test_clip_staging_and_mode_0600_isolation() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
 
         let mut png_bytes = Vec::new();
         png_bytes.extend_from_slice(b"\x89PNG\r\n\x1a\n");
@@ -9267,7 +9267,7 @@ mod tests {
 
     #[test]
     fn test_clip_staging_lru_cleanup_policy() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let staging_dir = get_clip_staging_dir();
 
         // Create a dummy valid PNG template
@@ -9299,7 +9299,7 @@ mod tests {
 
     #[test]
     fn test_image_clipboard_hash_and_metadata_serialization() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let dummy_hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
         let item = ClipboardItem {
@@ -9328,7 +9328,7 @@ mod tests {
 
     #[test]
     fn test_http_p2p_instant_text_clipboard_sync() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         set_visibility("ALL");
         let valid_raw_oma_id = rendezvous::generate_raw_oma_id();
         let valid_peer_oma_id = rendezvous::format_oma_id(&valid_raw_oma_id);
@@ -9363,7 +9363,8 @@ mod tests {
         client.write_all(req.as_bytes()).unwrap();
         client.write_all(&post_bytes).unwrap();
         let mut resp = String::new();
-        client.read_to_string(&mut resp).unwrap();
+        // The server may close before reading the whole request; keep what it sent.
+        let _ = client.read_to_string(&mut resp);
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "POST /api/p2p/clipboard must return 200 OK: {}", resp);
 
         let last_synced = get_last_synced_clipboard_hash();
@@ -9374,7 +9375,7 @@ mod tests {
 
     #[test]
     fn test_http_p2p_image_and_vault_endpoints() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         set_visibility("ALL");
         let valid_raw_oma_id = rendezvous::generate_raw_oma_id();
         let valid_peer_oma_id = rendezvous::format_oma_id(&valid_raw_oma_id);
@@ -9474,7 +9475,7 @@ mod tests {
 
     #[test]
     fn test_p2p_clipboard_rejects_invalid_or_missing_auth_token() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         set_visibility("ALL");
         let valid_raw_oma_id = rendezvous::generate_raw_oma_id();
         let valid_peer_oma_id = rendezvous::format_oma_id(&valid_raw_oma_id);
@@ -9529,7 +9530,7 @@ mod tests {
 
     #[test]
     fn test_webp_thumbnail_generation_and_caching() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
 
         // Create valid 128x128 test PNG
         let mut png_bytes = Vec::new();
@@ -9568,7 +9569,7 @@ mod tests {
 
     #[test]
     fn test_webp_thumbnail_security_and_bounds() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let staging_dir = get_clip_staging_dir();
 
         // 1. Path traversal hash rejection
@@ -9605,7 +9606,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_clip_staging_with_thumbnails() {
-        let _guard = TEST_SYNC_MUTEX.lock().unwrap();
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let staging_dir = get_clip_staging_dir();
 
         let mut png_template = Vec::new();
@@ -9645,7 +9646,8 @@ mod tests {
         c.write_all(req.as_bytes()).unwrap();
         c.write_all(&bytes).unwrap();
         let mut resp = String::new();
-        c.read_to_string(&mut resp).unwrap();
+        // The server may close before reading the whole request; keep what it sent.
+        let _ = c.read_to_string(&mut resp);
         resp
     }
 
@@ -10077,7 +10079,8 @@ mod tests {
         c.write_all(req.as_bytes()).unwrap();
         c.write_all(body).unwrap();
         let mut resp = String::new();
-        c.read_to_string(&mut resp).unwrap();
+        // The server may close before reading the whole request; keep what it sent.
+        let _ = c.read_to_string(&mut resp);
         server.join().unwrap();
 
         assert!(resp.starts_with("HTTP/1.1 413"), "Oversized upload must be rejected: {}", resp);
@@ -10399,7 +10402,8 @@ mod tests {
             c.write_all(head.as_bytes()).unwrap();
             c.write_all(&body).unwrap();
             let mut resp = String::new();
-            c.read_to_string(&mut resp).unwrap();
+            // The server may close before reading the whole request; keep what it sent.
+            let _ = c.read_to_string(&mut resp);
             server.join().unwrap();
             assert!(resp.starts_with("HTTP/1.1 200"), "{}", resp);
             let saved = get_download_dir().join(&name);
