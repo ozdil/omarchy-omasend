@@ -9,7 +9,10 @@ OmaID is broadcast in discovery beacons and request headers, so it cannot prove 
 sent a request (REPORT_v2 V2-SEC-01/02). v2 gives every device an Ed25519 key pair and
 trusts only keys that were exchanged in person, via a QR code.
 
-OmaID remains as a display/grouping label. It no longer grants any trust.
+OmaID remains as a display/grouping label. It no longer grants any trust. The desktop no
+longer sends it at all: not in beacons, not in request headers or bodies, not in
+`/api/p2p/ping` (it still reads it from older peers' beacons as a label). Legacy (v1)
+pairings are identified by their auth token alone.
 
 ## Encoding
 
@@ -127,7 +130,7 @@ address (requests through the WAN tunnel) only updates `last_seen`, never the st
 
 | Mode | Unsigned / unknown-key `POST /api/p2p/request` |
 |---|---|
-| `KNOWN` (default) | Refused (`403`) unless the OmaID belongs to a confirmed legacy pairing. |
+| `KNOWN` (default) | Refused (`403`) unless `X-OmaSend-Auth-Token` is the token of a confirmed legacy pairing. |
 | `EVERYONE` (10 minutes, then back to `KNOWN`) | Accepted; needs the user's approval. |
 | `OFF` | Every pairing, transfer and clipboard endpoint is refused. |
 
@@ -153,8 +156,8 @@ and is refused on receive.
 
 `GET /api/p2p/clipboard/image?hash=<sha256>` (fetch of an announced clipboard image) requires the
 same authorization as `POST /api/p2p/clipboard`: a v2 signature from a paired key (body tag
-`hex(SHA-256(""))`), or `X-OmaSend-OmaID` + `X-OmaSend-Auth-Token` of a confirmed legacy
-pairing.
+`hex(SHA-256(""))`), or the `X-OmaSend-Auth-Token` of a confirmed legacy pairing
+(`X-OmaSend-OmaID` is ignored).
 
 ### Local control
 
@@ -212,7 +215,7 @@ attackable offline.
 
 **Two numbers.** Every install now has:
 
-- the legacy `oma_id`: still carried in beacons and v1 requests, a public label only;
+- the legacy `oma_id`: a public label only (the desktop no longer sends it; older peers may);
 - a secret **account OmaID** (`account_id` on desktop, mode 0600; Keystore-encrypted on
   Android). Same format (16 digits, Luhn), generated randomly, **never sent anywhere**.
   The user reads it in Settings and types it on another device.
@@ -285,10 +288,9 @@ linking a new device, and the roster then adds the new device to the rest.
 
 The roster carries no secrets: public keys, names and addresses, on the LAN.
 
-**Not covered yet:** WAN discovery still derives its topic from the legacy `oma_id`. Neither
-platform publishes those records anywhere today (desktop anchors are local files, the Android
-announcer has no caller), so nothing is exposed; the topic must move to a random account key
-before WAN discovery ships. The web client (`omasend-web`) is still v1 and cannot link.
+The desktop removed the OmaID-derived WAN rendezvous (topic, record key, pairwise "P2P
+session key", same-owner proof): they were keyed by a public value. Any future WAN discovery
+must use a random account key. The web client (`omasend-web`) is still v1 and cannot link.
 
 Desktop CLI: `--account-id [--json]`, `--new-account-id`, `--link <OmaID> [--json]`, and
 `--unpair <device-id>`, which removes an own device everywhere as above.

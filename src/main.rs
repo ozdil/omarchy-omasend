@@ -5,13 +5,9 @@ pub mod rendezvous;
 pub mod omalink;
 
 pub use rendezvous::{
-    build_github_anchor_payload, compute_rendezvous_topic, create_stun_binding_request,
-    decrypt_p2p_payload, decrypt_rendezvous_record, derive_p2p_session_key, derive_rendezvous_key,
-    encrypt_p2p_payload, encrypt_rendezvous_record, format_github_anchor_ref, format_oma_id,
-    generate_raw_oma_id, hkdf_sha256, hmac_sha256, luhn_checksum, luhn_verify, normalize_oma_id,
-    parse_github_anchor_payload, parse_stun_response, publish_local_rendezvous_anchor,
-    query_local_rendezvous_anchor, query_stun_external_addr, query_stun_server, validate_oma_id,
-    EncryptedP2PEnvelope, EncryptedRendezvousEnvelope, NatTraversedSocket, RendezvousRecord,
+    create_stun_binding_request, format_oma_id, generate_raw_oma_id, hkdf_sha256, hmac_sha256,
+    luhn_checksum, luhn_verify, normalize_oma_id, parse_stun_response, query_stun_external_addr,
+    query_stun_server, validate_oma_id, NatTraversedSocket,
 };
 
 use aes_gcm::{
@@ -253,7 +249,9 @@ pub struct P2pBeaconPacket {
     pub magic: String,
     pub v: u32,
     pub id: String,
-    #[serde(default)]
+    /// Legacy OmaID. Still read from older peers as a display label, never sent: it is public,
+    /// and it used to be treated like a password (same-owner, pairing lookups).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub oma_id: String,
     pub name: String,
     pub ip: String,
@@ -1939,12 +1937,8 @@ pub fn p2p_push_image_clipboard_silent(
         return;
     }
     let (my_id, _) = get_or_create_device_id();
-    let my_oma_id = get_or_create_oma_id();
     let my_name = get_system_hostname();
-
-    let paired = load_paired_peers();
-    let matched_peer = paired.iter().find(|p| p.is_active() && p.ip.as_deref() == Some(target_ip));
-    let auth_token = matched_peer.and_then(|p| p.auth_token.clone()).unwrap_or_default();
+    let auth_token = legacy_token_for_ip(target_ip);
 
     let image_base64 = if let Some(d) = data {
         if d.len() <= INLINE_IMAGE_CLIP_MAX_SIZE {
@@ -1970,9 +1964,10 @@ pub fn p2p_push_image_clipboard_silent(
     };
 
     let local_ip = get_local_ip();
-    let inner_json = serde_json::json!({
-        "sender_id": my_oma_id,
-        "oma_id": my_oma_id,
+    // No OmaID and no OmaID-keyed "envelope": the request is authorized by its v2 signature
+    // (or, for a legacy peer, by the pairing token in the header).
+    let final_payload = serde_json::json!({
+        "sender_id": my_id,
         "device_id": my_id,
         "sender_name": my_name,
         "sender_alias": my_name,
@@ -1986,55 +1981,17 @@ pub fn p2p_push_image_clipboard_silent(
         "height": height,
         "image_base64": image_base64,
         "image_data_base64": image_base64,
-        "thumbnail_base64": thumb_b64,
-        "auth_token": auth_token
+        "thumbnail_base64": thumb_b64
     });
-
-    let target_oma_id = matched_peer
-        .map(|p| p.oma_id.clone())
-        .or_else(|| {
-            get_discovered_peers()
-                .into_iter()
-                .find(|dp| dp.ip == target_ip && !dp.oma_id.is_empty())
-                .map(|dp| dp.oma_id)
-        })
-        .unwrap_or_default();
-    let final_payload = if !target_oma_id.is_empty() {
-        if let Ok(env) = encrypt_p2p_payload(&my_oma_id, &target_oma_id, inner_json.to_string().as_bytes()) {
-            serde_json::json!({
-                "encrypted_envelope": env,
-                "oma_id": my_oma_id,
-                "sender_id": my_oma_id,
-                "device_id": my_id,
-                "sender_name": my_name,
-                "sender_alias": my_name,
-                "sender_ip": local_ip,
-                "content_type": "image",
-                "image_hash": hash,
-                "image_size": size,
-                "width": width,
-                "height": height,
-                "image_base64": image_base64,
-                "image_data_base64": image_base64,
-                "thumbnail_base64": thumb_b64,
-                "auth_token": auth_token
-            })
-        } else {
-            inner_json
-        }
-    } else {
-        inner_json
-    };
 
     let addr = resolve_peer_addr(target_ip);
     let req_bytes = final_payload.to_string().into_bytes();
-    let oma_id_hdr = my_oma_id.clone();
-    let auth_hdr = auth_token.clone();
+    let auth_hdr = legacy_token_header(&auth_token);
     thread::spawn(move || {
         if let Ok(mut stream) = connect_peer_with_timeout(&addr, Duration::from_millis(2500)) {
             let http_req = format!(
-                "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-OmaSend-OmaID: {}\r\nX-OmaSend-Auth-Token: {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
-                addr, oma_id_hdr, auth_hdr,
+                "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n{}{}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                addr, auth_hdr,
                 v2_auth_lines("POST", "/api/p2p/clipboard", &devicekey::body_tag_json(&req_bytes)),
                 req_bytes.len()
             );
@@ -2052,20 +2009,15 @@ pub fn p2p_fetch_image_clipboard_and_apply(sender_ip: &str, hash: &str, _content
     }
     let ip = sender_ip.to_string();
     let h = hash.to_string();
-    let my_oma_id = get_or_create_oma_id();
     // Legacy peers authorize the fetch with the token from the code-verified pairing.
-    let auth_token = load_paired_peers()
-        .into_iter()
-        .find(|p| p.is_active() && p.ip.as_deref() == Some(sender_ip))
-        .and_then(|p| p.auth_token)
-        .unwrap_or_default();
+    let auth_hdr = legacy_token_header(&legacy_token_for_ip(sender_ip));
     thread::spawn(move || {
         let addr = resolve_peer_addr(&ip);
         if let Ok(mut stream) = connect_peer_with_timeout(&addr, Duration::from_secs(5)) {
             let pq = format!("/api/p2p/clipboard/image?hash={}", h);
             let http_req = format!(
-                "GET {} HTTP/1.1\r\nHost: {}\r\nX-OmaSend-OmaID: {}\r\nX-OmaSend-Auth-Token: {}\r\n{}Connection: close\r\n\r\n",
-                pq, addr, my_oma_id, auth_token, v2_auth_lines("GET", &pq, &devicekey::body_tag_json(b""))
+                "GET {} HTTP/1.1\r\nHost: {}\r\n{}{}Connection: close\r\n\r\n",
+                pq, addr, auth_hdr, v2_auth_lines("GET", &pq, &devicekey::body_tag_json(b""))
             );
             if stream.write_all(http_req.as_bytes()).is_ok() {
                 let max_resp_bytes = (MAX_IMAGE_CLIP_SIZE + 65536) as u64;
@@ -2376,7 +2328,6 @@ fn broadcast_offline_beacon() {
     };
     let _ = socket.set_broadcast(true);
     let (device_id, fp) = get_or_create_device_id();
-    let oma_id = get_or_create_oma_id();
     let hostname = get_system_hostname();
     let ip = get_local_ip();
 
@@ -2384,7 +2335,7 @@ fn broadcast_offline_beacon() {
         magic: "OMASEND_P2P".to_string(),
         v: 1,
         id: device_id,
-        oma_id,
+        oma_id: String::new(),
         name: hostname,
         ip: ip.clone(),
         port: PORT,
@@ -2934,32 +2885,39 @@ fn load_trusted_peers() -> Vec<TrustedPeer> {
     Vec::new()
 }
 
-/// Inbound clipboard/transfer requests require a paired record that completed
-/// the code-verified handshake; trusted-only or unconfirmed entries are refused.
-fn is_peer_confirmed(oma_id: &str) -> bool {
-    let norm = rendezvous::normalize_oma_id(oma_id);
-    if norm.len() != 16 {
-        return false;
+/// Legacy (v1) authorization: the auth token a code-verified pairing stored. The token is the
+/// credential; the peer is looked up by it, never by a claimed OmaID (public, broadcast by
+/// older versions). A pairing without a token authorizes nothing any more.
+fn legacy_peer_authorized(provided_token: &str) -> Option<rendezvous::PairedPeer> {
+    let token = provided_token.trim();
+    if token.is_empty() {
+        return None;
     }
-    load_paired_peers().iter().any(|p| p.confirmed && rendezvous::normalize_oma_id(&p.oma_id) == norm)
+    load_paired_peers().into_iter().find(|p| {
+        p.confirmed && p.auth_token.as_deref().is_some_and(|t| !t.is_empty() && constant_time_eq_str(t, token))
+    })
 }
 
-/// Legacy (OmaID) authorization: a pairing that completed the code-verified handshake, and,
-/// when that pairing stored an auth token, the same token (compared in constant time).
-fn legacy_peer_authorized(oma_id: &str, provided_token: &str) -> bool {
-    let norm = rendezvous::normalize_oma_id(oma_id);
-    if norm.len() != 16 {
-        return false;
-    }
+/// True if a code-verified legacy pairing was made with the device at `ip` (label only).
+fn legacy_paired_at(ip: &str) -> bool {
+    !ip.is_empty() && load_paired_peers().iter().any(|p| p.is_active() && p.ip.as_deref() == Some(ip))
+}
+
+/// Our legacy auth token for the paired device at `ip`, sent only to that address.
+fn legacy_token_for_ip(ip: &str) -> String {
     load_paired_peers()
         .into_iter()
-        .find(|p| p.confirmed && rendezvous::normalize_oma_id(&p.oma_id) == norm)
-        .is_some_and(|p| match p.auth_token.as_deref() {
-            Some(expected) if !expected.is_empty() => !provided_token.is_empty() && constant_time_eq_str(expected, provided_token),
-            _ => true,
-        })
+        .find(|p| p.is_active() && !ip.is_empty() && p.ip.as_deref() == Some(ip))
+        .and_then(|p| p.auth_token)
+        .unwrap_or_default()
 }
 
+/// `X-OmaSend-Auth-Token` header line for a legacy peer, or nothing.
+fn legacy_token_header(token: &str) -> String {
+    if token.is_empty() { String::new() } else { format!("X-OmaSend-Auth-Token: {}\r\n", token) }
+}
+
+#[cfg(test)]
 fn is_peer_trusted(peer_id: &str) -> bool {
     is_peer_paired(peer_id) || load_trusted_peers().iter().any(|p| p.id == peer_id)
 }
@@ -3142,8 +3100,6 @@ fn get_discovered_peers_unlocked() -> Vec<DiscoveredPeer> {
     }
 
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let my_oma_id = get_or_create_oma_id();
-    let my_norm = rendezvous::normalize_oma_id(&my_oma_id);
     let (my_id, _) = get_or_create_device_id();
 
     let mut peers = Vec::new();
@@ -3168,17 +3124,15 @@ fn get_discovered_peers_unlocked() -> Vec<DiscoveredPeer> {
 
     let keys = trust_store().load();
     for p in &mut peers {
-        let peer_norm = rendezvous::normalize_oma_id(&p.oma_id);
-        let same_owner = !peer_norm.is_empty() && peer_norm == my_norm;
-        p.is_same_owner = same_owner;
-        p.is_trusted = same_owner || is_peer_paired(&p.oma_id) || is_peer_trusted(&p.id);
         p.transport = "LAN".to_string();
         p.key_trust = key_for_discovered(&keys, p)
             .map(|k| if k.own_device { "own" } else { "paired" }.to_string())
             .unwrap_or_default();
+        // Display labels only (authorization is per request: signatures, QUIC, tokens). They
+        // come from paired device keys and code-verified pairings, never from a claimed OmaID.
+        p.is_same_owner = p.key_trust == "own";
+        p.is_trusted = !p.key_trust.is_empty() || legacy_paired_at(&p.ip);
     }
-
-    peers.retain(|p| rendezvous::validate_oma_id(&p.oma_id));
 
     // Sort: Same-owner first, then online trusted, then alphabetical
     peers.sort_by(|a, b| {
@@ -3219,7 +3173,6 @@ fn update_discovered_peer(packet: &P2pBeaconPacket, src: IpAddr) {
     let _guard = lock_state_files();
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let (my_id, _) = get_or_create_device_id();
-    let my_oma_id = get_or_create_oma_id();
     // Only ignore if the packet comes from the exact same physical device
     if packet.id == my_id {
         return;
@@ -3242,28 +3195,17 @@ fn update_discovered_peer(packet: &P2pBeaconPacket, src: IpAddr) {
         return;
     }
 
-    let my_norm = rendezvous::normalize_oma_id(&my_oma_id);
-    let packet_norm = rendezvous::normalize_oma_id(&packet.oma_id);
-    if !rendezvous::validate_oma_id(&packet_norm) {
-        return;
-    }
-    let is_same_owner = packet_norm == my_norm;
-    let is_paired = is_peer_paired(&packet.oma_id);
-
-    // Verify if beacon IP matches the established authenticated paired peer IP, or if it belongs to same owner
-    let is_authenticated_paired = if is_same_owner {
-        true
-    } else if is_paired {
-        let paired = load_paired_peers();
-        paired.iter().any(|p| p.is_active() && rendezvous::normalize_oma_id(&p.oma_id) == packet_norm && p.ip.as_deref() == Some(src_ip.as_str()))
-    } else {
-        false
-    };
+    // A claimed OmaID proves nothing (it is public), so it no longer makes a beacon "same
+    // owner" or "trusted"; beacons without one (newer peers) are accepted. Trust labels are
+    // recomputed from the key store and code-verified pairings in get_discovered_peers.
+    let packet_oma_id = if rendezvous::validate_oma_id(&packet.oma_id) { packet.oma_id.clone() } else { String::new() };
+    let is_same_owner = false;
+    let is_authenticated_paired = legacy_paired_at(&src_ip);
 
     let mut peers = get_discovered_peers_unlocked();
     if let Some(existing) = peers.iter_mut().find(|p| p.id == packet.id) {
         existing.id = packet.id.clone();
-        existing.oma_id = packet.oma_id.clone();
+        existing.oma_id = packet_oma_id;
         existing.name = packet.name.clone();
         existing.ip = src_ip.clone();
         existing.port = packet.port;
@@ -3276,7 +3218,7 @@ fn update_discovered_peer(packet: &P2pBeaconPacket, src: IpAddr) {
     } else {
         peers.push(DiscoveredPeer {
             id: packet.id.clone(),
-            oma_id: packet.oma_id.clone(),
+            oma_id: packet_oma_id,
             name: packet.name.clone(),
             ip: src_ip.clone(),
             port: packet.port,
@@ -3347,6 +3289,24 @@ pub fn get_all_broadcast_addresses() -> Vec<Ipv4Addr> {
     addrs
 }
 
+/// Our discovery beacon. It carries no OmaID: a beacon is public and unauthenticated, and the
+/// device key (`pk`) is only an address hint that TLS/signatures verify later.
+fn beacon_packet(mode: &str) -> P2pBeaconPacket {
+    let (device_id, fp) = get_or_create_device_id();
+    P2pBeaconPacket {
+        magic: "OMASEND_P2P".to_string(),
+        v: 1,
+        id: device_id,
+        oma_id: String::new(),
+        name: get_system_hostname(),
+        ip: get_local_ip(),
+        port: PORT,
+        mode: mode.to_string(),
+        fp,
+        pk: device_identity().public_b64(),
+    }
+}
+
 pub fn send_p2p_beacon_burst(burst_count: usize) {
     let socket = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
@@ -3358,23 +3318,7 @@ pub fn send_p2p_beacon_burst(burst_count: usize) {
     if vis == "OFF" {
         return;
     }
-    let (device_id, fp) = get_or_create_device_id();
-    let oma_id = get_or_create_oma_id();
-    let hostname = get_system_hostname();
-    let ip = get_local_ip();
-
-    let packet = P2pBeaconPacket {
-        magic: "OMASEND_P2P".to_string(),
-        v: 1,
-        id: device_id,
-        oma_id,
-        name: hostname,
-        ip: ip.clone(),
-        port: PORT,
-        mode: vis,
-        fp,
-        pk: device_identity().public_b64(),
-    };
+    let packet = beacon_packet(&vis);
 
     if let Ok(bytes) = serde_json::to_vec(&packet) {
         let broadcast_targets = get_all_broadcast_addresses();
@@ -3496,27 +3440,15 @@ pub fn resolve_target_ip_or_omaid(target_ip_or_omaid: &str) -> Result<(String, u
 
     if is_oma_id {
         let formatted_id = rendezvous::format_oma_id(&norm);
-        // 1. Check active discovered peers
-        for peer in get_discovered_peers() {
-            if rendezvous::normalize_oma_id(&peer.oma_id) == norm && !peer.ip.is_empty() {
-                return Ok((peer.ip, peer.port, Some(formatted_id)));
-            }
-        }
-        // 2. Check paired peers
-        for peer in load_paired_peers() {
+        // Only a code-verified pairing maps an OmaID to an address. Beacons (anyone can claim
+        // any OmaID in them) and the OmaID-keyed rendezvous anchor are not used any more.
+        for peer in load_paired_peers().into_iter().filter(|p| p.is_active()) {
             if rendezvous::normalize_oma_id(&peer.oma_id) == norm {
                 if let Some(ip) = peer.ip {
                     if !ip.is_empty() {
                         return Ok((ip, PORT, Some(formatted_id)));
                     }
                 }
-            }
-        }
-        // 3. Check local blinded rendezvous anchor
-        if let Some(rec) = query_local_rendezvous_anchor(&norm, &get_state_dir()) {
-            if !rec.local_ip.is_empty() {
-                let port = if rec.local_port > 0 { rec.local_port } else { PORT };
-                return Ok((rec.local_ip, port, Some(formatted_id)));
             }
         }
         return Err(format!("Could not resolve IP address for OmaID {}", formatted_id));
@@ -3526,31 +3458,22 @@ pub fn resolve_target_ip_or_omaid(target_ip_or_omaid: &str) -> Result<(String, u
     if let Some((host, port_str)) = trimmed.rsplit_once(':') {
         if !host.contains(':') {
             if let Ok(p) = port_str.parse::<u16>() {
-                let known_oma = get_discovered_peers()
+                let known_oma = load_paired_peers()
                     .into_iter()
-                    .find(|dp| dp.ip == host && !dp.oma_id.is_empty())
-                    .map(|dp| dp.oma_id)
-                    .or_else(|| {
-                        load_paired_peers()
-                            .into_iter()
-                            .find(|pp| pp.ip.as_deref() == Some(host))
-                            .map(|pp| pp.oma_id)
-                    });
+                    .find(|pp| pp.ip.as_deref() == Some(host))
+                    .map(|pp| pp.oma_id);
                 return Ok((host.to_string(), p, known_oma));
             }
         }
     }
 
-    for peer in get_discovered_peers() {
-        if peer.ip == trimmed {
-            let oma_opt = if !peer.oma_id.is_empty() { Some(peer.oma_id) } else { None };
-            return Ok((peer.ip, peer.port, oma_opt));
-        }
-    }
     let known_oma = load_paired_peers()
         .into_iter()
         .find(|pp| pp.ip.as_deref() == Some(trimmed))
         .map(|pp| pp.oma_id);
+    if let Some(peer) = get_discovered_peers().into_iter().find(|p| p.ip == trimmed) {
+        return Ok((peer.ip, peer.port, known_oma));
+    }
     Ok((trimmed.to_string(), PORT, known_oma))
 }
 
@@ -3936,7 +3859,7 @@ fn p2p_send_files_to_peer(target_ip_or_omaid: &str, file_paths: &[PathBuf]) -> R
     // Phase 2: QR-paired devices only ever use the encrypted QUIC transport. There is no
     // silent fallback to plaintext HTTP, so blocking UDP cannot downgrade a paired device.
     let paired_key = trusted_key_for_target(target_ip_or_omaid);
-    let (resolved_ip, resolved_port, resolved_oma_id) = match resolve_target_ip_or_omaid(target_ip_or_omaid) {
+    let (resolved_ip, resolved_port, _) = match resolve_target_ip_or_omaid(target_ip_or_omaid) {
         Ok(v) => v,
         Err(_) if paired_key.is_some() => (String::new(), PORT, None),
         Err(e) => return Err(e),
@@ -4041,52 +3964,22 @@ fn p2p_send_files_to_peer(target_ip_or_omaid: &str, file_paths: &[PathBuf]) -> R
     }
 
     let (my_id, _) = get_or_create_device_id();
-    let my_oma_id = get_or_create_oma_id();
     let my_name = get_system_hostname();
+    // A legacy token goes only to the address it was paired at (never to whoever claims the
+    // peer's OmaID in a beacon).
+    let auth_token = legacy_token_for_ip(target_ip);
 
-    let paired = load_paired_peers();
-    let matched_peer = paired.iter().find(|p| {
-        (p.is_active() && p.ip.as_deref() == Some(target_ip))
-            || resolved_oma_id.as_deref().map(|ro| rendezvous::normalize_oma_id(&p.oma_id) == rendezvous::normalize_oma_id(ro)).unwrap_or(false)
-    });
-    let auth_token = matched_peer.and_then(|p| p.auth_token.clone()).unwrap_or_default();
-
-    // 1. Send transfer request
-    let request_payload = serde_json::json!({
-        "sender_id": my_oma_id,
-        "oma_id": my_oma_id,
+    // 1. Send transfer request. No OmaID: the request is authorized by its v2 signature, or
+    // by a legacy pairing token, and otherwise waits for the recipient's approval.
+    let final_payload = serde_json::json!({
+        "sender_id": my_id,
         "device_id": my_id,
         "sender_name": my_name,
         "sender_alias": my_name,
         "sender_ip": get_local_ip(),
-        "auth_token": auth_token,
         "files": files_json,
         "total_size_bytes": total_size_bytes
     });
-
-    let target_oma_id = resolved_oma_id
-        .or_else(|| matched_peer.map(|p| p.oma_id.clone()))
-        .unwrap_or_default();
-    let final_payload = if !target_oma_id.is_empty() {
-        if let Ok(env) = encrypt_p2p_payload(&my_oma_id, &target_oma_id, request_payload.to_string().as_bytes()) {
-            serde_json::json!({
-                "encrypted_envelope": env,
-                "oma_id": my_oma_id,
-                "sender_id": my_oma_id,
-                "device_id": my_id,
-                "sender_name": my_name,
-                "sender_alias": my_name,
-                "sender_ip": get_local_ip(),
-                "auth_token": auth_token,
-                "files": files_json,
-                "total_size_bytes": total_size_bytes
-            })
-        } else {
-            request_payload
-        }
-    } else {
-        request_payload
-    };
 
     let addr = format!("{}:{}", target_ip, resolved_port);
     let mut stream = match connect_peer_with_timeout(&addr, Duration::from_secs(4)) {
@@ -4101,8 +3994,8 @@ fn p2p_send_files_to_peer(target_ip_or_omaid: &str, file_paths: &[PathBuf]) -> R
     };
     let req_bytes = final_payload.to_string().into_bytes();
     let http_req = format!(
-        "POST /api/p2p/request HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-OmaSend-OmaID: {}\r\nX-OmaSend-Auth-Token: {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
-        addr, my_oma_id, auth_token,
+        "POST /api/p2p/request HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n{}{}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        addr, legacy_token_header(&auth_token),
         v2_auth_lines("POST", "/api/p2p/request", &devicekey::body_tag_json(&req_bytes)),
         req_bytes.len()
     );
@@ -4271,7 +4164,7 @@ fn p2p_sync_clipboard_to_peer(target_ip_or_omaid: &str) -> Result<(), String> {
             }
         };
     }
-    let (resolved_ip, resolved_port, resolved_oma_id) = resolve_target_ip_or_omaid(target_ip_or_omaid)?;
+    let (resolved_ip, resolved_port, _) = resolve_target_ip_or_omaid(target_ip_or_omaid)?;
     let target_ip = resolved_ip.as_str();
 
     if let Some((img_bytes, ct, w, h)) = get_pc_image_clipboard() {
@@ -4298,24 +4191,15 @@ fn p2p_sync_clipboard_to_peer(target_ip_or_omaid: &str) -> Result<(), String> {
     }
 
     let (my_id, _) = get_or_create_device_id();
-    let my_oma_id = get_or_create_oma_id();
     let my_name = get_system_hostname();
-
-    let paired = load_paired_peers();
-    let matched_peer = paired.iter().find(|p| {
-        (p.is_active() && p.ip.as_deref() == Some(target_ip))
-            || resolved_oma_id.as_deref().map(|ro| rendezvous::normalize_oma_id(&p.oma_id) == rendezvous::normalize_oma_id(ro)).unwrap_or(false)
-    });
-    let auth_token = matched_peer.and_then(|p| p.auth_token.clone()).unwrap_or_default();
+    let auth_token = legacy_token_for_ip(target_ip);
 
     let payload = serde_json::json!({
-        "sender_id": my_oma_id,
-        "oma_id": my_oma_id,
+        "sender_id": my_id,
         "device_id": my_id,
         "sender_name": my_name,
         "content_type": "text",
-        "text": text,
-        "auth_token": auth_token
+        "text": text
     });
     let addr = format!("{}:{}", target_ip, resolved_port);
     let mut stream = match connect_peer_with_timeout(&addr, Duration::from_secs(4)) {
@@ -4330,8 +4214,8 @@ fn p2p_sync_clipboard_to_peer(target_ip_or_omaid: &str) -> Result<(), String> {
     };
     let req_bytes = payload.to_string().into_bytes();
     let http_req = format!(
-        "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-OmaSend-OmaID: {}\r\nX-OmaSend-Auth-Token: {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
-        addr, my_oma_id, auth_token,
+        "POST /api/p2p/clipboard HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n{}{}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        addr, legacy_token_header(&auth_token),
         v2_auth_lines("POST", "/api/p2p/clipboard", &devicekey::body_tag_json(&req_bytes)),
         req_bytes.len()
     );
@@ -5697,6 +5581,19 @@ window.addEventListener('load', async function() {{
 
 // ------------------- CONNECTION HANDLER -------------------
 
+/// Body of the unauthenticated `/api/p2p/ping`: device id, name and visibility only.
+fn ping_response() -> serde_json::Value {
+    let (id, _) = get_or_create_device_id();
+    let (vis, _) = get_visibility();
+    serde_json::json!({
+        "status": "OK",
+        "id": id.clone(),
+        "device_id": id,
+        "name": get_system_hostname(),
+        "mode": vis
+    })
+}
+
 pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &str) {
     let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
     let header_deadline = Instant::now() + Duration::from_secs(HEADER_READ_TIMEOUT_SECS);
@@ -5820,21 +5717,11 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
 
     // --- P2P AIRDROP ENDPOINTS ---
     if req.path == "/api/p2p/ping" {
-        let (id, _) = get_or_create_device_id();
-        let (vis, _) = get_visibility();
-        let my_oma_id = get_or_create_oma_id();
-        let resp = serde_json::json!({
-            "status": "OK",
-            "id": my_oma_id.clone(),
-            "oma_id": my_oma_id,
-            "device_id": id,
-            "name": get_system_hostname(),
-            "mode": vis
-        });
+        // Unauthenticated: no OmaID (it used to double as a credential) and nothing secret.
+        let resp = ping_response();
         respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
         return;
     }
-
     if req.method == "POST" && req.path == "/api/local/core-send" {
         if !local_ctl {
             respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Forbidden\"}", None, None);
@@ -6184,65 +6071,38 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             }
         };
 
-        let my_oma_id = get_or_create_oma_id();
-        let my_norm = rendezvous::normalize_oma_id(&my_oma_id);
-        let mut resolved_req_data = req_data.clone();
-        if let Some(env_val) = req_data.get("encrypted_envelope") {
-            if let Ok(envelope) = serde_json::from_value::<EncryptedP2PEnvelope>(env_val.clone()) {
-                if let Ok(decrypted_bytes) = decrypt_p2p_payload(&my_oma_id, &envelope) {
-                    if let Ok(inner) = serde_json::from_slice::<serde_json::Value>(&decrypted_bytes) {
-                        resolved_req_data = inner;
-                    }
-                }
-            }
-        }
-        let req_data = resolved_req_data;
-
-        let sender_id = req_data.get("oma_id")
-            .or_else(|| req_data.get("sender_oma_id"))
-            .or_else(|| req_data.get("sender_id"))
+        // The sender id is a display label only. A claimed OmaID (public) authorizes nothing:
+        // a paired device signs the request (v2), a legacy pairing presents its token, and
+        // anything else may only ask (visibility EVERYONE) and waits for the user's approval.
+        let sender_id = req_data.get("sender_id")
+            .or_else(|| req_data.get("device_id"))
+            .or_else(|| req_data.get("oma_id"))
             .and_then(|v| v.as_str())
-            .or_else(|| req.get_header("x-omasend-omaid"))
             .unwrap_or("unknown")
-            .to_string();
+            .chars()
+            .take(64)
+            .collect::<String>();
         let sender_name = req_data["sender_name"].as_str().unwrap_or("Unknown Omarchy Device").to_string();
         let sender_ip = req_data["sender_ip"].as_str().unwrap_or("").to_string();
 
-        let norm_sender = rendezvous::normalize_oma_id(&sender_id);
-        let is_valid_sender_omaid = rendezvous::validate_oma_id(&norm_sender);
-        let is_same_owner = is_valid_sender_omaid && constant_time_eq_str(&norm_sender, &my_norm);
-
-        if !is_valid_sender_omaid {
-            let err = serde_json::json!({ "status": "REJECTED", "error": "Valid 16-digit OmaID required to send files" });
+        let provided_token = req.get_header("x-omasend-auth-token")
+            .or_else(|| req_data.get("auth_token").and_then(|v| v.as_str()))
+            .unwrap_or_default();
+        let legacy_peer = if v2_key.is_none() { legacy_peer_authorized(provided_token) } else { None };
+        if v2_key.is_none() && !provided_token.is_empty() && legacy_peer.is_none() {
+            let err = serde_json::json!({ "status": "REJECTED", "error": "Invalid peer authentication token" });
             respond(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
             return;
         }
-
-        if !is_same_owner {
-            // Foreign OmaID: if paired and confirmed with an auth_token, require valid token
-            let paired = load_paired_peers();
-            if let Some(peer_record) = paired.iter().find(|p| rendezvous::normalize_oma_id(&p.oma_id) == norm_sender) {
-                if peer_record.confirmed {
-                    let provided_token = req.get_header("x-omasend-auth-token")
-                        .or_else(|| req_data.get("auth_token").and_then(|v| v.as_str()))
-                        .unwrap_or_default();
-                    if let Some(ref expected_tok) = peer_record.auth_token {
-                        if !expected_tok.is_empty() && (provided_token.is_empty() || !constant_time_eq_str(expected_tok, provided_token)) {
-                            let err = serde_json::json!({ "status": "REJECTED", "error": "Invalid peer authentication token" });
-                            respond(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-
-        let is_trusted = is_same_owner;
+        let sender_name = match legacy_peer.as_ref() {
+            Some(p) => p.name.clone(),
+            None => sender_name,
+        };
 
         // Visibility KNOWN (the default) accepts only paired senders: a verified device key, or
-        // a legacy pairing that completed the code-verified handshake (its token was checked
-        // above). EVERYONE is the time-limited opt-in for strangers (M9).
-        if vis == "KNOWN" && v2_key.is_none() && !is_peer_confirmed(&sender_id) {
+        // a legacy pairing that completed the code-verified handshake and presented its token.
+        // EVERYONE is the time-limited opt-in for strangers (M9).
+        if vis == "KNOWN" && v2_key.is_none() && legacy_peer.is_none() {
             let err = serde_json::json!({ "status": "REJECTED", "error": "Recipient only accepts transfers from paired devices" });
             respond(&stream, "403 Forbidden", "application/json", err.to_string().as_bytes(), None, None);
             return;
@@ -6290,11 +6150,8 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         let token = hex::encode(token_bytes);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
-        // V2-SEC-01 interim fix: OmaID is broadcast in plaintext and cannot prove ownership,
-        // so a claimed same-owner OmaID no longer bypasses user approval. Every transfer is PENDING
-        // until per-device key authentication replaces OmaID string comparison.
-        // Phase 1: a cryptographically verified key that the user paired as "own device"
-        // may auto-accept; everything else waits for approval.
+        // Only a cryptographically verified key that the user paired as "own device" may
+        // auto-accept; everything else (including legacy pairings) waits for approval.
         let auto_accept = v2_key.as_ref().is_some_and(|k| k.own_device);
         let initial_status = if auto_accept { "ACCEPTED" } else { "PENDING" };
         let initial_expiry = if auto_accept { now.saturating_add(600) } else { now.saturating_add(30) };
@@ -6338,11 +6195,12 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             );
         }
 
+        // "Same owner" now means a verified key the user paired as one of their own devices.
         let resp = serde_json::json!({
             "status": initial_status,
-            "is_trusted": is_trusted || v2_key.is_some(),
+            "is_trusted": v2_key.is_some() || legacy_peer.is_some(),
             "verified_device": v2_key.is_some(),
-            "is_same_owner": is_same_owner,
+            "is_same_owner": auto_accept,
             "token": token
         });
         respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
@@ -6584,10 +6442,7 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                 respond(&stream, "401 Unauthorized", "application/json", err.to_string().as_bytes(), None, None);
                 return;
             }
-            devicekey::AuthResult::Absent => legacy_peer_authorized(
-                req.get_header("x-omasend-omaid").unwrap_or_default(),
-                req.get_header("x-omasend-auth-token").unwrap_or_default(),
-            ),
+            devicekey::AuthResult::Absent => legacy_peer_authorized(req.get_header("x-omasend-auth-token").unwrap_or_default()).is_some(),
         };
         if !peer_ok && !local_ctl && !authorized {
             respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Peer is not paired\"}", None, None);
@@ -6679,69 +6534,29 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                 return;
             }
         };
-        if let Ok(raw_val) = serde_json::from_slice::<serde_json::Value>(body_slice) {
-            let my_oma_id = get_or_create_oma_id();
-            let my_norm = rendezvous::normalize_oma_id(&my_oma_id);
-            let mut resolved_val = raw_val.clone();
-
-            // P2P E2EE Decryption: If payload is wrapped in an EncryptedP2PEnvelope, decrypt it
-            if let Some(env_val) = raw_val.get("encrypted_envelope") {
-                if let Ok(envelope) = serde_json::from_value::<EncryptedP2PEnvelope>(env_val.clone()) {
-                    if let Ok(decrypted_bytes) = decrypt_p2p_payload(&my_oma_id, &envelope) {
-                        if let Ok(inner) = serde_json::from_slice::<serde_json::Value>(&decrypted_bytes) {
-                            resolved_val = inner;
-                        }
-                    }
-                }
-            }
-            let val = resolved_val;
-
-            let sender_id = val.get("oma_id")
-                .or_else(|| val.get("sender_oma_id"))
-                .or_else(|| val.get("sender_id"))
-                .and_then(|v| v.as_str())
-                .or_else(|| raw_val.get("oma_id").and_then(|v| v.as_str()))
-                .or_else(|| raw_val.get("sender_id").and_then(|v| v.as_str()))
-                .or_else(|| req.get_header("x-omasend-omaid"))
-                .unwrap_or_default();
-            let sender_name = val["sender_name"]
-                .as_str()
-                .or_else(|| raw_val["sender_name"].as_str())
-                .unwrap_or("Nearby Device");
-
-            let norm_sender = rendezvous::normalize_oma_id(sender_id);
-            // V2-SEC-01 interim fix: a claimed same-owner OmaID is not proof of ownership.
-            // Clipboard writes require a confirmed pairing (and its auth token) for every sender.
-            let _claims_same_owner = !norm_sender.is_empty() && constant_time_eq_str(&norm_sender, &my_norm);
-
-            // Phase 1: a valid signature from a paired device key authorizes on its own.
-            if v2_key.is_none() {
-                let is_trusted = is_peer_confirmed(sender_id);
-                if !is_trusted {
-                    respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Peer OmaID is not paired\"}", None, None);
-                    return;
-                }
-
-                // Verify authentication token if configured for paired peer
+        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(body_slice) {
+            // A paired device key (v2 signature) authorizes on its own; otherwise only the token
+            // of a code-verified legacy pairing does. A claimed OmaID authorizes nothing.
+            let legacy_peer = if v2_key.is_none() {
                 let provided_token = req.get_header("x-omasend-auth-token")
                     .or_else(|| val.get("auth_token").and_then(|v| v.as_str()))
-                    .or_else(|| raw_val.get("auth_token").and_then(|v| v.as_str()))
                     .unwrap_or_default();
-
-                let paired = load_paired_peers();
-                if let Some(peer_record) = paired.iter().find(|p| rendezvous::normalize_oma_id(&p.oma_id) == norm_sender) {
-                    if !peer_record.confirmed {
-                        respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Peer pairing is not confirmed\"}", None, None);
+                match legacy_peer_authorized(provided_token) {
+                    Some(p) => Some(p),
+                    None => {
+                        respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Peer is not paired\"}", None, None);
                         return;
                     }
-                    if let Some(ref expected_tok) = peer_record.auth_token {
-                        if !expected_tok.is_empty() && (provided_token.is_empty() || !constant_time_eq_str(expected_tok, provided_token)) {
-                            respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Invalid peer authentication token\"}", None, None);
-                            return;
-                        }
-                    }
                 }
-            }
+            } else {
+                None
+            };
+            let sender_name = match (v2_key.as_ref(), legacy_peer.as_ref()) {
+                (Some(k), _) => k.name.clone(),
+                (None, Some(p)) => p.name.clone(),
+                (None, None) => "Nearby Device".to_string(),
+            };
+            let sender_name = sender_name.as_str();
 
             let content_type = val["content_type"]
                 .as_str()
@@ -7718,11 +7533,11 @@ fn main() {
         }
     }
 
-    if let Some(pos) = args.iter().position(|a| a == "--rendezvous-topic" || a == "--topic") {
-        let oma_id = args.get(pos + 1).cloned().unwrap_or_else(get_or_create_oma_id);
-        let topic = compute_rendezvous_topic(&oma_id);
-        println!("{}", topic);
-        return;
+    // The OmaID-keyed "blinded rendezvous" was derived from a public value and protected
+    // nothing; it is gone. Discovery is LAN beacons and the QUIC core's paired keys.
+    if args.iter().any(|a| matches!(a.as_str(), "--rendezvous-topic" | "--topic" | "--rendezvous" | "--publish-rendezvous" | "--rendezvous-query")) {
+        eprintln!("OmaID rendezvous was removed: it was keyed by the public OmaID and was not confidential.");
+        std::process::exit(2);
     }
 
     if args.iter().any(|a| a == "--stun") {
@@ -7734,48 +7549,6 @@ fn main() {
             }
         }
         return;
-    }
-
-    if args.iter().any(|a| a == "--rendezvous" || a == "--publish-rendezvous") {
-        let oma_id = get_or_create_oma_id();
-        let stun_addr = query_stun_external_addr().map(|a| a.to_string());
-        let (_, _, wan_url) = get_wan_status();
-        let (dev_id, _) = get_or_create_device_id();
-        let hostname = get_system_hostname();
-        match publish_local_rendezvous_anchor(
-            &oma_id,
-            &ip,
-            PORT,
-            stun_addr.as_deref(),
-            wan_url.as_deref(),
-            &dev_id,
-            &hostname,
-            &get_state_dir(),
-        ) {
-            Ok(envelope) => {
-                println!("{}", serde_json::to_string_pretty(&envelope).unwrap_or_default());
-            }
-            Err(e) => {
-                eprintln!("Error publishing rendezvous anchor: {}", e);
-                std::process::exit(1);
-            }
-        }
-        return;
-    }
-
-    if let Some(pos) = args.iter().position(|a| a == "--rendezvous-query") {
-        if let Some(target_oma_id) = args.get(pos + 1) {
-            match query_local_rendezvous_anchor(target_oma_id, &get_state_dir()) {
-                Some(rec) => {
-                    println!("{}", serde_json::to_string_pretty(&rec).unwrap_or_default());
-                }
-                None => {
-                    eprintln!("No rendezvous anchor found or decryption failed for OmaID {}", target_oma_id);
-                    std::process::exit(1);
-                }
-            }
-            return;
-        }
     }
 
     if let Some(pos) = args.iter().position(|a| a == "--set-visibility") {
@@ -9101,42 +8874,6 @@ mod tests {
     }
 
     #[test]
-    fn test_publish_and_query_local_rendezvous_anchor() {
-        let temp_dir = env::temp_dir().join(format!("rendezvous_test_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&temp_dir);
-        fs::create_dir_all(&temp_dir).unwrap();
-
-        let oma_id = "1234-5678-9012-3452";
-        let dev_id = "dev_alpha";
-        let hostname = "test-host";
-
-        let published = publish_local_rendezvous_anchor(
-            oma_id,
-            "192.168.1.200",
-            53317,
-            Some("203.0.113.10:53317"),
-            Some("https://test.trycloudflare.com"),
-            dev_id,
-            hostname,
-            &temp_dir,
-        ).expect("Publish local anchor");
-
-        assert_eq!(published.topic, compute_rendezvous_topic(oma_id));
-
-        let queried = query_local_rendezvous_anchor(oma_id, &temp_dir)
-            .expect("Query local rendezvous anchor");
-
-        assert_eq!(queried.device_id, dev_id);
-        assert_eq!(queried.hostname, hostname);
-        assert_eq!(queried.local_ip, "192.168.1.200");
-        assert_eq!(queried.local_port, 53317);
-        assert_eq!(queried.stun_addr.as_deref(), Some("203.0.113.10:53317"));
-        assert_eq!(queried.wan_url.as_deref(), Some("https://test.trycloudflare.com"));
-
-        let _ = fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
     fn test_stream_file_zero_copy_and_socket_transmission() {
         let temp_dir = env::temp_dir().join(format!("zero_copy_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
@@ -9869,7 +9606,7 @@ mod tests {
         let rogue_id = "trusted-only-device-0001";
         add_trusted_peer(rogue_id, "Trusted Only", "");
         assert!(is_peer_trusted(rogue_id));
-        assert!(!is_peer_confirmed(rogue_id));
+        assert!(legacy_peer_authorized("").is_none());
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
         let addr = listener.local_addr().unwrap();
@@ -9912,46 +9649,31 @@ mod tests {
         assert!(r.contains("clipboard shield"), "Response should explain shield rejection: {}", r);
     }
 
+    /// A legacy (v1) peer is identified by its pairing token alone; the OmaID it claims does
+    /// not matter, and an OmaID without the token authorizes nothing.
     #[test]
-    fn test_p2p_clipboard_accepts_encrypted_envelope() {
+    fn test_p2p_clipboard_legacy_token_is_the_credential() {
         let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         set_visibility("ALL");
-        let valid_raw_oma_id = rendezvous::generate_raw_oma_id();
-        let peer_id = rendezvous::format_oma_id(&valid_raw_oma_id);
+        let peer_id = rendezvous::format_oma_id(&rendezvous::generate_raw_oma_id());
         let paired_peer = confirmed_test_peer(&peer_id, "Paired Peer");
         let auth_token = paired_peer.auth_token.unwrap_or_default();
-        let my_oma_id = get_or_create_oma_id();
+        assert!(!auth_token.is_empty());
+        assert_eq!(legacy_peer_authorized(&auth_token).map(|p| p.oma_id), Some(paired_peer.oma_id.clone()));
 
-        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind local listener");
-        let addr = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (s, _) = listener.accept().expect("Accept");
-            handle_connection(s, "127.0.0.1", "1234", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
-        });
+        let text = serde_json::json!({ "sender_name": "Paired Peer", "content_type": "text", "text": "token only, no OmaID" });
+        let r = post_once("/api/p2p/clipboard", &format!("X-OmaSend-Auth-Token: {}\r\n", auth_token), &text);
+        assert!(r.starts_with("HTTP/1.1 200 OK"), "token-authenticated legacy clipboard must work: {}", r);
 
-        let secret_msg = "Zero-Knowledge Sovereign P2P Message 42";
-        let inner = serde_json::json!({
-            "oma_id": peer_id,
-            "sender_id": peer_id,
-            "sender_name": "Paired Peer",
-            "content_type": "text",
-            "text": secret_msg
-        });
+        let claimed = serde_json::json!({ "oma_id": peer_id, "sender_id": peer_id, "content_type": "text", "text": "claim only" });
+        let r = post_once("/api/p2p/clipboard", &format!("X-OmaSend-OmaID: {}\r\n", peer_id), &claimed);
+        assert!(r.starts_with("HTTP/1.1 403"), "a claimed OmaID without the token must be refused: {}", r);
 
-        // Encrypt with pairwise session key
-        let envelope = encrypt_p2p_payload(&peer_id, &my_oma_id, inner.to_string().as_bytes())
-            .expect("Encrypt P2P payload");
-
-        let headers = format!("X-OmaSend-OmaID: {}\r\nX-OmaSend-Auth-Token: {}\r\n", peer_id, auth_token);
-        let r = post_json(addr, "/api/p2p/clipboard", &headers, &serde_json::json!({
-            "encrypted_envelope": envelope,
-            "oma_id": peer_id,
-            "sender_id": peer_id,
-            "sender_name": "Paired Peer",
-            "auth_token": auth_token
+        // The old OmaID-keyed "encrypted_envelope" is not decrypted any more.
+        let r = post_once("/api/p2p/clipboard", &format!("X-OmaSend-Auth-Token: {}\r\n", auth_token), &serde_json::json!({
+            "encrypted_envelope": { "v": 2, "sender_oma_id": peer_id, "nonce": "00", "ciphertext": "00", "timestamp": 0 }
         }));
-        server.join().unwrap();
-        assert!(r.starts_with("HTTP/1.1 200 OK"), "Encrypted envelope must be accepted with 200 OK: {}", r);
+        assert!(r.starts_with("HTTP/1.1 400"), "{}", r);
     }
 
     #[test]
@@ -9983,7 +9705,7 @@ mod tests {
         }));
         assert!(resp_transfer.starts_with("HTTP/1.1 200 OK"), "Same-owner transfer must return 200 OK: {}", resp_transfer);
         assert!(resp_transfer.contains("\"status\":\"PENDING\""), "Claimed same-owner transfer must not auto-accept: {}", resp_transfer);
-        assert!(resp_transfer.contains("\"is_same_owner\":true"), "Same-owner flag must be true: {}", resp_transfer);
+        assert!(resp_transfer.contains("\"is_same_owner\":false"), "A claimed OmaID is not proof of ownership: {}", resp_transfer);
 
         // 2. Claimed same-owner clipboard write without a confirmed pairing -> rejected
         let resp_clip = post_json(addr, "/api/p2p/clipboard", &req_headers, &serde_json::json!({
@@ -10027,7 +9749,7 @@ mod tests {
         assert!(resp.contains("\"status\":\"PENDING\""), "Foreign OmaID must enter Gatekeeper PENDING state: {}", resp);
         assert!(resp.contains("\"is_same_owner\":false"), "Foreign OmaID must have is_same_owner=false: {}", resp);
 
-        // Verify resolve_target_ip_or_omaid resolves discovered peer by 16-digit OmaID
+        // An OmaID seen only in a (spoofable) beacon does not resolve to an address.
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let peers = vec![DiscoveredPeer {
             id: "dev_colleague_01".to_string(),
@@ -10045,10 +9767,14 @@ mod tests {
         }];
         save_discovered_peers(&peers);
 
+        assert!(resolve_target_ip_or_omaid(&foreign_oma_id).is_err(), "beacon-claimed OmaID must not resolve");
+
+        // A code-verified pairing does: its address is the observed source of the handshake.
+        let paired = confirmed_test_peer(&foreign_oma_id, "Colleague Workstation");
         let (resolved_ip, resolved_port, resolved_oma) = resolve_target_ip_or_omaid(&foreign_oma_id)
-            .expect("Resolve target by 16-digit OmaID");
-        assert_eq!(resolved_ip, "192.168.1.88");
-        assert_eq!(resolved_port, 53317);
+            .expect("Resolve paired target by 16-digit OmaID");
+        assert_eq!(Some(resolved_ip), paired.ip);
+        assert_eq!(resolved_port, PORT);
         assert_eq!(resolved_oma.as_deref(), Some(foreign_oma_id.as_str()));
     }
 
@@ -10768,5 +10494,41 @@ mod tests {
         assert!(v.get("pin").is_none() && v.get("session_key").is_none() && v.get("cluster_id").is_none());
         assert!(!v["active_url"].as_str().unwrap_or_default().contains('#'));
         assert!(!v["active_url"].as_str().unwrap_or_default().contains("pin"));
+    }
+
+    /// The public OmaID and the secret account OmaID never go out in beacons or /ping, and a
+    /// beacon claiming our OmaID is not treated as "same owner".
+    #[test]
+    fn test_no_oma_id_in_beacon_or_ping() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        set_visibility("ALL");
+        let oma = get_or_create_oma_id();
+        let account = omalink::get_or_create_account_id(&get_state_dir());
+        let ids = [oma.clone(), rendezvous::normalize_oma_id(&oma), account.clone(), rendezvous::normalize_oma_id(&account)];
+        let beacon = serde_json::to_string(&beacon_packet("KNOWN")).unwrap();
+        let ping = ping_response().to_string();
+        for (what, json) in [("beacon", &beacon), ("ping", &ping)] {
+            assert!(!json.contains("oma_id"), "{} must not carry an oma_id field: {}", what, json);
+            for id in &ids {
+                assert!(!json.contains(id.as_str()), "{} leaks an OmaID: {}", what, json);
+            }
+        }
+        let r = get_once("/api/p2p/ping", "");
+        assert!(!r.contains("oma_id") && !r.contains(&rendezvous::normalize_oma_id(&oma)), "{}", r);
+
+        // A newer peer's beacon (no OmaID) is listed; one claiming our OmaID is not "same owner".
+        let src: IpAddr = "192.168.200.7".parse().unwrap();
+        let mut b: P2pBeaconPacket = serde_json::from_str(&beacon).unwrap();
+        b.id = "no-omaid-peer".to_string();
+        b.pk = String::new();
+        update_discovered_peer(&b, src);
+        b.id = "claims-my-omaid".to_string();
+        b.oma_id = oma.clone();
+        update_discovered_peer(&b, src);
+        let peers = get_discovered_peers();
+        assert!(peers.iter().any(|p| p.id == "no-omaid-peer"));
+        let claimer = peers.iter().find(|p| p.id == "claims-my-omaid").expect("listed");
+        assert!(!claimer.is_same_owner && !claimer.is_trusted);
+        save_discovered_peers(&peers.into_iter().filter(|p| p.ip != "192.168.200.7").collect::<Vec<_>>());
     }
 }

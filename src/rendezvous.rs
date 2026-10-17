@@ -1,7 +1,3 @@
-use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes256Gcm, Key, Nonce,
-};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
@@ -361,39 +357,6 @@ pub fn is_peer_paired(oma_id: &str, state_dir: &Path) -> bool {
     peers.iter().any(|p| normalize_oma_id(&p.oma_id) == norm)
 }
 
-/// Verifies whether an OmaID has completed the code-verified pairing handshake
-pub fn is_peer_confirmed(oma_id: &str, state_dir: &Path) -> bool {
-    let norm = normalize_oma_id(oma_id);
-    if norm.len() != 16 {
-        return false;
-    }
-    load_paired_peers(state_dir)
-        .iter()
-        .any(|p| p.confirmed && normalize_oma_id(&p.oma_id) == norm)
-}
-
-/// Verifies the peer's authentication token in constant time
-pub fn verify_peer_auth_token(oma_id: &str, provided_token: &str, state_dir: &Path) -> bool {
-    let norm = normalize_oma_id(oma_id);
-    if norm.len() != 16 {
-        return false;
-    }
-    let peers = load_paired_peers(state_dir);
-    if let Some(peer) = peers.iter().find(|p| normalize_oma_id(&p.oma_id) == norm) {
-        if !peer.confirmed {
-            return false;
-        }
-        if let Some(ref expected) = peer.auth_token {
-            if !expected.is_empty() {
-                return !provided_token.is_empty()
-                    && constant_time_eq(expected.as_bytes(), provided_token.as_bytes());
-            }
-        }
-        return true;
-    }
-    false
-}
-
 /// Registers a peer locally without issuing a pairing code (used by trust and
 /// accepted-transfer flows). Existing records are returned unchanged: their
 /// address, token and confirmation state are never modified here. New records
@@ -584,250 +547,13 @@ pub fn store_completed_pairing(
     Ok(peer)
 }
 
-// ------------------- BLINDED RENDEZVOUS & KDF -------------------
-
-const RENDEZVOUS_SALT: &[u8] = b"omasend-e2ee-rendezvous-salt-v1";
-const RENDEZVOUS_INFO: &[u8] = b"omasend-e2ee-rendezvous-aes256-gcm-key-v1";
-const RENDEZVOUS_TOPIC_KEY: &[u8] = b"omasend-gh-rendezvous-v1";
-
-/// Computes the 64-character hex topic ID for blinded rendezvous using HMAC-SHA256
-pub fn compute_rendezvous_topic(oma_id: &str) -> String {
-    let normalized = normalize_oma_id(oma_id);
-    let ikm = if normalized.len() == 16 {
-        normalized.as_bytes()
-    } else {
-        oma_id.trim().as_bytes()
-    };
-    let topic_bytes = hmac_sha256(ikm, RENDEZVOUS_TOPIC_KEY);
-    hex::encode(topic_bytes)
-}
-
-/// Derives a 256-bit symmetric encryption key from OmaID using HKDF-SHA256
-pub fn derive_rendezvous_key(oma_id: &str) -> [u8; 32] {
-    let normalized = normalize_oma_id(oma_id);
-    let ikm = if normalized.len() == 16 {
-        normalized.as_bytes()
-    } else {
-        oma_id.trim().as_bytes()
-    };
-    hkdf_sha256(ikm, RENDEZVOUS_SALT, RENDEZVOUS_INFO)
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct RendezvousRecord {
-    pub v: u32,
-    pub topic: String,
-    pub device_id: String,
-    pub hostname: String,
-    pub local_ip: String,
-    pub local_port: u16,
-    pub stun_addr: Option<String>,
-    pub wan_url: Option<String>,
-    pub timestamp: u64,
-    pub expires_at: u64,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct EncryptedRendezvousEnvelope {
-    pub topic: String,
-    pub nonce: String,
-    pub ciphertext: String,
-    pub updated_at: u64,
-}
-
-/// Encrypts a RendezvousRecord using AES-256-GCM keyed by the OmaID-derived key
-pub fn encrypt_rendezvous_record(
-    oma_id: &str,
-    record: &RendezvousRecord,
-) -> Result<EncryptedRendezvousEnvelope, String> {
-    let mut key = derive_rendezvous_key(oma_id);
-    let cipher_key = Key::<Aes256Gcm>::from_slice(&key);
-    let cipher = Aes256Gcm::new(cipher_key);
-    key.zeroize();
-
-    let mut nonce_bytes = [0u8; 12];
-    getrandom::getrandom(&mut nonce_bytes).map_err(|e| format!("Random nonce failed: {}", e))?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let mut plaintext = serde_json::to_vec(record)
-        .map_err(|e| format!("Record serialization failed: {}", e))?;
-
-    let ciphertext = cipher
-        .encrypt(nonce, plaintext.as_ref())
-        .map_err(|e| {
-            plaintext.zeroize();
-            format!("AES-256-GCM encryption failed: {}", e)
-        })?;
-    plaintext.zeroize();
-
-    let topic = compute_rendezvous_topic(oma_id);
-
-    Ok(EncryptedRendezvousEnvelope {
-        topic,
-        nonce: hex::encode(nonce_bytes),
-        ciphertext: hex::encode(ciphertext),
-        updated_at: record.timestamp,
-    })
-}
-
-/// Decrypts an EncryptedRendezvousEnvelope using the OmaID-derived key
-pub fn decrypt_rendezvous_record(
-    oma_id: &str,
-    envelope: &EncryptedRendezvousEnvelope,
-) -> Result<RendezvousRecord, String> {
-    let expected_topic = compute_rendezvous_topic(oma_id);
-    if !constant_time_eq(envelope.topic.as_bytes(), expected_topic.as_bytes()) {
-        return Err("Rendezvous topic mismatch for specified OmaID".to_string());
-    }
-
-    let mut key = derive_rendezvous_key(oma_id);
-    let cipher_key = Key::<Aes256Gcm>::from_slice(&key);
-    let cipher = Aes256Gcm::new(cipher_key);
-    key.zeroize();
-
-    let nonce_bytes = hex::decode(&envelope.nonce)
-        .map_err(|e| format!("Invalid nonce hex: {}", e))?;
-    if nonce_bytes.len() != 12 {
-        return Err("Invalid nonce length; expected 12 bytes".to_string());
-    }
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let ciphertext_bytes = hex::decode(&envelope.ciphertext)
-        .map_err(|e| format!("Invalid ciphertext hex: {}", e))?;
-
-    let mut plaintext = cipher
-        .decrypt(nonce, ciphertext_bytes.as_ref())
-        .map_err(|e| format!("AES-256-GCM decryption failed: {}", e))?;
-
-    let res = serde_json::from_slice(&plaintext)
-        .map_err(|e| format!("Record deserialization failed: {}", e));
-    plaintext.zeroize();
-    res
-}
-
-// ------------------- NOISE/E2EE P2P TRANSPORT TUNNEL -------------------
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct EncryptedP2PEnvelope {
-    pub v: u32,
-    pub sender_oma_id: String,
-    pub nonce: String,
-    pub ciphertext: String,
-    pub timestamp: u64,
-}
-
-/// Derives a pairwise session key between two OmaIDs using symmetric HKDF
-pub fn derive_p2p_session_key(local_oma_id: &str, remote_oma_id: &str) -> [u8; 32] {
-    let mut norm_local = normalize_oma_id(local_oma_id);
-    let mut norm_remote = normalize_oma_id(remote_oma_id);
-    // Canonical ordering guarantees both sides derive the exact same pairwise key
-    let mut ikm = Vec::with_capacity(32);
-    if norm_local <= norm_remote {
-        ikm.extend_from_slice(norm_local.as_bytes());
-        ikm.extend_from_slice(norm_remote.as_bytes());
-    } else {
-        ikm.extend_from_slice(norm_remote.as_bytes());
-        ikm.extend_from_slice(norm_local.as_bytes());
-    }
-    let out = hkdf_sha256(&ikm, b"omasend-p2p-noise-salt-v2", b"omasend-p2p-chacha-aes-tunnel-v2");
-    ikm.zeroize();
-    norm_local.zeroize();
-    norm_remote.zeroize();
-    out
-}
-
-/// Derives a cryptographic Zero-Knowledge Same-Owner Proof (HMAC-SHA256) so two devices
-/// sharing the same Anonymous Numbered OmaID can verify ownership without relying solely on
-/// plaintext header strings, and with constant-time verification.
-pub fn compute_same_owner_zk_proof(oma_id: &str, device_id: &str, timestamp_bucket: u64) -> String {
-    let mut norm = normalize_oma_id(oma_id);
-    let mut master_key = hkdf_sha256(
-        norm.as_bytes(),
-        b"omasend-zk-same-owner-salt-v1",
-        b"omasend-zk-same-owner-auth-key-v1",
-    );
-    norm.zeroize();
-    let msg = format!("omasend-zk-v1:{}:{}", device_id.trim(), timestamp_bucket);
-    let tag = hmac_sha256(&master_key, msg.as_bytes());
-    master_key.zeroize();
-    hex::encode(tag)
-}
-
-/// Verifies a Zero-Knowledge Same-Owner Proof across the current and adjacent 60-second time buckets
-/// in constant time (`constant_time_eq`) to prevent timing side-channels and replay attacks.
-pub fn verify_same_owner_zk_proof(
-    local_oma_id: &str,
-    sender_device_id: &str,
-    provided_proof_hex: &str,
-    now_secs: u64,
-) -> bool {
-    if provided_proof_hex.len() != 64 || sender_device_id.trim().is_empty() {
-        return false;
-    }
-    let bucket = now_secs / 60;
-    for b in [bucket.saturating_sub(1), bucket, bucket.saturating_add(1)] {
-        let expected = compute_same_owner_zk_proof(local_oma_id, sender_device_id, b);
-        if constant_time_eq(expected.as_bytes(), provided_proof_hex.as_bytes()) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Encrypts an arbitrary JSON or binary payload for direct P2P transport
-pub fn encrypt_p2p_payload(
-    local_oma_id: &str,
-    remote_oma_id: &str,
-    plaintext: &[u8],
-) -> Result<EncryptedP2PEnvelope, String> {
-    let mut key = derive_p2p_session_key(local_oma_id, remote_oma_id);
-    let cipher_key = Key::<Aes256Gcm>::from_slice(&key);
-    let cipher = Aes256Gcm::new(cipher_key);
-    key.zeroize();
-
-    let mut nonce_bytes = [0u8; 12];
-    getrandom::getrandom(&mut nonce_bytes).map_err(|e| format!("CSPRNG nonce failed: {}", e))?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let ciphertext = cipher
-        .encrypt(nonce, plaintext)
-        .map_err(|e| format!("E2EE encryption failed: {}", e))?;
-
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-
-    Ok(EncryptedP2PEnvelope {
-        v: 2,
-        sender_oma_id: format_oma_id(local_oma_id),
-        nonce: hex::encode(nonce_bytes),
-        ciphertext: hex::encode(ciphertext),
-        timestamp: now,
-    })
-}
-
-/// Decrypts a received P2P payload envelope using the derived pairwise key
-pub fn decrypt_p2p_payload(
-    local_oma_id: &str,
-    envelope: &EncryptedP2PEnvelope,
-) -> Result<Vec<u8>, String> {
-    let mut key = derive_p2p_session_key(local_oma_id, &envelope.sender_oma_id);
-    let cipher_key = Key::<Aes256Gcm>::from_slice(&key);
-    let cipher = Aes256Gcm::new(cipher_key);
-    key.zeroize();
-
-    let nonce_bytes = hex::decode(&envelope.nonce)
-        .map_err(|e| format!("Invalid nonce hex: {}", e))?;
-    if nonce_bytes.len() != 12 {
-        return Err("Invalid nonce length; expected 12 bytes".to_string());
-    }
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let ciphertext_bytes = hex::decode(&envelope.ciphertext)
-        .map_err(|e| format!("Invalid ciphertext hex: {}", e))?;
-
-    cipher
-        .decrypt(nonce, ciphertext_bytes.as_ref())
-        .map_err(|e| format!("E2EE decryption failed: {}", e))
-}
+// ------------------- OmaID-DERIVED "E2EE" (REMOVED) -------------------
+//
+// The blinded rendezvous topic/key, the pairwise "P2P session key", the GitHub/local rendezvous
+// anchors and the "same-owner ZK proof" were all derived from the OmaID alone. The OmaID is
+// public (it used to be broadcast in every beacon), so none of them were confidential or
+// authenticating; they were removed rather than kept around as a trap. Device authentication
+// is the Ed25519 device key (devicekey.rs) and confidentiality the QUIC core.
 
 // ------------------- STUN PROTOCOL CLIENT (RFC 5389) -------------------
 
@@ -951,77 +677,6 @@ pub fn query_stun_external_addr() -> Option<SocketAddr> {
         }
     }
     None
-}
-
-// ------------------- GITHUB / GIT GIST DISCOVERY ANCHOR -------------------
-
-/// Generates a standardized git ref tag for GitHub-based rendezvous anchor
-pub fn format_github_anchor_ref(topic: &str) -> String {
-    format!("refs/tags/rendezvous/{}", topic)
-}
-
-/// Builds an encrypted rendezvous payload ready for Git/Gist publishing
-pub fn build_github_anchor_payload(
-    oma_id: &str,
-    record: &RendezvousRecord,
-) -> Result<String, String> {
-    let envelope = encrypt_rendezvous_record(oma_id, record)?;
-    serde_json::to_string(&envelope).map_err(|e| format!("Serialization error: {}", e))
-}
-
-/// Parses and decrypts a rendezvous payload retrieved from Git/Gist
-pub fn parse_github_anchor_payload(
-    oma_id: &str,
-    raw_json: &str,
-) -> Result<RendezvousRecord, String> {
-    let envelope: EncryptedRendezvousEnvelope =
-        serde_json::from_str(raw_json).map_err(|e| format!("Invalid envelope JSON: {}", e))?;
-    decrypt_rendezvous_record(oma_id, &envelope)
-}
-
-/// Publishes local rendezvous discovery record to ~/.local/state/omarchy/omasend/rendezvous_anchor.json
-#[allow(clippy::too_many_arguments)]
-pub fn publish_local_rendezvous_anchor(
-    oma_id: &str,
-    local_ip: &str,
-    port: u16,
-    stun_addr: Option<&str>,
-    wan_url: Option<&str>,
-    device_id: &str,
-    hostname: &str,
-    state_dir: &Path,
-) -> Result<EncryptedRendezvousEnvelope, String> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let topic = compute_rendezvous_topic(oma_id);
-    let record = RendezvousRecord {
-        v: 1,
-        topic,
-        device_id: device_id.to_string(),
-        hostname: hostname.to_string(),
-        local_ip: local_ip.to_string(),
-        local_port: port,
-        stun_addr: stun_addr.map(|s| s.to_string()),
-        wan_url: wan_url.map(|s| s.to_string()),
-        timestamp: now,
-        expires_at: now + 3600,
-    };
-    let envelope = encrypt_rendezvous_record(oma_id, &record)?;
-    let envelope_json = serde_json::to_string_pretty(&envelope)
-        .map_err(|e| format!("JSON serialize error: {}", e))?;
-    let anchor_file = state_dir.join("rendezvous_anchor.json");
-    crate::write_secure_file(&anchor_file, &envelope_json)?;
-    Ok(envelope)
-}
-
-/// Queries and decrypts local rendezvous discovery record
-pub fn query_local_rendezvous_anchor(oma_id: &str, state_dir: &Path) -> Option<RendezvousRecord> {
-    let anchor_file = state_dir.join("rendezvous_anchor.json");
-    let content = crate::read_secure_file(&anchor_file).ok()?;
-    let envelope: EncryptedRendezvousEnvelope = serde_json::from_str(&content).ok()?;
-    decrypt_rendezvous_record(oma_id, &envelope).ok()
 }
 
 // ------------------- LONG-LIVED STUN & NAT TRAVERSED SOCKET -------------------
@@ -1178,76 +833,6 @@ pub fn qr_svg(content: &str) -> Option<String> {
     ))
 }
 
-// ------------------- FAST RENDEZVOUS STATUS CACHE -------------------
-
-pub const RENDEZVOUS_CACHE_TTL_SECS: u64 = 30;
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
-pub struct RendezvousStatus {
-    pub oma_id: String,
-    pub cluster_id: String,
-    pub local_ip: String,
-    pub mode: String,
-    pub stun_addr: Option<String>,
-    pub tailscale_ip: Option<String>,
-    pub updated_at: u64,
-}
-
-pub fn load_rendezvous_status_cache(state_dir: &Path) -> Option<RendezvousStatus> {
-    let cache_path = state_dir.join("rendezvous_status_cache.json");
-    let content = crate::read_secure_file(&cache_path).ok()?;
-    serde_json::from_str::<RendezvousStatus>(&content).ok()
-}
-
-pub fn save_rendezvous_status_cache(state_dir: &Path, status: &RendezvousStatus) {
-    let cache_path = state_dir.join("rendezvous_status_cache.json");
-    if let Ok(json) = serde_json::to_string_pretty(status) {
-        let _ = crate::write_secure_file(&cache_path, &json);
-    }
-}
-
-/// Returns cached RendezvousStatus immediately (<1ms) if `rendezvous_status_cache.json`
-/// exists and is fresher than 30 seconds (with matching `oma_id`, `local_ip`, and `mode`).
-/// If missing or stale, returns immediate local info (preserving any previously cached STUN
-/// or local anchor address) and saves it to avoid blocking `--json` UI polls.
-pub fn get_rendezvous_status_fast(
-    state_dir: &Path,
-    oma_id: &str,
-    local_ip: &str,
-    mode: &str,
-) -> RendezvousStatus {
-    let now = unix_now();
-    let cached_opt = load_rendezvous_status_cache(state_dir);
-
-    if let Some(ref cached) = cached_opt {
-        if now.saturating_sub(cached.updated_at) < RENDEZVOUS_CACHE_TTL_SECS
-            && cached.oma_id == oma_id
-            && cached.local_ip == local_ip
-            && cached.mode == mode
-        {
-            return cached.clone();
-        }
-    }
-
-    let prev_stun = cached_opt
-        .as_ref()
-        .and_then(|c| c.stun_addr.clone())
-        .or_else(|| query_local_rendezvous_anchor(oma_id, state_dir).and_then(|r| r.stun_addr));
-    let prev_ts = cached_opt.as_ref().and_then(|c| c.tailscale_ip.clone());
-
-    let fast_status = RendezvousStatus {
-        oma_id: oma_id.to_string(),
-        cluster_id: compute_rendezvous_topic(oma_id),
-        local_ip: local_ip.to_string(),
-        mode: mode.to_string(),
-        stun_addr: prev_stun,
-        tailscale_ip: prev_ts,
-        updated_at: now,
-    };
-    save_rendezvous_status_cache(state_dir, &fast_status);
-    fast_status
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1335,58 +920,6 @@ mod tests {
     }
 
     #[test]
-    fn test_blinded_rendezvous_topic_and_kdf() {
-        let oma_id = "4829-1048-5729-1104";
-        let topic = compute_rendezvous_topic(oma_id);
-        assert_eq!(topic.len(), 64);
-        assert!(hex::decode(&topic).is_ok());
-
-        // Normalized and formatted should yield identical topic
-        let norm = normalize_oma_id(oma_id);
-        assert_eq!(compute_rendezvous_topic(&norm), topic);
-
-        let key = derive_rendezvous_key(oma_id);
-        assert_eq!(key.len(), 32);
-        assert_eq!(derive_rendezvous_key(&norm), key);
-    }
-
-    #[test]
-    fn test_rendezvous_encryption_and_tamper_detection() {
-        let oma_id_alice = "1111-2222-3333-4444";
-        let oma_id_bob = "5555-6666-7777-8888";
-
-        let record = RendezvousRecord {
-            v: 1,
-            topic: compute_rendezvous_topic(oma_id_alice),
-            device_id: "alice_device_001".to_string(),
-            hostname: "alice-workstation".to_string(),
-            local_ip: "192.168.1.100".to_string(),
-            local_port: 53317,
-            stun_addr: Some("203.0.113.50:53317".to_string()),
-            wan_url: Some("https://alice.trycloudflare.com".to_string()),
-            timestamp: 1727700000,
-            expires_at: 1727703600,
-        };
-
-        let envelope = encrypt_rendezvous_record(oma_id_alice, &record).expect("Encryption must succeed");
-        assert_eq!(envelope.topic, record.topic);
-
-        // Decrypt with correct OmaID
-        let decrypted = decrypt_rendezvous_record(oma_id_alice, &envelope).expect("Decryption must succeed");
-        assert_eq!(decrypted, record);
-
-        // Decrypt with incorrect OmaID must fail
-        let bob_decrypt = decrypt_rendezvous_record(oma_id_bob, &envelope);
-        assert!(bob_decrypt.is_err(), "Decryption with wrong OmaID must fail");
-
-        // Tampered ciphertext must fail
-        let mut tampered = envelope.clone();
-        tampered.ciphertext = format!("aa{}", &tampered.ciphertext[2..]);
-        let tamper_decrypt = decrypt_rendezvous_record(oma_id_alice, &tampered);
-        assert!(tamper_decrypt.is_err(), "Tampered ciphertext must fail authentication");
-    }
-
-    #[test]
     fn test_stun_packet_builder_and_xor_mapped_parser() {
         let (req, tx_id) = create_stun_binding_request();
         assert_eq!(req.len(), 20);
@@ -1422,30 +955,6 @@ mod tests {
         let parsed = parse_stun_response(&resp, &tx_id).expect("Parse STUN response");
         assert_eq!(parsed.ip(), IpAddr::V4(Ipv4Addr::new(198, 51, 100, 25)));
         assert_eq!(parsed.port(), 54321);
-    }
-
-    #[test]
-    fn test_github_anchor_payload_lifecycle() {
-        let oma_id = "9876-5432-1098-7654";
-        let topic = compute_rendezvous_topic(oma_id);
-        assert_eq!(format_github_anchor_ref(&topic), format!("refs/tags/rendezvous/{}", topic));
-
-        let record = RendezvousRecord {
-            v: 1,
-            topic: topic.clone(),
-            device_id: "dev_999".to_string(),
-            hostname: "arch-box".to_string(),
-            local_ip: "10.0.0.45".to_string(),
-            local_port: 53317,
-            stun_addr: Some("198.51.100.10:53317".to_string()),
-            wan_url: None,
-            timestamp: 1727710000,
-            expires_at: 1727713600,
-        };
-
-        let json_payload = build_github_anchor_payload(oma_id, &record).expect("Build anchor payload");
-        let parsed_record = parse_github_anchor_payload(oma_id, &json_payload).expect("Parse anchor payload");
-        assert_eq!(parsed_record, record);
     }
 
     #[test]
@@ -1607,30 +1116,5 @@ mod tests {
         for bad in ["8.8.8.8", "100.64.0.1", "2001:4860::8888", "::ffff:8.8.8.8"] {
             assert!(!is_local_network_ip(&bad.parse().unwrap()), "{} should be rejected", bad);
         }
-    }
-
-    #[test]
-    fn test_same_owner_zk_proof_verification_and_replay_resistance() {
-        let oma_id = generate_raw_oma_id();
-        let formatted_oma_id = format_oma_id(&oma_id);
-        let device_id = "pc-linux-a1b2c3d4";
-        let now_secs = 1_760_000_120u64;
-        let bucket = now_secs / 60;
-
-        let proof = compute_same_owner_zk_proof(&formatted_oma_id, device_id, bucket);
-        assert_eq!(proof.len(), 64);
-
-        // Exact bucket and +/- 1 adjacent bucket must verify
-        assert!(verify_same_owner_zk_proof(&oma_id, device_id, &proof, now_secs));
-        assert!(verify_same_owner_zk_proof(&formatted_oma_id, device_id, &proof, now_secs + 55));
-        assert!(verify_same_owner_zk_proof(&formatted_oma_id, device_id, &proof, now_secs - 55));
-
-        // Expired replay (> 2 buckets away) must fail
-        assert!(!verify_same_owner_zk_proof(&oma_id, device_id, &proof, now_secs + 180));
-
-        // Different OmaID or different device_id must fail
-        let other_oma_id = generate_raw_oma_id();
-        assert!(!verify_same_owner_zk_proof(&other_oma_id, device_id, &proof, now_secs));
-        assert!(!verify_same_owner_zk_proof(&oma_id, "different-device-id", &proof, now_secs));
     }
 }
