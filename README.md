@@ -59,7 +59,7 @@
 - `wl-clipboard` (provides `wl-copy` and `wl-paste` on Wayland)
 - `libnotify` (desktop notifications via `notify-send`)
 - `zenity` (GTK file selection dialog)
-- `cloudflared` (optional, required for Global WAN Tunnel mode)
+- `cloudflared` (optional, for the Global WAN Tunnel; off by default, never started automatically, and only the root-owned system package in `/usr/bin` or `/usr/local/bin` is used. Only the E2EE web portal is reachable through the tunnel)
 
 ---
 

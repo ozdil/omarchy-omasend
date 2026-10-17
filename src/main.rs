@@ -272,8 +272,7 @@ pub struct ServerState {
     pub port: u16,
     pub local_ip: String,
     pub tailscale_ip: Option<String>,
-    pub pin: String,
-    pub session_key: String,
+    // The portal secret and E2EE key are deliberately not part of the status (see main()).
     pub active_mode: String, // "LAN" or "WAN"
     pub wan_active: bool,
     pub wan_connecting: bool,
@@ -300,7 +299,7 @@ pub struct ServerState {
     // OmaID, Blinded Rendezvous & WAN Discovery
     pub oma_id: String,
     pub wan_mode: String,
-    pub cluster_id: String,
+    /// External address from STUN, looked up only when the WAN tunnel is turned on.
     pub stun_addr: Option<String>,
     #[serde(default)]
     pub sound_enabled: bool,
@@ -607,22 +606,30 @@ pub fn write_secure_file(path: &Path, content: &str) -> Result<(), String> {
     write_secure_bytes(path, content.as_bytes())
 }
 
+/// Length in hex characters of the portal access secret (still stored as `pin.txt` and sent
+/// as `X-OmaSend-PIN`): 24 random bytes, 192 bits. The old 4-digit PIN could be brute forced
+/// through the WAN tunnel; a stored 4-digit PIN is not accepted and is replaced on first use.
+pub const PORTAL_SECRET_HEX_LEN: usize = 48;
+
 fn get_or_create_pin() -> String {
     let pin_file = get_state_dir().join("pin.txt");
     if let Ok(content) = read_secure_file(&pin_file) {
         let p = content.trim();
-        if p.len() == 4 && p.chars().all(|c| c.is_ascii_digit()) {
-            return p.to_string();
+        if p.len() == PORTAL_SECRET_HEX_LEN && p.chars().all(|c| c.is_ascii_hexdigit()) {
+            return p.to_ascii_lowercase();
         }
     }
     generate_new_pin()
 }
 
 fn generate_new_pin() -> String {
-    let mut rand_bytes = [0u8; 2];
-    let _ = getrandom::getrandom(&mut rand_bytes);
-    let val = ((rand_bytes[0] as u32) << 8 | (rand_bytes[1] as u32)) % 9000 + 1000;
-    let pin = format!("{:04}", val);
+    let mut rand_bytes = [0u8; PORTAL_SECRET_HEX_LEN / 2];
+    if getrandom::getrandom(&mut rand_bytes).is_err() {
+        // Never fall back to a guessable secret: without a CSPRNG the portal stays locked.
+        eprintln!("CSPRNG failure: portal secret not created");
+        return String::new();
+    }
+    let pin = hex::encode(rand_bytes);
     let pin_file = get_state_dir().join("pin.txt");
     if let Err(e) = write_secure_file(&pin_file, &pin) {
         eprintln!("Error writing secure pin file: {}", e);
@@ -733,26 +740,33 @@ fn get_wan_provider() -> Option<String> {
     read_secure_file(&provider_file).ok().map(|s| s.trim().to_string())
 }
 
+/// True if `path` and every directory above it are owned by root and not writable by group or
+/// others, and `path` is a regular file (not a symlink). A user-writable binary on the tunnel
+/// path would let any process running as the user swap what serves the portal.
+fn is_root_owned_and_locked(path: &Path) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else { return false };
+    if !meta.file_type().is_file() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+        return false;
+    }
+    let mut dir = path.parent();
+    while let Some(d) = dir {
+        match fs::metadata(d) {
+            Ok(m) if m.uid() == 0 && m.mode() & 0o022 == 0 => {}
+            _ => return false,
+        }
+        dir = d.parent();
+    }
+    true
+}
+
+/// cloudflared from a system package only. `~/.local/bin` and `$PATH` lookups are no longer
+/// used: anything the user (or malware running as the user) can write is not trusted to carry
+/// the portal to the internet.
 fn get_cloudflared_bin() -> Option<String> {
-    for candidate in &["/usr/bin/cloudflared", "/usr/local/bin/cloudflared"] {
-        if Path::new(candidate).is_file() {
-            return Some(candidate.to_string());
-        }
-    }
-    if let Ok(home) = env::var("HOME") {
-        let local_bin = format!("{}/.local/bin/cloudflared", home);
-        if Path::new(&local_bin).is_file() {
-            return Some(local_bin);
-        }
-    }
-    let deadline = Instant::now() + Duration::from_millis(300);
-    if let Some(out) = run_cmd_bounded("/usr/bin/which", &["cloudflared"], &[], deadline, 256) {
-        let path = String::from_utf8_lossy(&out).trim().to_string();
-        if !path.is_empty() && Path::new(&path).is_file() {
-            return Some(path);
-        }
-    }
-    None
+    ["/usr/bin/cloudflared", "/usr/local/bin/cloudflared"]
+        .iter()
+        .find(|c| is_root_owned_and_locked(Path::new(c)))
+        .map(|c| c.to_string())
 }
 
 fn get_wan_status() -> (bool, bool, Option<String>) {
@@ -803,6 +817,18 @@ fn get_wan_status() -> (bool, bool, Option<String>) {
     (false, false, None)
 }
 
+/// External address from the STUN lookup done when the WAN tunnel was started.
+fn wan_stun_path() -> PathBuf {
+    get_state_dir().join("wan_stun.txt")
+}
+
+/// Printed whenever the user turns the WAN tunnel on. The tunnel is off by default and never
+/// started automatically.
+const WAN_WARNING: &str = "WARNING: WAN access publishes this machine's OmaSend web portal on a public trycloudflare.com address.\n\
+Anyone with the portal link (it contains the access secret) can upload files to this PC, download shared files and read or set its clipboard.\n\
+Only the portal is reachable through the tunnel; device pairing, transfers and clipboard sync stay LAN-only.\n\
+Turn it off when you are done: omasend-engine --stop-wan";
+
 fn stop_wan_tunnel() {
     let pid_file = get_state_dir().join("wan_pid.txt");
     let url_file = get_state_dir().join("wan_url.txt");
@@ -823,6 +849,7 @@ fn stop_wan_tunnel() {
     let _ = fs::remove_file(&connecting_file);
     let _ = fs::remove_file(&provider_file);
     let _ = fs::remove_file(&log_file);
+    let _ = fs::remove_file(wan_stun_path());
     set_active_mode("LAN");
     update_all_qr();
     notify_desktop("OmaSend: Global WAN", "Secure WAN tunnel closed. Switched to local Wi-Fi mode.");
@@ -886,6 +913,16 @@ fn start_wan_tunnel() -> Result<String, String> {
                 let _ = write_secure_file(&connecting_file, "connecting");
                 let _ = write_secure_file(&provider_file, "Cloudflare");
                 set_active_mode("WAN");
+                // The external address is looked up once here, while the user has WAN on;
+                // status polling (`--json`) only reads this file and never talks to STUN.
+                match query_stun_external_addr() {
+                    Some(a) => {
+                        let _ = write_secure_file(&wan_stun_path(), &a.to_string());
+                    }
+                    None => {
+                        let _ = fs::remove_file(wan_stun_path());
+                    }
+                }
                 return Ok("Cloudflare tunnel launched in background".to_string());
             }
             Err(e) => {
@@ -894,7 +931,7 @@ fn start_wan_tunnel() -> Result<String, String> {
         }
     }
 
-    Err("WAN Tunneling requires cloudflared. Please install the trusted system package: pacman -S cloudflared (see README.md)".to_string())
+    Err("WAN Tunneling requires cloudflared from a system package (root-owned /usr/bin/cloudflared or /usr/local/bin/cloudflared): pacman -S cloudflared (see README.md)".to_string())
 }
 
 // ------------------- QR CODE & URLS -------------------
@@ -1025,6 +1062,22 @@ pub fn update_oma_id_qr() -> (String, String) {
     (svg_path, png_path)
 }
 
+/// Portal address without any secret, safe for status output.
+fn portal_base_url(ip: &str, mode: &str, wan_url: Option<&str>) -> String {
+    match wan_url {
+        Some(u) if mode == "WAN" => u.trim_end_matches('/').to_string(),
+        _ => format!("http://{}:{}", ip, PORT),
+    }
+}
+
+/// Portal link that carries the access secret and the E2EE key. Both live in the fragment,
+/// which browsers never send to the server (or to Cloudflare, or into proxy logs); the login
+/// page reads the secret from it and presents it in a header. Only the 0600 QR file and the
+/// explicit `--portal-url` command ever show this link.
+fn portal_secret_url(base: &str, pin: &str, key: &str) -> String {
+    format!("{}/#key={}&pin={}", base, key, pin)
+}
+
 fn update_all_qr() {
     let ip = get_local_ip();
     let pin = get_or_create_pin();
@@ -1032,23 +1085,13 @@ fn update_all_qr() {
     let mode = get_active_mode();
     let (_wan_active, _wan_connecting, wan_url) = get_wan_status();
 
-    let target_base = if mode == "WAN" {
-        if let Some(ref u) = wan_url {
-            u.clone()
-        } else {
-            format!("http://{}:{}", ip, PORT)
-        }
-    } else {
-        format!("http://{}:{}", ip, PORT)
-    };
-
-    let full_url = format!("{}/?pin={}#key={}", target_base, pin, key);
+    let full_url = portal_secret_url(&portal_base_url(&ip, &mode, wan_url.as_deref()), &pin, &key);
 
     let last_qr_file = get_state_dir().join("last_qr_url.txt");
     let qr_file = get_state_dir().join("qr.svg");
 
     if !qr_file.exists() || read_secure_file(&last_qr_file).map(|s| s.trim() != full_url).unwrap_or(true) {
-        // The URL carries the PIN, so the file is written 0600.
+        // The URL carries the portal secret, so the file is written 0600.
         if let Some(svg) = rendezvous::qr_svg(&full_url) {
             let _ = write_secure_file(&qr_file, &svg);
         }
@@ -2658,6 +2701,24 @@ const TUNNEL_HEADERS: &[&str] = &["cf-connecting-ip", "cf-ray", "x-forwarded-for
 
 fn has_tunnel_headers(req: &HttpRequest) -> bool {
     TUNNEL_HEADERS.iter().any(|h| req.get_header(h).is_some())
+}
+
+/// A request that came in through the WAN tunnel: cloudflared connects from loopback and adds
+/// its headers. Such requests may only reach the web portal (see `is_portal_route`).
+fn is_tunnel_request(req: &HttpRequest, client_ip: IpAddr) -> bool {
+    client_ip.to_canonical().is_loopback() && has_tunnel_headers(req)
+}
+
+/// The only routes served to the internet through the WAN tunnel: the portal page, its login,
+/// status, and the E2EE (browser-encrypted) upload, download and clipboard endpoints. Pairing,
+/// linking, v2/core, local control, p2p transfers/decisions/clipboard, and the plaintext portal
+/// variants stay LAN-only.
+fn is_portal_route(method: &str, path: &str) -> bool {
+    matches!(
+        (method, path),
+        ("GET", "/") | ("POST", "/api/login") | ("GET", "/api/status") | ("POST", "/api/upload-encrypted")
+            | ("GET", "/api/clipboard-encrypted") | ("POST", "/api/clipboard-encrypted")
+    ) || (method == "GET" && path.starts_with("/api/download-encrypted/"))
 }
 
 fn local_token_matches(req: &HttpRequest) -> bool {
@@ -4920,12 +4981,56 @@ static PIN_RATE_LIMITER: AttemptLimiter = Mutex::new(None);
 /// Failed /api/v2/pair attempts per source address (M17).
 static PAIR_RATE_LIMITER: AttemptLimiter = Mutex::new(None);
 
+/// Failed portal-secret attempts from all addresses together. The per-address limit alone is
+/// no defence through the tunnel, where an attacker controls many source addresses.
+static PIN_GLOBAL_LIMITER: Mutex<Option<PinAttemptState>> = Mutex::new(None);
+pub const PIN_GLOBAL_MAX_FAILURES: u32 = 30;
+
 pub fn is_pin_rate_limited(ip: IpAddr) -> bool {
     is_rate_limited(&PIN_RATE_LIMITER, ip)
 }
 
 pub fn record_pin_attempt(ip: IpAddr, success: bool) -> bool {
-    record_attempt(&PIN_RATE_LIMITER, ip, success)
+    let per_ip = record_attempt(&PIN_RATE_LIMITER, ip, success);
+    if success {
+        return per_ip;
+    }
+    record_global_pin_failure() && per_ip
+}
+
+fn is_pin_globally_limited() -> bool {
+    let guard = PIN_GLOBAL_LIMITER.lock().unwrap_or_else(|p| p.into_inner());
+    guard.as_ref().and_then(|s| s.blocked_until).is_some_and(|b| Instant::now() < b)
+}
+
+/// Counts one failure in the global budget; returns false once it is used up
+/// (`PIN_GLOBAL_MAX_FAILURES` within 60 s -> every non-local client waits 60 s).
+fn record_global_pin_failure() -> bool {
+    let mut guard = PIN_GLOBAL_LIMITER.lock().unwrap_or_else(|p| p.into_inner());
+    let now = Instant::now();
+    let state = guard.get_or_insert(PinAttemptState {
+        failed_count: 0,
+        window_start: now,
+        blocked_until: None,
+    });
+    if let Some(b) = state.blocked_until {
+        if now < b {
+            return false;
+        }
+        state.blocked_until = None;
+        state.failed_count = 0;
+        state.window_start = now;
+    }
+    if now.duration_since(state.window_start) > Duration::from_secs(60) {
+        state.failed_count = 0;
+        state.window_start = now;
+    }
+    state.failed_count = state.failed_count.saturating_add(1);
+    if state.failed_count >= PIN_GLOBAL_MAX_FAILURES {
+        state.blocked_until = Some(now + Duration::from_secs(60));
+        return false;
+    }
+    true
 }
 
 fn is_rate_limited(limiter: &AttemptLimiter, ip: IpAddr) -> bool {
@@ -4984,6 +5089,7 @@ fn record_attempt(limiter: &AttemptLimiter, ip: IpAddr, success: bool) -> bool {
 
 #[cfg(test)]
 pub fn reset_pin_rate_limiter() {
+    *PIN_GLOBAL_LIMITER.lock().unwrap_or_else(|p| p.into_inner()) = None;
     for limiter in [&PIN_RATE_LIMITER, &PAIR_RATE_LIMITER] {
         let mut guard = match limiter.lock() {
             Ok(g) => g,
@@ -4995,14 +5101,9 @@ pub fn reset_pin_rate_limiter() {
     }
 }
 
+/// The portal secret is accepted only from the `X-OmaSend-PIN` header. A `?pin=` query
+/// parameter is ignored: URLs end up in browser history, proxy and Cloudflare logs.
 fn extract_provided_pin(req: &HttpRequest) -> Option<String> {
-    for part in req.query.split('&') {
-        if let Some(val) = part.strip_prefix("pin=") {
-            if !val.is_empty() {
-                return Some(val.to_string());
-            }
-        }
-    }
     if let Some(h) = req.get_header("x-omasend-pin") {
         if !h.is_empty() {
             return Some(h.to_string());
@@ -5017,6 +5118,12 @@ const WEB_SESSION_COOKIE: &str = "omasend_session";
 /// session key is rotated and does not reveal the PIN.
 fn web_session_value(pin: &str, key_hex: &str) -> String {
     hex::encode(rendezvous::hmac_sha256(key_hex.as_bytes(), format!("omasend-web-session|{}", pin).as_bytes()))
+}
+
+/// `Set-Cookie` value (attributes after the first `;`; `send_response` appends Path, HttpOnly
+/// and SameSite=Strict).
+fn web_session_set_cookie(value: &str, secure: bool) -> String {
+    format!("{}={}{}", WEB_SESSION_COOKIE, value, if secure { "; Secure" } else { "" })
 }
 
 fn web_session_cookie(req: &HttpRequest) -> Option<&str> {
@@ -5050,7 +5157,7 @@ fn send_response(
     cors_origin: Option<&str>,
 ) {
     let cookie_header = if let Some(c) = cookie {
-        format!("Set-Cookie: {}; Path=/; HttpOnly; SameSite=Lax\r\n", c)
+        format!("Set-Cookie: {}; Path=/; HttpOnly; SameSite=Strict\r\n", c)
     } else {
         String::new()
     };
@@ -5182,7 +5289,7 @@ fn render_login_page() -> String {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-<title>OmaSend | PIN Verification</title>
+<title>OmaSend | Portal Access</title>
 <style>
 * {{ box-sizing: border-box; margin: 0; padding: 0; }}
 body {{ font-family: "JetBrainsMono Nerd Font", "JetBrains Mono", monospace; background: #0d1117; color: #dbe4ee; display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; }}
@@ -5192,7 +5299,7 @@ body {{ font-family: "JetBrainsMono Nerd Font", "JetBrains Mono", monospace; bac
 .tag {{ display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: #00cbb8; border: 1px solid #00cbb8; background: rgba(0, 203, 184, 0.1); padding: 3px 8px; margin-bottom: 12px; }}
 h1 {{ font-size: 18px; font-weight: 700; color: #dbe4ee; margin-bottom: 8px; letter-spacing: 0.5px; }}
 p {{ font-size: 12px; color: #8b949e; margin-bottom: 24px; line-height: 1.6; }}
-.pin-input {{ width: 100%; font-size: 28px; letter-spacing: 10px; text-align: center; background: #0d1117; border: 1px solid #00cbb8; color: #00eed9; border-radius: 0; padding: 12px; margin-bottom: 20px; font-family: "JetBrainsMono Nerd Font", "JetBrains Mono", monospace; outline: none; transition: border-color 0.2s; }}
+.pin-input {{ width: 100%; font-size: 13px; letter-spacing: 1px; text-align: center; background: #0d1117; border: 1px solid #00cbb8; color: #00eed9; border-radius: 0; padding: 12px; margin-bottom: 20px; font-family: "JetBrainsMono Nerd Font", "JetBrains Mono", monospace; outline: none; transition: border-color 0.2s; }}
 .pin-input:focus {{ border-color: #00eed9; box-shadow: 0 0 12px rgba(0,203,184,0.25); }}
 button {{ width: 100%; background: #00cbb8; color: #0d1117; border: none; padding: 13px; font-size: 13px; font-weight: 700; font-family: "JetBrainsMono Nerd Font", "JetBrains Mono", monospace; letter-spacing: 0.5px; border-radius: 0; cursor: pointer; text-transform: uppercase; transition: opacity 0.2s; }}
 button:active {{ opacity: 0.85; }}
@@ -5203,12 +5310,32 @@ button:active {{ opacity: 0.85; }}
 <div class="logo-wrap">{}</div>
 <div class="tag">ZERO-TRUST GATEWAY</div>
 <h1>OMASEND AIRBRIDGE</h1>
-<p>Enter the 4-digit security PIN displayed on your Omarchy desktop panel.</p>
-<form method="GET" action="/">
-<input type="number" name="pin" class="pin-input" placeholder="----" required autofocus pattern="[0-9]*" inputmode="numeric">
+<p id="msg">Scan the portal QR code on your Omarchy desktop panel, or paste the access secret (omasend-engine --portal-url).</p>
+<form id="login">
+<input type="password" id="secret" class="pin-input" placeholder="access secret" required autofocus autocomplete="off" spellcheck="false">
 <button type="submit">Verify &amp; Connect</button>
 </form>
 </div>
+<script>
+// The secret travels in the link's fragment (never sent to the server) and is presented once
+// in a header; the server answers with an HttpOnly session cookie.
+async function login(secret) {{
+  var res = await fetch('/api/login', {{ method: 'POST', headers: {{ 'X-OmaSend-PIN': secret }}, credentials: 'same-origin' }});
+  if (res.ok) {{
+    var key = window.location.hash.match(/key=([a-f0-9]{{64}})/i);
+    history.replaceState(null, '', '/' + (key ? '#key=' + key[1] : ''));
+    window.location.reload();
+  }} else {{
+    document.getElementById('msg').innerText = res.status === 429 ? 'Too many attempts. Wait a minute and try again.' : 'Access denied.';
+  }}
+}}
+var m = window.location.hash.match(/pin=([a-f0-9]+)/i);
+if (m) {{ login(m[1]); }}
+document.getElementById('login').addEventListener('submit', function(e) {{
+  e.preventDefault();
+  login(document.getElementById('secret').value.trim());
+}});
+</script>
 </body>
 </html>"#,
         OMARCHY_INLINE_LOGO_SVG
@@ -5610,10 +5737,17 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
         return;
     }
 
+    // Internet traffic from the WAN tunnel only ever reaches the portal.
+    let via_tunnel = is_tunnel_request(&req, client_ip);
+    if via_tunnel && !is_portal_route(&req.method, &req.path) {
+        respond(&stream, "404 Not Found", "application/json", b"{\"error\":\"Not available over WAN\"}", None, None);
+        return;
+    }
+
     // The local CLI/panel is never locked out by someone else's wrong PINs (M5).
     let rl_ip = rate_limit_ip(&req, client_ip);
     if !local_ctl && is_pin_rate_limited(rl_ip) {
-        let err = b"{\"error\":\"Too many failed PIN attempts. Please wait 60 seconds.\"}";
+        let err = b"{\"error\":\"Too many failed access attempts. Please wait 60 seconds.\"}";
         respond(
             &stream,
             "429 Too Many Requests",
@@ -5627,15 +5761,23 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
 
     let web_session = web_session_value(pin, key_hex);
     let maybe_pin = extract_provided_pin(&req);
+    // While the global budget is used up no new secret is even compared. Existing portal
+    // sessions (cookie) and paired-device traffic keep working, so this cannot be used to cut
+    // off the user's own devices.
+    if maybe_pin.is_some() && !local_ctl && is_pin_globally_limited() {
+        let err = b"{\"error\":\"Too many failed access attempts. Please wait 60 seconds.\"}";
+        respond(&stream, "429 Too Many Requests", "application/json", err, None, Some(&[("Retry-After", "60")]));
+        return;
+    }
     let authorized = match maybe_pin {
-        Some(ref p) if constant_time_eq_str(p, pin) => {
+        Some(ref p) if !pin.is_empty() && constant_time_eq_str(p, pin) => {
             record_pin_attempt(rl_ip, true);
             true
         }
         Some(_) if !local_ctl => {
             let not_blocked = record_pin_attempt(rl_ip, false);
             if !not_blocked {
-                let err = b"{\"error\":\"Too many failed PIN attempts. Please wait 60 seconds.\"}";
+                let err = b"{\"error\":\"Too many failed access attempts. Please wait 60 seconds.\"}";
                 respond(
                     &stream,
                     "429 Too Many Requests",
@@ -6675,15 +6817,22 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
             let html = render_login_page();
             respond(&stream, "200 OK", "text/html; charset=utf-8", html.as_bytes(), None, None);
         } else {
-            respond(&stream, "401 Unauthorized", "text/plain", b"Unauthorized. Please provide valid PIN.", None, None);
+            respond(&stream, "401 Unauthorized", "text/plain", b"Unauthorized. Please provide the portal access secret.", None, None);
         }
         return;
     }
 
-    // The cookie holds a value derived from the PIN and the session key, never the PIN itself.
-    let set_cookie = Some(format!("{}={}", WEB_SESSION_COOKIE, web_session));
+    // The cookie holds a value derived from the secret and the session key, never the secret
+    // itself. Through the tunnel the browser talks HTTPS to Cloudflare, so it is also Secure;
+    // on the LAN the portal is plain http and a Secure cookie would be dropped by the browser.
+    let set_cookie = Some(web_session_set_cookie(&web_session, via_tunnel));
 
-    if req.method == "GET" && req.path == "/" {
+    if req.method == "POST" && req.path == "/api/login" {
+        // The login page presents the secret (from the link's fragment) in X-OmaSend-PIN and
+        // gets the session cookie back; the secret never appears in a URL.
+        respond(&stream, "200 OK", "application/json", b"{\"ok\":true}", set_cookie.as_deref(), None);
+    }
+    else if req.method == "GET" && req.path == "/" {
         let shared_files = get_directory_files(&get_shared_dir());
         let html = render_web_app(ip, &shared_files);
         respond(&stream, "200 OK", "text/html; charset=utf-8", html.as_bytes(), set_cookie.as_deref(), None);
@@ -7267,6 +7416,58 @@ fn run_server() {
     }
 }
 
+/// The `--json` status the panel polls. It must never carry the portal secret, the E2EE
+/// session key or the account OmaID, and it does no network I/O (no STUN).
+fn build_server_state(ip: &str) -> ServerState {
+    let (wan_active, wan_connecting, wan_url) = get_wan_status();
+    let active_mode = get_active_mode();
+    let active_url = portal_base_url(ip, &active_mode, wan_url.as_deref());
+    let (vis, rem) = get_visibility();
+    let (dev_id, _) = get_or_create_device_id();
+    let oma_id = get_or_create_oma_id();
+    let wan_mode = if wan_active { "WAN" } else { "LAN" }.to_string();
+    // No network I/O here: the panel polls --json. STUN runs once when WAN is turned on.
+    let stun_addr = if wan_active || wan_connecting {
+        read_secure_file(&wan_stun_path()).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+    ServerState {
+        status: "ACTIVE".to_string(),
+        port: PORT,
+        local_ip: ip.to_string(),
+        tailscale_ip: get_tailscale_ip(),
+        active_mode,
+        wan_active,
+        wan_connecting,
+        wan_provider: if wan_active || wan_connecting { get_wan_provider() } else { None },
+        wan_url,
+        active_url,
+        download_dir: get_download_dir().to_string_lossy().to_string(),
+        shared_dir: get_shared_dir().to_string_lossy().to_string(),
+        qr_path: get_state_dir().join("qr.svg").to_string_lossy().to_string(),
+        omaid_qr_path: get_state_dir().join("omaid_qr.svg").to_string_lossy().to_string(),
+        total_received: RECEIVED_COUNTER.load(Ordering::SeqCst),
+        recent_files: get_directory_files(&get_download_dir()),
+        shared_files: get_directory_files(&get_shared_dir()),
+        p2p_device_id: dev_id,
+        p2p_hostname: get_system_hostname(),
+        p2p_visibility: vis,
+        p2p_visibility_remaining_secs: rem,
+        p2p_discovered_peers: get_discovered_peers(),
+        p2p_pending_transfer: get_pending_transfer(),
+        p2p_transfer_progress: get_transfer_progress(),
+        clipboard_vault: get_clipboard_vault_items(),
+        oma_id,
+        wan_mode,
+        stun_addr,
+        sound_enabled: is_sound_enabled(),
+        firewall_status: check_firewall_status(),
+        device_key_id: device_identity().device_id(),
+        paired_devices: paired_devices_view(),
+    }
+}
+
 // ------------------- CLI ENTRYPOINT -------------------
 
 fn main() {
@@ -7790,6 +7991,7 @@ fn main() {
     }
 
     if args.iter().any(|a| a == "--start-wan") {
+        eprintln!("{}", WAN_WARNING);
         match start_wan_tunnel() {
             Ok(url) => println!("WAN Tunnel Started: {}", url),
             Err(e) => eprintln!("Error starting WAN tunnel: {}", e),
@@ -7809,6 +8011,7 @@ fn main() {
             stop_wan_tunnel();
             println!("WAN Stopped");
         } else {
+            eprintln!("{}", WAN_WARNING);
             match start_wan_tunnel() {
                 Ok(msg) => println!("WAN Started: {}", msg),
                 Err(e) => eprintln!("Error: {}", e),
@@ -7838,22 +8041,19 @@ fn main() {
         return;
     }
 
-    let (wan_active, wan_connecting, wan_url) = get_wan_status();
+    let (_, _, wan_url) = get_wan_status();
     let active_mode = get_active_mode();
-    let qr_file = get_state_dir().join("qr.svg");
-    let qr_path = qr_file.to_string_lossy().to_string();
-    let ddir = get_download_dir().to_string_lossy().to_string();
-    let sdir = get_shared_dir().to_string_lossy().to_string();
+    let qr_path = get_state_dir().join("qr.svg").to_string_lossy().to_string();
 
-    let active_url = if active_mode == "WAN" {
-        if let Some(ref u) = wan_url {
-            format!("{}/?pin={}#key={}", u, pin, session_key)
-        } else {
-            format!("http://{}:{}/?pin={}#key={}", ip, PORT, pin, session_key)
-        }
-    } else {
-        format!("http://{}:{}/?pin={}#key={}", ip, PORT, pin, session_key)
-    };
+    // Status output never carries the portal secret or the E2EE key: waybar tooltips, the
+    // panel's --json polls and terminal scrollback all end up in places the user does not
+    // treat as secret. The full link is in the 0600 QR file, or printed on explicit request.
+    let active_url = portal_base_url(&ip, &active_mode, wan_url.as_deref());
+
+    if args.iter().any(|a| a == "--portal-url") {
+        println!("{}", portal_secret_url(&active_url, &pin, &session_key));
+        return;
+    }
 
     if args.iter().any(|a| a == "--status") {
         let mode_tag = if active_mode == "WAN" { "WAN" } else { "LAN" };
@@ -7865,50 +8065,7 @@ fn main() {
     }
 
     if args.iter().any(|a| a == "--json") {
-        let (vis, rem) = get_visibility();
-        let (dev_id, _) = get_or_create_device_id();
-        let oma_id = get_or_create_oma_id();
-        let cluster_id = compute_rendezvous_topic(&oma_id);
-        let wan_mode = if wan_active { "WAN" } else { "LAN" }.to_string();
-        let stun_addr = query_stun_external_addr().map(|a| a.to_string());
-        let state = ServerState {
-            status: "ACTIVE".to_string(),
-            port: PORT,
-            local_ip: ip,
-            tailscale_ip: get_tailscale_ip(),
-            pin,
-            session_key,
-            active_mode,
-            wan_active,
-            wan_connecting,
-            wan_provider: if wan_active || wan_connecting { get_wan_provider() } else { None },
-            wan_url,
-            active_url,
-            download_dir: ddir,
-            shared_dir: sdir,
-            qr_path,
-            omaid_qr_path: get_state_dir().join("omaid_qr.svg").to_string_lossy().to_string(),
-            total_received: RECEIVED_COUNTER.load(Ordering::SeqCst),
-            recent_files: get_directory_files(&get_download_dir()),
-            shared_files: get_directory_files(&get_shared_dir()),
-            p2p_device_id: dev_id,
-            p2p_hostname: get_system_hostname(),
-            p2p_visibility: vis,
-            p2p_visibility_remaining_secs: rem,
-            p2p_discovered_peers: get_discovered_peers(),
-            p2p_pending_transfer: get_pending_transfer(),
-            p2p_transfer_progress: get_transfer_progress(),
-            clipboard_vault: get_clipboard_vault_items(),
-            oma_id,
-            wan_mode,
-            cluster_id,
-            stun_addr,
-            sound_enabled: is_sound_enabled(),
-            firewall_status: check_firewall_status(),
-            device_key_id: device_identity().device_id(),
-            paired_devices: paired_devices_view(),
-        };
-        if let Ok(s) = serde_json::to_string_pretty(&state) {
+        if let Ok(s) = serde_json::to_string_pretty(&build_server_state(&ip)) {
             println!("{}", s);
         }
         return;
@@ -7916,9 +8073,9 @@ fn main() {
 
     println!("OMASEND - WIRELESS AIRBRIDGE & E2EE CLIPBOARD SENTINEL");
     println!("Mode: {}", active_mode);
-    println!("Active URL: {}", active_url);
-    println!("QR: {}", qr_path);
-    println!("E2EE Key: {}", session_key);
+    println!("Portal: {}", active_url);
+    println!("QR (portal link with access secret and E2EE key): {}", qr_path);
+    println!("Full portal link: omasend-engine --portal-url");
 }
 
 #[cfg(test)]
@@ -8004,7 +8161,8 @@ mod tests {
     fn test_pin_and_session_key_lifecycle_enforces_0600() {
         let state_dir = get_state_dir();
         let pin = get_or_create_pin();
-        assert_eq!(pin.len(), 4);
+        assert_eq!(pin.len(), PORTAL_SECRET_HEX_LEN);
+        assert!(pin.chars().all(|c| c.is_ascii_hexdigit()));
 
         let pin_file = state_dir.join("pin.txt");
         let pin_meta = fs::symlink_metadata(&pin_file).expect("pin.txt must exist");
@@ -8199,11 +8357,12 @@ mod tests {
 
     #[test]
     fn test_extract_provided_pin() {
+        // Never from the URL: query strings end up in history and proxy logs.
         let req_query = HttpRequest {
             query: "foo=bar&pin=4321&baz=1".to_string(),
             ..Default::default()
         };
-        assert_eq!(extract_provided_pin(&req_query), Some("4321".to_string()));
+        assert_eq!(extract_provided_pin(&req_query), None);
 
         let req_header = HttpRequest {
             headers: vec![("x-omasend-pin".to_string(), "9988".to_string())],
@@ -8898,16 +9057,13 @@ mod tests {
     }
 
     #[test]
-    fn test_server_state_includes_oma_id_and_rendezvous_fields() {
+    fn test_server_state_includes_oma_id_and_wan_fields() {
         let oma_id = "4829-1048-5729-1104".to_string();
-        let topic = compute_rendezvous_topic(&oma_id);
         let state = ServerState {
             status: "ACTIVE".to_string(),
             port: PORT,
             local_ip: "192.168.1.50".to_string(),
             tailscale_ip: None,
-            pin: "1234".to_string(),
-            session_key: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_string(),
             active_mode: "LAN".to_string(),
             wan_active: false,
             wan_connecting: false,
@@ -8931,7 +9087,6 @@ mod tests {
             clipboard_vault: vec![],
             oma_id: oma_id.clone(),
             wan_mode: "LAN".to_string(),
-            cluster_id: topic.clone(),
             stun_addr: Some("198.51.100.1:53317".to_string()),
             sound_enabled: true,
             firewall_status: "OK".to_string(),
@@ -8942,7 +9097,6 @@ mod tests {
         let json = serde_json::to_string(&state).expect("Serialize ServerState");
         assert!(json.contains("\"oma_id\":\"4829-1048-5729-1104\""));
         assert!(json.contains("\"wan_mode\":\"LAN\""));
-        assert!(json.contains(&format!("\"cluster_id\":\"{}\"", topic)));
         assert!(json.contains("\"stun_addr\":\"198.51.100.1:53317\""));
     }
 
@@ -10228,7 +10382,7 @@ mod tests {
         let local = format!("X-OmaSend-Local: {}\r\n", ensure_local_api_token());
         let tunneled = format!("{}Cf-Connecting-Ip: 203.0.113.9\r\n", local);
         let r = post_once("/api/p2p/decision", &tunneled, &body);
-        assert!(r.starts_with("HTTP/1.1 403"), "tunnelled request must be refused even with a token: {}", r);
+        assert!(r.starts_with("HTTP/1.1 404"), "tunnelled request must be refused even with a token: {}", r);
         assert_eq!(get_pending_transfer().unwrap().status, "PENDING");
 
         let r = post_once("/api/p2p/decision", &local, &body);
@@ -10265,7 +10419,7 @@ mod tests {
         let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         reset_pin_rate_limiter();
         for _ in 0..6 {
-            let _ = get_once("/api/status?pin=0000", "Cf-Connecting-Ip: 198.51.100.7\r\n");
+            let _ = get_once("/api/status", "X-OmaSend-PIN: 0000\r\nCf-Connecting-Ip: 198.51.100.7\r\n");
         }
         let r = get_once("/api/status", "Cf-Connecting-Ip: 198.51.100.7\r\n");
         assert!(r.starts_with("HTTP/1.1 429"), "attacker bucket must be blocked: {}", r);
@@ -10278,7 +10432,7 @@ mod tests {
         // loopback. (Asserting this without locking out 127.0.0.1 keeps parallel tests safe.)
         let local = format!("X-OmaSend-Local: {}\r\n", ensure_local_api_token());
         for _ in 0..6 {
-            let r = get_once("/api/status?pin=0000", &local);
+            let r = get_once("/api/status", &format!("{}X-OmaSend-PIN: 0000\r\n", local));
             assert!(r.starts_with("HTTP/1.1 200"), "{}", r);
         }
         let r = get_once("/api/status", "");
@@ -10396,7 +10550,7 @@ mod tests {
             let server = serve_one(listener);
             let mut c = TcpStream::connect(addr).unwrap();
             let head = format!(
-                "POST /upload?pin=1234 HTTP/1.1\r\nHost: {}\r\nContent-Type: multipart/form-data; boundary={}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "POST /upload HTTP/1.1\r\nHost: {}\r\nX-OmaSend-PIN: 1234\r\nContent-Type: multipart/form-data; boundary={}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 addr, boundary, body.len()
             );
             c.write_all(head.as_bytes()).unwrap();
@@ -10422,22 +10576,26 @@ mod tests {
         let offer = devicekey::parse_pair_uri(&uri).unwrap();
         let attacker = devicekey::DeviceIdentity::from_seed([3u8; 32]);
         let bogus = serde_json::json!({ "pk": attacker.public_b64(), "name": "x", "mac": "00", "sig": "AA" });
-        let hdr = "Cf-Connecting-Ip: 198.51.100.20\r\n";
+        // Pairing is LAN-only: through the WAN tunnel the route does not exist.
+        let r = post_once("/api/v2/pair", "Cf-Connecting-Ip: 198.51.100.20\r\n", &bogus);
+        assert!(r.starts_with("HTTP/1.1 404"), "{}", r);
         for _ in 0..5 {
-            let r = post_once("/api/v2/pair", hdr, &bogus);
+            let r = post_once("/api/v2/pair", "", &bogus);
             assert!(r.starts_with("HTTP/1.1 403"), "{}", r);
         }
-        let r = post_once("/api/v2/pair", hdr, &bogus);
+        let r = post_once("/api/v2/pair", "", &bogus);
         assert!(r.starts_with("HTTP/1.1 429"), "same address is now limited: {}", r);
+        // The limit is per address; the failed guesses did not burn the offer.
+        reset_pin_rate_limiter();
 
-        // The genuine initiator (another address) still pairs with the same QR code.
+        // The genuine initiator still pairs with the same QR code.
         let phone = devicekey::DeviceIdentity::from_seed([4u8; 32]);
         let body = devicekey::build_pair_request(&phone, &offer, "Phone", 53318);
-        let r = post_once("/api/v2/pair", "Cf-Connecting-Ip: 198.51.100.21\r\n", &body);
+        let r = post_once("/api/v2/pair", "", &body);
         assert!(r.starts_with("HTTP/1.1 200"), "{}", r);
         let stored = trust_store().get(&phone.public_b64()).expect("paired");
         assert!(!stored.own_device);
-        assert!(stored.ip.is_empty(), "a tunnel (loopback) source is not stored as the peer address");
+        assert!(stored.ip.is_empty(), "a loopback source is not stored as the peer address");
         trust_store().remove(&stored.pk).unwrap();
 
         set_visibility("OFF");
@@ -10508,5 +10666,107 @@ mod tests {
         assert!(html.contains("data-name=\"x&#39;);alert(1);(&#39;&lt;img&gt;.txt\""));
         assert_eq!(notification_text("<b>evil</b> & co"), "&lt;b&gt;evil&lt;/b&gt; &amp; co");
         assert!(notification_text("-u critical").starts_with('\u{2060}'));
+    }
+
+    /// The WAN tunnel (loopback + proxy headers) reaches only the portal routes.
+    #[test]
+    fn test_tunnel_requests_only_reach_portal_routes() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        reset_pin_rate_limiter();
+        let cf = "Cf-Connecting-Ip: 203.0.113.50\r\n";
+        let local = format!("X-OmaSend-Local: {}\r\n", ensure_local_api_token());
+        for path in ["/api/p2p/ping", "/api/p2p/peers", "/api/p2p/decision?token=x", "/api/p2p/clipboard/image?hash=00", "/download/x.txt", "/api/clipboard"] {
+            let r = get_once(path, cf);
+            assert!(r.starts_with("HTTP/1.1 404"), "{} must not be reachable through the tunnel: {}", path, r);
+            let r = get_once(path, &format!("{}{}", local, cf));
+            assert!(r.starts_with("HTTP/1.1 404"), "{} must not be reachable through the tunnel even with the local token: {}", path, r);
+        }
+        for path in ["/api/v2/pair", "/api/v2/link/start", "/api/v2/account/sync", "/api/p2p/request", "/api/p2p/pair", "/api/p2p/clipboard", "/api/local/core-send", "/api/p2p/decision", "/upload"] {
+            let r = post_once(path, cf, &serde_json::json!({}));
+            assert!(r.starts_with("HTTP/1.1 404"), "POST {} must not be reachable through the tunnel: {}", path, r);
+        }
+        let r = get_once("/api/status", cf);
+        assert!(r.starts_with("HTTP/1.1 200"), "{}", r);
+        let r = get_once("/", cf);
+        assert!(r.starts_with("HTTP/1.1 200") && r.contains("Portal Access"), "{}", r);
+        // The same LAN routes still work without proxy headers.
+        let r = get_once("/api/p2p/ping", "");
+        assert!(r.starts_with("HTTP/1.1 200"), "{}", r);
+
+        assert!(is_portal_route("GET", "/api/download-encrypted/a.txt"));
+        assert!(is_portal_route("POST", "/api/login"));
+        assert!(!is_portal_route("GET", "/api/p2p/upload"));
+        assert!(!is_portal_route("POST", "/api/v2/pair"));
+        reset_pin_rate_limiter();
+    }
+
+    /// The portal secret is long and random, is accepted only from a header, and logging in
+    /// returns a hardened session cookie (Secure only through the HTTPS tunnel).
+    #[test]
+    fn test_portal_login_cookie_and_secret() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        reset_pin_rate_limiter();
+        let secret = get_or_create_pin();
+        assert!(secret.len() * 4 >= 128, "portal secret must carry at least 128 bits");
+        assert_ne!(generate_new_pin(), secret);
+        let _ = write_secure_file(&get_state_dir().join("pin.txt"), "1234");
+        let migrated = get_or_create_pin();
+        assert_eq!(migrated.len(), PORTAL_SECRET_HEX_LEN, "a stored 4-digit PIN must be replaced");
+
+        let r = post_once("/api/login", "X-OmaSend-PIN: 1234\r\n", &serde_json::json!({}));
+        assert!(r.starts_with("HTTP/1.1 200"), "{}", r);
+        let cookie = r.lines().find(|l| l.starts_with("Set-Cookie:")).expect("session cookie").to_string();
+        assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"), "{}", cookie);
+        assert!(!cookie.contains("Secure"), "plain-http LAN portal cannot use a Secure cookie: {}", cookie);
+        assert!(!cookie.contains("1234"));
+
+        let r = post_once("/api/login", "X-OmaSend-PIN: 1234\r\nCf-Connecting-Ip: 203.0.113.51\r\n", &serde_json::json!({}));
+        let cookie = r.lines().find(|l| l.starts_with("Set-Cookie:")).expect("session cookie").to_string();
+        assert!(cookie.contains("; Secure") && cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"), "{}", cookie);
+
+        let r = post_once("/api/login?pin=1234", "", &serde_json::json!({}));
+        assert!(r.starts_with("HTTP/1.1 401"), "?pin= must not authenticate: {}", r);
+
+        let url = portal_secret_url("http://192.168.1.5:53317", &secret, "ab");
+        assert!(!url.contains("?pin="));
+        let frag = url.split_once('#').expect("fragment").1;
+        assert!(frag.contains(&secret));
+        reset_pin_rate_limiter();
+    }
+
+    /// Many addresses together cannot keep guessing: a global failure budget stops new secret
+    /// attempts, while requests without a secret (paired devices, sessions) still work.
+    #[test]
+    fn test_global_pin_budget_blocks_distributed_guessing() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        reset_pin_rate_limiter();
+        for i in 0..PIN_GLOBAL_MAX_FAILURES {
+            let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, (i % 250) as u8 + 1));
+            record_pin_attempt(ip, false);
+        }
+        assert!(is_pin_globally_limited());
+        let r = get_once("/api/status", "X-OmaSend-PIN: 1234\r\nCf-Connecting-Ip: 203.0.113.77\r\n");
+        assert!(r.starts_with("HTTP/1.1 429"), "fresh address must be refused while the budget is spent: {}", r);
+        let r = get_once("/api/p2p/ping", "");
+        assert!(r.starts_with("HTTP/1.1 200"), "requests without a secret keep working: {}", r);
+        reset_pin_rate_limiter();
+        assert!(!is_pin_globally_limited());
+    }
+
+    /// --json never carries the portal secret, the session key or the account OmaID.
+    #[test]
+    fn test_status_json_has_no_secrets() {
+        let _guard = TEST_SYNC_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let pin = get_or_create_pin();
+        let key = get_or_create_session_key();
+        let account = omalink::get_or_create_account_id(&get_state_dir());
+        let json = serde_json::to_string(&build_server_state("192.168.1.50")).unwrap();
+        assert!(!json.contains(&pin), "portal secret leaked into --json");
+        assert!(!json.contains(&key), "session key leaked into --json");
+        assert!(!json.contains(&account) && !json.contains(&rendezvous::normalize_oma_id(&account)), "account OmaID leaked into --json");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("pin").is_none() && v.get("session_key").is_none() && v.get("cluster_id").is_none());
+        assert!(!v["active_url"].as_str().unwrap_or_default().contains('#'));
+        assert!(!v["active_url"].as_str().unwrap_or_default().contains("pin"));
     }
 }
