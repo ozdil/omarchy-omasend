@@ -26,3 +26,24 @@ test("assetlinks only with valid fingerprints", () => {
 test("join page never puts the invite in markup", () => {
   assert.doesNotMatch(join(), /fetch\(|XMLHttpRequest|sendBeacon/);
 });
+
+test("pages follow the device theme without script", () => {
+  const html = join();
+  assert.match(html, /prefers-color-scheme:dark/);
+  assert.match(html, /<meta name="color-scheme" content="light dark">/);
+  assert.match(html, /theme-color" media="\(prefers-color-scheme: dark\)/);
+});
+
+test("only /j may run script, and only the join script", async () => {
+  const { HEADERS, JOIN_HEADERS, JOIN_SCRIPT_HASH } = await import("./headers.js");
+  const { JOIN_SCRIPT } = await import("./pages.js");
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JOIN_SCRIPT));
+  assert.equal(JOIN_SCRIPT_HASH, "sha256-" + Buffer.from(digest).toString("base64"));
+  assert.match(JOIN_HEADERS["content-security-policy"], new RegExp(`script-src '${JOIN_SCRIPT_HASH.replace(/[+/=]/g, "\\$&")}'`));
+  assert.doesNotMatch(HEADERS["content-security-policy"], /script-src/);
+  for (const h of [HEADERS, JOIN_HEADERS]) {
+    assert.doesNotMatch(h["content-security-policy"], /script-src 'unsafe-inline/);
+    assert.match(h["content-security-policy"], /object-src 'none'/);
+  }
+  assert.match(join(), new RegExp(`<script>${JOIN_SCRIPT.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}</script>`));
+});

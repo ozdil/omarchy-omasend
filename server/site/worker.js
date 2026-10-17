@@ -1,15 +1,8 @@
 import privacyMd from "../../PRIVACY_POLICY.md";
 import { home, join, support, privacy, assetLinks } from "./pages.js";
+import { HEADERS, JOIN_HEADERS } from "./headers.js";
 
-const HEADERS = {
-  "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
-  "referrer-policy": "no-referrer",
-  "x-content-type-options": "nosniff",
-  "strict-transport-security": "max-age=31536000; includeSubDomains",
-  "permissions-policy": "camera=(), microphone=(), geolocation=()",
-};
-
-const page = (html) => new Response(html, { headers: { ...HEADERS, "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=600" } });
+const page = (html, headers = HEADERS) => new Response(html, { headers: { ...headers, "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=600" } });
 
 export function route(req, env, md = privacyMd) {
   if (req.method !== "GET" && req.method !== "HEAD") return new Response("Method not allowed", { status: 405, headers: HEADERS });
@@ -18,7 +11,7 @@ export function route(req, env, md = privacyMd) {
     case "/":
       return page(home());
     case "/j":
-      return page(join());
+      return page(join(), JOIN_HEADERS);
     case "/support":
     case "/delete":
       return page(support());

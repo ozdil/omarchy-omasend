@@ -1,4 +1,5 @@
 // omaid.app: a few static pages. No cookies, no scripts from elsewhere, no logs.
+// Light or dark follows the device (prefers-color-scheme), with the same ink and paper as the web app.
 // The join page reads its invite from the URL fragment, which browsers never send to a server.
 
 const MARK =
@@ -8,8 +9,9 @@ export const PLAY_URL = "https://play.google.com/store/apps/details?id=io.omarch
 export const SOURCE_URL = "https://github.com/ozdil/omarchy-omasend";
 
 const CSS = `
-:root{color-scheme:light dark;--bg:#fafafa;--fg:#111;--mute:#666;--line:#ddd;--box:#f0f0f0}
-@media (prefers-color-scheme:dark){:root{--bg:#0e0e0e;--fg:#e8e8e8;--mute:#999;--line:#2a2a2a;--box:#181818}}
+:root{color-scheme:light dark;--paper:#f6f6f4;--ink:#18181a}
+@media (prefers-color-scheme:dark){:root{--paper:#111214;--ink:#e8e8e6}}
+:root{--bg:var(--paper);--fg:var(--ink);--mute:color-mix(in srgb,var(--ink) 62%,var(--paper));--line:color-mix(in srgb,var(--ink) 16%,var(--paper));--box:color-mix(in srgb,var(--ink) 4%,var(--paper));accent-color:var(--ink)}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.6 ui-monospace,"JetBrains Mono","Cascadia Code",Menlo,monospace}
 main{max-width:720px;margin:0 auto;padding:40px 16px 64px}
@@ -42,6 +44,9 @@ export function layout(title, body, script = "") {
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#f6f6f4">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#111214">
 <title>${esc(title)}</title>
 <style>${CSS}</style></head>
 <body><main>
@@ -66,7 +71,7 @@ export function home() {
 }
 
 // The invite stays in the fragment: this script copies it locally and sends it nowhere.
-const JOIN_SCRIPT = `
+export const JOIN_SCRIPT = `
 (function(){
   var link = location.href.split("?")[0];
   var ok = /#n=\\d{16}&k=[A-Za-z0-9_-]+$/.test(link);

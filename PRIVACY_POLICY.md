@@ -69,7 +69,7 @@ OmaSend requests only the strictly minimum Android system permissions necessary 
 OmaSend does not integrate with advertising networks, analytics SDKs, or data brokers.
 
 Two services are used only for the optional features described above:
-- **Cloudflare** hosts the OmaID registry (`id.omaid.app`) and the `omaid.app` website.
+- **Cloudflare** hosts the OmaID registry (`id.omaid.app`) and the `omaid.app` website. The website sets no cookies, loads nothing from other sites and keeps no logs; as the infrastructure provider, Cloudflare processes connection metadata (such as IP addresses) to deliver each request and to block abuse, and keeps its own security logs for a limited time as described in its privacy policy.
 - **n0 relays** (iroh) forward end-to-end encrypted traffic between your own devices when they are on different networks.
 
 ---
