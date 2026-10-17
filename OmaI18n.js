@@ -190,8 +190,8 @@ var DICT = {
     en: "visible to your devices"
   },
   "about_line": {
-    tr: "OmaSend · QR ile eşleştirilen cihazlar arasında uçtan uca şifreli (QUIC · TLS 1.3, UDP 53318). Eşleştirilmemiş cihazlarla şifresiz HTTP (53317), her aktarım onay ister. MIT lisanslı.",
-    en: "OmaSend · end-to-end encrypted between QR-paired devices (QUIC · TLS 1.3, UDP 53318). Unpaired devices use unencrypted HTTP (53317) and every transfer needs approval. MIT licensed."
+    tr: "OmaSend · Omarchy, Android ve tarayıcı arasında dosya ve pano. QR ile eşleştirilen cihazlar arasında uçtan uca şifreli (QUIC · TLS 1.3, UDP 53318), dosyalar BLAKE3 ile doğrulanır. OmaID ile kendi cihazlarınız internet üzerinden de bağlanır; röle yalnızca şifreli trafiği görür, numaranız gönderilmez. Eşleştirilmemiş cihazlarla şifresiz HTTP (53317), her aktarım onay ister. MIT lisanslı.",
+    en: "OmaSend · files and clipboard between Omarchy, Android and the browser. End-to-end encrypted between QR-paired devices (QUIC · TLS 1.3, UDP 53318), files verified with BLAKE3. With OmaID your own devices also connect over the internet; relays only see encrypted traffic and your number is never sent. Unpaired devices use unencrypted HTTP (53317) and every transfer needs approval. MIT licensed."
   },
   "about_tooltip": {
     tr: "OmaSend Hakkında ve Sistem Bilgisi",
@@ -850,4 +850,10 @@ function tr(lang, key) {
   if (entry["en"] !== undefined) return entry["en"];
   if (entry["tr"] !== undefined) return entry["tr"];
   return key;
+}
+
+// "OmaSend · …" becomes "OmaSend v2.0.9 · …" once the manifest version is known.
+function aboutWithVersion(line, version) {
+  if (!version) return line;
+  return line.replace(/^OmaSend ·/, "OmaSend v" + version + " ·");
 }

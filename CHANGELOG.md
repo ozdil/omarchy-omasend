@@ -4,6 +4,32 @@ Bu belgede OmaSend masaüstü ve Android uygulamaları için yapılan tüm sür�
 
 ---
 
+## [2.0.9] - 2026-10-17 (Android: 2.0.9, versionCode 109)
+
+Masaüstü, Android ve web istemcisi bu sürümden itibaren aynı sürüm numarasını taşıyor (masaüstü 2.0.0'dan, web 1.8.0'dan 2.0.9'a geçti).
+
+### Yeni
+- **OmaID hesabı:** Bir kişinin tüm cihazları için tek, anonim, 16 haneli numara (Mullvad modeli). Numara hiçbir yere gönderilmez. `id.omaid.app` (Cloudflare Worker + D1) yalnızca Argon2id ile türetilmiş kimliği ve uçtan uca şifreli, hesap anahtarıyla imzalı (Ed25519) cihaz listesini saklar; IP ya da kayıt tutmaz. Yeni cihaz numara + tek seferlik onayla (iki ekranda aynı 6 haneli kod) ya da `https://omaid.app/j#…` katılım QR'ıyla eklenir. Masaüstü komutları: `--account`, `--account-create`, `--account-join`, `--account-approve/--account-reject`, `--account-invite`, `--account-remove`, `--account-change-number`, `--account-leave`, `--account-reset`. Daemon hesabı arka planda eşitler.
+- **İnternet üzerinden paylaşım:** Hesap varsa çekirdek iroh rölelerini (n0) kullanır, delik açma (hole punching) ile doğrudan bağlantıya geçer. Röle üzerinden 4 GiB'a kadar aktarım; daha büyükleri doğrudan bağlantı ister. Gizlilik politikası güncellendi.
+- **Ortak pano, son kopya kazanır:** Pano mesajları kopyalanma zamanını taşır; 2 dakikadan eski ya da görülen en yeni kopyadan eski kopyalar atılır. Masaüstünde her kopya için bildirim ve ses kaldırıldı. Android'de "Pano" Hızlı Ayarlar kutucuğu.
+- **Tarayıcı eşleştirme:** Eşleştirme kartında Tarayıcı sekmesi (`--pair-offer-web`); motor web istemcisini `/web/` altında sunar (yalnızca gönderim).
+- **Altı haneli eşleşme kodu:** `pairing_code` iki anahtardan aynı kodu türetir; masaüstü `--pair-with` sonrasında, eşleşme bildiriminde ve `--devices` içinde gösterir. Android'e UniFFI ile açıldı.
+- **Tek renkli arayüz:** Panel, pano ve başlatıcı simgesi Omarchy temasının ön plan rengini kullanır (logo B). İkincil metinler her temada WCAG AA.
+
+### Geliştirmeler
+- İsimlerdeki bidi ve sıfır genişlikli karakterler temizleniyor (`sanitize_name`, `sanitize_label`).
+- `risky_file_kind`: çalıştırılabilir dosyalar ve çift uzantılar bekleyen aktarımda `risky_files` olarak ve bildirimde uyarıyla gösteriliyor.
+- Herkese açık OmaID artık kimlik bilgisi/anahtar değil; motor herkese açık istemci adreslerini reddediyor, WAN portalı kilitlendi, gizli bilgiler durum çıktısından çıkarıldı.
+- Pano ve İndirilenler izleyicileri olay tabanlı.
+
+### Hata düzeltmeleri
+- Telefondan PC'ye gönderimde "Permission denied (os error 13)": çekirdek Android içerik URI'lerini açık tanımlayıcıdan okuyor; Landlock korumalı daemon giden dosyaları `state_dir/outgoing` altına hazırlıyor.
+- Aktarım reddi artık bir durum koduyla bildiriliyor (zaman aşımı beklenmiyor).
+- Son cihaz hesaptan çıkınca kayıt siliniyor; her değişiklikten önce eşitleme yapılıyor.
+- Android 2.0.6–2.0.9: kayıtlı QR resminden eşleşme, Hızlı Ayarlar etiketi kesilmesi, "1 cihaz" yazımı, Hakkında metni güncellendi.
+
+---
+
 ## [2.0.0] - 2026-10-15
 
 ### Protokol v2: cihaz anahtarları, QR eşleşme ve şifreli aktarım

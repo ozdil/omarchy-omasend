@@ -1826,7 +1826,7 @@ Panel {
               tooltipText: root.t("about_tooltip")
               foreground: root.foreground
               fontFamily: root.fontFamily
-              onClicked: root.setStatus(root.t("about_line"), false)
+              onClicked: root.setStatus(OmaI18n.aboutWithVersion(root.t("about_line"), root.pluginVersion), false)
             }
           }
         }
