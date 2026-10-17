@@ -2516,6 +2516,11 @@ fn core_failure_message(name: &str, err: &str) -> String {
 }
 
 /// QR-paired devices for the panel / `--devices`, with online state from discovery.
+/// Six-digit code for this device and `peer_pk`; the other device shows the same one.
+fn pairing_code_with(peer_pk: &str) -> String {
+    omasend_core::pairing_code(device_identity().public_b64(), peer_pk.to_string())
+}
+
 fn paired_devices_view() -> Vec<serde_json::Value> {
     let discovered = get_discovered_peers();
     trust_store()
@@ -2533,6 +2538,7 @@ fn paired_devices_view() -> Vec<serde_json::Value> {
                 "online": seen.is_some(),
                 "added_at": k.added_at,
                 "last_seen": k.last_seen,
+                "pairing_code": pairing_code_with(&k.pk),
             })
         })
         .collect()
@@ -3556,7 +3562,10 @@ fn p2p_pair_v2(uri: &str, own_device: bool) -> Result<devicekey::TrustedKey, Str
     devicekey::verify_pair_response(device_identity(), &offer, &json)?;
     let vk = devicekey::decode_pk(&offer.pk).ok_or("Invalid responder key")?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let name = json["name"].as_str().filter(|n| !n.is_empty()).unwrap_or(&offer.name).chars().take(64).collect();
+    let name = match omasend_core::sanitize_label(json["name"].as_str().unwrap_or(""), 64) {
+        n if n.is_empty() => offer.name.clone(),
+        n => n,
+    };
     let key = devicekey::TrustedKey {
         pk: offer.pk.clone(),
         device_id: devicekey::device_id_for_pk(vk.as_bytes()),
@@ -5707,13 +5716,19 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
                 record_attempt(&PAIR_RATE_LIMITER, rl_ip, true);
                 let label = format!("{} ({})", key.name, key.device_id);
                 let own = key.own_device;
+                let code = pairing_code_with(&key.pk);
                 if trust_store().upsert(key).is_err() {
                     respond(&stream, "500 Internal Server Error", "application/json", b"{\"error\":\"Failed to store device key\"}", None, None);
                     return;
                 }
                 notify_desktop(
                     "OmaSend: Device paired",
-                    &format!("{} is now paired{}.", label, if own { " as one of your devices" } else { "" }),
+                    &format!(
+                        "{} is now paired{}.\nPairing code: {}. The other device must show the same code; if it doesn't, unpair it.",
+                        label,
+                        if own { " as one of your devices" } else { "" },
+                        code
+                    ),
                 );
                 respond(&stream, "200 OK", "application/json", resp.to_string().as_bytes(), None, None);
             }
@@ -7182,8 +7197,13 @@ fn main() {
         let own = args.iter().any(|a| a == "--own");
         match p2p_pair_v2(uri, own) {
             Ok(k) => {
+                let code = pairing_code_with(&k.pk);
                 println!("Paired with {} ({}){}", k.name, k.device_id, if k.own_device { " as one of your devices" } else { "" });
-                notify_desktop("OmaSend: Device paired", &format!("{} ({})", k.name, k.device_id));
+                println!("Pairing code: {}  (the other device must show the same code; if not, run --unpair {})", code, k.device_id);
+                notify_desktop(
+                    "OmaSend: Device paired",
+                    &format!("{} ({})\nPairing code: {}. The other device must show the same code.", k.name, k.device_id, code),
+                );
             }
             Err(e) => {
                 eprintln!("Pairing failed: {}", e);

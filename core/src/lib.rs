@@ -229,6 +229,17 @@ pub fn risky_file_kind(name: String) -> Option<String> {
     Some("executable".into())
 }
 
+/// Six-digit code both devices show after pairing, formatted "482 913". The two keys are
+/// sorted, so both sides compute the same value; if a wrong or swapped QR code put another
+/// key in the middle, the two screens show different codes.
+#[uniffi::export]
+pub fn pairing_code(pk_a: String, pk_b: String) -> String {
+    let (lo, hi) = if pk_a <= pk_b { (pk_a, pk_b) } else { (pk_b, pk_a) };
+    let h = blake3::derive_key("omasend 2026-10 pairing code v1", format!("{}\n{}", lo, hi).as_bytes());
+    let n = u64::from_be_bytes(h[..8].try_into().expect("32-byte hash")) % 1_000_000;
+    format!("{:03} {:03}", n / 1000, n % 1000)
+}
+
 pub fn sanitize_name(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or("");
     let mut out: String = base

@@ -73,6 +73,23 @@ The initiator checks that `pk` equals the key from the QR code, then verifies `s
 Each side stores the other's `quic_port` with the key. The responder stores the initiator's
 address from the TCP source of the request; a loopback source (the WAN tunnel) is not stored.
 
+### Pairing code
+
+After pairing, both devices show a six-digit code and the user compares the two screens. A
+wrong or swapped QR code puts a different key on one side, so the codes differ.
+
+```
+lo, hi = sorted([pk_a, pk_b])          # the b64url strings
+h      = BLAKE3-derive_key("omasend 2026-10 pairing code v1", lo + "\n" + hi)
+n      = u64_be(h[0..8]) mod 1_000_000
+code   = "%03d %03d" % (n / 1000, n % 1000)
+```
+
+`omasend_core::pairing_code` implements it (exported to Android). Vector: `pk_a` =
+`6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw`, `pk_b` = 43 × `A` → `981 921`. The desktop shows
+it in the pairing notification and the `--pair-with` output, and lists it as `pairing_code` in
+`--devices`.
+
 ### Failure policy
 
 - The offer secret is 256 bits, so guessing it is not a practical attack. The limits only

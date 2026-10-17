@@ -214,6 +214,19 @@ fn deceptive_characters_are_removed_from_names() {
 }
 
 #[test]
+fn pairing_code_is_symmetric_and_key_bound() {
+    let a = "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw".to_string();
+    let b = "A".repeat(43);
+    let code = pairing_code(a.clone(), b.clone());
+    assert_eq!(code, pairing_code(b.clone(), a.clone()));
+    assert_eq!(code.len(), 7);
+    assert!(code.chars().enumerate().all(|(i, c)| if i == 3 { c == ' ' } else { c.is_ascii_digit() }));
+    assert_ne!(code, pairing_code(a, "B".repeat(43)));
+    // Cross-platform vector, also in PROTOCOL_V2.md.
+    assert_eq!(code, "981 921");
+}
+
+#[test]
 fn risky_files_are_flagged() {
     let kind = |n: &str| risky_file_kind(n.to_string());
     assert_eq!(kind("install.sh").as_deref(), Some("executable"));
