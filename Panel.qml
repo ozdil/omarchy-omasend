@@ -101,7 +101,9 @@ Panel {
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color ink: foreground
   readonly property color urgent: foreground
-  readonly property color dim: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.55)
+  // 0.85 keeps secondary text at WCAG AA (4.5:1) even on low-contrast light themes
+  // such as Rosé Pine Dawn and Catppuccin Latte; hierarchy comes from size and weight.
+  readonly property color dim: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.85)
   readonly property color hoverFill: bar ? Style.hoverFillFor(bar.foreground, root.ink) : "transparent"
   readonly property color selectedFill: bar ? Style.selectedFillFor(bar.foreground, root.ink) : "transparent"
   readonly property string fontFamily: (root.bar && root.bar.fontFamily)

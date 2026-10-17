@@ -103,8 +103,8 @@ QtObject {
             root.border = mut ? mut : Qt.rgba(fgc.r, fgc.g, fgc.b, 0.18);
             root.borderLight = Qt.rgba(fgc.r, fgc.g, fgc.b, 0.3);
             root.textMain = dict["bright_foreground"] || fg;
-            root.textMuted = dict["light_foreground"] || mut || Qt.rgba(fgc.r, fgc.g, fgc.b, 0.65);
-            root.textDim = dict["dark_foreground"] || dict["color8"] || Qt.rgba(fgc.r, fgc.g, fgc.b, 0.4);
+            root.textMuted = Qt.rgba(fgc.r, fgc.g, fgc.b, 0.85);
+            root.textDim = Qt.rgba(fgc.r, fgc.g, fgc.b, 0.66);
         } else {
             root.bgDark = dict["dark_background"] || Qt.darker(base, 1.08);
             root.bgSurface = dict["lighter_background"] || Qt.lighter(base, 1.03);
@@ -113,10 +113,11 @@ QtObject {
             root.border = mut ? mut : Qt.rgba(fgc.r, fgc.g, fgc.b, 0.18);
             root.borderLight = Qt.rgba(fgc.r, fgc.g, fgc.b, 0.3);
             root.textMain = dict["bright_foreground"] || fg;
-            root.textMuted = dict["light_foreground"] || mut || Qt.rgba(fgc.r, fgc.g, fgc.b, 0.65);
-            root.textDim = dict["dark_foreground"] || dict["color8"] || Qt.rgba(fgc.r, fgc.g, fgc.b, 0.4);
+            root.textMuted = Qt.rgba(fgc.r, fgc.g, fgc.b, 0.85);
+            root.textDim = Qt.rgba(fgc.r, fgc.g, fgc.b, 0.66);
         }
 
+        // Muted text stays at 4.5:1 and dim at 3:1 on every bundled Omarchy theme.
         // Monochrome: the accent and every status tone are the theme's own ink, so the
         // window follows each Omarchy theme without adding a second hue.
         root.accent = fgc;
