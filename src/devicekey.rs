@@ -417,7 +417,7 @@ pub fn parse_pair_uri(uri: &str) -> Result<ParsedOffer, String> {
         secret,
         host,
         port,
-        name: url_decode(map.get("n").map(String::as_str).unwrap_or("")),
+        name: omasend_core::sanitize_label(&url_decode(map.get("n").map(String::as_str).unwrap_or("")), 64),
         own_device: map.get("o").map(String::as_str) == Some("1"),
         quic_port: map.get("q").and_then(|q| q.parse().ok()).unwrap_or(0),
     })
@@ -458,7 +458,10 @@ pub fn accept_pair_request(
     my_quic_port: u16,
 ) -> Result<(serde_json::Value, TrustedKey), String> {
     let i_pk = body["pk"].as_str().ok_or("Missing pk")?.to_string();
-    let i_name = body["name"].as_str().unwrap_or("Unknown device").chars().take(64).collect::<String>();
+    let i_name = match omasend_core::sanitize_label(body["name"].as_str().unwrap_or(""), 64) {
+        n if n.is_empty() => "Unknown device".to_string(),
+        n => n,
+    };
     let mac = body["mac"].as_str().ok_or("Missing mac")?;
     let sig = body["sig"].as_str().ok_or("Missing sig")?;
     let vk = decode_pk(&i_pk).ok_or("Invalid public key")?;
@@ -688,6 +691,22 @@ mod tests {
         let (pk2, ts2, n2, s2) = (get2("X-OmaSend-Pk"), get2("X-OmaSend-Ts"), get2("X-OmaSend-Nonce"), get2("X-OmaSend-Sig"));
         let h2 = SignedHeaders { pk: pk2.as_deref(), ts: ts2.as_deref(), nonce: n2.as_deref(), sig: s2.as_deref() };
         assert_eq!(verify_request(&r_store, &h2, "POST", "/api/p2p/request", &body_tag_json(b"{\"evil\":1}")), AuthResult::Rejected("Invalid signature"));
+    }
+
+    #[test]
+    fn test_pairing_names_drop_deceptive_characters() {
+        let r_dir = tmpdir("names");
+        let responder = DeviceIdentity::from_seed(random_bytes::<32>());
+        let initiator = DeviceIdentity::from_seed(random_bytes::<32>());
+        // A responder name with a bidi override and a line break is cleaned on the scanning side.
+        let uri = create_pair_offer(&responder, &r_dir, "Desk\u{202E}\nkoc", "192.168.1.10", 53317, false, 53318);
+        let offer = parse_pair_uri(&uri).unwrap();
+        assert_eq!(offer.name, "Desk koc");
+        // An initiator name made only of invisible characters falls back to a neutral label.
+        let mut req = build_pair_request(&initiator, &offer, "Phone", 53318);
+        req["name"] = serde_json::json!("\u{200B}\u{2066}\u{3164}");
+        let (_, key) = accept_pair_request(&responder, &r_dir, "Desk", &req, "192.168.1.20", 53318).unwrap();
+        assert_eq!(key.name, "Unknown device");
     }
 
     #[test]
