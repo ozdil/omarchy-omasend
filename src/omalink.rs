@@ -414,6 +414,16 @@ fn save_revoked(state_dir: &Path, list: &[String]) -> Result<(), String> {
     crate::write_secure_file(&state_dir.join(REVOKED_FILE), &serde_json::to_string(tail).map_err(|e| e.to_string())?)
 }
 
+/// Adds a key to the revocation list (no number rotation: used by OmaID accounts).
+pub fn revoke_key(state_dir: &Path, pk: &str) -> Result<(), String> {
+    let mut revoked = load_revoked(state_dir);
+    if !revoked.iter().any(|r| r == pk) {
+        revoked.push(pk.to_string());
+        save_revoked(state_dir, &revoked)?;
+    }
+    Ok(())
+}
+
 pub fn is_revoked(state_dir: &Path, pk: &str) -> bool {
     load_revoked(state_dir).iter().any(|r| r == pk)
 }

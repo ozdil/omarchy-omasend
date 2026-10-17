@@ -3,6 +3,7 @@ pub mod devicekey;
 pub mod military;
 pub mod rendezvous;
 pub mod omalink;
+pub mod omaid;
 
 pub use rendezvous::{
     build_github_anchor_payload, compute_rendezvous_topic, create_stun_binding_request,
@@ -2458,7 +2459,16 @@ fn core_addrs(key: &devicekey::TrustedKey) -> Vec<String> {
     if !key.ip.is_empty() && !ips.contains(&key.ip) {
         ips.push(key.ip.clone());
     }
-    ips.into_iter().map(|ip| format!("{}:{}", ip, port)).collect()
+    let mut out: Vec<String> = ips.into_iter().map(|ip| format!("{}:{}", ip, port)).collect();
+    // OmaID account devices also publish their relay (internet path) in the account vault.
+    if key.own_device {
+        for a in omaid::addrs_for(&get_state_dir(), &key.pk) {
+            if !out.contains(&a) {
+                out.push(a);
+            }
+        }
+    }
+    out
 }
 
 /// User-facing message for a failed transfer/clipboard push to a paired device.
@@ -2612,6 +2622,254 @@ impl omasend_core::NodeCallbacks for DesktopCoreCallbacks {
     }
 }
 
+// ------------------------------------------------------------------ OmaID account
+
+fn account_me() -> omasend_core::account::AccountDevice {
+    let node = CORE_NODE.get();
+    omaid::me(
+        device_identity().public_b64(),
+        get_system_hostname(),
+        node.map(|n| n.relay_url()).unwrap_or_default(),
+        &get_local_ip(),
+        node.map(|n| n.bound_port()).unwrap_or(CORE_QUIC_PORT),
+    )
+}
+
+fn account_http() -> std::sync::Arc<dyn omasend_core::account::AccountHttp> {
+    std::sync::Arc::new(omaid::Curl)
+}
+
+/// Applies a report from any account call and tells the user what changed.
+fn account_apply(r: &omasend_core::account::AccountReport) -> Result<(), String> {
+    let ch = omaid::apply_report(&get_state_dir(), &trust_store(), &device_identity().public_b64(), r)?;
+    for name in &ch.new_devices {
+        notify_desktop("OmaSend: Device added", &format!("{} is now one of your devices.", name));
+    }
+    for (name, code) in &ch.new_joins {
+        notify_desktop(
+            "OmaSend: New device wants to join",
+            &format!("{} wants to join your OmaID. Approve it only if it shows the code {}.", name, code),
+        );
+    }
+    if ch.joined {
+        notify_desktop("OmaSend: Joined your OmaID", "This computer is now part of your account.");
+    }
+    if ch.reset_started {
+        notify_desktop(
+            "OmaSend: Account reset requested",
+            "Someone started a reset of your OmaID with its number. If it was not you, cancel it in OmaSend.",
+        );
+    }
+    if ch.removed_self {
+        notify_desktop("OmaSend: Removed from OmaID", "This computer was removed from your account.");
+    }
+    Ok(())
+}
+
+fn account_sync_now() -> Result<(), String> {
+    let Some(state) = omaid::load_state(&get_state_dir()) else { return Ok(()) };
+    let r = omasend_core::account::account_sync(account_http(), state, account_me(), device_identity().seed().to_vec()).map_err(|e| e.to_string())?;
+    account_apply(&r)
+}
+
+const ACCOUNT_POKE: &str = "omaid_poke";
+
+/// Asks the daemon to sync right away (after a CLI change, or while a QR invite is shown).
+fn account_poke() {
+    let _ = write_secure_file(&get_state_dir().join(ACCOUNT_POKE), "1");
+}
+
+/// Background sync: every 5 minutes, every 15 seconds while something is pending (our
+/// join request, someone else's, or a QR invite on screen), and at once when poked.
+fn start_omaid_sync() {
+    thread::spawn(|| {
+        let dir = get_state_dir();
+        let mut next = Instant::now();
+        loop {
+            let poked = fs::remove_file(dir.join(ACCOUNT_POKE)).is_ok();
+            if (poked || Instant::now() >= next) && omaid::load_state(&dir).is_some() {
+                if let Err(e) = account_sync_now() {
+                    eprintln!("OmaID sync: {}", e);
+                }
+                let r = omaid::load_report(&dir);
+                let busy = r["status"].as_str() != Some("member")
+                    || r["joins"].as_array().is_some_and(|j| !j.is_empty())
+                    || read_secure_file(&dir.join("omaid_invite_until"))
+                        .ok()
+                        .and_then(|t| t.trim().parse::<u64>().ok())
+                        .is_some_and(|t| t > SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs());
+                next = Instant::now() + Duration::from_secs(if busy { 15 } else { 300 });
+            }
+            thread::sleep(Duration::from_secs(5));
+        }
+    });
+}
+
+/// The core only uses relays when started for an account, so joining or leaving
+/// restarts a running daemon (a new daemon replaces the old one).
+fn restart_daemon_if_running() {
+    let pid_file = get_state_dir().join("engine.pid");
+    let running = read_secure_file(&pid_file).ok().and_then(|p| p.trim().parse::<i32>().ok()).is_some_and(|pid| pid_is(pid, ENGINE_COMM));
+    if !running {
+        return;
+    }
+    if let Ok(exe) = env::current_exe() {
+        let _ = Command::new(exe)
+            .arg("--serve")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn();
+    }
+}
+
+/// `--account*` commands. Returns true when one was handled.
+fn account_cli(args: &[String]) -> bool {
+    use omasend_core::account as acct;
+    let json = args.iter().any(|a| a == "--json");
+    let arg_after = |flag: &str| args.iter().position(|a| a == flag).and_then(|p| args.get(p + 1)).cloned();
+    let dir = get_state_dir();
+    let seed = device_identity().seed().to_vec();
+    let state = || omaid::load_state(&dir).ok_or_else(|| "This device has no OmaID account. Create one with --account-create or join with --account-join <number>.".to_string());
+    let print = |res: Result<serde_json::Value, String>| {
+        match &res {
+            Ok(v) if json => println!("{}", serde_json::json!({ "ok": true, "account": v })),
+            Ok(v) => println!("{}", serde_json::to_string_pretty(v).unwrap_or_default()),
+            Err(e) if json => println!("{}", serde_json::json!({ "ok": false, "error": e })),
+            Err(e) => eprintln!("OmaID: {}", e),
+        }
+        if res.is_err() {
+            std::process::exit(1);
+        }
+    };
+    let report = |r: Result<acct::AccountReport, omasend_core::CoreError>| -> Result<serde_json::Value, String> {
+        let r = r.map_err(|e| e.to_string())?;
+        account_apply(&r)?;
+        Ok(omaid::report_json(&r))
+    };
+    let resync = |new_state: Result<String, omasend_core::CoreError>| -> Result<serde_json::Value, String> {
+        let st = new_state.map_err(|e| e.to_string())?;
+        omaid::save_state(&dir, &st)?;
+        report(acct::account_sync(account_http(), st, account_me(), seed.clone()))
+    };
+
+    if args.iter().any(|a| a == "--account") {
+        print(match omaid::load_state(&dir) {
+            None => Ok(serde_json::json!({ "status": "none" })),
+            Some(st) => report(acct::account_sync(account_http(), st, account_me(), seed.clone())).or_else(|e| {
+                // Offline: show the last known state.
+                let mut last = omaid::load_report(&dir);
+                if last.is_null() {
+                    return Err(e);
+                }
+                last["offline"] = serde_json::json!(true);
+                Ok(last)
+            }),
+        });
+        return true;
+    }
+    if args.iter().any(|a| a == "--account-create") {
+        if omaid::load_state(&dir).is_some() {
+            print(Err("This device already has an OmaID account.".into()));
+        }
+        let number = arg_after("--account-create").filter(|n| !n.starts_with("--")).unwrap_or_default();
+        print(resync(acct::account_create(account_http(), omaid::server(), number, account_me(), seed.clone())));
+        restart_daemon_if_running();
+        return true;
+    }
+    if let Some(number) = arg_after("--account-join") {
+        if omaid::load_state(&dir).is_some() {
+            print(Err("This device already has an OmaID account. Leave it first with --account-leave.".into()));
+        }
+        print(report(acct::account_join(account_http(), omaid::server(), number, account_me(), seed.clone())));
+        account_poke();
+        restart_daemon_if_running();
+        return true;
+    }
+    if let Some(rid) = arg_after("--account-approve") {
+        print(state().and_then(|st| resync(acct::account_approve(account_http(), st, rid, seed.clone()))));
+        return true;
+    }
+    if let Some(rid) = arg_after("--account-reject") {
+        print(state().and_then(|st| {
+            acct::account_reject(account_http(), st.clone(), rid).map_err(|e| e.to_string())?;
+            report(acct::account_sync(account_http(), st, account_me(), seed.clone()))
+        }));
+        return true;
+    }
+    if let Some(target) = arg_after("--account-remove") {
+        print(state().and_then(|st| {
+            let r = omaid::load_report(&dir);
+            let pk = r["devices"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|d| d["pk"].as_str() == Some(&target) || d["device_id"].as_str() == Some(&target) || d["name"].as_str() == Some(&target))
+                .and_then(|d| d["pk"].as_str().map(str::to_string))
+                .ok_or_else(|| format!("No device '{}' on this account", target))?;
+            if pk == device_identity().public_b64() {
+                return Err("Use --account-leave to remove this device".into());
+            }
+            resync(acct::account_remove(account_http(), st, pk))
+        }));
+        return true;
+    }
+    if args.iter().any(|a| a == "--account-invite") {
+        print(state().and_then(|st| {
+            let inv = acct::account_invite(st).map_err(|e| e.to_string())?;
+            omaid::save_state(&dir, &inv.state)?;
+            let until = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() + 600;
+            write_secure_file(&dir.join("omaid_invite_until"), &until.to_string())?;
+            account_poke();
+            // The QR goes to a 0600 file: the link carries the number and a one-time key.
+            let svg_path = dir.join("omaid_invite.svg");
+            if let Some(svg) = rendezvous::qr_svg(&inv.uri) {
+                write_secure_file(&svg_path, &svg)?;
+            }
+            Ok(serde_json::json!({ "uri": inv.uri, "qr_svg": svg_path.to_string_lossy(), "expires": until }))
+        }));
+        return true;
+    }
+    if args.iter().any(|a| a == "--account-change-number") {
+        print(state().and_then(|st| resync(acct::account_change_number(account_http(), st))));
+        return true;
+    }
+    if args.iter().any(|a| a == "--account-cancel-reset") {
+        print(state().and_then(|st| {
+            acct::account_cancel_reset(account_http(), st.clone()).map_err(|e| e.to_string())?;
+            report(acct::account_sync(account_http(), st, account_me(), seed.clone()))
+        }));
+        return true;
+    }
+    if let Some(number) = arg_after("--account-reset") {
+        if omaid::load_state(&dir).is_some() {
+            print(Err("This device already has an OmaID account.".into()));
+        }
+        print(resync(acct::account_reset_start(account_http(), omaid::server(), number)));
+        return true;
+    }
+    if args.iter().any(|a| a == "--account-leave") {
+        print(state().and_then(|st| {
+            let r = omaid::load_report(&dir);
+            let others = r["devices"].as_array().map(|d| d.len()).unwrap_or(0) > 1;
+            if others {
+                acct::account_leave(account_http(), st, seed.clone()).map_err(|e| e.to_string())?;
+            }
+            for d in r["devices"].as_array().into_iter().flatten() {
+                if let Some(pk) = d["pk"].as_str() {
+                    let _ = trust_store().remove(pk);
+                }
+            }
+            omaid::clear(&dir);
+            Ok(serde_json::json!({ "status": "none" }))
+        }));
+        restart_daemon_if_running();
+        return true;
+    }
+    false
+}
+
 /// Started once by the daemon. Failure is non-fatal: the HTTP transport keeps working.
 fn start_core_node() {
     if CORE_NODE.get().is_some() {
@@ -2623,7 +2881,8 @@ fn start_core_node() {
         get_system_hostname(),
         get_download_dir().to_string_lossy().to_string(),
         CORE_QUIC_PORT,
-        false,
+        // Relays (internet path) only for OmaID accounts; otherwise LAN only.
+        omaid::load_state(&get_state_dir()).is_some(),
         cb,
     ) {
         Ok(node) => {
@@ -5771,7 +6030,9 @@ pub fn handle_connection(mut stream: TcpStream, ip: &str, pin: &str, key_hex: &s
     if req.method == "POST" && (req.path == "/api/v2/link/start" || req.path == "/api/v2/link/finish") {
         // Linking is LAN-only: the WAN tunnel arrives from loopback, and a
         // hidden device takes no guesses at all.
-        if client_ip.to_canonical().is_loopback() || get_visibility().0 == "OFF" {
+        // With an OmaID account, new devices join through an approved request instead:
+        // the number alone must not be enough.
+        if client_ip.to_canonical().is_loopback() || get_visibility().0 == "OFF" || omaid::load_state(&get_state_dir()).is_some() {
             respond(&stream, "403 Forbidden", "application/json", b"{\"error\":\"Linking not available\"}", None, None);
             return;
         }
@@ -7204,6 +7465,7 @@ fn run_server() {
     ensure_local_api_token();
     clean_stale_outgoing();
     start_core_node();
+    start_omaid_sync();
 
     let pid_file = state_dir.join("engine.pid");
     if let Ok(old_pid_str) = read_secure_file(&pid_file) {
@@ -7288,6 +7550,10 @@ fn main() {
     if args.iter().any(|a| a == "--test-notification") {
         notify_desktop("OmaSend", "Masaustu bildirim sistemi aktif ve calisiyor.");
         println!("Test bildirimi gonderildi.");
+        return;
+    }
+
+    if args.iter().any(|a| a.starts_with("--account") && a != "--account-id") && account_cli(&args) {
         return;
     }
 
