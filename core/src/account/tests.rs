@@ -96,6 +96,10 @@ impl AccountHttp for FakeRegistry {
                         rows.insert(id, r);
                         reply(200, json!({}))
                     }
+                    ("delete", Some(r)) if r.pk == signer => {
+                        rows.remove(&id);
+                        reply(200, json!({}))
+                    }
                     ("reset", Some(mut r)) if r.reset.is_none() => {
                         r.reset = Some((signer, now()));
                         rows.insert(id, r);
@@ -220,8 +224,16 @@ fn create_join_approve_remove() {
     assert!(Client { http: reg.clone() }.signed(&old, &old_sk, json!({ "op": "drop_joins", "drop_joins": [] })).is_err());
 
     // A removed device's new request is not offered for approval.
-    let _ = account_join(reg.clone(), SERVER.into(), number, c.1.clone(), c.0.clone()).unwrap();
+    let _ = account_join(reg.clone(), SERVER.into(), number.clone(), c.1.clone(), c.0.clone()).unwrap();
     assert!(sync(&reg, &sa, &a).joins.is_empty());
+
+    // The last devices leave; the account is gone.
+    let sb = sync(&reg, &sb, &b).state;
+    account_leave(reg.clone(), sb, b.0.clone()).unwrap();
+    let sa = sync(&reg, &sa, &a).state;
+    assert_eq!(sync(&reg, &sa, &a).devices.len(), 1);
+    account_delete(reg.clone(), sa.clone()).unwrap();
+    assert!(account_join(reg.clone(), SERVER.into(), number.clone(), c.1.clone(), c.0.clone()).is_err());
 }
 
 #[test]

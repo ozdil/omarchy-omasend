@@ -2879,7 +2879,16 @@ fn account_cli(args: &[String]) -> bool {
     let arg_after = |flag: &str| args.iter().position(|a| a == flag).and_then(|p| args.get(p + 1)).cloned();
     let dir = get_state_dir();
     let seed = device_identity().seed().to_vec();
-    let state = || omaid::load_state(&dir).ok_or_else(|| "This device has no OmaID account. Create one with --account-create or join with --account-join <number>.".to_string());
+    // Every change starts from a fresh sync: another device may have rotated the keys.
+    let state = || -> Result<String, String> {
+        let st = omaid::load_state(&dir).ok_or_else(|| "This device has no OmaID account. Create one with --account-create or join with --account-join <number>.".to_string())?;
+        let r = acct::account_sync(account_http(), st, account_me(), seed.clone()).map_err(|e| e.to_string())?;
+        account_apply(&r)?;
+        if r.state.is_empty() {
+            return Err("This device is no longer part of the OmaID account.".into());
+        }
+        Ok(r.state)
+    };
     let print = |res: Result<serde_json::Value, String>| {
         match &res {
             Ok(v) if json => println!("{}", serde_json::json!({ "ok": true, "account": v })),
@@ -3003,6 +3012,9 @@ fn account_cli(args: &[String]) -> bool {
             let others = r["devices"].as_array().map(|d| d.len()).unwrap_or(0) > 1;
             if others {
                 acct::account_leave(account_http(), st, seed.clone()).map_err(|e| e.to_string())?;
+            } else {
+                // The last device: nothing should stay on the registry.
+                acct::account_delete(account_http(), st).map_err(|e| e.to_string())?;
             }
             for d in r["devices"].as_array().into_iter().flatten() {
                 if let Some(pk) = d["pk"].as_str() {

@@ -950,6 +950,19 @@ pub fn account_leave(http: Arc<dyn AccountHttp>, state: String, device_seed: Vec
     rekey(&Client { http }, &mut st, Some(&pk), None)
 }
 
+/// Deletes the whole account from the registry (the last device leaving).
+#[uniffi::export]
+pub fn account_delete(http: Arc<dyn AccountHttp>, state: String) -> Result<(), CoreError> {
+    let st = State::parse(&state)?;
+    let (account_sk, _) = st.member_keys()?;
+    let c = Client { http };
+    if c.signed(&st, &account_sk, json!({ "op": "delete" }))? {
+        Ok(())
+    } else {
+        Err(fail("could not delete the account"))
+    }
+}
+
 /// With no device left to approve: claims the account with the number alone. Every
 /// device still on the account sees `reset_pending` and can cancel during the wait.
 #[uniffi::export]
