@@ -71,7 +71,7 @@ export function home() {
 }
 
 // The invite stays in the fragment: this script copies it locally and sends it nowhere.
-const JOIN_SCRIPT = `
+export const JOIN_SCRIPT = `
 (function(){
   var link = location.href.split("?")[0];
   var ok = /#n=\\d{16}&k=[A-Za-z0-9_-]+$/.test(link);
