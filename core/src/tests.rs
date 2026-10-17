@@ -294,3 +294,21 @@ fn stale_partials_are_removed_on_start() {
     assert!(fresh.exists());
     node.shutdown();
 }
+
+#[test]
+fn clipboard_last_copy_wins() {
+    use std::sync::atomic::AtomicU64;
+    let last = AtomicU64::new(0);
+    let now = 1_000_000_000;
+    assert!(clipboard_is_newest(&last, now - 5_000, now));
+    // An older copy arriving late is dropped, a newer one wins.
+    assert!(!clipboard_is_newest(&last, now - 6_000, now));
+    assert!(clipboard_is_newest(&last, now - 1_000, now));
+    // A local copy after that supersedes anything stamped before it.
+    last.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+    assert!(!clipboard_is_newest(&last, now - 500, now));
+    // Stale copies are dropped; peers without a stamp are accepted.
+    let fresh = AtomicU64::new(0);
+    assert!(!clipboard_is_newest(&fresh, now - CLIPBOARD_TTL_MS - 1, now));
+    assert!(clipboard_is_newest(&fresh, 0, now));
+}

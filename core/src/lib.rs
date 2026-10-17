@@ -17,8 +17,9 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine as _;
@@ -46,6 +47,8 @@ const MAX_FRAME: usize = 1 << 20;
 const MAX_FILES: usize = 10_000;
 const MAX_FILE_SIZE: u64 = 1 << 40; // 1 TiB
 const MAX_CLIPBOARD: usize = 512 * 1024;
+/// A shared clipboard copy older than this is dropped on arrival.
+const CLIPBOARD_TTL_MS: u64 = 120_000;
 const DECISION_TIMEOUT: Duration = Duration::from_secs(120);
 const CHUNK: usize = 256 * 1024;
 const PARTIAL_DIR: &str = ".omasend-partial";
@@ -144,7 +147,12 @@ enum Msg {
     Decision { accepted: bool, resume: Vec<u64>, reason: Option<String> },
     FileHeader { transfer_id: String, index: u32, offset: u64 },
     FileDone { index: u32, ok: bool, error: Option<String> },
-    Clipboard { text: String },
+    Clipboard {
+        text: String,
+        /// Copy time in Unix ms; 0 from peers that predate it.
+        #[serde(default)]
+        ts: u64,
+    },
     Ack { ok: bool, error: Option<String> },
 }
 
@@ -319,6 +327,25 @@ async fn blake3_file(path: &Path, limit: Option<u64>) -> Result<(blake3::Hasher,
     Ok((h, total))
 }
 
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// Decides whether a received copy stamped `ts` should replace the clipboard,
+/// and records it as the newest when it does. `ts == 0` (older peers) always wins.
+fn clipboard_is_newest(last: &AtomicU64, ts: u64, now: u64) -> bool {
+    if ts == 0 {
+        last.fetch_max(now, Ordering::SeqCst);
+        return true;
+    }
+    if now.saturating_sub(ts) > CLIPBOARD_TTL_MS {
+        return false;
+    }
+    // Clamp a clock running ahead so it cannot block later copies for long.
+    let ts = ts.min(now + CLIPBOARD_TTL_MS);
+    last.fetch_max(ts, Ordering::SeqCst) < ts
+}
+
 // ------------------------------------------------------------------ node
 
 struct Inner {
@@ -327,6 +354,8 @@ struct Inner {
     my_name: String,
     pending: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     cancels: Mutex<HashMap<String, CancellationToken>>,
+    /// Time of the newest clipboard copy seen here, local or received.
+    last_clip_ms: AtomicU64,
 }
 
 impl Inner {
@@ -382,11 +411,14 @@ async fn serve_connection(inner: Arc<Inner>, conn: Connection, peer: String, tru
     let known_name = inner.cb.peer_name(peer.clone());
     let peer_name = if known_name.is_empty() { peer_name } else { known_name };
     match read_msg(&mut recv).await? {
-        Msg::Clipboard { text } => {
+        Msg::Clipboard { text, ts } => {
             if text.len() > MAX_CLIPBOARD {
                 write_msg(&mut send, &Msg::Ack { ok: false, error: Some("clipboard too large".into()) }).await?;
             } else {
-                inner.cb.clipboard(peer.clone(), text);
+                // The newest copy wins; a stale or superseded one is acked and dropped.
+                if clipboard_is_newest(&inner.last_clip_ms, ts, now_ms()) {
+                    inner.cb.clipboard(peer.clone(), text);
+                }
                 write_msg(&mut send, &Msg::Ack { ok: true, error: None }).await?;
             }
             linger(&conn, send).await
@@ -639,6 +671,7 @@ impl OmaNode {
             my_name: my_name.chars().take(64).collect(),
             pending: Mutex::new(HashMap::new()),
             cancels: Mutex::new(HashMap::new()),
+            last_clip_ms: AtomicU64::new(0),
         });
         let (endpoint, router) = rt.block_on(async {
             let secret = SecretKey::from_bytes(&seed);
@@ -738,6 +771,12 @@ impl OmaNode {
         })
     }
 
+    /// Records a local copy so older clipboard text still in flight from
+    /// another device does not overwrite it.
+    pub fn note_local_clipboard(&self) {
+        self.inner.last_clip_ms.fetch_max(now_ms(), Ordering::SeqCst);
+    }
+
     pub fn send_clipboard(&self, peer_pk: String, addrs: Vec<String>, text: String) -> Result<(), CoreError> {
         if text.len() > MAX_CLIPBOARD {
             return Err(fail("clipboard too large"));
@@ -751,7 +790,9 @@ impl OmaNode {
                 .map_err(|e| fail(chain(&e)))?;
             let (mut send, mut recv) = conn.open_bi().await.map_err(|e| fail(chain(&e)))?;
             write_msg(&mut send, &Msg::Hello { v: 2, name: inner.my_name.clone() }).await?;
-            write_msg(&mut send, &Msg::Clipboard { text }).await?;
+            let ts = now_ms();
+            inner.last_clip_ms.fetch_max(ts, Ordering::SeqCst);
+            write_msg(&mut send, &Msg::Clipboard { text, ts }).await?;
             let r = match read_msg(&mut recv).await? {
                 Msg::Ack { ok: true, .. } => Ok(()),
                 Msg::Ack { error, .. } => Err(fail(error.unwrap_or_else(|| "rejected".into()))),

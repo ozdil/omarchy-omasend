@@ -2015,6 +2015,9 @@ fn get_active_paired_peer_ips() -> Vec<String> {
 /// pushes: the legacy HTTP path is plaintext on the LAN (M6). `--sync-clipboard <peer>` still
 /// sends to a legacy peer when the user asks for it explicitly.
 fn auto_push_clipboard_text(text: &str) {
+    if let Some(node) = CORE_NODE.get() {
+        node.note_local_clipboard();
+    }
     for key in trust_store().load().into_iter().filter(|k| k.own_device) {
         let text = text.to_string();
         thread::spawn(move || {
@@ -2758,15 +2761,13 @@ impl omasend_core::NodeCallbacks for DesktopCoreCallbacks {
         }
     }
 
-    fn clipboard(&self, peer_pk: String, text: String) {
+    fn clipboard(&self, _peer_pk: String, text: String) {
         set_last_synced_clipboard_hash(&compute_clipboard_hash(&text));
         if military::is_sensitive_clipboard_payload(&text) {
             return;
         }
+        // Shared clipboard is silent, like Universal Clipboard: no popup or sound per copy.
         set_pc_clipboard(&text);
-        let from = trust_store().get(&peer_pk).map(|k| k.name).unwrap_or_else(|| "paired device".into());
-        notify_desktop("OmaSend: Universal Clipboard", &format!("Received clipboard text from {}.", from));
-        play_clipboard_sound();
     }
 }
 
