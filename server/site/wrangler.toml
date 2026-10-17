@@ -18,4 +18,4 @@ ANDROID_PACKAGE = "io.omarchy.omasend"
 # Comma-separated SHA-256 fingerprints of the Play app signing certificate
 # (Play Console > App integrity) and of the upload key (sideloaded builds).
 # Empty: no App Links file is served.
-ANDROID_CERT_SHA256 = "65:2B:A2:F5:D1:93:75:04:FF:DE:0E:81:72:B7:1E:E2:5A:30:FB:1B:F9:C4:AC:AD:11:9C:0B:72:DD:4B:2B:A0"
+ANDROID_CERT_SHA256 = "BA:94:B5:C8:6C:A2:F0:6B:D7:F2:D6:1D:E8:A9:B1:81:D6:49:82:32:D4:4F:48:72:08:7B:04:37:72:4A:5C:E9,65:2B:A2:F5:D1:93:75:04:FF:DE:0E:81:72:B7:1E:E2:5A:30:FB:1B:F9:C4:AC:AD:11:9C:0B:72:DD:4B:2B:A0"
