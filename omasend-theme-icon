@@ -1,0 +1,39 @@
+#!/bin/bash
+# Recolor the OmaSend launcher icon with the current Omarchy theme's foreground.
+# Runs from build.sh and from ~/.config/omarchy/hooks/theme-set.d/omasend-icon.
+set -euo pipefail
+
+DIR="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)"
+SYMBOLIC="${DIR}/assets/omasend-symbolic.svg"
+DESKTOP_SRC="${DIR}/omasend.desktop"
+COLORS="${HOME}/.local/state/omarchy/current/theme/colors.toml"
+ICON_DIR="${HOME}/.local/share/omasend/icons"
+APP_DIR="${HOME}/.local/share/applications"
+HICOLOR="${HOME}/.local/share/icons/hicolor"
+
+[[ -f "${SYMBOLIC}" && -f "${DESKTOP_SRC}" ]] || exit 0
+
+fg=""
+if [[ -f "${COLORS}" ]]; then
+    fg="$(sed -n 's/^[[:space:]]*foreground[[:space:]]*=[[:space:]]*"\(#[0-9A-Fa-f]\{6\}\)".*/\1/p' "${COLORS}" | head -n 1)"
+fi
+[[ "${fg}" =~ ^#[0-9A-Fa-f]{6}$ ]] || fg="#d6e2ee"
+fg="${fg,,}"
+
+mkdir -p "${ICON_DIR}" "${APP_DIR}" "${HICOLOR}/scalable/apps"
+
+# A new file name per color: the shell caches icon images by URL.
+icon="${ICON_DIR}/omasend-${fg#\#}.svg"
+sed "s/currentColor/${fg}/g" "${SYMBOLIC}" > "${icon}.tmp"
+mv -f "${icon}.tmp" "${icon}"
+find "${ICON_DIR}" -maxdepth 1 -name 'omasend-*.svg' ! -path "${icon}" -delete
+
+# Themed lookups of "omasend" (notifications, other launchers) get the same mark.
+cp -f "${icon}" "${HICOLOR}/scalable/apps/omasend.svg"
+rm -f "${HICOLOR}"/*x*/apps/omasend.png
+
+sed "s|^Icon=.*|Icon=${icon}|" "${DESKTOP_SRC}" > "${APP_DIR}/omasend.desktop.tmp"
+mv -f "${APP_DIR}/omasend.desktop.tmp" "${APP_DIR}/omasend.desktop"
+
+command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -f -t "${HICOLOR}" 2>/dev/null || true
+command -v update-desktop-database >/dev/null && update-desktop-database -q "${APP_DIR}" 2>/dev/null || true

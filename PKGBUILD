@@ -29,6 +29,9 @@ package() {
     install -Dm755 "target/release/omasend-engine" "${pkgdir}/usr/bin/omasend-engine"
     install -Dm755 "omasend-status" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/omasend-status"
     install -Dm755 "omasend-dashboard" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/omasend-dashboard"
+    install -Dm755 "omasend-theme-icon" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/omasend-theme-icon"
+    install -Dm644 "omasend.desktop" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/omasend.desktop"
+    install -Dm644 "assets/omasend-symbolic.svg" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/assets/omasend-symbolic.svg"
     install -Dm644 "manifest.json" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/manifest.json"
     install -Dm644 "Panel.qml" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/Panel.qml"
     install -Dm644 "OmaI18n.js" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/OmaI18n.js"
@@ -41,6 +44,8 @@ package() {
         install -Dm644 "${f}" "${pkgdir}/usr/share/omarchy/plugins/ozdil.omasend/${f}"
     done
     install -Dm644 "omasend.desktop" "${pkgdir}/usr/share/applications/omasend.desktop"
+    install -Dm644 "assets/omasend.svg" "${pkgdir}/usr/share/icons/hicolor/scalable/apps/omasend.svg"
+    install -Dm644 "assets/omasend-symbolic.svg" "${pkgdir}/usr/share/icons/hicolor/symbolic/apps/omasend-symbolic.svg"
     install -Dm644 "README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
     install -Dm644 "LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 }

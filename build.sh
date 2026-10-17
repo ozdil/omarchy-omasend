@@ -94,9 +94,18 @@ if [[ -d "${PLUGIN_TARGET_DIR}" && "${DIR}" != "${PLUGIN_TARGET_DIR}" ]]; then
         /usr/bin/rm -rf "${PLUGIN_TARGET_DIR}/qml"
         /usr/bin/cp -R "${DIR}/qml" "${PLUGIN_TARGET_DIR}/qml"
     fi
-    for f in omasend-dashboard omasend-status; do
+    for f in omasend-dashboard omasend-status omasend-theme-icon; do
         [[ -f "${DIR}/${f}" ]] && /usr/bin/install -m 755 "${DIR}/${f}" "${PLUGIN_TARGET_DIR}/${f}"
     done
+    /usr/bin/cp -f "${DIR}/omasend.desktop" "${PLUGIN_TARGET_DIR}/omasend.desktop"
+
+    # Launcher icon follows the theme: recolor now and on every theme change.
+    HOOK_DIR="${HOME}/.config/omarchy/hooks/theme-set.d"
+    /usr/bin/mkdir -p "${HOOK_DIR}"
+    /usr/bin/printf '%s\n' '#!/bin/bash' \
+        'icon="${HOME}/.config/omarchy/plugins/ozdil.omasend/omasend-theme-icon"' \
+        '[[ -x "${icon}" ]] && "${icon}" || true' > "${HOOK_DIR}/omasend-icon"
+    "${PLUGIN_TARGET_DIR}/omasend-theme-icon" || true
 fi
 
 # Sync engine binary to ~/.local/bin/omasend-engine (used by Panel.qml)

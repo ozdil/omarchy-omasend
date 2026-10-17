@@ -21,6 +21,174 @@ function detectLang(rawEnv, qtLocaleName) {
 }
 
 var DICT = {
+  "pair_mode_web": {
+    tr: "Tarayıcı",
+    en: "Browser"
+  },
+  "web_pair_instructions": {
+    tr: "Telefonun kamerasıyla okut ya da bağlantıyı tarayıcıda aç; sayfa bu cihazla uçtan uca şifreli eşleşir.",
+    en: "Scan with your phone's camera or open the link in a browser; the page pairs with this device end to end encrypted."
+  },
+  "web_link_copy_tooltip": {
+    tr: "Bağlantıyı kopyala",
+    en: "Copy link"
+  },
+  "web_link_copied": {
+    tr: "Bağlantı kopyalandı",
+    en: "Link copied"
+  },
+  "web_not_installed": {
+    tr: "Web istemcisi kurulu değil",
+    en: "Web client is not installed"
+  },
+  "web_pair_unsupported": {
+    tr: "Bu motor sürümü tarayıcı eşleştirmeyi desteklemiyor",
+    en: "This engine version does not support browser pairing"
+  },
+  "account_copied": {
+    tr: "Hesap numarası kopyalandı",
+    en: "Account number copied"
+  },
+  "account_copy_tooltip": {
+    tr: "Numarayı kopyala",
+    en: "Copy number"
+  },
+  "account_hide_tooltip": {
+    tr: "Numarayı gizle",
+    en: "Hide number"
+  },
+  "account_number_label": {
+    tr: "HESAP NUMARANIZ (OmaID)",
+    en: "YOUR ACCOUNT NUMBER (OmaID)"
+  },
+  "account_show_tooltip": {
+    tr: "Numarayı göster",
+    en: "Show number"
+  },
+  "link_btn": {
+    tr: "Bağla",
+    en: "Link"
+  },
+  "link_failed": {
+    tr: "Bağlanamadı",
+    en: "Could not link"
+  },
+  "link_hint": {
+    tr: "Numara ağda gönderilmez, yalnızca bağlantıyı doğrulamak için kullanılır. Kimseyle paylaşmayın: bu numarayı bilen, cihazınızı kendi cihazı gibi bağlayabilir.",
+    en: "The number is never sent over the network; it only proves the link. Do not share it: anyone who knows it can link a device as yours."
+  },
+  "link_instructions": {
+    tr: "Kendi cihazlarınızı bağlamak için diğer cihazın hesap numarasını buraya yazın. İki cihaz da aynı ağda ve açık olmalı.",
+    en: "To link your own devices, type the other device's account number here. Both devices must be on and on the same network."
+  },
+  "link_invalid": {
+    tr: "Geçersiz numara: 16 haneli OmaID girin.",
+    en: "Invalid number: enter the 16-digit OmaID."
+  },
+  "link_ok": {
+    tr: "Bağlandı: %1",
+    en: "Linked: %1"
+  },
+  "link_working": {
+    tr: "Bağlanıyor…",
+    en: "Linking…"
+  },
+  "pair_mode_omaid": {
+    tr: "OmaID",
+    en: "OmaID"
+  },
+  "pair_mode_qr": {
+    tr: "QR kod",
+    en: "QR code"
+  },
+  "add_device": {
+    tr: "Cihaz ekle",
+    en: "Add device"
+  },
+  "add_device_sub": {
+    tr: "QR ile",
+    en: "with QR"
+  },
+  "badge_own_short": {
+    tr: "senin",
+    en: "yours"
+  },
+  "close_btn": {
+    tr: "Kapat",
+    en: "Close"
+  },
+  "details_header": {
+    tr: "AYRINTILAR",
+    en: "DETAILS"
+  },
+  "hidden_short": {
+    tr: "gizli",
+    en: "hidden"
+  },
+  "incoming_encrypted": {
+    tr: "Uçtan uca şifreli, eşleşmiş cihazdan",
+    en: "End-to-end encrypted, from a paired device"
+  },
+  "incoming_not_encrypted": {
+    tr: "Şifresiz, eşleşmemiş cihaz. Beklemiyorsanız reddedin.",
+    en: "Not encrypted, unpaired device. Decline if you did not expect it."
+  },
+  "incoming_wants_to_share": {
+    tr: "%1 paylaşmak istiyor",
+    en: "%1 wants to share"
+  },
+  "nearby_unencrypted_header": {
+    tr: "YAKINDAKİLER · ŞİFRESİZ (%1)",
+    en: "NEARBY · NOT ENCRYPTED (%1)"
+  },
+  "security_blocked_title": {
+    tr: "ENGELLİ",
+    en: "BLOCKED"
+  },
+  "security_off_sub": {
+    tr: "Görünmez, dosya alınmıyor.",
+    en: "Invisible and not receiving."
+  },
+  "security_off_title": {
+    tr: "KAPALI",
+    en: "OFF"
+  },
+  "security_secure_sub": {
+    tr: "Uçtan uca şifreli · %1/%2 cihazınız çevrimiçi",
+    en: "End-to-end encrypted · %1 of %2 devices online"
+  },
+  "security_secure_sub_empty": {
+    tr: "Uçtan uca şifreli · henüz eşleşmiş cihaz yok",
+    en: "End-to-end encrypted · no paired devices yet"
+  },
+  "security_secure_title": {
+    tr: "GÜVENLİ",
+    en: "SECURE"
+  },
+  "send_empty_hint": {
+    tr: "Telefonunuzu eklemek için Cihaz ekle'ye tıklayın. Eşleşmiş cihazlar arasında her şey uçtan uca şifrelidir.",
+    en: "Click Add device to pair your phone. Everything between paired devices is end-to-end encrypted."
+  },
+  "send_hint": {
+    tr: "Dosya seçmek için cihaza tıklayın, sağ tık panoyu gönderir.",
+    en: "Click a device to pick files. Right-click sends the clipboard."
+  },
+  "send_hint_default": {
+    tr: "Dosyaları bar ikonuna bırakın, %1 cihazına gider.",
+    en: "Drop files on the bar icon to send them to %1."
+  },
+  "send_to_header": {
+    tr: "GÖNDER",
+    en: "SEND TO"
+  },
+  "tile_unpair_armed": {
+    tr: "tekrar × ile kaldır",
+    en: "× again to remove"
+  },
+  "visible_to_your_devices": {
+    tr: "cihazlarınıza görünür",
+    en: "visible to your devices"
+  },
   "about_line": {
     tr: "OmaSend · QR ile eşleştirilen cihazlar arasında uçtan uca şifreli (QUIC · TLS 1.3, UDP 53318). Eşleştirilmemiş cihazlarla şifresiz HTTP (53317), her aktarım onay ister. MIT lisanslı.",
     en: "OmaSend · end-to-end encrypted between QR-paired devices (QUIC · TLS 1.3, UDP 53318). Unpaired devices use unencrypted HTTP (53317) and every transfer needs approval. MIT licensed."

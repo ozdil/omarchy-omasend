@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Layouts
 import QtQuick.Controls
+import QtQuick.Shapes
 import Quickshell
 import Quickshell.Io
 import "theme"
@@ -189,11 +190,23 @@ Rectangle {
             Layout.fillWidth: true
             spacing: 12
 
-            Text {
-                text: ""
-                font.family: Theme.iconFont
-                font.pixelSize: 26
-                color: root.serviceOn ? Theme.accent : Theme.textDim
+            // OmaSend mark (same path as assets/omasend-symbolic.svg)
+            Item {
+                implicitWidth: 28
+                implicitHeight: 28
+                Shape {
+                    width: 300
+                    height: 300
+                    scale: 28 / 300
+                    transformOrigin: Item.TopLeft
+                    preferredRendererType: Shape.CurveRenderer
+                    ShapePath {
+                        fillColor: root.serviceOn ? Theme.textMain : Theme.textDim
+                        strokeColor: "transparent"
+                        strokeWidth: 0
+                        PathSvg { path: "M0 0h180v20h-180zM200 0h100v20h-100zM0 20h20v20h-20zM140 20h20v20h-20zM240 20h60v20h-60zM0 40h20v20h-20zM40 40h120v20h-120zM220 40h40v20h-40zM280 40h20v20h-20zM0 60h20v20h-20zM40 60h20v20h-20zM200 60h40v20h-40zM280 60h20v20h-20zM0 80h20v20h-20zM40 80h20v20h-20zM180 80h40v20h-40zM0 100h20v20h-20zM40 100h20v20h-20zM160 100h40v20h-40zM240 100h20v20h-20zM280 100h20v20h-20zM0 120h20v20h-20zM40 120h20v20h-20zM160 120h20v20h-20zM240 120h20v20h-20zM280 120h20v20h-20zM0 140h60v20h-60zM240 140h20v20h-20zM280 140h20v20h-20zM0 160h20v20h-20zM40 160h20v20h-20zM240 160h20v20h-20zM280 160h20v20h-20zM0 180h20v20h-20zM40 180h20v20h-20zM240 180h20v20h-20zM280 180h20v20h-20zM0 200h20v20h-20zM40 200h20v20h-20zM240 200h20v20h-20zM280 200h20v20h-20zM0 220h20v20h-20zM40 220h20v20h-20zM240 220h20v20h-20zM280 220h20v20h-20zM0 240h20v20h-20zM40 240h220v20h-220zM280 240h20v20h-20zM0 260h20v20h-20zM140 260h20v20h-20zM280 260h20v20h-20zM0 280h160v20h-160zM180 280h120v20h-120z" }
+                    }
+                }
             }
             ColumnLayout {
                 spacing: 2

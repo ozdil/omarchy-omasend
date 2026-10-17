@@ -59,6 +59,17 @@ Panel {
   property string statusMsg: ""
   property bool statusError: false
 
+  // --- Link with OmaID (needs an engine with --link / --account-id) ---
+  property string pairMode: "qr"
+  property string accountId: ""
+  property bool showAccountId: false
+  property bool linkSupported: false
+
+  // --- Pair a browser (needs an engine with --pair-offer-web; detected on first use) ---
+  property bool webSupported: true
+  property string pairWebUrl: ""
+  property bool pairWebInstalled: true
+
   // --- Unpair confirmation (second click within 4 s) ---
   property string armedUnpair: ""
   // Pairing QR found on screen, waiting for the user to confirm (name + device id shown).
@@ -80,6 +91,11 @@ Panel {
   property int selectedIndex: 0
   property bool cursorActive: false
 
+  // --- Layout ---
+  readonly property int tileColumns: 4
+  property bool showNearby: false
+  property bool showDetails: false
+
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.55)
@@ -98,7 +114,7 @@ Panel {
   readonly property bool serviceOn: root.visibility !== "OFF"
 
   // Discovered peers that are not QR-paired keys (legacy transport, receiver approves).
-  readonly property var nearby: {
+  readonly property var nearbyAll: {
     if (!root.serviceOn || !root.discovered) return []
     var out = []
     for (var i = 0; i < root.discovered.length; i++) {
@@ -107,6 +123,19 @@ Panel {
     }
     return out
   }
+
+  // Unencrypted peers stay folded away until asked for, so they are never a keyboard or drop target by accident.
+  readonly property var nearby: root.showNearby ? root.nearbyAll : []
+
+  // One word for the panel's security state: secure, blocked or off.
+  readonly property string securityState: {
+    if (!root.serviceOn) return "off"
+    var fw = root.firewallStatus
+    if (fw.indexOf("UFW_ACTIVE_CHECK") === 0 || fw.indexOf("UFW_BLOCKED") === 0 || fw.indexOf("NFT_BLOCKED") === 0) return "blocked"
+    return "secure"
+  }
+  readonly property color securityColor: root.securityState === "secure" ? Color.accent
+                                       : (root.securityState === "blocked" ? root.urgent : root.dim)
 
   readonly property int onlineCount: {
     var n = 0
@@ -202,13 +231,51 @@ Panel {
   function openPairing() {
     root.showPair = true
     root.pairedCountAtOpen = root.pairedDevices.length
+    root.showAccountId = false
     root.newPairOffer()
+    if (!accountProc.running) accountProc.running = true
+  }
+
+  function omaIdDigits(text) { return String(text || "").replace(/[^0-9]/g, "") }
+
+  // 16 digits with a valid Luhn check digit, same rule as the engine.
+  function omaIdValid(text) {
+    var d = root.omaIdDigits(text)
+    if (d.length !== 16) return false
+    var sum = 0
+    for (var i = 0; i < 16; i++) {
+      var n = Number(d.charAt(15 - i))
+      if (i % 2 === 1) { n *= 2; if (n > 9) n -= 9 }
+      sum += n
+    }
+    return sum % 10 === 0
+  }
+
+  function formatAccountId(id, masked) {
+    var d = root.omaIdDigits(id)
+    var groups = []
+    for (var i = 0; i < d.length; i += 4) groups.push(masked && i < d.length - 4 ? "••••" : d.slice(i, i + 4))
+    return groups.join(" ")
+  }
+
+  function linkWithOmaId(text) {
+    if (linkProc.running) return
+    if (!root.omaIdValid(text)) {
+      root.setStatus(root.t("link_invalid"), true)
+      return
+    }
+    root.setStatus(root.t("link_working"), false)
+    linkProc.output = ""
+    linkProc.command = [root.engine(), "--link", root.omaIdDigits(text), "--json"]
+    linkProc.running = true
   }
 
   function newPairOffer() {
     root.pairQrPath = ""
     if (pairProc.running) pairProc.running = false
-    pairProc.command = [root.engine(), "--pair-offer", "--json"].concat(root.pairOwn ? ["--own"] : [])
+    root.pairWebUrl = ""
+    var flag = root.pairMode === "web" ? "--pair-offer-web" : "--pair-offer"
+    pairProc.command = [root.engine(), flag, "--json"].concat(root.pairOwn ? ["--own"] : [])
     pairProc.running = true
   }
 
@@ -251,14 +318,14 @@ Panel {
     root.sendFileTo(tgt.address)
   }
 
-  function moveCursor(dy) {
+  function moveCursor(delta) {
     if (!root.cursorActive) {
       root.cursorActive = true
       root.selectedIndex = 0
       return
     }
     if (root.targets.length === 0) return
-    root.selectedIndex = Math.max(0, Math.min(root.targets.length - 1, root.selectedIndex + dy))
+    root.selectedIndex = Math.max(0, Math.min(root.targets.length - 1, root.selectedIndex + delta))
   }
 
   function activateSelected() {
@@ -303,12 +370,15 @@ Panel {
       root.selectedIndex = 0
       root.cursorActive = false
       root.armedUnpair = ""
+      root.showDetails = false
       if (panelFlick) panelFlick.contentY = 0
       root.forceScan()
       root.refresh()
       Qt.callLater(function() { keyCatcher.forceActiveFocus() })
     } else {
       root.showPair = false
+      root.showAccountId = false
+      linkInput.text = ""
     }
   }
 
@@ -397,6 +467,16 @@ Panel {
         pairProc.running = false
         try {
           var d = JSON.parse(String(text || ""))
+          // Older engines answer --pair-offer-web --json with the status JSON (no web_url): hide the browser tab.
+          if (root.pairMode === "web" && !d.web_url) {
+            root.webSupported = false
+            root.pairMode = "qr"
+            root.setStatus(root.t("web_pair_unsupported"), true)
+            root.newPairOffer()
+            return
+          }
+          root.pairWebUrl = String(d.web_url || "")
+          root.pairWebInstalled = d.web_installed !== false
           root.pairQrPath = String(d.qr_svg || "")
           root.pairExpiresAt = Math.floor(Date.now() / 1000) + (Number(d.expires_in_secs) || 300)
           root.refreshNonce++
@@ -405,6 +485,48 @@ Panel {
           root.setStatus(root.t("pair_qr_failed"), true)
         }
       }
+    }
+  }
+
+  // Older engines answer --account-id --json with the status JSON, which has no account_id: the OmaID tab stays hidden.
+  Process {
+    id: accountProc
+    command: [root.engine(), "--account-id", "--json"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        accountProc.running = false
+        try {
+          var d = JSON.parse(String(text || "").slice(0, 65536))
+          var id = String(d.account_id || "")
+          root.linkSupported = root.omaIdValid(id)
+          root.accountId = root.linkSupported ? root.omaIdDigits(id) : ""
+        } catch (e) {
+          root.linkSupported = false
+        }
+        if (!root.linkSupported && root.pairMode === "omaid") root.pairMode = "qr"
+      }
+    }
+  }
+
+  Process {
+    id: linkProc
+    property string output: ""
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: linkProc.output = String(text || "").slice(0, 65536) }
+    onExited: function(code) {
+      linkProc.running = false
+      var d = null
+      try { d = JSON.parse(linkProc.output) } catch (e) {}
+      if (d && d.ok) {
+        var names = []
+        for (var i = 0; i < (d.linked || []).length; i++) names.push(String(d.linked[i].name || ""))
+        root.setStatus(root.tf("link_ok", names.join(", ")), false)
+        linkInput.text = ""
+        root.showPair = false
+      } else {
+        root.setStatus(d && d.error ? String(d.error) : root.t("link_failed"), true)
+      }
+      root.refresh()
     }
   }
 
@@ -537,14 +659,22 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
+    // The glyph only reserves the button's size; the OmaSend logo below is what is drawn.
     text: root.dropBlasting ? "󰄬" : ""
     active: root.dropActive || root.dropBlasting
     useActiveColor: false
-    foreground: (root.dropActive || root.dropBlasting) ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
+    foreground: root.dropBlasting ? Color.accent : "transparent"
     tooltipText: "OmaSend · " + root.tf("tooltip_devices", root.onlineCount, root.pairedDevices.length)
     onPressed: function(b) {
       if (b === Qt.RightButton) root.forceScan()
       else root.toggle()
+    }
+
+    OmaLogo {
+      anchors.centerIn: parent
+      visible: !root.dropBlasting
+      size: Math.round(Math.min(parent.width, parent.height) * 0.66)
+      color: root.dropActive ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
     }
 
     DropArea {
@@ -699,11 +829,18 @@ Panel {
 
         Text {
           anchors.centerIn: parent
+          visible: root.dropBlasting
           textFormat: Text.PlainText
-          text: root.dropBlasting ? "󰄬" : ""
+          text: "󰄬"
           color: Color.accent
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
+        }
+        OmaLogo {
+          anchors.centerIn: parent
+          visible: !root.dropBlasting
+          size: Style.space(20)
+          color: Color.accent
         }
       }
 
@@ -750,6 +887,8 @@ Panel {
 
   // =========================================================================
   // MAIN PANEL
+  // Quick Share simplicity, Mullvad-style clarity about what is encrypted:
+  // one security line, your devices as tiles, everything else tucked away.
   // =========================================================================
   KeyboardPanel {
     id: panel
@@ -764,7 +903,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      onMoveRequested: function(dx, dy) { if (dy !== 0) root.moveCursor(dy) }
+      onMoveRequested: function(dx, dy) { root.moveCursor(dx + dy * root.tileColumns) }
       onActivateRequested: root.activateSelected()
       onDeleteRequested: {
         var tg = root.targets[root.selectedIndex]
@@ -779,6 +918,7 @@ Panel {
         if (key === "r" || key === "R") root.forceScan()
         else if (key === "o" || key === "O") root.openFolder()
         else if (key === "p" || key === "P") { if (root.showPair) root.showPair = false; else root.openPairing() }
+        else if (key === "n" || key === "N") root.showNearby = !root.showNearby
         else if (key === "c" || key === "C") {
           var tg = root.targets[root.selectedIndex]
           if (root.cursorActive && tg) root.syncClipboardTo(tg.address)
@@ -805,71 +945,51 @@ Panel {
           width: panelFlick.width
           spacing: Style.space(12)
 
+          readonly property real tileWidth: Math.floor((width - Style.space(6) * (root.tileColumns - 1)) / root.tileColumns)
+
           // ---------------------------------------------------------------
-          // HERO
+          // HEADER: logo, name, on/off
           // ---------------------------------------------------------------
           Item {
             width: parent.width
-            implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight, heroActions.implicitHeight)
+            implicitHeight: Math.max(heroLogo.height, heroLabels.implicitHeight, powerSwitch.implicitHeight)
 
-            Text {
-              id: heroIcon
-              textFormat: Text.PlainText
-              text: ""
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.display
-              opacity: root.serviceOn ? 1.0 : 0.5
+            OmaLogo {
+              id: heroLogo
+              size: Style.space(30)
+              color: root.serviceOn ? root.foreground : root.dim
               anchors.left: parent.left
               anchors.verticalCenter: parent.verticalCenter
             }
 
-            RowLayout {
-              id: heroActions
-              spacing: Style.space(8)
+            ToggleSwitch {
+              id: powerSwitch
+              checked: root.serviceOn
+              foreground: root.foreground
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
+              onToggled: root.toggleService()
 
-              Button {
-                iconText: "󰐲"
-                tooltipText: root.t("pair_tooltip")
-                foreground: root.showPair ? Color.accent : root.foreground
+              PanelToolTip {
+                visible: powerSwitch.containsMouse
+                text: root.serviceOn ? root.t("turn_off_service") : root.t("turn_on_service")
                 fontFamily: root.fontFamily
-                iconSize: Style.font.subtitle * 1.4
-                horizontalPadding: Style.space(5)
-                verticalPadding: Style.space(2)
-                Layout.alignment: Qt.AlignVCenter
-                onClicked: { if (root.showPair) root.showPair = false; else root.openPairing() }
-              }
-
-              ToggleSwitch {
-                id: powerSwitch
-                checked: root.serviceOn
-                foreground: root.foreground
-                Layout.alignment: Qt.AlignVCenter
-                onToggled: root.toggleService()
-
-                PanelToolTip {
-                  visible: powerSwitch.containsMouse
-                  text: root.serviceOn ? root.t("turn_off_service") : root.t("turn_on_service")
-                  fontFamily: root.fontFamily
-                }
               }
             }
 
             Column {
               id: heroLabels
-              anchors.left: heroIcon.right
-              anchors.leftMargin: Style.space(14)
-              anchors.right: parent.right
-              anchors.rightMargin: heroActions.width + Style.space(12)
+              anchors.left: heroLogo.right
+              anchors.leftMargin: Style.space(12)
+              anchors.right: powerSwitch.left
+              anchors.rightMargin: Style.space(12)
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(2)
 
               Text {
                 width: parent.width
                 textFormat: Text.PlainText
-                text: "OmaSend · " + root.hostname
+                text: "OmaSend"
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.title
@@ -879,48 +999,229 @@ Panel {
               Text {
                 width: parent.width
                 textFormat: Text.PlainText
-                text: root.serviceOn ? root.tf("hero_sub_on", root.onlineCount) : root.t("service_disabled_sub")
-                color: Qt.darker(root.foreground, 1.4)
+                text: root.hostname + " · " + (root.serviceOn ? root.t("visible_to_your_devices") : root.t("hidden_short"))
+                color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
-                font.bold: true
-                font.letterSpacing: 1.2
                 elide: Text.ElideRight
               }
             }
           }
 
           // ---------------------------------------------------------------
-          // INFO GRID
+          // SECURITY STATE (one line, always visible)
           // ---------------------------------------------------------------
-          GridLayout {
+          BorderSurface {
             width: parent.width
-            columns: 4
-            columnSpacing: Style.space(16)
-            rowSpacing: Style.spacing.labelGap
+            implicitHeight: secRow.implicitHeight + Style.space(16)
+            color: Style.normalFillFor(root.foreground, root.securityColor)
+            borderSpec: Border.controlSpec("normal", root.foreground, root.securityColor)
+            radius: Style.cornerRadius
 
-            InfoLabel { text: root.t("label_device_id") }
-            DetailValue {
-              text: root.shortId(root.deviceKeyId)
-              copyable: true
-              tooltipText: root.deviceKeyId
-              onClickedAction: if (root.deviceKeyId) root.copyText(root.deviceKeyId)
+            RowLayout {
+              id: secRow
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.leftMargin: Style.space(12)
+              anchors.rightMargin: Style.space(12)
+              spacing: Style.space(10)
+
+              Text {
+                textFormat: Text.PlainText
+                text: root.securityState === "secure" ? "󰌾" : (root.securityState === "blocked" ? "󰒃" : "󰌿")
+                color: root.securityColor
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.title
+                Layout.alignment: Qt.AlignVCenter
+              }
+              ColumnLayout {
+                Layout.fillWidth: true
+                spacing: Style.space(1)
+
+                Text {
+                  Layout.fillWidth: true
+                  textFormat: Text.PlainText
+                  text: root.t("security_" + root.securityState + "_title")
+                  color: root.securityColor
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  font.letterSpacing: 1.2
+                  elide: Text.ElideRight
+                }
+                Text {
+                  Layout.fillWidth: true
+                  textFormat: Text.PlainText
+                  text: root.securityState === "secure"
+                        ? (root.pairedDevices.length > 0
+                           ? root.tf("security_secure_sub", root.onlineCount, root.pairedDevices.length)
+                           : root.t("security_secure_sub_empty"))
+                        : (root.securityState === "blocked" ? root.t("firewall_warning_label") : root.t("security_off_sub"))
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                }
+              }
             }
-            InfoLabel { text: root.t("label_ip_address") }
-            DetailValue {
-              text: root.localIp
-              copyable: true
-              tooltipText: root.t("copy_ip_tooltip")
-              onClickedAction: root.copyText(root.localIp)
+          }
+
+          // ---------------------------------------------------------------
+          // INCOMING TRANSFER (needs a decision)
+          // ---------------------------------------------------------------
+          BorderSurface {
+            id: incomingCard
+            readonly property bool encrypted: root.pendingTransfer !== null && root.pendingTransfer.transport === "quic"
+            readonly property color tone: encrypted ? Color.accent : root.urgent
+            visible: root.pendingTransfer !== null && root.pendingTransfer.status === "PENDING"
+            width: parent.width
+            implicitHeight: inCol.implicitHeight + Style.space(20)
+            color: Style.normalFillFor(root.foreground, incomingCard.tone)
+            borderSpec: Border.controlSpec("normal", root.foreground, incomingCard.tone)
+            radius: Style.cornerRadius
+
+            ColumnLayout {
+              id: inCol
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.leftMargin: Style.space(12)
+              anchors.rightMargin: Style.space(12)
+              spacing: Style.space(6)
+
+              Text {
+                Layout.fillWidth: true
+                textFormat: Text.PlainText
+                text: root.tf("incoming_wants_to_share", root.pendingTransfer ? String(root.pendingTransfer.sender_name || "") : "")
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: true
+                elide: Text.ElideRight
+              }
+              Text {
+                Layout.fillWidth: true
+                textFormat: Text.PlainText
+                text: root.pendingTransfer ? (root.pendingTransfer.file_names || []).join(", ") : ""
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                maximumLineCount: 2
+                wrapMode: Text.WrapAnywhere
+                elide: Text.ElideRight
+              }
+              Text {
+                Layout.fillWidth: true
+                textFormat: Text.PlainText
+                text: incomingCard.encrypted ? ("󰌾 " + root.t("incoming_encrypted")) : ("󰌿 " + root.t("incoming_not_encrypted"))
+                color: incomingCard.tone
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+              RowLayout {
+                Layout.fillWidth: true
+                Layout.topMargin: Style.space(2)
+                spacing: Style.space(8)
+
+                Item { Layout.fillWidth: true }
+                Button {
+                  text: root.t("reject_btn")
+                  fontSize: Style.font.bodySmall
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  horizontalPadding: Style.space(14)
+                  verticalPadding: Style.spacing.controlPaddingY
+                  bordered: true
+                  onClicked: if (root.pendingTransfer) root.rejectTransfer(root.pendingTransfer.token)
+                }
+                Button {
+                  text: root.t("accept_btn")
+                  fontSize: Style.font.bodySmall
+                  foreground: Color.accent
+                  fontFamily: root.fontFamily
+                  horizontalPadding: Style.space(14)
+                  verticalPadding: Style.spacing.controlPaddingY
+                  bordered: true
+                  active: true
+                  onClicked: if (root.pendingTransfer) root.acceptTransfer(root.pendingTransfer.token)
+                }
+              }
             }
-            InfoLabel { text: root.t("label_paired") }
-            DetailValue { text: root.onlineCount + "/" + root.pairedDevices.length }
-            InfoLabel { text: root.t("label_received") }
-            DetailValue {
-              text: root.totalReceived + " " + root.t("files_unit")
-              copyable: true
-              tooltipText: root.t("open_downloads_tooltip")
-              onClickedAction: root.openFolder()
+          }
+
+          // ---------------------------------------------------------------
+          // ACTIVE TRANSFER
+          // ---------------------------------------------------------------
+          BorderSurface {
+            visible: root.transferProgress !== null
+            width: parent.width
+            implicitHeight: progressCol.implicitHeight + Style.space(18)
+            color: Style.normalFillFor(root.foreground, Color.accent)
+            borderSpec: Border.controlSpec("normal", root.foreground, Color.accent)
+            radius: Style.cornerRadius
+
+            ColumnLayout {
+              id: progressCol
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.leftMargin: Style.space(12)
+              anchors.rightMargin: Style.space(8)
+              spacing: Style.space(6)
+
+              RowLayout {
+                Layout.fillWidth: true
+                spacing: Style.space(8)
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: (root.transferProgress && String(root.transferProgress.direction || "").indexOf("send") === 0) ? "󰕒" : "󰇚"
+                  color: Color.accent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+                Text {
+                  Layout.fillWidth: true
+                  textFormat: Text.PlainText
+                  text: root.transferProgress ? String(root.transferProgress.file_name || "") : ""
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  font.bold: true
+                  elide: Text.ElideMiddle
+                }
+                Text {
+                  textFormat: Text.PlainText
+                  text: root.transferProgress ? (Number(root.transferProgress.percent || 0) + "%") : ""
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+                PanelActionButton {
+                  iconText: "󰅖"
+                  tooltipText: root.t("cancel_btn")
+                  foreground: root.dim
+                  hoverColor: root.urgent
+                  fontFamily: root.fontFamily
+                  onClicked: root.cancelTransfer()
+                }
+              }
+
+              Rectangle {
+                Layout.fillWidth: true
+                height: Style.space(4)
+                radius: Style.space(2)
+                color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.14)
+
+                Rectangle {
+                  width: parent.width * Math.max(0.02, Math.min(1.0, (root.transferProgress ? Number(root.transferProgress.percent || 0) : 0) / 100.0))
+                  height: parent.height
+                  radius: parent.radius
+                  color: Color.accent
+                }
+              }
             }
           }
 
@@ -941,90 +1242,292 @@ Panel {
               width: parent.width - Style.space(20)
               spacing: Style.space(8)
 
-              Text {
+              RowLayout {
                 width: parent.width
-                textFormat: Text.PlainText
-                text: root.t("pair_title")
-                color: Color.accent
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-                font.letterSpacing: 1.0
-              }
 
-              Rectangle {
-                anchors.horizontalCenter: parent.horizontalCenter
-                width: Style.space(176)
-                height: Style.space(176)
-                radius: Style.cornerRadius
-                color: "#ffffff"
-
-                Image {
-                  anchors.centerIn: parent
-                  width: Style.space(164)
-                  height: Style.space(164)
-                  source: root.pairQrPath ? ("file://" + root.pairQrPath + "?v=" + root.refreshNonce) : ""
-                  sourceSize.width: 512
-                  sourceSize.height: 512
-                  fillMode: Image.PreserveAspectFit
-                  smooth: false
-                  cache: false
+                Text {
+                  Layout.fillWidth: true
+                  textFormat: Text.PlainText
+                  text: root.t("pair_title")
+                  color: Color.accent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  font.letterSpacing: 1.0
+                }
+                PanelActionButton {
+                  iconText: "󰅖"
+                  tooltipText: root.t("close_btn")
+                  foreground: root.dim
+                  fontFamily: root.fontFamily
+                  onClicked: root.showPair = false
                 }
               }
 
-              Text {
-                width: parent.width
-                textFormat: Text.PlainText
-                text: root.t("pair_instructions")
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
-                horizontalAlignment: Text.AlignHCenter
-              }
-
-              Text {
-                width: parent.width
-                textFormat: Text.PlainText
-                text: root.tf("pair_expires", Math.max(0, root.pairExpiresAt - root.nowSecs))
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                horizontalAlignment: Text.AlignHCenter
-              }
-
               RowLayout {
+                visible: root.linkSupported || root.webSupported
                 width: parent.width
                 spacing: Style.space(6)
 
                 ScopePill {
-                  label: root.t("pair_own")
-                  activeWhen: root.pairOwn
-                  onClicked: { if (!root.pairOwn) { root.pairOwn = true; root.newPairOffer() } }
+                  label: root.t("pair_mode_qr")
+                  activeWhen: root.pairMode === "qr"
+                  onClicked: { if (root.pairMode !== "qr") { var wasWeb = root.pairMode === "web"; root.pairMode = "qr"; if (wasWeb || !root.pairQrPath) root.newPairOffer() } }
                 }
                 ScopePill {
-                  label: root.t("pair_other")
-                  activeWhen: !root.pairOwn
-                  onClicked: { if (root.pairOwn) { root.pairOwn = false; root.newPairOffer() } }
+                  visible: root.webSupported
+                  label: root.t("pair_mode_web")
+                  activeWhen: root.pairMode === "web"
+                  onClicked: { if (root.pairMode !== "web") { root.pairMode = "web"; root.newPairOffer() } }
+                }
+                ScopePill {
+                  visible: root.linkSupported
+                  label: root.t("pair_mode_omaid")
+                  activeWhen: root.pairMode === "omaid"
+                  onClicked: root.pairMode = "omaid"
                 }
                 Item { Layout.fillWidth: true }
-                PanelActionButton {
-                  iconText: "󰐳"
-                  tooltipText: root.t("pair_scan_screen_tooltip")
-                  foreground: root.foreground
-                  fontFamily: root.fontFamily
-                  onClicked: root.scanScreenForPairing()
+              }
+
+              Column {
+                visible: root.pairMode === "qr" || root.pairMode === "web"
+                width: parent.width
+                spacing: Style.space(8)
+
+                Rectangle {
+                  anchors.horizontalCenter: parent.horizontalCenter
+                  width: Style.space(176)
+                  height: Style.space(176)
+                  radius: Style.cornerRadius
+                  color: "#ffffff"
+
+                  Image {
+                    anchors.centerIn: parent
+                    width: Style.space(164)
+                    height: Style.space(164)
+                    source: root.pairQrPath ? ("file://" + root.pairQrPath + "?v=" + root.refreshNonce) : ""
+                    sourceSize.width: 512
+                    sourceSize.height: 512
+                    fillMode: Image.PreserveAspectFit
+                    smooth: false
+                    cache: false
+                  }
+                }
+
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: root.pairMode === "web" ? root.t("web_pair_instructions") : root.t("pair_instructions")
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                  horizontalAlignment: Text.AlignHCenter
+                }
+
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: root.tf("pair_expires", Math.max(0, root.pairExpiresAt - root.nowSecs))
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  horizontalAlignment: Text.AlignHCenter
+                }
+
+                RowLayout {
+                  visible: root.pairMode === "web" && root.pairWebUrl !== ""
+                  width: parent.width
+                  spacing: Style.space(4)
+
+                  Text {
+                    Layout.fillWidth: true
+                    textFormat: Text.PlainText
+                    text: root.pairWebUrl
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideMiddle
+                  }
+                  PanelActionButton {
+                    iconText: "󰆏"
+                    tooltipText: root.t("web_link_copy_tooltip")
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    onClicked: { root.copyText(root.pairWebUrl); root.setStatus(root.t("web_link_copied"), false) }
+                  }
+                }
+
+                Text {
+                  visible: root.pairMode === "web" && !root.pairWebInstalled
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: root.t("web_not_installed")
+                  color: root.urgent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  wrapMode: Text.WordWrap
+                  horizontalAlignment: Text.AlignHCenter
+                }
+
+                RowLayout {
+                  width: parent.width
+                  spacing: Style.space(6)
+
+                  ScopePill {
+                    label: root.t("pair_own")
+                    activeWhen: root.pairOwn
+                    onClicked: { if (!root.pairOwn) { root.pairOwn = true; root.newPairOffer() } }
+                  }
+                  ScopePill {
+                    label: root.t("pair_other")
+                    activeWhen: !root.pairOwn
+                    onClicked: { if (root.pairOwn) { root.pairOwn = false; root.newPairOffer() } }
+                  }
+                  Item { Layout.fillWidth: true }
+                  PanelActionButton {
+                    visible: root.pairMode === "qr"
+                    iconText: "󰐳"
+                    tooltipText: root.t("pair_scan_screen_tooltip")
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    onClicked: root.scanScreenForPairing()
+                  }
+                }
+
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: root.pairOwn ? root.t("pair_own_hint") : root.t("pair_other_hint")
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
                 }
               }
 
-              Text {
+              // Link your own devices by typing the account OmaID (SPAKE2; the number itself is never sent).
+              Column {
+                visible: root.pairMode === "omaid"
                 width: parent.width
-                textFormat: Text.PlainText
-                text: root.pairOwn ? root.t("pair_own_hint") : root.t("pair_other_hint")
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
+                spacing: Style.space(8)
+
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: root.t("account_number_label")
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  font.letterSpacing: 1.0
+                }
+
+                RowLayout {
+                  width: parent.width
+                  spacing: Style.space(4)
+
+                  Text {
+                    Layout.fillWidth: true
+                    textFormat: Text.PlainText
+                    text: root.accountId === "" ? "…" : root.formatAccountId(root.accountId, !root.showAccountId)
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    font.bold: true
+                    font.letterSpacing: 1.0
+                    elide: Text.ElideRight
+                  }
+                  PanelActionButton {
+                    iconText: root.showAccountId ? "󰈉" : "󰈈"
+                    tooltipText: root.showAccountId ? root.t("account_hide_tooltip") : root.t("account_show_tooltip")
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    onClicked: root.showAccountId = !root.showAccountId
+                  }
+                  PanelActionButton {
+                    iconText: "󰆏"
+                    tooltipText: root.t("account_copy_tooltip")
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    onClicked: if (root.accountId) { root.copyText(root.accountId); root.setStatus(root.t("account_copied"), false) }
+                  }
+                }
+
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: root.t("link_instructions")
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                }
+
+                RowLayout {
+                  width: parent.width
+                  spacing: Style.space(6)
+
+                  BorderSurface {
+                    Layout.fillWidth: true
+                    implicitHeight: linkInput.implicitHeight + Style.space(12)
+                    color: "transparent"
+                    borderSpec: Border.controlSpec("normal", root.foreground, linkInput.activeFocus ? Color.accent : root.foreground)
+                    radius: Style.cornerRadius
+
+                    TextInput {
+                      id: linkInput
+                      anchors.left: parent.left
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      anchors.leftMargin: Style.space(8)
+                      anchors.rightMargin: Style.space(8)
+                      color: root.foreground
+                      selectionColor: Color.accent
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      font.letterSpacing: 1.0
+                      maximumLength: 24
+                      inputMethodHints: Qt.ImhDigitsOnly
+                      validator: RegularExpressionValidator { regularExpression: /[0-9 -]*/ }
+                      clip: true
+                      enabled: !linkProc.running
+                      onAccepted: root.linkWithOmaId(text)
+                      Keys.onEscapePressed: keyCatcher.forceActiveFocus()
+
+                      Text {
+                        anchors.fill: parent
+                        visible: linkInput.text === "" && !linkInput.activeFocus
+                        textFormat: Text.PlainText
+                        text: "0000 0000 0000 0000"
+                        color: root.dim
+                        font: linkInput.font
+                      }
+                    }
+                  }
+                  Button {
+                    text: linkProc.running ? root.t("link_working") : root.t("link_btn")
+                    fontSize: Style.font.bodySmall
+                    foreground: Color.accent
+                    fontFamily: root.fontFamily
+                    horizontalPadding: Style.space(12)
+                    verticalPadding: Style.spacing.controlPaddingY
+                    bordered: true
+                    active: root.omaIdValid(linkInput.text) && !linkProc.running
+                    onClicked: root.linkWithOmaId(linkInput.text)
+                  }
+                }
+
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: root.t("link_hint")
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                }
               }
 
               // Confirmation for a pairing QR found on screen.
@@ -1098,249 +1601,48 @@ Panel {
           }
 
           // ---------------------------------------------------------------
-          // FIREWALL WARNING
-          // ---------------------------------------------------------------
-          BorderSurface {
-            visible: root.firewallStatus.indexOf("UFW_ACTIVE_CHECK") === 0 || root.firewallStatus.indexOf("UFW_BLOCKED") === 0 || root.firewallStatus.indexOf("NFT_BLOCKED") === 0
-            width: parent.width
-            implicitHeight: fwRow.implicitHeight + Style.space(12)
-            color: Style.normalFillFor(root.foreground, root.urgent)
-            borderSpec: Border.controlSpec("normal", root.foreground, root.urgent)
-            radius: Style.cornerRadius
-
-            RowLayout {
-              id: fwRow
-              anchors.left: parent.left
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              anchors.leftMargin: Style.space(10)
-              anchors.rightMargin: Style.space(10)
-              spacing: Style.space(8)
-
-              Text {
-                textFormat: Text.PlainText
-                text: "󰒃"
-                color: root.urgent
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-              }
-              Text {
-                Layout.fillWidth: true
-                textFormat: Text.PlainText
-                text: root.t("firewall_warning_label")
-                color: root.urgent
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
-              }
-            }
-          }
-
-          // ---------------------------------------------------------------
-          // INCOMING TRANSFER (needs a decision)
+          // SEND TO: paired devices as tiles, plus "Add device"
           // ---------------------------------------------------------------
           Column {
-            visible: root.pendingTransfer !== null && root.pendingTransfer.status === "PENDING"
             width: parent.width
             spacing: Style.space(8)
 
-            PanelSeparator { foreground: root.foreground }
             PanelSectionHeader {
-              text: root.t("incoming_transfer_header")
+              text: root.t("send_to_header")
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
 
-            CursorSurface {
+            Flow {
               width: parent.width
-              current: true
-              foreground: root.foreground
-              implicitHeight: pendingRow.implicitHeight + Style.spacing.rowPaddingX
+              spacing: Style.space(6)
 
-              RowLayout {
-                id: pendingRow
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                anchors.leftMargin: Style.space(10)
-                anchors.rightMargin: Style.space(8)
-                spacing: Style.space(8)
+              Repeater {
+                model: root.pairedDevices
 
-                Text {
-                  textFormat: Text.PlainText
-                  text: "󰇚"
-                  color: Color.accent
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.title
-                  Layout.alignment: Qt.AlignVCenter
-                }
-
-                ColumnLayout {
-                  Layout.fillWidth: true
-                  spacing: Style.space(1)
-
-                  Text {
-                    textFormat: Text.PlainText
-                    Layout.fillWidth: true
-                    text: root.pendingTransfer ? String(root.pendingTransfer.sender_name || "") : ""
-                    color: root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.body
-                    elide: Text.ElideRight
-                  }
-                  Text {
-                    textFormat: Text.PlainText
-                    Layout.fillWidth: true
-                    text: {
-                      if (!root.pendingTransfer) return ""
-                      var enc = root.pendingTransfer.transport === "quic"
-                      return (enc ? "󰌾 " + root.t("encrypted") : "󰌿 " + root.t("not_encrypted"))
-                        + " · " + (root.pendingTransfer.file_names || []).join(", ")
-                    }
-                    color: root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    elide: Text.ElideRight
-                  }
-                }
-
-                PanelActionButton {
-                  iconText: "󰄬"
-                  tooltipText: root.t("accept_btn")
-                  foreground: Color.accent
-                  fontFamily: root.fontFamily
-                  onClicked: if (root.pendingTransfer) root.acceptTransfer(root.pendingTransfer.token)
-                }
-                PanelActionButton {
-                  iconText: "󰅖"
-                  tooltipText: root.t("reject_btn")
-                  foreground: root.urgent
-                  hoverColor: root.urgent
-                  fontFamily: root.fontFamily
-                  onClicked: if (root.pendingTransfer) root.rejectTransfer(root.pendingTransfer.token)
+                DeviceTile {
+                  required property var modelData
+                  required property int index
+                  width: column.tileWidth
+                  rowIndex: index
+                  kind: "paired"
+                  name: String(modelData.name || "")
+                  address: String(modelData.device_id || "")
+                  online: Boolean(modelData.online)
+                  own: Boolean(modelData.own_device)
+                  detail: String(modelData.ip || "") + " · " + root.shortId(modelData.device_id)
                 }
               }
-            }
-          }
 
-          // ---------------------------------------------------------------
-          // ACTIVE TRANSFER
-          // ---------------------------------------------------------------
-          Column {
-            visible: root.transferProgress !== null
-            width: parent.width
-            spacing: Style.space(8)
-
-            PanelSeparator { foreground: root.foreground }
-            PanelSectionHeader {
-              text: root.t("active_transfer_header")
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-            }
-
-            CursorSurface {
-              width: parent.width
-              current: true
-              foreground: root.foreground
-              implicitHeight: progressCol.implicitHeight + Style.space(14)
-
-              ColumnLayout {
-                id: progressCol
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                anchors.leftMargin: Style.space(10)
-                anchors.rightMargin: Style.space(8)
-                spacing: Style.space(6)
-
-                RowLayout {
-                  Layout.fillWidth: true
-                  spacing: Style.space(8)
-
-                  Text {
-                    textFormat: Text.PlainText
-                    text: (root.transferProgress && String(root.transferProgress.direction || "").indexOf("send") === 0) ? "" : "󰇚"
-                    color: Color.accent
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.body
-                  }
-                  Text {
-                    Layout.fillWidth: true
-                    textFormat: Text.PlainText
-                    text: root.transferProgress
-                          ? (String(root.transferProgress.file_name || "") + " (" + Number(root.transferProgress.percent || 0) + "%)")
-                          : ""
-                    color: root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.bodySmall
-                    font.bold: true
-                    elide: Text.ElideRight
-                  }
-                  PanelActionButton {
-                    iconText: "󰅖"
-                    tooltipText: root.t("cancel_btn")
-                    foreground: root.urgent
-                    hoverColor: root.urgent
-                    fontFamily: root.fontFamily
-                    onClicked: root.cancelTransfer()
-                  }
-                }
-
-                Rectangle {
-                  Layout.fillWidth: true
-                  height: Style.space(4)
-                  radius: Style.space(2)
-                  color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.14)
-
-                  Rectangle {
-                    width: parent.width * Math.max(0.02, Math.min(1.0, (root.transferProgress ? Number(root.transferProgress.percent || 0) : 0) / 100.0))
-                    height: parent.height
-                    radius: parent.radius
-                    color: Color.accent
-                  }
-                }
-              }
-            }
-          }
-
-          // ---------------------------------------------------------------
-          // MY DEVICES (QR-paired keys, end-to-end encrypted)
-          // ---------------------------------------------------------------
-          PanelSeparator { foreground: root.foreground }
-
-          Column {
-            width: parent.width
-            spacing: Style.space(6)
-
-            PanelSectionHeader {
-              text: root.t("my_devices_header")
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-            }
-
-            Repeater {
-              model: root.pairedDevices
-
-              DeviceRow {
-                required property var modelData
-                required property int index
-                width: parent.width
-                rowIndex: index
-                kind: "paired"
-                name: String(modelData.name || "")
-                address: String(modelData.device_id || "")
-                online: Boolean(modelData.online)
-                own: Boolean(modelData.own_device)
-                detail: (Boolean(modelData.online) ? (root.t("online") + " · " + String(modelData.ip || "")) : root.t("not_seen"))
-                        + " · " + root.shortId(modelData.device_id)
-              }
+              AddTile { width: column.tileWidth }
             }
 
             Text {
-              visible: root.pairedDevices.length === 0
               width: parent.width
               textFormat: Text.PlainText
-              text: root.t("no_paired_devices")
+              text: root.pairedDevices.length === 0
+                    ? root.t("send_empty_hint")
+                    : (root.defaultTarget ? root.tf("send_hint_default", root.defaultTarget.name) : root.t("send_hint"))
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -1349,47 +1651,101 @@ Panel {
           }
 
           // ---------------------------------------------------------------
-          // NEARBY (not paired: legacy transport, receiver approves)
+          // NEARBY (not paired, not encrypted): collapsed by default
           // ---------------------------------------------------------------
-          PanelSeparator { foreground: root.foreground }
-
           Column {
+            visible: root.serviceOn && root.nearbyAll.length > 0
             width: parent.width
-            spacing: Style.space(6)
+            spacing: Style.space(8)
 
-            PanelSectionHeader {
-              text: root.t("nearby_header")
-              foreground: root.foreground
-              fontFamily: root.fontFamily
+            Disclosure {
+              width: parent.width
+              label: root.tf("nearby_unencrypted_header", root.nearbyAll.length)
+              expanded: root.showNearby
+              tone: root.urgent
+              onToggled: root.showNearby = !root.showNearby
             }
 
-            Repeater {
-              model: root.nearby
+            Flow {
+              visible: root.showNearby
+              width: parent.width
+              spacing: Style.space(6)
 
-              DeviceRow {
-                required property var modelData
-                required property int index
-                width: parent.width
-                rowIndex: root.pairedDevices.length + index
-                kind: "nearby"
-                name: String(modelData.name || "")
-                address: String(modelData.ip || "")
-                online: true
-                own: false
-                detail: String(modelData.ip || "") + " · " + root.t("needs_approval")
+              Repeater {
+                model: root.nearby
+
+                DeviceTile {
+                  required property var modelData
+                  required property int index
+                  width: column.tileWidth
+                  rowIndex: root.pairedDevices.length + index
+                  kind: "nearby"
+                  name: String(modelData.name || "")
+                  address: String(modelData.ip || "")
+                  online: true
+                  own: false
+                  detail: String(modelData.ip || "")
+                }
               }
             }
 
             Text {
+              visible: root.showNearby
               width: parent.width
               textFormat: Text.PlainText
-              text: root.nearby.length === 0
-                    ? (root.serviceOn ? root.t("nearby_empty") : root.t("service_disabled_sub"))
-                    : root.t("nearby_footnote")
+              text: root.t("nearby_footnote")
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               wrapMode: Text.WordWrap
+            }
+          }
+
+          // ---------------------------------------------------------------
+          // DETAILS (device key, address, counters): collapsed by default
+          // ---------------------------------------------------------------
+          Column {
+            width: parent.width
+            spacing: Style.space(8)
+
+            Disclosure {
+              width: parent.width
+              label: root.t("details_header")
+              expanded: root.showDetails
+              tone: root.foreground
+              onToggled: root.showDetails = !root.showDetails
+            }
+
+            GridLayout {
+              visible: root.showDetails
+              width: parent.width
+              columns: 4
+              columnSpacing: Style.space(16)
+              rowSpacing: Style.spacing.labelGap
+
+              InfoLabel { text: root.t("label_device_id") }
+              DetailValue {
+                text: root.shortId(root.deviceKeyId)
+                copyable: true
+                tooltipText: root.deviceKeyId
+                onClickedAction: if (root.deviceKeyId) root.copyText(root.deviceKeyId)
+              }
+              InfoLabel { text: root.t("label_ip_address") }
+              DetailValue {
+                text: root.localIp
+                copyable: true
+                tooltipText: root.t("copy_ip_tooltip")
+                onClickedAction: root.copyText(root.localIp)
+              }
+              InfoLabel { text: root.t("label_paired") }
+              DetailValue { text: root.onlineCount + "/" + root.pairedDevices.length }
+              InfoLabel { text: root.t("label_received") }
+              DetailValue {
+                text: root.totalReceived + " " + root.t("files_unit")
+                copyable: true
+                tooltipText: root.t("open_downloads_tooltip")
+                onClickedAction: root.openFolder()
+              }
             }
           }
         }
@@ -1474,6 +1830,33 @@ Panel {
   // =========================================================================
   // COMPONENTS
   // =========================================================================
+  // OmaSend mark from the brand guide (assets/omasend-symbolic.svg): the send arrow breaking out of the Omarchy frame (option B).
+  // One color, so it follows the bar theme.
+  component OmaLogo: Item {
+    id: logo
+    property color color: root.foreground
+    property real size: Style.space(16)
+    width: size
+    height: size
+    implicitWidth: size
+    implicitHeight: size
+
+    Shape {
+      width: 300
+      height: 300
+      scale: logo.size / 300
+      transformOrigin: Item.TopLeft
+      preferredRendererType: Shape.CurveRenderer
+
+      ShapePath {
+        fillColor: logo.color
+        strokeColor: "transparent"
+        strokeWidth: 0
+        PathSvg { path: "M0 0h180v20h-180zM200 0h100v20h-100zM0 20h20v20h-20zM140 20h20v20h-20zM240 20h60v20h-60zM0 40h20v20h-20zM40 40h120v20h-120zM220 40h40v20h-40zM280 40h20v20h-20zM0 60h20v20h-20zM40 60h20v20h-20zM200 60h40v20h-40zM280 60h20v20h-20zM0 80h20v20h-20zM40 80h20v20h-20zM180 80h40v20h-40zM0 100h20v20h-20zM40 100h20v20h-20zM160 100h40v20h-40zM240 100h20v20h-20zM280 100h20v20h-20zM0 120h20v20h-20zM40 120h20v20h-20zM160 120h20v20h-20zM240 120h20v20h-20zM280 120h20v20h-20zM0 140h60v20h-60zM240 140h20v20h-20zM280 140h20v20h-20zM0 160h20v20h-20zM40 160h20v20h-20zM240 160h20v20h-20zM280 160h20v20h-20zM0 180h20v20h-20zM40 180h20v20h-20zM240 180h20v20h-20zM280 180h20v20h-20zM0 200h20v20h-20zM40 200h20v20h-20zM240 200h20v20h-20zM280 200h20v20h-20zM0 220h20v20h-20zM40 220h20v20h-20zM240 220h20v20h-20zM280 220h20v20h-20zM0 240h20v20h-20zM40 240h220v20h-220zM280 240h20v20h-20zM0 260h20v20h-20zM140 260h20v20h-20zM280 260h20v20h-20zM0 280h160v20h-160zM180 280h120v20h-120z" }
+      }
+    }
+  }
+
   component ScopePill: Button {
     required property string label
     property bool activeWhen: false
@@ -1487,8 +1870,52 @@ Panel {
     active: activeWhen
   }
 
-  component DeviceRow: CursorSurface {
-    id: row
+  // Collapsible section header ("Nearby", "Details").
+  component Disclosure: Item {
+    id: disc
+    property string label: ""
+    property bool expanded: false
+    property color tone: root.foreground
+    signal toggled()
+    implicitHeight: discRow.implicitHeight + Style.space(4)
+
+    MouseArea {
+      anchors.fill: parent
+      cursorShape: Qt.PointingHandCursor
+      onClicked: disc.toggled()
+    }
+
+    RowLayout {
+      id: discRow
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.space(6)
+
+      Text {
+        Layout.fillWidth: true
+        textFormat: Text.PlainText
+        text: disc.label
+        color: Qt.rgba(disc.tone.r, disc.tone.g, disc.tone.b, 0.75)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        font.bold: true
+        font.letterSpacing: 1.0
+        elide: Text.ElideRight
+      }
+      Text {
+        textFormat: Text.PlainText
+        text: disc.expanded ? "󰅀" : "󰅂"
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+      }
+    }
+  }
+
+  // One device, Quick Share style: click to pick files, right-click sends the clipboard.
+  component DeviceTile: Item {
+    id: tile
     required property int rowIndex
     property string kind: "nearby"
     property string name: ""
@@ -1498,111 +1925,188 @@ Panel {
     property bool own: false
     readonly property bool paired: kind === "paired"
     readonly property bool armed: paired && root.armedUnpair === address
+    readonly property bool hasCursor: root.cursorActive && root.selectedIndex === rowIndex
+    readonly property bool hot: tileHover.hovered || hasCursor
 
-    current: paired && online
-    hasCursor: root.cursorActive && root.selectedIndex === rowIndex
-    foreground: root.foreground
-    fill: root.hoverFill
-    currentFill: root.selectedFill
-    implicitHeight: rowBody.implicitHeight
+    implicitHeight: tileCol.implicitHeight + Style.space(14)
+
+    Rectangle {
+      anchors.fill: parent
+      radius: Style.cornerRadius
+      color: tile.hasCursor ? root.selectedFill : (tileHover.hovered ? root.hoverFill : "transparent")
+    }
+
+    HoverHandler {
+      id: tileHover
+      cursorShape: Qt.PointingHandCursor
+      onHoveredChanged: if (hovered) { root.cursorActive = true; root.selectedIndex = tile.rowIndex }
+    }
 
     MouseArea {
       anchors.fill: parent
-      hoverEnabled: true
       acceptedButtons: Qt.LeftButton | Qt.RightButton
-      cursorShape: Qt.PointingHandCursor
-      onEntered: {
-        root.cursorActive = true
-        root.selectedIndex = row.rowIndex
-      }
       onClicked: function(mouse) {
-        if (!row.address) return
-        if (mouse.button === Qt.RightButton) root.syncClipboardTo(row.address)
-        else root.sendFileTo(row.address)
+        if (!tile.address) return
+        if (mouse.button === Qt.RightButton) root.syncClipboardTo(tile.address)
+        else root.sendFileTo(tile.address)
       }
     }
 
-    Item {
-      id: rowBody
-      anchors.left: parent.left
-      anchors.right: parent.right
+    PanelToolTip {
+      visible: tileHover.hovered && tile.detail !== ""
+      text: tile.detail
+      fontFamily: root.fontFamily
+    }
+
+    Column {
+      id: tileCol
       anchors.top: parent.top
-      anchors.leftMargin: Style.space(10)
-      anchors.rightMargin: Style.space(6)
-      implicitHeight: Math.max(rowIcon.implicitHeight, rowInfo.implicitHeight, rowActions.implicitHeight) + Style.spacing.rowPaddingX
+      anchors.topMargin: Style.space(8)
+      anchors.horizontalCenter: parent.horizontalCenter
+      width: parent.width - Style.space(8)
+      spacing: Style.space(4)
+
+      Item {
+        anchors.horizontalCenter: parent.horizontalCenter
+        width: Style.space(44)
+        height: Style.space(44)
+
+        Rectangle {
+          anchors.fill: parent
+          radius: width / 2
+          color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, tile.online ? 0.10 : 0.04)
+          border.width: Math.max(1, Style.space(1.5))
+          border.color: tile.armed ? root.urgent
+                       : (tile.paired && tile.online ? Color.accent
+                       : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.18))
+        }
+        Text {
+          anchors.centerIn: parent
+          textFormat: Text.PlainText
+          text: /android|phone|pixel|galaxy|sdk_gphone|samsung|xiaomi/i.test(tile.name) ? "󰏲" : "󰌢"
+          color: tile.online ? root.foreground : root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.title
+        }
+      }
 
       Text {
-        id: rowIcon
+        width: parent.width
         textFormat: Text.PlainText
-        text: /android|phone|pixel|galaxy|sdk_gphone|samsung|xiaomi/i.test(row.name) ? "󰏲" : "󰌢"
-        color: (row.paired && row.online) ? root.foreground : Qt.darker(root.foreground, 1.4)
+        text: tile.name
+        color: tile.online ? root.foreground : root.dim
         font.family: root.fontFamily
-        font.pixelSize: Style.font.title
-        anchors.left: parent.left
-        anchors.verticalCenter: parent.verticalCenter
+        font.pixelSize: Style.font.bodySmall
+        font.bold: tile.paired && tile.online
+        horizontalAlignment: Text.AlignHCenter
+        elide: Text.ElideRight
+      }
+      Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: tile.armed ? root.t("tile_unpair_armed")
+              : (tile.paired ? ("󰌾 " + (tile.online ? (tile.own ? root.t("badge_own_short") : root.t("online")) : root.t("not_seen")))
+                             : ("󰌿 " + root.t("not_encrypted")))
+        color: tile.armed ? root.urgent : (tile.paired ? (tile.online ? Color.accent : root.dim) : root.urgent)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        horizontalAlignment: Text.AlignHCenter
+        elide: Text.ElideRight
+      }
+    }
+
+    // Per-device actions appear on hover only.
+    PanelActionButton {
+      visible: tile.paired && (tile.hot || tile.armed)
+      anchors.top: parent.top
+      anchors.left: parent.left
+      iconText: "󰅍"
+      tooltipText: root.t("send_clipboard_tooltip")
+      foreground: root.dim
+      fontFamily: root.fontFamily
+      onClicked: root.syncClipboardTo(tile.address)
+    }
+    PanelActionButton {
+      visible: tile.paired && (tile.hot || tile.armed)
+      anchors.top: parent.top
+      anchors.right: parent.right
+      iconText: "󰅖"
+      tooltipText: tile.armed ? root.t("unpair_confirm_tooltip") : root.t("unpair_tooltip")
+      foreground: tile.armed ? root.urgent : root.dim
+      hoverColor: root.urgent
+      bordered: tile.armed
+      fontFamily: root.fontFamily
+      onClicked: root.requestUnpair(tile.address)
+    }
+  }
+
+  // "Add device": opens the QR pairing card.
+  component AddTile: Item {
+    id: addTile
+    implicitHeight: addCol.implicitHeight + Style.space(14)
+
+    Rectangle {
+      anchors.fill: parent
+      radius: Style.cornerRadius
+      color: addHover.hovered || root.showPair ? root.hoverFill : "transparent"
+    }
+
+    HoverHandler { id: addHover; cursorShape: Qt.PointingHandCursor }
+
+    MouseArea {
+      anchors.fill: parent
+      onClicked: { if (root.showPair) root.showPair = false; else root.openPairing() }
+    }
+
+    Column {
+      id: addCol
+      anchors.top: parent.top
+      anchors.topMargin: Style.space(8)
+      anchors.horizontalCenter: parent.horizontalCenter
+      width: parent.width - Style.space(8)
+      spacing: Style.space(4)
+
+      Item {
+        anchors.horizontalCenter: parent.horizontalCenter
+        width: Style.space(44)
+        height: Style.space(44)
+
+        Rectangle {
+          anchors.fill: parent
+          radius: width / 2
+          color: "transparent"
+          border.width: Math.max(1, Style.space(1.5))
+          border.color: root.showPair ? Color.accent : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.28)
+        }
+        Text {
+          anchors.centerIn: parent
+          textFormat: Text.PlainText
+          text: "󰐕"
+          color: root.showPair ? Color.accent : root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.title
+        }
       }
 
-      RowLayout {
-        id: rowActions
-        anchors.right: parent.right
-        anchors.verticalCenter: parent.verticalCenter
-        spacing: Style.space(2)
-
-        Text {
-          textFormat: Text.PlainText
-          text: row.paired ? "󰌾" : "󰌿"
-          color: row.paired ? Color.accent : Qt.darker(root.foreground, 1.4)
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.body
-          Layout.rightMargin: Style.space(4)
-        }
-        PanelActionButton {
-          visible: row.paired
-          iconText: "󰅍"
-          tooltipText: root.t("send_clipboard_tooltip")
-          foreground: root.foreground
-          fontFamily: root.fontFamily
-          onClicked: root.syncClipboardTo(row.address)
-        }
-        PanelActionButton {
-          visible: row.paired
-          iconText: "󰅖"
-          tooltipText: row.armed ? root.t("unpair_confirm_tooltip") : root.t("unpair_tooltip")
-          foreground: row.armed ? root.urgent : root.dim
-          hoverColor: root.urgent
-          bordered: row.armed
-          fontFamily: root.fontFamily
-          onClicked: root.requestUnpair(row.address)
-        }
+      Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: root.t("add_device")
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        horizontalAlignment: Text.AlignHCenter
+        elide: Text.ElideRight
       }
-
-      Column {
-        id: rowInfo
-        spacing: Style.space(1)
-        anchors.left: rowIcon.right
-        anchors.leftMargin: Style.space(10)
-        anchors.right: rowActions.left
-        anchors.rightMargin: Style.space(6)
-        anchors.verticalCenter: parent.verticalCenter
-
-        Text {
-          width: parent.width
-          textFormat: Text.PlainText
-          text: row.name + (row.paired ? (row.own ? "  · " + root.t("badge_own") : "  · " + root.t("badge_paired")) : "")
-          color: root.foreground
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.body
-          elide: Text.ElideRight
-        }
-        Text {
-          width: parent.width
-          textFormat: Text.PlainText
-          text: row.armed ? root.t("unpair_armed") : row.detail
-          color: row.armed ? root.urgent : Qt.darker(root.foreground, 1.5)
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          elide: Text.ElideRight
-        }
+      Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: "󰐲 " + root.t("add_device_sub")
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        horizontalAlignment: Text.AlignHCenter
+        elide: Text.ElideRight
       }
     }
   }
